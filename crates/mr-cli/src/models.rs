@@ -174,9 +174,15 @@ struct Fetched {
 /// Parse a `/models` reply: OpenAI's `{"data":[{"id":...}]}`, Google's
 /// `{"models":[{"name":"models/...",...}]}`, or a bare array. The Google `models/` prefix is
 /// stripped — the relay's `model` field carries the bare id and the endpoint re-adds it. Canonical
-/// reasoning-level suffixes are folded into the base model only when that base is also reported;
-/// otherwise an id such as `foo-high` remains a real model in its own right.
-fn parse_models(body: &str) -> Result<Vec<Fetched>, CliError> {
+/// reasoning-level suffixes are folded into the base model only when that base is also reported
+/// **and** the provider's dialect can send the level; otherwise an id such as `foo-max` remains a
+/// real model in its own right.
+///
+/// The dialect check is what stops a sync from writing a level the validator would refuse. An
+/// OpenAI-shaped provider that lists `foo` and `foo-max` is telling us it has two model ids, not
+/// that it can send `reasoning_effort: "max"`; folding the suffix would invent a tier the dialect
+/// lowers to `xhigh`.
+fn parse_models(body: &str, dialect: mr_core::dialect::Dialect) -> Result<Vec<Fetched>, CliError> {
     let v: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| CliError::failure(format!("the /models response is not JSON: {e}")))?;
     let arr = if let Some(a) = v.as_array() {
@@ -258,12 +264,13 @@ fn parse_models(body: &str) -> Result<Vec<Fetched>, CliError> {
     }
 
     // Decide against the complete id set, not only ids seen so far, so suffix-first provider lists
-    // fold identically to base-first lists. A base that is absent keeps the suffixed id intact.
+    // fold identically to base-first lists. A base that is absent keeps the suffixed id intact, and
+    // so does a level this provider's dialect cannot put on the wire.
     let mut levels_by_base: HashMap<String, Vec<ReasoningLevel>> = HashMap::new();
     let mut retained = Vec::with_capacity(out.len());
     for fetched in out {
         if let Some((base, level)) = canonical_level_suffix(&fetched.id) {
-            if ids.contains(base) {
+            if ids.contains(base) && dialect.supports_reasoning_level(level) {
                 levels_by_base
                     .entry(base.to_owned())
                     .or_default()
@@ -289,7 +296,7 @@ fn parse_models(body: &str) -> Result<Vec<Fetched>, CliError> {
 ///
 /// `ReasoningLevel::parse` accepts human-friendly aliases (`x-high`, `extra-high`) that are useful
 /// in config but are not canonical provider id tokens; this helper deliberately uses the canonical
-/// seven-token import vocabulary instead.
+/// eight-token vocabulary — the same list as `LEVEL_SUFFIXES` in `mr-core` — instead.
 fn canonical_level_suffix(id: &str) -> Option<(&str, ReasoningLevel)> {
     let (base, suffix) = id.rsplit_once('-')?;
     if base.is_empty() {
@@ -297,6 +304,7 @@ fn canonical_level_suffix(id: &str) -> Option<(&str, ReasoningLevel)> {
     }
     let level = match suffix {
         "none" => ReasoningLevel::None,
+        "minimal" => ReasoningLevel::Minimal,
         "low" => ReasoningLevel::Low,
         "medium" => ReasoningLevel::Medium,
         "high" => ReasoningLevel::High,
@@ -400,13 +408,17 @@ async fn sync_one(
     let url = format!("{base}/models{query}");
     let pid = p.id.as_str().to_owned();
 
-    let reply = net::request(
+    let reply = net::request_bounded(
         client,
         http::Method::GET,
         &url,
         &headers,
         None,
         std::time::Duration::from_secs(20),
+        // A catalogue is data, not a probe: infron answers with 513 models, and the probe-sized cap
+        // cut that reply at 16 KiB mid-string, which surfaced as "the /models response is not JSON"
+        // — a parse error naming the symptom and hiding the truncation.
+        net::CATALOGUE_MAX_BODY,
     )
     .await?;
     if !reply.status.is_success() {
@@ -430,7 +442,7 @@ async fn sync_one(
         return Err(e);
     }
 
-    let fetched = parse_models(&reply.body)?;
+    let fetched = parse_models(&reply.body, p.dialect)?;
     let (added, refreshed) = merge(p, fetched, now);
     p.models_synced_at = Some(now);
     Ok(Summary {
@@ -548,6 +560,7 @@ async fn sync(ctx: &Ctx, provider: Option<&str>, all: bool) -> Result<(), CliErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mr_core::dialect::Dialect;
 
     #[test]
     fn source_filter_accepts_serde_and_colloquial_spellings() {
@@ -564,7 +577,7 @@ mod tests {
     #[test]
     fn parse_models_folds_level_ids_only_when_the_base_is_listed() {
         // The suffix precedes its base deliberately: model listing order must not change folding.
-        let models = parse_models(r#"["foo-high", "bar-high", "foo"]"#).unwrap();
+        let models = parse_models(r#"["foo-high", "bar-high", "foo"]"#, Dialect::OpenAi).unwrap();
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "bar-high");
         assert!(models[0].reasoning_levels.is_empty());
@@ -574,10 +587,42 @@ mod tests {
 
     #[test]
     fn parse_models_keeps_a_suffixed_id_when_no_base_is_listed() {
-        let models = parse_models(r#"["foo-high"]"#).unwrap();
+        let models = parse_models(r#"["foo-high"]"#, Dialect::OpenAi).unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "foo-high");
         assert!(models[0].reasoning_levels.is_empty());
+    }
+
+    #[test]
+    fn a_minimal_suffix_folds_like_every_other_level_name() {
+        // `minimal` is part of the canonical naming vocabulary, so a catalogue that lists it as a
+        // variant must not leave it behind as a separate model id.
+        let models = parse_models(r#"["foo", "foo-minimal"]"#, Dialect::OpenAi).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].reasoning_levels, vec![ReasoningLevel::Minimal]);
+    }
+
+    #[test]
+    fn a_suffix_the_dialect_cannot_send_stays_a_model_id() {
+        // An OpenAI-shaped provider that lists `foo-max` has two model ids. Folding it would
+        // claim a `max` tier the dialect rewrites to `xhigh`, and the validator would then refuse
+        // the very configuration sync just wrote.
+        let models = parse_models(r#"["foo", "foo-max"]"#, Dialect::OpenAi).unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["foo", "foo-max"]
+        );
+        assert!(models[0].reasoning_levels.is_empty());
+        assert!(models[1].reasoning_levels.is_empty());
+    }
+
+    #[test]
+    fn a_budget_dialect_folds_a_suffix_it_can_send() {
+        // Anthropic expresses every tier, so the same catalogue shape really is a level variant.
+        let models = parse_models(r#"["foo", "foo-max"]"#, Dialect::Anthropic).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "foo");
+        assert_eq!(models[0].reasoning_levels, vec![ReasoningLevel::Max]);
     }
 
     #[test]
@@ -587,6 +632,7 @@ mod tests {
                 {"id":"gpt-5.5","object":"model","capabilities":["chat"]},
                 {"id":"o3-mini","context_length":200000,"max_output_tokens":100000}
             ]}"#,
+            Dialect::OpenAi,
         )
         .unwrap();
         assert_eq!(openai.len(), 2);
@@ -601,6 +647,7 @@ mod tests {
             r#"{"models":[
                 {"name":"models/gemini-2.5-pro","displayName":"Gemini 2.5 Pro","contextWindow":1048576}
             ]}"#,
+            Dialect::Google,
         )
         .unwrap();
         // The `models/` prefix is stripped: the relay's model field wants the bare id.
@@ -608,7 +655,7 @@ mod tests {
         assert_eq!(google[0].label.as_deref(), Some("Gemini 2.5 Pro"));
         assert_eq!(google[0].context_length, Some(1_048_576));
 
-        let bare = parse_models(r#"["a","models/b"]"#).unwrap();
+        let bare = parse_models(r#"["a","models/b"]"#, Dialect::OpenAi).unwrap();
         assert_eq!(
             bare.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
             vec!["a", "b"]
@@ -617,11 +664,11 @@ mod tests {
 
     #[test]
     fn parse_models_rejects_nonsense() {
-        let err = parse_models("not json at all").unwrap_err();
+        let err = parse_models("not json at all", Dialect::OpenAi).unwrap_err();
         assert_eq!(err.exit, crate::output::Exit::Failure);
-        let err = parse_models(r#"{"hello":"world"}"#).unwrap_err();
+        let err = parse_models(r#"{"hello":"world"}"#, Dialect::OpenAi).unwrap_err();
         assert!(err.message.contains("`data`"), "{}", err.message);
-        let err = parse_models(r#"[{"object":"model"}]"#).unwrap_err();
+        let err = parse_models(r#"[{"object":"model"}]"#, Dialect::OpenAi).unwrap_err();
         assert!(err.message.contains("neither an `id`"), "{}", err.message);
     }
 

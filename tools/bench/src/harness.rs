@@ -130,6 +130,7 @@ impl Harness {
             oauth_refreshers: Arc::new(HashMap::new()),
             oauth_store: Arc::clone(&oauth_store),
             quota: Arc::new(manarouter_relay::quota::QuotaManager::new(oauth_store)),
+            activity: Arc::new(manarouter_relay::activity::ActivityLog::new()),
             sticky_success: Arc::new(StickySuccess::default()),
         };
 

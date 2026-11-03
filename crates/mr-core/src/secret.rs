@@ -12,15 +12,21 @@
 //!
 //! ```text
 //! ~/.config/manarouter/
-//!   config.json       # references secrets by id, never contains them
+//!   config.json       # references account secrets by id; provider headers are stored verbatim
 //!   vault.key         # 32 random bytes, mode 0600, never leaves the machine
 //!   vault.enc         # AES-256-GCM ciphertext, one nonce per entry
 //! ```
 //!
 //! The configuration file names a credential by id — `provider/<provider-id>/account/<account-id>`
-//! — and this module maps that id to bytes. Nothing else in the codebase ever sees a key in its
-//! serialised form, which is what makes "greppable for key-shaped strings" a checkable property
+//! — and this module maps that id to bytes. Nothing else in the codebase stores an *account* key in
+//! its serialised form, which is what keeps "greppable for key-shaped strings" a checkable property
 //! rather than an aspiration.
+//!
+//! One deliberate exception sits outside this module: a provider's static `headers` map is written
+//! in the clear to `config.json` and to the routing snapshot. Those headers are not credentials by
+//! design (see `docs/21-security.md`), and the relay must be able to apply them on every request
+//! without decrypting anything. A key placed in a provider header is therefore not protected; the
+//! panel and the CLI both point at `mr account add` / the account drawer for that instead.
 //!
 //! ## Why a key file and not a passphrase
 //!
@@ -202,6 +208,27 @@ impl Vault {
     /// Open the vault in the conventional config directory.
     pub fn open_default() -> Result<Self> {
         Self::open(config_dir())
+    }
+
+    /// Re-read the same vault from disk, as a fresh snapshot.
+    ///
+    /// A [`Vault`] holds the entries it read when it was opened. That is the right shape for a
+    /// process that owns the file — writes go through the same handle, and `put` reloads when the
+    /// handle is clean — but the relay is *not* that process: the panel and `mr` store credentials
+    /// while it runs, and a snapshot taken at startup cannot see any of them. The symptom is not
+    /// subtle once you look for it: an account given a credential through the panel reports "no
+    /// credential in the vault" until the relay restarts, so a working provider looks broken.
+    ///
+    /// This is the read-side remedy: a caller that finds nothing can ask for a fresh snapshot and
+    /// look again. It costs one file read, and only on the path where something was already missing.
+    pub fn refreshed(&self) -> Result<Self> {
+        match self.path.parent() {
+            Some(dir) => Self::open(dir),
+            None => Err(Error::Secret(format!(
+                "the vault path {} has no parent directory, which should be impossible",
+                self.path.display()
+            ))),
+        }
     }
 
     /// Store or replace a secret.
@@ -570,6 +597,26 @@ mod tests {
         // The normal state for a provider that is configured but not yet authenticated.
         let (_d, v) = vault();
         assert!(v.get("nope").unwrap().is_none());
+    }
+
+    /// A held vault is a snapshot; asking for a fresh one sees what another writer stored.
+    ///
+    /// This is the relay's situation with the panel: the process opened the file at startup, the
+    /// operator added a credential afterwards, and only a re-read can tell the difference between
+    /// "no secret here" and "no secret here *when I looked*".
+    #[test]
+    fn a_refreshed_snapshot_sees_a_secret_another_handle_stored() {
+        let (dir, stale) = vault();
+        let mut writer = Vault::open(dir.path()).unwrap();
+        writer.put("late", "sk-late").unwrap();
+        writer.flush().unwrap();
+
+        assert!(
+            stale.get("late").unwrap().is_none(),
+            "the held snapshot must not see a write made after it was opened"
+        );
+        let fresh = stale.refreshed().unwrap();
+        assert_eq!(fresh.get("late").unwrap().as_deref(), Some("sk-late"));
     }
 
     #[test]

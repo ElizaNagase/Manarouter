@@ -34,6 +34,7 @@ use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
 use http_body_util::BodyExt as _;
 use mr_core::model::Http2Preference;
+use rustls::client::Resumption;
 
 /// Everything needed to issue one upstream request.
 ///
@@ -403,6 +404,14 @@ impl Upstream {
         // means an h2-capable provider gets h2 and everyone else falls back to HTTP/1.1.
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
+        // TLS session resumption: a repeat connection to the same provider can resume an existing
+        // session instead of paying a full handshake. This is the biggest single latency win on
+        // anything that is not already a warm socket — a cold TLS handshake dominates every other
+        // stage of the relay's added-latency budget. The store is bounded so a long-running relay
+        // cannot grow it without bound, and the same store serves every worker because the client
+        // is shared.
+        tls.resumption = Resumption::in_memory_sessions(2048);
+
         // The same trust store and ALPN offer for the origin hop of a proxied request: the
         // certificate is verified against the *origin's* name, and the origin is what speaks h2.
         let tls = std::sync::Arc::new(tls);
@@ -640,13 +649,24 @@ async fn send_with<C>(
 where
     C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
 {
+    // Wait for the response *headers* under a deadline, not only for the body's first byte.
+    //
+    // Without this a provider that accepts the connection and then answers nothing holds the
+    // request open indefinitely: `total_timeout` is `None` for a normal provider (a long streamed
+    // generation must be allowed to finish), and the body deadline below has not started yet
+    // because there is no body to read. `ttfb_timeout` is the operator's statement of "an answer
+    // that has not begun by now is not coming", and headers are part of beginning to answer — so
+    // it bounds this wait too, and the caller sees a stall it can fail over from instead of a
+    // request that never returns.
+    let (deadline, from_ttfb) = match request.total_timeout {
+        Some(total) if total < request.ttfb_timeout => (total, false),
+        _ => (request.ttfb_timeout, true),
+    };
     let send_fut = client.request(req);
-    let resp = match request.total_timeout {
-        Some(total) => match tokio::time::timeout(total, send_fut).await {
-            Ok(r) => r,
-            Err(_) => return Err(UpstreamError::TotalTimeout(total)),
-        },
-        None => send_fut.await,
+    let resp = match tokio::time::timeout(deadline, send_fut).await {
+        Ok(r) => r,
+        Err(_) if from_ttfb => return Err(UpstreamError::TtfbTimeout(deadline)),
+        Err(_) => return Err(UpstreamError::TotalTimeout(deadline)),
     };
     let headers_at = started.elapsed();
     resp.map_err(|e| classify(&e, request, headers_at))
@@ -1069,6 +1089,48 @@ mod tests {
             video: Some("video/model".into()),
             ..RoutingDefaults::default()
         }
+    }
+
+    /// A provider that accepts the connection and then says nothing must fail like any other
+    /// stall. Before the headers deadline this waited forever when `total_timeout` was unset, which
+    /// is the default for any provider expected to stream a long answer.
+    #[tokio::test]
+    async fn a_silent_provider_fails_instead_of_holding_the_request_open() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let held = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(socket);
+        });
+
+        let upstream = Upstream::new(Duration::from_secs(30), 8).expect("client");
+        let started = std::time::Instant::now();
+        let error = upstream
+            .send(UpstreamRequest {
+                method: Method::POST,
+                url: format!("http://{addr}/v1/chat/completions"),
+                headers: HeaderMap::new(),
+                proxy: None,
+                body: Bytes::from_static(b"{}"),
+                http2: Http2Preference::Auto,
+                connect_timeout: Duration::from_secs(1),
+                ttfb_timeout: Duration::from_millis(250),
+                total_timeout: None,
+            })
+            .await
+            .expect_err("a silent provider must fail");
+        assert!(
+            matches!(error, UpstreamError::TtfbTimeout(d) if d.as_millis() == 250),
+            "expected a TTFB timeout, got {error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait must be bounded by the timeout, not by the test"
+        );
+        held.abort();
     }
 
     #[test]

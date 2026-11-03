@@ -28,7 +28,6 @@ use hyper_util::client::legacy::Client as LegacyClient;
 use hyper_util::rt::TokioExecutor;
 use rand::rngs::OsRng;
 use rand::RngCore as _;
-use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -571,15 +570,24 @@ pub struct Loopback {
     port: u16,
 }
 
-async fn bind_dual_stack_localhost(port: u16) -> io::Result<TcpListener> {
-    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_only_v6(false)?;
-    socket.set_nonblocking(true)?;
-    let address = std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, port, 0, 0);
-    socket.bind(&address.into())?;
-    socket.listen(128)?;
-    let listener: std::net::TcpListener = socket.into();
-    TcpListener::from_std(listener)
+/// Bind a loopback-only listener for the redirect.
+///
+/// This deliberately does **not** use a dual-stack socket bound to `::`. `::` is the unspecified
+/// address — every interface — so the browser callback would be reachable from the LAN: any other
+/// host could POST a bogus `?error=` and abort the operator's login, and the plaintext redirect
+/// would leave the machine. The capture is a loopback seam, so it is bound as one: `127.0.0.1`
+/// first (which every browser reaches for `localhost`), then `::1` for IPv6-only stacks.
+async fn bind_loopback(port: u16) -> io::Result<TcpListener> {
+    match TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+        Ok(listener) => Ok(listener),
+        // Only for the name `localhost`: the browser may resolve it to either loopback family,
+        // so listening on ::1 still catches the callback. For a literal address there is no such
+        // choice — the redirect names one address, and listening on the other would never receive
+        // the request.
+        Err(ipv4_error) => TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port))
+            .await
+            .map_err(|_| ipv4_error),
+    }
 }
 
 impl Loopback {
@@ -595,12 +603,12 @@ impl Loopback {
         let candidates = redirects.candidates();
         let mut failures: Vec<String> = Vec::new();
         for port in candidates.clone() {
-            // For registered localhost, make an IPv6 dual-stack socket (IPV6_V6ONLY=false),
-            // so browsers resolving to either ::1 or 127.0.0.1 reach this same listener.
-            let bind_result = if redirects.host == "localhost" {
-                bind_dual_stack_localhost(port).await
-            } else {
-                TcpListener::bind((redirects.host, port)).await
+            // The registered redirect host is `localhost` for some platforms and `127.0.0.1` for
+            // others; both resolve to loopback, and both are bound as loopback here. A wide bind
+            // would expose the capture to the LAN.
+            let bind_result = match redirects.host {
+                "localhost" => bind_loopback(port).await,
+                _ => TcpListener::bind((redirects.host, port)).await,
             };
             match bind_result {
                 Ok(listener) => {

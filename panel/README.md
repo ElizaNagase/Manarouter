@@ -15,13 +15,14 @@ All requests are **relative** (`/api/…`); the panel talks only to the origin t
 | `app.js` | Entry point: session gate, hash router (`#/view/param`), health poller wiring, the persistent restart-pending banner, shared `ctx` passed to every view. |
 | `api.js` | Single fetch wrapper. Parses the `{ error: { code, message, details } }` envelope, centralises the 401 → login transition, offers `getRaw`/`putRaw` for the config file. |
 | `dom.js` | `h()` element builder — the only sanctioned DOM construction. **Exactly one deliberate `innerHTML`** — docs markdown in `view-docs.js`, escaped at the door by `markdown.js` — and server strings (provider labels, model ids, error messages, doc text) enter the DOM as text nodes or `textContent` only. Also: validation-problem → field mapping, error blocks, chips, form fields. |
-| `format.js` | Pure, DOM-free helpers (uptime/age, chip-class selection, problem grouping, port diffing, combo step moves, hedge-enum parsing). See “Testing”. The hedge-enum helpers (`parseWinnerFail` / `buildWinnerFail`) carry a known mismatch with the backend — see the “Hedge enum” note under “API contract as understood by this panel”. |
+| `format.js` | Pure, DOM-free helpers (uptime/age, chip-class selection, problem grouping, port diffing, combo step moves, hedge-enum parsing). See “Testing”. The hedge-enum helpers (`parseWinnerFail` / `buildWinnerFail`) build the backend's internally tagged form; legacy externally tagged documents are still read. |
 | `poll.js` | Health poll scheduler. Chained `setTimeout` (never overlapping), **stops entirely while `document.visibilityState !== 'visible'`** — a background tab must not hammer a loopback socket — and fires one immediate tick on return. |
+| `combo-live.js` | The sidebar's live combo visualizer, under the Combos nav entry. Polls `GET /api/activity` (the control plane proxying the relay's `/control/activity`) every 1.5 s through `poll.js`. `comboActivityView` is the pure decision — in flight, idle with history and its relative age, never run, control plane unreachable — so all four states are tested without a DOM. |
 | `toast.js` | Global notification area. Success/error/warning/info map onto the semantic colours; error toasts render the backend's full `details` list. |
 | `dialog.js` | Promise-based confirm dialog (focus trap, Escape, focus restore) and the one-time client-key reveal (no accidental backdrop dismissal; copy button). |
 | `view-login.js` | Password screen when `password_required && !authenticated`. |
 | `view-overview.js` | Health stats, snapshot digest/age, counts, live-updated uptime, and the relay reachability probe (`fetch(url, {mode:'no-cors'})` — opaque but proves the socket answers). |
-| `view-providers.js` | Dense provider table + detail drawer: accounts (add/toggle/delete), models (add manual/hide/delete), timeouts, headers, route overrides, per-provider **Sync models**. |
+| `view-providers.js` | Dense provider table + detail drawer: accounts (add/toggle/delete), models (add manual/hide/delete), timeouts, headers, route overrides, per-provider **Sync models**. Creating a provider opens the account drawer for it immediately, so the new provider is never left without a credential. |
 | `view-combos.js` | Combo list + editor. Step list is drag-reorderable (plus ↑/↓ buttons for keyboard) and **never sorted** — the array order *is* the priority order. Hedge help text summarises `docs/07-hedged-race.md`. |
 | `view-keys.js` | Client keys, allow-lists (one per line), create flow with the show-once plaintext dialog. |
 | `view-aliases.js` | Alias table editor (add + delete; the API has no alias PUT). |
@@ -41,6 +42,12 @@ Contracts verified against the conductor implementation (still verify interactiv
 
 1. **Account creation** — `POST /api/providers/{id}/accounts` is sent `{ label, identity, secret }`
    (the `Account` struct's fields; the secret is expected to become a server-side `secret_ref`).
+   `secret` is **required by the panel** and refused before the request is sent; the only way to
+   omit it is to tick "This provider needs no API key" for a local server (Ollama, llama.cpp) that
+   genuinely accepts credential-less requests. The OAuth path sends `secret: null`, because the
+   credential comes from the sign-in flow. Panel flow for a new provider: **Add provider** → the
+   account drawer opens for the provider just created → **Add account** (or **Connect** for
+   OAuth) → the detail drawer opens with the account listed.
 2. **Model hide/show** — `POST /api/providers/{id}/models` is treated as an upsert and sent the
    full model object with `hidden` flipped (`hidden` is authored metadata; manual entries win
    over syncs per `docs/03-configuration.md`). If the backend grows a dedicated toggle route,
@@ -51,16 +58,13 @@ Contracts verified against the conductor implementation (still verify interactiv
    **Caveat:** the endpoint exists, but the ledger only reflects traffic that has actually flowed, so in a real
    deployment this view is always empty. That empty state is honest, not a missing route — see
    `docs/08-quota-tracking.md`.
-5. **Hedge enum** — `hedge.on_winner_fail` is parsed/built as the externally tagged serde form
-   `{"rerun-excluding":{"max_rounds":2}}` / `{"stable-fallback":{"step":1}}` /
-   `{"pick-highest-passed":null}`; a bare string form is tolerated on read.
-   **KNOWN BUG:** this is wrong. `WinnerFailMode` in `crates/mr-core/src/dialect.rs` is internally
-   tagged (`#[serde(tag = "mode")]`), so the wire form is
-   `{"mode":"rerun-excluding","max_rounds":2}` / `{"mode":"stable-fallback","step":2}`. The shape this
-   panel builds is rejected by the backend, and a config written by the backend is mis-read here.
-   `crates/mr-core/src/dialect.rs` has a regression test pinning the authoritative form
-   (`on_winner_fail_uses_the_internally_tagged_wire_form`); `format.js` (`parseWinnerFail` /
-   `buildWinnerFail`) and the panel test below must be changed to match it.
+5. **Hedge enum** — `hedge.on_winner_fail` is sent in the internally tagged form the backend uses
+   (`#[serde(tag = "mode")]` in `crates/mr-core/src/dialect.rs`):
+   `{"mode":"rerun-excluding","max_rounds":2}` / `{"mode":"stable-fallback","step":2}` /
+   `{"mode":"pick-highest-passed"}`. `format.js` (`parseWinnerFail` / `buildWinnerFail`) builds that
+   form and still *reads* the older externally tagged shape, so a config written by an earlier
+   build keeps loading. The backend form is pinned by
+   `on_winner_fail_uses_the_internally_tagged_wire_form` in `dialect.rs`.
 6. **Auth kinds** — provider auth is sent as the internally tagged form `{"type":"bearer"}`,
    `{"type":"api-key-header","header":…}`, `{"type":"header","name":…,"prefix":…}`,
    `{"type":"query-param","param":…}`, `{"type":"oauth","platform":…}`.
@@ -178,7 +182,9 @@ The panel was **not** executed in a browser in this environment. Manual checklis
 
 1. Overview: stats fill from `/api/health`; stop the backend → pill turns red, boot screen
    offers Retry; hide the tab for a minute and confirm (via network inspector) no polls fire.
-2. Providers: open drawer, add/toggle/delete an account, add a manual model, hide/show,
+2. Providers: **Add provider** → the account drawer opens on its own; submitting with an empty
+   secret is refused inline, ticking "needs no API key" allows it; after adding, the detail drawer
+   opens showing the account. Then toggle/delete an account, add a manual model, hide/show, and
    Sync models (button must stay disabled while running).
 3. Combos: drag a step and verify participants + stable-step references move with it; save;
    reload and confirm order survived exactly.

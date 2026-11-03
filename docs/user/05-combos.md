@@ -66,9 +66,9 @@ Two things to keep in mind:
 
   The replacement is a participant that had already answered when the winner was committed. In the
   usual shape of a race — the preferred model answers first and alone — there is nobody else to fall
-  back to, and the stream ends with an error as it always did. `on_winner_fail` has four modes; the
-  one that runs is "pick the highest-priority that passed" (`pick-highest-passed`), which is also
-  the default. The other three are accepted configuration that the relay ignores for now.
+  back to, and the stream ends with an error as it always did. `on_winner_fail` has four modes and
+  all four run; the default is "pick the highest-priority that passed" (`pick-highest-passed`), which
+  is one of the two that spend no extra upstream request.
 
 With a priority combo, enabling the hedge setting can also activate a process-local preference for
 the last successful step.

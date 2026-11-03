@@ -1,5 +1,8 @@
 # --- Rust ---
-/target/
+# No trailing slash: a `target` that has been relocated to another disk is a
+# symlink, and `/target/` matches only a directory, so the link would show up as
+# an untracked file and could be committed by accident.
+/target
 **/*.rs.bk
 *.pdb
 

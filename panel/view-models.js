@@ -3,11 +3,10 @@
 // provenance, not health — semantic colours stay semantic.
 
 import { api } from './api.js';
-import { h, chip, emptyState, errorBlock, field, toggle } from './dom.js';
-import { formatCompact } from './format.js';
+import { h, chip, emptyState, errorBlock, field, toggle, copyButton } from './dom.js';
+import { formatCompact, REASONING_LEVELS, providerLevels, declaredLevels, modelLevels } from './format.js';
 
 const SOURCES = ['synced', 'manual', 'inferred'];
-const REASONING_LEVELS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultra', 'max'];
 const INPUT_MODALITIES = ['text', 'image', 'audio', 'video', 'pdf', 'file'];
 const MODEL_TEST_PROMPT = 'reply with "yes"';
 
@@ -147,33 +146,56 @@ export async function renderModels(mount, ctx) {
   }
 
   function modelMetadataEditor(p, m) {
-    const levelsDerived = !Array.isArray(m.reasoning_levels) || m.reasoning_levels.length === 0;
+    const dialectLevels = providerLevels(p, m);
+    const configuredLevels = declaredLevels(m);
+    const effectiveLevels = modelLevels(m, p);
+    const levelsDerived = configuredLevels.length === 0;
     const modalitiesDerived = !Array.isArray(m.input_modalities) || m.input_modalities.length === 0;
-    const configuredLevels = Array.isArray(m.reasoning_levels) ? m.reasoning_levels.filter((level) => REASONING_LEVELS.includes(level)) : [];
     const configuredModalities = Array.isArray(m.input_modalities) ? m.input_modalities.filter((modality) => INPUT_MODALITIES.includes(modality)) : [];
     const defaultLevel = REASONING_LEVELS.includes(m.default_reasoning_level) ? m.default_reasoning_level : '';
     const defaultLevelLabel = defaultLevel || 'inherit global';
+    const effectiveDefault = REASONING_LEVELS.includes(m.effective_default_reasoning_level)
+      ? m.effective_default_reasoning_level
+      : '';
+    // The picker offers the provider's levels, never the whole ladder: a level its dialect cannot
+    // send would be refused by the backend on save. A stored default outside that list is kept as
+    // an option so opening the editor does not silently rewrite the value.
+    const defaultChoices = !defaultLevel || dialectLevels.includes(defaultLevel)
+      ? dialectLevels
+      : [...dialectLevels, defaultLevel];
+    // A level the entry declares but the dialect cannot send is not offered (the backend would
+    // refuse the save), and it is named in the hint instead of disappearing quietly on the next
+    // save.
+    const unsendableLevels = configuredLevels.filter((level) => !dialectLevels.includes(level));
+    const unsendableNote = unsendableLevels.length
+      ? ` Declared but unsendable on this provider: ${unsendableLevels.join(', ')} — saving will drop it.`
+      : '';
+    // Validation refuses a default the declared list does not contain, so say so before the save
+    // turns into a 400 with the same words.
+    const strayDefaultNote = defaultLevel && configuredLevels.length && !configuredLevels.includes(defaultLevel)
+      ? ` The default ${defaultLevel} is not one of the declared levels; check it or clear it to inherit.`
+      : '';
     const levels = new Set(configuredLevels);
     const modalities = new Set(configuredModalities);
     const levelInputs = [];
     const modalityInputs = [];
     const defaultSelect = h('select', { class: 'input', 'aria-label': `Default reasoning level for ${m.id}` },
       h('option', { value: '' }, 'inherit global default'),
-      ...REASONING_LEVELS.map((level) => h('option', { value: level }, level)));
+      ...defaultChoices.map((level) => h('option', { value: level }, level)));
     defaultSelect.value = defaultLevel;
     const save = h('button', { class: 'btn btn-sm', type: 'button' }, 'Save metadata');
     const editor = h('details', { class: 'model-metadata' },
       h('summary', {}, 'Configure'),
-      h('p', { class: 'hint' }, `Current reasoning levels: ${levelsDerived ? 'automatic (derived by server)' : configuredLevels.join(', ')} · Default level: ${defaultLevelLabel} · Input modalities: ${modalitiesDerived ? 'automatic (derived by server)' : configuredModalities.join(', ')}. Saving overrides writes these explicit lists.`),
+      h('p', { class: 'hint' }, `This ${p.dialect} provider can send: ${dialectLevels.join(', ')}. The model currently offers: ${effectiveLevels.length ? effectiveLevels.join(', ') : 'no reasoning levels'}${levelsDerived ? ' (derived; nothing is declared on this entry)' : ''}.${unsendableNote}${strayDefaultNote} Runs at ${effectiveDefault || defaultLevelLabel} when the name carries no level · Input modalities: ${modalitiesDerived ? 'automatic (derived by server)' : configuredModalities.join(', ')}. Saving writes the checked list explicitly.`),
       h('span', { class: 'field-label' }, 'Supported reasoning levels'),
-      h('div', { class: 'model-meta-options' }, ...REASONING_LEVELS.map((level) => {
+      h('div', { class: 'model-meta-options' }, ...dialectLevels.map((level) => {
         const control = toggle(level, { checked: levels.has(level), id: `model-${p.id}-${m.id}-${level}` });
         control.input.value = level;
         control.input.addEventListener('change', () => control.input.checked ? levels.add(level) : levels.delete(level));
         levelInputs.push(control.input);
         return control.row;
       })),
-      field('Per-model default reasoning level', defaultSelect, { hint: 'Choose a known level or inherit the global default.' }),
+      field('Per-model default reasoning level', defaultSelect, { hint: 'Choose a level this provider can send, or inherit the global default.' }),
       h('span', { class: 'field-label' }, 'Accepted input modalities'),
       h('div', { class: 'model-meta-options' }, ...INPUT_MODALITIES.map((modality) => {
         const control = toggle(modality, { checked: modalities.has(modality), id: `model-${p.id}-${m.id}-input-${modality}` });

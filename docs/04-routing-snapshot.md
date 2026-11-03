@@ -208,10 +208,17 @@ the same code path.
 `reasoning_levels` on the model entry wins outright; otherwise the bundled table
 `catalog/model_meta.json`, keyed `provider/model` and falling back to a provider-agnostic `model`
 key; otherwise, when the model or its provider declares the `reasoning` capability — or the dialect
-serves only reasoning models, currently `codex` — the generic set `none, low, medium, high, xhigh,
-max`. A model that reaches none of the three has `levels == 0` and its name gets no `-<level>`
-suffix. The generic set deliberately omits `minimal`, `ultra` and `max`: they are provider-specific
-tiers, and advertising one a provider rejects turns a working request into a 400.
+serves only reasoning models, currently `codex` — the dialect's own level vocabulary. A model that
+reaches none of the three has `levels == 0` and its name gets no `-<level>` suffix.
+
+The vocabulary comes from `Dialect::expressible_reasoning_levels`, one authoritative list per
+dialect: named-effort dialects (`openai`, `codex`, `copilot`, `command-code-go`) send
+`reasoning_effort` and can name `none, minimal, low, medium, high, xhigh`; budget dialects
+(`anthropic`, `google`, `antigravity`) send a thinking budget and can express every tier, including
+`ultra` and `max`. Whatever the source — declared, catalogue or vocabulary — the result is filtered
+through that same list, so the compiler never offers a tier its dialect would rewrite or drop. A
+declared `max` on an `openai` model is therefore an error from `Provider::validate` (quoting the
+levels the dialect can send), not a level that quietly runs as `xhigh`.
 
 ---
 

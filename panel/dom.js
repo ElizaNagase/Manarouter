@@ -55,6 +55,8 @@ const ICON_PATHS = {
   down: 'M8 3v10M4 9l4 4 4-4',
   check: 'M3 8.5l3.5 3.5L13 4.5',
   pencil: 'M4 12l.8-2.8 6.4-6.4a1.4 1.4 0 0 1 2 2L6.8 11.2 4 12z',
+  key: 'M6.2 9.8a2.8 2.8 0 1 0-2.4 1.2h1.2M6.2 9.8L13 3m-2.4 1.4l1.6 1.6',
+  play: 'M5 3.5l7 4.5-7 4.5z',
   grip: null, // drawn with circles below
 };
 

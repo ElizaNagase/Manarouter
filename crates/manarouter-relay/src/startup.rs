@@ -113,7 +113,17 @@ pub fn load_config() -> Result<Config, StartupError> {
         ))
     })?;
 
-    let problems = config.validate();
+    // Advisories are logged, not fatal: a provider that exists before its first account is how the
+    // panel and the quickstart both create providers, and a gateway that refuses to start on one
+    // leaves the operator with a configuration no command will fix.
+    for advisory in config
+        .validate()
+        .into_iter()
+        .filter(|p| mr_core::config::is_advisory(p))
+    {
+        tracing::warn!(problem = %advisory, "configuration advisory");
+    }
+    let problems = config.validate_fatal();
     if !problems.is_empty() {
         let mut message = String::from("the configuration is not valid:");
         for problem in &problems {
@@ -209,6 +219,7 @@ pub fn build_state(
         quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&oauth_store))),
         oauth_store,
         sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+        activity: Arc::new(crate::activity::ActivityLog::new()),
     };
 
     // Adopt routing changes written by the control plane, without a restart.

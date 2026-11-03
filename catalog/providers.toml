@@ -112,7 +112,7 @@ oauth_project_required = true
 [providers.headers]
 "X-Goog-Api-Client" = "google-cloud-sdk vscode_cloudshelleditor/0.1"
 "Client-Metadata" = '{"ideType":"ANTIGRAVITY","platform":"WINDOWS","pluginType":"GEMINI"}'
-"User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/${antigravity_version} Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36"
+"User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/2.1.1 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36"
 
 [[providers.quota]]
 name = "weekly"

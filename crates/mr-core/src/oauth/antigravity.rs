@@ -28,6 +28,30 @@ fn all_ide_scopes() -> Vec<&'static str> {
         .collect()
 }
 
+/// The `platform` field of `ClientMetadata` for `loadCodeAssist` / `onboardUser`.
+///
+/// Measured against the live endpoint on 2026-11-01, one value at a time, holding the credential
+/// and every other field fixed:
+///
+/// | value | answer |
+/// |---|---|
+/// | `LINUX` | `400 INVALID_ARGUMENT` |
+/// | `WINDOWS` | `400 INVALID_ARGUMENT` |
+/// | `MACOS` | `400 INVALID_ARGUMENT` |
+/// | `DESKTOP` | `400 INVALID_ARGUMENT` |
+/// | `UNSPECIFIED` | `400 INVALID_ARGUMENT` |
+/// | `PLATFORM_UNSPECIFIED` | accepted |
+///
+/// So the enum has exactly the protobuf default plus whatever the IDE really sends, and every value
+/// this file previously tried — including `DESKTOP`, which a research note recommended — was a 400.
+/// That is worth stating plainly because of where it fired: `complete_login_with` calls
+/// `loadCodeAssist` on every login, so a fresh Antigravity sign-in could never complete, and the
+/// operator saw an `INVALID_ARGUMENT` about a field they had never heard of. `PLATFORM_UNSPECIFIED`
+/// is the value that gets past validation to the answer that matters, which is the account's tier.
+fn platform_name() -> &'static str {
+    "PLATFORM_UNSPECIFIED"
+}
+
 fn token_set_from(
     body: &str,
     previous_refresh: Option<&str>,
@@ -109,6 +133,62 @@ fn store_cloudcode_context(tokens: &mut TokenSet, project_id: &str, tier: Option
             .extra
             .insert("cloudcode_tier_id".into(), Value::String(tier.into()));
     }
+}
+
+/// Why onboarding cannot go ahead, quoting Google's own verdict rather than paraphrasing it.
+///
+/// A login that stops here is the operator's only signal about an account that will never serve a
+/// request, so it has to carry the reason. Google's `loadCodeAssist` answers with the tiers it will
+/// grant (`allowedTiers`) and, more usefully, the ones it will not (`ineligibleTiers`, each with a
+/// `reasonCode` and a `reasonMessage`). The message below is the difference between "requires a
+/// paid-tier project" — which sends an operator looking for billing — and the truth observed on
+/// 2026-11-01, where the free tier was refused with `UNSUPPORTED_CLIENT` and a note to migrate to
+/// the Antigravity suite. Only Google can decide that; our job is not to hide it.
+fn tier_refusal(load_code_assist: &Value, chosen_tier: &str) -> String {
+    let allowed: Vec<&str> = load_code_assist
+        .get("allowedTiers")
+        .and_then(Value::as_array)
+        .map(|tiers| {
+            tiers
+                .iter()
+                .filter_map(|tier| tier.get("id").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    let ineligible: Vec<String> = load_code_assist
+        .get("ineligibleTiers")
+        .and_then(Value::as_array)
+        .map(|tiers| {
+            tiers
+                .iter()
+                .map(|tier| {
+                    let id = tier.get("tierId").and_then(Value::as_str).unwrap_or("?");
+                    let code = tier
+                        .get("reasonCode")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?");
+                    let why = tier
+                        .get("reasonMessage")
+                        .and_then(Value::as_str)
+                        .map(|message| format!(": {message}"))
+                        .unwrap_or_default();
+                    format!("{id} ({code}){why}")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut refusal = format!(
+        "Cloud Code would onboard this account only as `{chosen_tier}`, which needs a Google Cloud \
+         project with billing enabled; onboarding is not attempted without one"
+    );
+    if allowed.len() > 1 || allowed.first().is_some_and(|id| *id != chosen_tier) {
+        refusal.push_str(&format!(" (offered: {})", allowed.join(", ")));
+    }
+    if !ineligible.is_empty() {
+        refusal.push_str(&format!("; refused: {}", ineligible.join("; ")));
+    }
+    refusal
 }
 
 fn parse_google_identity(reply: &super::flow::HttpReply) -> Result<AccountIdentity> {
@@ -319,8 +399,14 @@ impl OAuthPlatform for Antigravity {
         if let Some(pkce) = pkce {
             pairs.push(("code_verifier", pkce.verifier()));
         }
+        // Google rejects token requests without a User-Agent that names the client family.
+        // Mirror what Copilot does: a fixed UA string, not a template.
         let reply = Http::shared()?
-            .post_form(GOOGLE_TOKEN_ENDPOINT, &[], &pairs)
+            .post_form(
+                GOOGLE_TOKEN_ENDPOINT,
+                &[("user-agent", "Antigravity/manarouter")],
+                &pairs,
+            )
             .await?;
         if let Some((class, detail)) = endpoint_failure(reply.status, &reply.body) {
             return Err(oauth_failure(class, Self::ID, detail));
@@ -354,8 +440,13 @@ impl OAuthPlatform for Antigravity {
             ("refresh_token", refresh_token),
             ("grant_type", "refresh_token"),
         ];
+        // Google rejects token requests without a User-Agent that names the client family.
         let reply = Http::shared()?
-            .post_form(GOOGLE_TOKEN_ENDPOINT, &[], &pairs)
+            .post_form(
+                GOOGLE_TOKEN_ENDPOINT,
+                &[("user-agent", "Antigravity/manarouter")],
+                &pairs,
+            )
             .await?;
         if let Some((class, detail)) = endpoint_failure(reply.status, &reply.body) {
             return Err(oauth_failure(class, Self::ID, detail));
@@ -382,7 +473,7 @@ impl OAuthPlatform for Antigravity {
         let body = serde_json::json!({
             "metadata": {
                 "ideType": if self.tier == ClientTier::Ide { "ANTIGRAVITY" } else { "IDE_UNSPECIFIED" },
-                "platform": std::env::consts::OS.to_ascii_uppercase(),
+                "platform": platform_name(),
                 "pluginType": "GEMINI"
             }
         }).to_string();
@@ -426,11 +517,11 @@ impl OAuthPlatform for Antigravity {
             .and_then(Value::as_str)
             .unwrap_or("legacy-tier");
         if tier != "free-tier" {
-            return Err(oauth_error("Cloud Code requires a paid-tier project; specify an explicit project before onboarding"));
+            return Err(oauth_error(tier_refusal(&value, tier)));
         }
         let onboard_body = serde_json::json!({"tierId": tier, "metadata": {
             "ideType": if self.tier == ClientTier::Ide { "ANTIGRAVITY" } else { "IDE_UNSPECIFIED" },
-            "platform": std::env::consts::OS.to_ascii_uppercase(), "pluginType": "GEMINI"
+            "platform": platform_name(), "pluginType": "GEMINI"
         }})
         .to_string();
         let reply = http
@@ -504,7 +595,10 @@ impl OAuthPlatform for Antigravity {
 
     fn fingerprint_headers(&self) -> &'static [(&'static str, &'static str)] {
         // Byte-identical to the catalogue's `[providers.headers]`. The `User-Agent` stays
-        // catalogue-only because its value is a template (`${antigravity_version}`).
+        // catalogue-only, and it now carries a literal version: it used to carry
+        // `${antigravity_version}`, which nothing substituted, so every inference request sent the
+        // template itself as part of the client fingerprint. `2.1.1` is the same version the quota
+        // reader pins, so the two paths present one client rather than two.
         // UNCERTAIN: the exact `X-Goog-Api-Client` spelling (`google-cloud-sdk
         // vscode_cloudshelleditor/0.1`) is reverse-engineered (docs/12); if it is wrong the
         // request may land in the wrong client's quota pool — a silent wrong-bucket, not an
@@ -740,5 +834,64 @@ mod tests {
         assert_eq!(IDE.tier(), "ide");
         assert_eq!(Antigravity::gemini_cli().tier(), "gemini-cli");
         assert_ne!(IDE.client_id(), Antigravity::gemini_cli().client_id());
+    }
+
+    /// The platform value is the one the endpoint accepts, and the four it refused stay refused.
+    ///
+    /// This test exists because the previous value (`DESKTOP`) was a `400 INVALID_ARGUMENT` on every
+    /// login. It cannot call Google, so it pins the measurement recorded on `platform_name` rather
+    /// than re-deriving it: if someone changes the constant, the table above the function is the
+    /// evidence they have to argue with.
+    #[test]
+    fn the_client_metadata_platform_is_the_value_google_accepts() {
+        assert_eq!(platform_name(), "PLATFORM_UNSPECIFIED");
+        for refused in ["DESKTOP", "LINUX", "WINDOWS", "MACOS", "UNSPECIFIED"] {
+            assert_ne!(
+                platform_name(),
+                refused,
+                "`{refused}` was rejected live with 400 INVALID_ARGUMENT"
+            );
+        }
+    }
+
+    /// A refused tier quotes Google's `ineligibleTiers` reason instead of paraphrasing it.
+    ///
+    /// Captured live on 2026-11-01: the free tier was refused with `UNSUPPORTED_CLIENT` and a
+    /// migration note. That sentence is the only thing that tells an operator their account cannot
+    /// work, so it must survive into the error.
+    #[test]
+    fn a_refused_tier_quotes_googles_reason() {
+        let reply = serde_json::json!({
+            "allowedTiers": [{
+                "id": "standard-tier",
+                "userDefinedCloudaicompanionProject": true,
+                "isDefault": true
+            }],
+            "ineligibleTiers": [{
+                "reasonCode": "UNSUPPORTED_CLIENT",
+                "reasonMessage": "This client is no longer supported for Gemini Code Assist for individuals. To continue using Gemini, please migrate to the Antigravity suite of products: https://antigravity.google",
+                "tierId": "free-tier",
+                "tierName": "Gemini Code Assist for individuals"
+            }]
+        });
+
+        let refusal = tier_refusal(&reply, "standard-tier");
+        assert!(refusal.contains("`standard-tier`"), "{refusal}");
+        assert!(refusal.contains("billing"), "{refusal}");
+        assert!(
+            refusal.contains("free-tier (UNSUPPORTED_CLIENT)"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("antigravity.google"), "{refusal}");
+    }
+
+    /// With no ineligible list the message still says what onboarding would need.
+    #[test]
+    fn a_paid_tier_with_nothing_refused_still_explains_itself() {
+        let reply = serde_json::json!({"allowedTiers": [{"id": "legacy-tier", "isDefault": true}]});
+        let refusal = tier_refusal(&reply, "legacy-tier");
+        assert!(refusal.contains("`legacy-tier`"), "{refusal}");
+        assert!(refusal.contains("billing"), "{refusal}");
+        assert!(!refusal.contains("refused:"), "{refusal}");
     }
 }

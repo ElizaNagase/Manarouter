@@ -122,6 +122,55 @@ pub fn highest_level(levels: &[ReasoningLevel]) -> Option<ReasoningLevel> {
     levels.iter().copied().max_by_key(|level| level.rank())
 }
 
+/// The reasoning levels a model actually offers, ascending.
+///
+/// This is the derivation the compiler, the panel and the validator share, so "what levels does
+/// this model have" has one answer. The precedence is fixed:
+///
+/// 1. the operator's explicit `reasoning_levels` wins outright, because a hand-entered list is the
+///    only source that knows about a provider's non-standard tiers;
+/// 2. otherwise the bundled per-model capability table, which is provider catalogue metadata and
+///    is more specific than a dialect-wide guess;
+/// 3. otherwise the dialect's own list, but **only** when the model or its provider declares the
+///    [`Capability::Reasoning`] capability or the dialect serves reasoning models exclusively.
+///
+/// The result is always intersected with [`Dialect::expressible_reasoning_levels`]: a stale list or
+/// a catalogue row naming a tier the dialect lowers or rewrites must not become an offered level,
+/// because every offered level is also an accepted `-<level>` name. [`Provider::validate`] reports
+/// such an entry as a problem rather than letting this silently clean it up.
+pub fn effective_reasoning_levels(
+    provider_id: &str,
+    dialect: Dialect,
+    provider_capabilities: &[Capability],
+    model: &ModelEntry,
+) -> Vec<ReasoningLevel> {
+    let seeded: &[ReasoningLevel] = if model.capabilities.contains(&Capability::Reasoning)
+        || provider_capabilities.contains(&Capability::Reasoning)
+        || dialect.always_reasons()
+    {
+        dialect.expressible_reasoning_levels()
+    } else {
+        &[]
+    };
+    let candidate: &[ReasoningLevel] = if !model.reasoning_levels.is_empty() {
+        &model.reasoning_levels
+    } else {
+        match crate::catalog::catalog().model_meta(provider_id, &model.id) {
+            Some(meta) if !meta.levels.is_empty() => meta.levels,
+            _ => seeded,
+        }
+    };
+
+    let mut levels: Vec<ReasoningLevel> = candidate
+        .iter()
+        .copied()
+        .filter(|level| dialect.supports_reasoning_level(*level))
+        .collect();
+    levels.sort_unstable_by_key(|level| level.rank());
+    levels.dedup();
+    levels
+}
+
 /// Where a [`ModelEntry`] came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -625,6 +674,102 @@ impl Provider {
         format!("{}/{}", self.id, model)
     }
 
+    /// The reasoning levels this provider's dialect can send, ascending.
+    ///
+    /// The panel's pickers read the same list, so a level offered in the UI is one the validator
+    /// and the compiler will also accept for this provider.
+    #[inline]
+    pub fn dialect_reasoning_levels(&self) -> &'static [ReasoningLevel] {
+        self.dialect.expressible_reasoning_levels()
+    }
+
+    /// The reasoning levels `model` actually offers, ascending.
+    #[inline]
+    pub fn effective_reasoning_levels(&self, model: &ModelEntry) -> Vec<ReasoningLevel> {
+        effective_reasoning_levels(self.id.as_str(), self.dialect, &self.capabilities, model)
+    }
+
+    /// Why a configured level cannot reach this provider, or `None` when it can.
+    ///
+    /// The message names the level, the dialect and the levels that dialect *can* send, because a
+    /// bare "invalid level" leaves the operator guessing which spelling the provider wanted. The
+    /// same wording is used for a model entry, a model default and a combo step so the three
+    /// surfaces do not read as three different rules.
+    pub fn unsendable_level_reason(&self, level: ReasoningLevel) -> Option<String> {
+        if self.dialect.supports_reasoning_level(level) {
+            return None;
+        }
+        let allowed: Vec<&str> = self
+            .dialect
+            .expressible_reasoning_levels()
+            .iter()
+            .map(|level| level.as_str())
+            .collect();
+        Some(format!(
+            "the {} dialect cannot send reasoning level {:?}; it can express {}",
+            self.dialect.as_str(),
+            level.as_str(),
+            allowed.join(", "),
+        ))
+    }
+
+    /// Every reasoning-level problem on this provider's model entries.
+    ///
+    /// Validation is deliberately stricter than the compiler. The compiler caps an offered set to
+    /// what the dialect can send so a stale file still routes, but that cap is a silent loss: the
+    /// operator asked for `max` and would get `xhigh`. Reporting it here is what makes the loss
+    /// visible before a request is spent.
+    pub fn reasoning_level_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        for model in &self.models {
+            for level in &model.reasoning_levels {
+                if let Some(reason) = self.unsendable_level_reason(*level) {
+                    problems.push(format!(
+                        "model {:?} declares reasoning level {:?}, but {reason}",
+                        model.id,
+                        level.as_str(),
+                    ));
+                }
+            }
+            if let Some(default) = model.default_reasoning_level {
+                if let Some(reason) = self.unsendable_level_reason(default) {
+                    problems.push(format!(
+                        "model {:?} defaults to reasoning level {:?}, but {reason}",
+                        model.id,
+                        default.as_str(),
+                    ));
+                } else if !model.reasoning_levels.is_empty()
+                    && !model.reasoning_levels.contains(&default)
+                {
+                    let declared: Vec<&str> = model
+                        .reasoning_levels
+                        .iter()
+                        .map(|level| level.as_str())
+                        .collect();
+                    problems.push(format!(
+                        "model {:?} defaults to reasoning level {:?}, but its declared \
+                         reasoning_levels do not include it ({})",
+                        model.id,
+                        default.as_str(),
+                        declared.join(", "),
+                    ));
+                }
+            }
+            if let Some(wire) = &model.reasoning_wire {
+                for level in wire.keys() {
+                    if let Some(reason) = self.unsendable_level_reason(*level) {
+                        problems.push(format!(
+                            "model {:?} overrides the reasoning wire for level {:?}, but {reason}",
+                            model.id,
+                            level.as_str(),
+                        ));
+                    }
+                }
+            }
+        }
+        problems
+    }
+
     /// Validate internal consistency, returning every problem found rather than the first.
     ///
     /// The panel calls this before saving and the compiler calls it before publishing, so an
@@ -652,17 +797,16 @@ impl Provider {
         }
         for a in &self.accounts {
             let has_secret = a.secret_ref.is_some() || a.oauth_ref.is_some();
-            if !has_secret && !matches!(self.auth, AuthKind::Bearer) && a.enabled {
-                // Not fatal: some providers genuinely need no credential, but the operator almost
-                // certainly meant to attach one, so it is worth surfacing.
+            // Bearer is exempt on purpose: a local llama.cpp or Ollama server accepts requests with
+            // no credential at all, and an account with no secret is exactly how that is expressed.
+            // For every other auth kind the upstream would certainly reject the request, so an
+            // enabled account with nothing attached is a configuration error rather than a choice.
+            if !has_secret && a.enabled && !matches!(self.auth, AuthKind::Bearer) {
                 problems.push(format!(
-                    "account {:?} has no credential attached; it will only work if the upstream \
-                     needs none",
-                    a.label.as_deref().unwrap_or(a.id.as_str())
+                    "account {:?} has no credential attached, but this provider does not \
+                     authenticate with a bearer token; add the account's secret",
+                    a.label.as_deref().unwrap_or(a.id.as_str()),
                 ));
-            }
-            if a.max_concurrent > 0 && a.max_concurrent < 1 {
-                problems.push(format!("account {} has an impossible max_concurrent", a.id));
             }
             for w in &a.quota {
                 if w.seconds <= 0 {
@@ -672,9 +816,6 @@ impl Provider {
                     ));
                 }
             }
-        }
-        if matches!(self.auth, AuthKind::OAuth { .. }) && self.accounts.is_empty() {
-            problems.push("OAuth provider has no accounts to log in".into());
         }
         if self.ttfb_timeout_ms == 0 && self.total_timeout_ms == 0 {
             problems.push(
@@ -688,6 +829,10 @@ impl Provider {
                 problems.push("a model entry has an empty id".into());
             }
         }
+        problems.extend(self.reasoning_level_problems());
+        // A capability the dialect cannot serve only surfaces as a failed request otherwise:
+        // correct-looking configuration, opaque upstream error.
+        problems.extend(self.dialect_capability_mismatches());
         problems
     }
 
@@ -840,6 +985,17 @@ pub struct ComboStep {
     /// Relative weight, reserved for future weighted strategies.
     #[serde(default)]
     pub weight: u32,
+    /// The reasoning level this step runs at, pinning it without touching the model's own default.
+    ///
+    /// A combo can mix tiers deliberately — a cheap model at `low` first, an expensive one at `max`
+    /// when it retries. Absent means "the model's default", which is what a step has always done.
+    ///
+    /// A level the model does not offer is **not** an error and never reaches the wire: it is
+    /// clamped to that model's highest available level at compile time (`max` on a model that tops
+    /// out at `xhigh` runs at `xhigh`), the same substitution an out-of-range `-<level>` suffix
+    /// follows. A model that offers no levels at all emits no reasoning field regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<crate::dialect::ReasoningLevel>,
     /// Free-form operator note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -853,6 +1009,7 @@ impl ComboStep {
             model: model.into(),
             enabled: true,
             weight: 0,
+            level: None,
             note: None,
         }
     }
@@ -1279,6 +1436,190 @@ mod tests {
             p.accounts.push(a);
         }
         p
+    }
+
+    /// A model entry with nothing declared, so level derivation starts from the dialect.
+    fn model_entry(id: &str) -> ModelEntry {
+        ModelEntry {
+            id: id.into(),
+            source: ModelSource::Manual,
+            label: None,
+            context_length: None,
+            max_output_tokens: None,
+            capabilities: Vec::new(),
+            input_modalities: Vec::new(),
+            reasoning_levels: Vec::new(),
+            default_reasoning_level: None,
+            reasoning_wire: None,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            pricing: None,
+            synced_at: None,
+            hidden: false,
+        }
+    }
+
+    /// A provider whose only property under test is its dialect and capabilities.
+    fn reasoning_provider(dialect: Dialect, capabilities: Vec<Capability>) -> Provider {
+        let mut p = Provider::new("p1", dialect, "https://example.test/v1");
+        p.capabilities = capabilities;
+        p
+    }
+
+    #[test]
+    fn a_model_with_no_levels_exposes_the_dialects_levels_when_the_provider_reasons() {
+        let p = reasoning_provider(
+            Dialect::OpenAi,
+            vec![Capability::Chat, Capability::Reasoning],
+        );
+        assert_eq!(
+            p.effective_reasoning_levels(&model_entry("m1")),
+            vec![
+                ReasoningLevel::None,
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_model_with_no_levels_and_no_reasoning_capability_exposes_none() {
+        let p = reasoning_provider(Dialect::OpenAi, vec![Capability::Chat]);
+        assert!(p.effective_reasoning_levels(&model_entry("m1")).is_empty());
+    }
+
+    #[test]
+    fn a_codex_model_is_seeded_without_a_reasoning_capability() {
+        // Codex serves reasoning models exclusively, so the dialect itself is the evidence.
+        let p = reasoning_provider(Dialect::Codex, vec![Capability::Responses]);
+        assert_eq!(
+            p.effective_reasoning_levels(&model_entry("gpt-5.5-codex")),
+            Dialect::Codex.expressible_reasoning_levels()
+        );
+    }
+
+    #[test]
+    fn a_declared_level_set_wins_over_the_dialect_default() {
+        let p = reasoning_provider(
+            Dialect::OpenAi,
+            vec![Capability::Chat, Capability::Reasoning],
+        );
+        let mut m = model_entry("m1");
+        m.reasoning_levels = vec![ReasoningLevel::Low, ReasoningLevel::High];
+        assert_eq!(
+            p.effective_reasoning_levels(&m),
+            vec![ReasoningLevel::Low, ReasoningLevel::High]
+        );
+    }
+
+    #[test]
+    fn the_compiler_cap_drops_a_catalogue_tier_the_dialect_cannot_send() {
+        // The bundled table says this model offers `max`; the openai dialect lowers `max` to
+        // `xhigh`, so offering it would advertise a tier the upstream never receives.
+        let mut p = reasoning_provider(Dialect::OpenAi, vec![Capability::Chat]);
+        p.id = crate::ProviderId::from("agnes".to_owned());
+        assert_eq!(
+            p.effective_reasoning_levels(&model_entry("agnes-2.0-flash")),
+            vec![
+                ReasoningLevel::None,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_level_the_dialect_cannot_send_is_refused_with_its_name() {
+        let mut p = reasoning_provider(Dialect::OpenAi, vec![Capability::Chat]);
+        let mut m = model_entry("m1");
+        m.reasoning_levels = vec![ReasoningLevel::Max];
+        p.models = vec![m];
+
+        let problems = p.reasoning_level_problems();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        let problem = &problems[0];
+        assert!(problem.contains("\"max\""), "{problem}");
+        assert!(problem.contains("openai"), "{problem}");
+        assert!(
+            problem.contains("none, minimal, low, medium, high, xhigh"),
+            "the message must quote the levels the dialect can send: {problem}"
+        );
+    }
+
+    #[test]
+    fn a_budget_dialect_accepts_a_level_the_named_dialect_refuses() {
+        let mut p = reasoning_provider(Dialect::Anthropic, vec![Capability::Chat]);
+        let mut m = model_entry("m1");
+        m.reasoning_levels = vec![ReasoningLevel::Max];
+        p.models = vec![m];
+        assert!(p.reasoning_level_problems().is_empty());
+    }
+
+    #[test]
+    fn a_model_default_the_dialect_cannot_send_is_refused_with_its_name() {
+        let mut p = reasoning_provider(Dialect::OpenAi, vec![Capability::Chat]);
+        let mut m = model_entry("m1");
+        m.default_reasoning_level = Some(ReasoningLevel::Ultra);
+        p.models = vec![m];
+
+        let problem = p.reasoning_level_problems().join("\n");
+        assert!(problem.contains("\"ultra\""), "{problem}");
+        assert!(problem.contains("defaults"), "{problem}");
+    }
+
+    #[test]
+    fn a_model_default_must_be_one_of_the_levels_it_declares() {
+        let mut p = reasoning_provider(Dialect::Anthropic, vec![Capability::Chat]);
+        let mut m = model_entry("m1");
+        m.reasoning_levels = vec![ReasoningLevel::Low, ReasoningLevel::High];
+        m.default_reasoning_level = Some(ReasoningLevel::Max);
+        p.models = vec![m];
+
+        let problem = p.reasoning_level_problems().join("\n");
+        assert!(problem.contains("do not include it"), "{problem}");
+        assert!(problem.contains("low, high"), "{problem}");
+    }
+
+    #[test]
+    fn a_reasoning_wire_override_for_an_unsendable_level_is_refused() {
+        let mut p = reasoning_provider(Dialect::OpenAi, vec![Capability::Chat]);
+        let mut m = model_entry("m1");
+        m.reasoning_wire = Some(
+            [(
+                ReasoningLevel::Max,
+                serde_json::json!({ "reasoning_effort": "high" }),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        p.models = vec![m];
+
+        let problem = p.reasoning_level_problems().join("\n");
+        assert!(problem.contains("\"max\""), "{problem}");
+        assert!(
+            problem.contains("overrides the reasoning wire"),
+            "{problem}"
+        );
+    }
+
+    #[test]
+    fn provider_validation_carries_the_reasoning_level_problem() {
+        // The panel and the compiler read `Provider::validate`; a problem that only lived on a
+        // private helper would never reach either.
+        let mut p = reasoning_provider(Dialect::OpenAi, vec![Capability::Chat]);
+        let mut m = model_entry("m1");
+        m.reasoning_levels = vec![ReasoningLevel::Max];
+        p.models = vec![m];
+
+        let problems = p.validate();
+        assert!(
+            problems.iter().any(|p| p.contains("reasoning level")),
+            "{problems:?}"
+        );
     }
 
     #[test]

@@ -104,9 +104,9 @@ The full request path, step by step, is in [architecture](01-architecture.md).
 | Per-account health states and provider rollup | implemented | [key selection](05-key-selection.md) §6 |
 | Key strategies: `priority`, `round-robin`, `random`, `least-used` | implemented (config, compile and relay selection) | [key selection](05-key-selection.md) |
 | Combos and the three combo strategies | implemented (schema, compile and relay execution) | [combos](06-combos.md) |
-| Hedged race with four winner-fail modes | the race is implemented and unit-tested, and so is the winner's recovery; `pick-highest-passed` (the default) runs, the other three modes are accepted and ignored for now | [the hedged race](07-hedged-race.md) |
+| Hedged race with four winner-fail modes | the race is implemented and unit-tested, and so is the winner's recovery; all four modes run — `pick-highest-passed` (the default) and its different-provider sibling reuse a participant that already answered, the other two spend a bounded re-dispatch | [the hedged race](07-hedged-race.md) |
 | Reset-aware priority | implemented (the selector demotes an exhausted step and restores it once its reset passes) | [combos](06-combos.md) §3 |
-| Session affinity for a combo winner | implemented (combo-wide, process-local, default 1800 s window) | [the hedged race](07-hedged-race.md) |
+| Sticky-success preference for a hedged combo, and session affinity | sticky-success is implemented (combo-wide, process-local, default 1800 s window); session affinity — pinning a conversation to a step via `x-manarouter-session` — is **not** wired, though `Combo::affinity` is compiled into the plan | [the hedged race](07-hedged-race.md) §8 |
 | Quota windows, live signals, cooldowns | implemented: cooldowns and live signals in the relay; `/api/quota` serves cached provider windows and `/api/usage` serves the per-request ledger the relay records | [configuration](03-configuration.md) §3 |
 | OAuth login flows | implemented for Codex, Copilot and Antigravity; the `cline` catalogue entry is a migration refusal, not a working login | [security](21-security.md) §5 |
 | Web panel | implemented (served by the conductor on 20901) | [architecture](01-architecture.md) §6 |

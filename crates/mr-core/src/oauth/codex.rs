@@ -799,10 +799,10 @@ mod tests {
         assert_eq!(class, FailureClass::Permanent);
         assert_eq!(detail, "invalid_client");
 
-        // Server trouble without a JSON body → transient, status only.
+        // Server trouble without a JSON body → transient, status plus clipped body.
         let (class, detail) = endpoint_failure(502, "<html>bad gateway</html>").expect("failure");
         assert_eq!(class, FailureClass::Transient);
-        assert_eq!(detail, "HTTP 502");
+        assert_eq!(detail, r#"HTTP 502 body="<html>bad gateway</html>""#);
 
         // Unknown code on a 400 stays retryable (§1.10's line: only invalid_grant is fatal).
         let (class, _) = endpoint_failure(400, r#"{"error":"something_new"}"#).expect("failure");

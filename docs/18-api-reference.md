@@ -36,6 +36,54 @@ provider is down, the router looks down while it is working perfectly.
 `GET /v1/models` is the one route that answers without touching a provider; what it lists is described
 under [The `/v1/models` listing](#the-v1models-listing).
 
+### Control routes (loopback only)
+
+Two routes exist for the panel's own use and are not part of the API surface: they refuse any caller
+that is not on loopback, because the instance may bind a LAN or tailnet interface and these skip the
+client-key check. A local process already runs as the operator and can read the vault, so the loopback
+check is the whole authorisation for them.
+
+| Method | Path | Answers |
+|---|---|---|
+| `POST` | `/control/probe` | Runs one small completion for a model or combo through the ordinary dispatch path — routing table, dialect translation, account selection, cooldowns, fallbacks — and returns the ordinary OpenAI response. This is what "test this model" and the combo health check use, which is why they work for every dialect rather than only the OpenAI shape. |
+| `GET` | `/control/activity` | The combo decisions this process has made, newest first, and the account cooldowns it currently holds. It is answered from memory, by the process that made the decisions, because only that process knows which step a combo committed to. |
+
+`GET /control/activity` returns at most 24 entries and forgets them on restart, which is the honest
+scope of a fact about in-flight work:
+
+```json
+{
+  "entries": [
+    {
+      "combo": "expensivesmart",
+      "requested": "expensivesmart",
+      "step": "commandcode/deepseek/deepseek-v4.1-flash",
+      "started_at": 1793707608231,
+      "finished_at": null,
+      "outcome": null
+    }
+  ],
+  "cooldowns": {
+    "mig-a2fefbe19a6cf4c643b545b613b2e701": {
+      "until_ms": 1793707688231,
+      "reason": "rate_limited",
+      "failures": 1
+    }
+  }
+}
+```
+
+`finished_at` and `outcome` are `null` while the client is still receiving the answer; the entry is
+finished when the client-facing response body is dropped, which is when the relay has finished writing
+or the client stopped reading. `outcome` is `ok` then, or `failed` when no step answered and the relay
+gave up. Only a request whose model name resolved to a **combo** is recorded: a plain
+`provider/model` request is not a combo decision.
+
+`cooldowns` is the relay's own account-health map, expired-but-not-yet-cleared entries included, so
+this view cannot disagree with the selection it is meant to explain. `reason` is one of
+`rate_limited`, `quota_exhausted`, `auth_failed`, `backoff`. No label, account secret, request id or
+body appears anywhere in the document.
+
 ### Model addressing
 
 A `model` field is a name, and a name can carry a **reasoning level** as a `-<level>` suffix
@@ -95,11 +143,17 @@ in a snapshot.
 operator's explicit `reasoning_levels` on the model entry wins outright; otherwise the bundled table
 `catalog/model_meta.json`, keyed `provider/model` and falling back to a provider-agnostic `model` key;
 otherwise, when the model or its provider declares the `reasoning` capability — or the dialect serves
-reasoning models only, currently `codex` — the generic set `none, low, medium, high, xhigh, max`. A
-model that reaches none of those has **no** levels: its name gets no `-<level>` suffix, and it runs at
-`none`, which emits no reasoning field at all. The generic set deliberately omits `minimal`, `ultra`
-and `max`, which are provider-specific tiers; advertising one a provider rejects turns a working
-request into a 400.
+reasoning models only, currently `codex` — the dialect's own vocabulary
+(`Dialect::expressible_reasoning_levels`). A model that reaches none of those has **no** levels: its
+name gets no `-<level>` suffix, and it runs at `none`, which emits no reasoning field at all.
+
+The vocabulary is per dialect, and it is the same list validation accepts: named-effort dialects
+(`openai`, `codex`, `copilot`, `command-code-go`) can send `none, minimal, low, medium, high, xhigh`,
+while budget dialects (`anthropic`, `google`, `antigravity`) express every tier, `ultra` and `max`
+included. Any source — declared, catalogue or vocabulary — is filtered through that list, so the
+listing never offers a tier the dialect would rewrite or drop. A configured level outside the list
+is refused by the configuration validator with its name and the vocabulary quoted, so the panel
+cannot save it and startup will not publish it; it is never silently lowered.
 
 **An out-of-range level does not fail.** Asking for `-max` on a model that tops out at `xhigh` succeeds
 and runs at that model's **highest available** level, so the request simply reasons less than it asked
@@ -446,6 +500,7 @@ replacements of a whole resource, not submissions that create a new one.
 | `PUT` `DELETE` | `/api/keys/{id}` |
 | `POST` | `/api/keys/{id}/rotate`, `/api/keys/{id}/regenerate` |
 | `GET` | `/api/docs`, `/api/docs/{name}` |
+| `GET` | `/api/activity` | The relay's combo activity and cooldown map, proxied from `GET /control/activity` — see [Control routes](#control-routes-loopback-only) in Part 1. When the relay is not answering it returns `502` naming the port rather than an empty list, because "nothing is running" and "I cannot see" are different facts |
 
 `/api/providers/{id}` has no `GET`: the list route returns every provider in full, and a single
 provider is read from there. `/api/providers/{id}/models` is a `POST` that upserts one model rather

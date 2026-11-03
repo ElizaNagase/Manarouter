@@ -23,7 +23,13 @@ use mr_core::snapshot::{AccountPlan, ComboPlan, ProviderPlan, StepPlan};
 /// The distinction drives the cooldown length and, more importantly, what the panel tells the
 /// operator. A rate limit resolves itself; a rejected credential does not, and presenting the two
 /// the same way sends someone to wait for a fix that requires their action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize` spells this in snake_case for `GET /control/activity`, which is a machine reading
+/// the relay's state. `as_str` keeps the hyphenated spelling the logs and the panel already use;
+/// the two spellings are deliberate rather than accidental, so they are two methods rather than
+/// one shared string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CooldownReason {
     /// The provider throttled us. Resolves on its own.
     RateLimited,
@@ -53,7 +59,7 @@ impl CooldownReason {
 }
 
 /// A temporary unavailability, with the instant it ends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Cooldown {
     /// Wall-clock milliseconds at which the account becomes usable again.
     pub until_ms: u64,
@@ -88,6 +94,16 @@ impl Health {
     /// A consistent view, held for the duration of a request.
     pub fn view(&self) -> arc_swap::Guard<std::sync::Arc<HashMap<String, Cooldown>>> {
         self.map.load()
+    }
+
+    /// A copy of the cooldown map, for the control endpoint.
+    ///
+    /// A copy rather than the guard because the caller serialises it: holding the guard across a
+    /// JSON document would keep a whole generation alive for the length of a panel request. The
+    /// map is small — one entry per account currently out of rotation — so this is a handful of
+    /// strings, not a scan of the routing table.
+    pub fn snapshot(&self) -> HashMap<String, Cooldown> {
+        self.map.load().as_ref().clone()
     }
 
     /// Take an account out of rotation until `until_ms`.
@@ -312,10 +328,78 @@ fn rotate_by(items: &[usize], by: u64) -> Vec<usize> {
     out
 }
 
-/// Choose an account for a step.
+/// Every account a step may use, in the order the key strategy wants them tried.
 ///
 /// `counter` is the step's own rotation counter, so that two steps on the same provider do not
 /// advance each other's position.
+///
+/// Health and the model lists filter here; the strategy orders what remains, and the first entry is
+/// [`pick_account`]'s choice. The whole list is returned because health is not the only reason an
+/// account can be unusable: an account whose credential is absent from the vault, or whose OAuth
+/// refresh was rejected, cannot serve this request either, and skipping it to the next candidate is
+/// the same decision with the same ordering. A caller that discovers such a reason must walk this
+/// list rather than invent a second ordering that could disagree with it.
+///
+/// An empty list means every account is cooling down or forbidden this model, which the caller must
+/// treat as "this step cannot serve" rather than as an error — the next step in the order is the
+/// right answer.
+pub fn account_candidates<'a>(
+    provider: &'a ProviderPlan,
+    strategy: KeyStrategy,
+    counter: u64,
+    health: &HashMap<String, Cooldown>,
+    now_ms: u64,
+    model: &str,
+) -> Vec<&'a AccountPlan> {
+    // Candidates in the operator's order. `priority` is expressed by the order of the account list
+    // in the configuration, so nothing here needs to sort for that strategy.
+    let mut candidates: Vec<&AccountPlan> = provider
+        .accounts
+        .iter()
+        .filter(|a| account_available(a.id.as_str(), health, now_ms))
+        .filter(|a| account_allows_model(a, model))
+        .collect();
+
+    match strategy {
+        KeyStrategy::Priority => {}
+        KeyStrategy::RoundRobin => rotate_candidates(&mut candidates, counter),
+        KeyStrategy::Random => {
+            // Seeded from the counter rather than from the OS, so a test can be deterministic and a
+            // production call is still unpredictable. Pulling entropy on the request path would be a
+            // syscall per request for a decision that does not need it.
+            let mut x = counter
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(now_ms);
+            x ^= x >> 30;
+            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x ^= x >> 27;
+            rotate_candidates(&mut candidates, x);
+        }
+        KeyStrategy::LeastUsed => {
+            // `max_concurrent` is the only load signal the snapshot carries, and it is a *capacity*,
+            // not a count of in-flight requests. Using it as a tie-break keeps the pool fresh when
+            // capacities differ, and it is honest about being a preference rather than a
+            // measurement — a real least-used needs a counter the relay does not keep per account.
+            candidates.sort_by_key(|a| std::cmp::Reverse(a.max_concurrent));
+        }
+    }
+    candidates
+}
+
+/// Rotate a candidate list so the strategy's next choice is first, leaving an empty list alone.
+fn rotate_candidates(accounts: &mut [&AccountPlan], by: u64) {
+    if accounts.is_empty() {
+        return;
+    }
+    let shift = (by % accounts.len() as u64) as usize;
+    accounts.rotate_left(shift);
+}
+
+/// Choose an account for a step.
+///
+/// This is the first of [`account_candidates`]'s ordered list: the same filtering and the same
+/// strategy ordering, so a caller that needs to fall through to a later candidate is reading the
+/// list this function read.
 ///
 /// Returns `None` when every account is cooling down, which the caller must treat as "this step
 /// cannot serve" rather than as an error — the next step in the order is the right answer.
@@ -327,47 +411,9 @@ pub fn pick_account<'a>(
     now_ms: u64,
     model: &str,
 ) -> Option<&'a AccountPlan> {
-    // Candidates in the operator's order. `priority` is expressed by the order of the account list
-    // in the configuration, so nothing here needs to sort for that strategy.
-    let mut candidates: Vec<&AccountPlan> = provider
-        .accounts
-        .iter()
-        .filter(|a| account_available(a.id.as_str(), health, now_ms))
-        .filter(|a| account_allows_model(a, model))
-        .collect();
-
-    if candidates.is_empty() {
-        return None;
-    }
-
-    match strategy {
-        KeyStrategy::Priority => candidates.first().copied(),
-        KeyStrategy::RoundRobin => {
-            let i = (counter % candidates.len() as u64) as usize;
-            candidates.get(i).copied()
-        }
-        KeyStrategy::Random => {
-            // Seeded from the counter rather than from the OS, so a test can be deterministic and a
-            // production call is still unpredictable. Pulling entropy on the request path would be a
-            // syscall per request for a decision that does not need it.
-            let mut x = counter
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .wrapping_add(now_ms);
-            x ^= x >> 30;
-            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            x ^= x >> 27;
-            let i = (x % candidates.len() as u64) as usize;
-            candidates.get(i).copied()
-        }
-        KeyStrategy::LeastUsed => {
-            // `max_concurrent` is the only load signal the snapshot carries, and it is a *capacity*,
-            // not a count of in-flight requests. Using it as a tie-break keeps the pool fresh when
-            // capacities differ, and it is honest about being a preference rather than a
-            // measurement — a real least-used needs a counter the relay does not keep per account.
-            candidates.sort_by_key(|a| std::cmp::Reverse(a.max_concurrent));
-            candidates.first().copied()
-        }
-    }
+    account_candidates(provider, strategy, counter, health, now_ms, model)
+        .into_iter()
+        .next()
 }
 
 /// Whether an account's allow/deny lists permit a model.
@@ -1021,6 +1067,107 @@ mod tests {
             3,
             "a degenerate mix would never reach all three"
         );
+    }
+
+    /// The ids of a candidate list, in order.
+    fn candidate_ids<'a>(candidates: &[&'a AccountPlan]) -> Vec<&'a str> {
+        candidates.iter().map(|a| a.id.as_str()).collect()
+    }
+
+    #[test]
+    fn account_candidates_lists_every_eligible_account_in_the_operator_order() {
+        // This is the list a caller walks when it has to skip an account for a reason health does
+        // not model. It must be the same set and the same order `pick_account` chose from, or the
+        // fall-through would be a second opinion about which account is next.
+        let p = provider("p", vec![account("a"), account("b"), account("c")]);
+        let candidates = account_candidates(&p, KeyStrategy::Priority, 0, &healthy(), 0, "m");
+        assert_eq!(candidate_ids(&candidates), vec!["a", "b", "c"]);
+        assert_eq!(
+            pick_account(&p, KeyStrategy::Priority, 0, &healthy(), 0, "m").unwrap(),
+            candidates[0]
+        );
+    }
+
+    #[test]
+    fn account_candidates_leave_out_the_ineligible_without_reordering_the_rest() {
+        let mut limited = account("b");
+        limited.models_allow = vec!["only-this".into()];
+        let p = provider("p", vec![account("a"), limited, account("c")]);
+        let mut h = HashMap::new();
+        h.insert(
+            "a".to_owned(),
+            Cooldown {
+                until_ms: 9_000,
+                reason: CooldownReason::RateLimited,
+                failures: 1,
+            },
+        );
+        let candidates = account_candidates(&p, KeyStrategy::Priority, 0, &h, 1_000, "m");
+        assert_eq!(candidate_ids(&candidates), vec!["c"]);
+    }
+
+    #[test]
+    fn round_robin_candidates_are_a_rotation_of_the_same_set() {
+        // As the counter advances, the fall-through order rotates with the first choice. Losing or
+        // duplicating an account would make "try the next candidate" mean something else entirely.
+        let p = provider("p", vec![account("a"), account("b"), account("c")]);
+        let expected = [
+            vec!["a", "b", "c"],
+            vec!["b", "c", "a"],
+            vec!["c", "a", "b"],
+        ];
+        for (counter, order) in expected.iter().enumerate() {
+            let candidates = account_candidates(
+                &p,
+                KeyStrategy::RoundRobin,
+                counter as u64,
+                &healthy(),
+                0,
+                "m",
+            );
+            assert_eq!(&candidate_ids(&candidates), order);
+            assert_eq!(
+                pick_account(
+                    &p,
+                    KeyStrategy::RoundRobin,
+                    counter as u64,
+                    &healthy(),
+                    0,
+                    "m"
+                )
+                .unwrap(),
+                candidates[0]
+            );
+        }
+    }
+
+    #[test]
+    fn random_candidates_start_at_the_account_pick_account_would_have_chosen() {
+        // The random strategy's first pick is unchanged by walking the rest of the list.
+        let p = provider("p", vec![account("a"), account("b"), account("c")]);
+        for i in 0..100 {
+            let candidates =
+                account_candidates(&p, KeyStrategy::Random, i, &healthy(), i * 977, "m");
+            assert_eq!(
+                pick_account(&p, KeyStrategy::Random, i, &healthy(), i * 977, "m").unwrap(),
+                candidates[0]
+            );
+            // ...and the rotation still holds every account exactly once.
+            let mut ids = candidate_ids(&candidates);
+            ids.sort_unstable();
+            assert_eq!(ids, vec!["a", "b", "c"]);
+        }
+    }
+
+    #[test]
+    fn least_used_candidates_are_ordered_by_capacity_as_a_whole() {
+        let mut a = account("a");
+        a.max_concurrent = 1;
+        let mut b = account("b");
+        b.max_concurrent = 4;
+        let p = provider("p", vec![a, b]);
+        let candidates = account_candidates(&p, KeyStrategy::LeastUsed, 0, &healthy(), 0, "m");
+        assert_eq!(candidate_ids(&candidates), vec!["b", "a"]);
     }
 
     #[test]

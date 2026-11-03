@@ -806,11 +806,14 @@ impl RoutingSnapshot {
                                     .find(|m| m.id.eq_ignore_ascii_case(&step.model))
                             })
                             .unwrap_or(&UNKNOWN_MODEL);
+                        // A step may pin its own tier; otherwise the routing default applies.
+                        // `plan_step` clamps a level the model does not offer to the model's
+                        // highest one, so an over-asked level degrades instead of failing.
                         steps.push(plan_step(
                             provider,
                             plan,
                             entry,
-                            config.routing.default_reasoning_level,
+                            step.level.unwrap_or(config.routing.default_reasoning_level),
                         ));
                         remap[authored_index] = Some((steps.len() - 1) as u16);
                     }
@@ -1749,56 +1752,21 @@ fn plan_step(
 
 /// The levels a model offers, as a bitmask.
 ///
-/// Three sources, in the order the design fixes: the operator's explicit list wins outright;
-/// otherwise the bundled capability table; otherwise the dialect's own notion of whether this model
-/// reasons at all. The third step is the one that keeps the feature working for a model nobody has
-/// metadata for — a provider that declares the `Reasoning` capability gets a usable level set
-/// rather than silently losing its `-<level>` names.
+/// The precedence lives in [`crate::model::effective_reasoning_levels`] so the panel, the validator
+/// and this compiler cannot disagree about it: the operator's explicit list wins, then the bundled
+/// provider catalogue, then the dialect's own list when the model or provider declares reasoning
+/// support. That function also caps the result to what the dialect can put on the wire, which is
+/// why a stale `max` on an OpenAI-shaped provider never becomes an offered tier here even before
+/// validation has had a chance to report it.
 fn effective_levels(model: &ModelEntry, provider: &ProviderPlan) -> u32 {
-    let declared = |levels: &[ReasoningLevel]| {
-        levels
-            .iter()
-            .fold(0u32, |mask, level| mask | (1u32 << level.rank()))
-    };
-    if !model.reasoning_levels.is_empty() {
-        return declared(&model.reasoning_levels);
-    }
-    if let Some(meta) = crate::catalog::catalog().model_meta(provider.id.as_str(), &model.id) {
-        if !meta.levels.is_empty() {
-            return declared(meta.levels);
-        }
-    }
-    if model.capabilities.contains(&Capability::Reasoning)
-        || provider.capabilities.contains(&Capability::Reasoning)
-        || dialect_default_levels(provider.dialect)
-    {
-        // The generic set an OpenAI-shaped provider understands. `minimal`, `ultra` and `max` are
-        // deliberately absent: they are provider-specific tiers, and advertising one a provider
-        // rejects turns a working request into a 400.
-        return declared(&DEFAULT_REASONING_LEVELS);
-    }
-    0
-}
-
-/// The levels a dialect assumes a reasoning model supports when nothing more specific is known.
-const DEFAULT_REASONING_LEVELS: [ReasoningLevel; 6] = [
-    ReasoningLevel::None,
-    ReasoningLevel::Low,
-    ReasoningLevel::Medium,
-    ReasoningLevel::High,
-    ReasoningLevel::XHigh,
-    ReasoningLevel::Max,
-];
-
-/// Whether a dialect's models reason by default, so a model with no metadata is still seeded.
-///
-/// Codex and Antigravity only serve reasoning models at all (their `force_stream` dialects are
-/// built around thinking output), so an operator who lists a model there and declares no metadata
-/// still gets level-qualified names. For the OpenAI-compatible dialects this answers `false`: a
-/// plain chat model must not sprout `-high` variants nobody asked for, and the provider's own
-/// `Reasoning` capability is what turns them on.
-fn dialect_default_levels(dialect: Dialect) -> bool {
-    matches!(dialect, Dialect::Codex)
+    crate::model::effective_reasoning_levels(
+        provider.id.as_str(),
+        provider.dialect,
+        &provider.capabilities,
+        model,
+    )
+    .iter()
+    .fold(0u32, |mask, level| mask | (1u32 << level.rank()))
 }
 
 /// The input modalities a model accepts, as a bitmask over `InputModality`'s discriminant.
@@ -1890,24 +1858,36 @@ fn dialect_reasoning_fragment(
         // recursive, so the fragment is shaped exactly as deep as the field it has to reach.
         // `thinkingLevel` is a two-value switch in the Gemini API, so everything from `medium` up
         // is `high` with the corresponding budget.
-        Dialect::Google | Dialect::Antigravity => serde_json::json!({
-            "generationConfig": {
-                "thinkingConfig": {
-                    "thinkingLevel": if level.rank() >= ReasoningLevel::High.rank() { "high" } else { "low" },
-                    "thinkingBudget": thinking_budget(level),
+        Dialect::Google | Dialect::Antigravity => {
+            let generation = serde_json::json!({
+                "generationConfig": {
+                    "thinkingConfig": {
+                        "thinkingLevel": if level.rank() >= ReasoningLevel::High.rank() { "high" } else { "low" },
+                        "thinkingBudget": thinking_budget(level),
+                    }
                 }
+            });
+            if dialect == Dialect::Antigravity {
+                // Antigravity's body is an envelope (`{project, model, request, userAgent}`), so a
+                // fragment aimed at the Gemini payload has to sit under `request`. At the envelope's
+                // top level it is not a field of anything: the upstream answers 400
+                // `Unknown name "generationConfig": Cannot find field.`
+                serde_json::json!({ "request": generation })
+            } else {
+                generation
             }
-        }),
+        }
     })
 }
 
 /// The `reasoning_effort` string a provider accepts for a level.
 ///
-/// The highest value an OpenAI-shaped provider accepts is `xhigh`, so `ultra` and `max` are
-/// normalised down to it — the sanitation rule OmniRoute applies, and the reason `xhigh` support is
-/// described there as opt-out rather than universal. Sending `max` to a provider that has never
-/// heard of it is a 400, and the tier a client asked for is not lost: it is recorded on the step,
-/// and the substitution is what the panel shows.
+/// These dialects name the effort, so their vocabulary is the six strings listed in
+/// [`Dialect::expressible_reasoning_levels`]. `ultra` and `max` are not among them and a compiled
+/// step never offers either: the request reroutes to the model's highest offered tier through the
+/// ordinary `-<level>` rule. The arms below remain as a last-resort mapping so a malformed or
+/// hand-built step cannot put a string the upstream has never heard of into a body; reaching them
+/// would mean the compiled level mask was bypassed.
 fn effort_spelling(dialect: Dialect, level: ReasoningLevel) -> &'static str {
     match dialect {
         // `xhigh` is the ceiling for the OpenAI-shaped providers, so the two tiers above it land
@@ -4034,6 +4014,26 @@ mod tests {
         RoutingSnapshot::compile(&config).unwrap()
     }
 
+    /// As [`compile_one`], but on a dialect that can express a different slice of the ladder.
+    ///
+    /// A test about the top tiers has to use a budget dialect: the named-effort dialects do not
+    /// offer `max`, and the compiler would correctly cap the declaration before the test could
+    /// observe it.
+    fn compile_one_on(
+        dialect: Dialect,
+        provider_models: Vec<ModelEntry>,
+        combos: Vec<Combo>,
+    ) -> RoutingSnapshot {
+        let mut provider = level_provider("p1", provider_models);
+        provider.dialect = dialect;
+        let mut config = Config {
+            providers: vec![provider],
+            ..Config::default()
+        };
+        config.combos = combos;
+        RoutingSnapshot::compile(&config).unwrap()
+    }
+
     /// The `(model, level, substituted)` triple of a direct hit.
     fn direct(resolution: Resolution<'_>) -> (String, u8, bool) {
         match resolution {
@@ -4087,7 +4087,10 @@ mod tests {
 
     #[test]
     fn a_slashed_model_id_resolves_with_a_level_suffix() {
-        let snapshot = compile_one(
+        // `max` is expressed by a budget dialect; on a named-effort dialect the compiler would cap
+        // it to `xhigh`, which is the behaviour the next test pins instead.
+        let snapshot = compile_one_on(
+            Dialect::Anthropic,
             vec![with_levels(
                 "deepseek/deepseek-v4.1-flash",
                 &[
@@ -4218,6 +4221,102 @@ mod tests {
     }
 
     #[test]
+    fn a_combo_step_pins_its_own_reasoning_level() {
+        // Two steps, two tiers: the combo is authored to spend little on the first attempt and more
+        // on the retry, without either model's own default being edited.
+        let mut first = combo("c1", "coding", &[("p1", "cheap"), ("p1", "strong")]);
+        first.steps[0].level = Some(ReasoningLevel::Low);
+        first.steps[1].level = Some(ReasoningLevel::High);
+        let snapshot = compile_one(
+            vec![
+                with_levels(
+                    "cheap",
+                    &[
+                        ReasoningLevel::Low,
+                        ReasoningLevel::Medium,
+                        ReasoningLevel::High,
+                    ],
+                ),
+                with_levels(
+                    "strong",
+                    &[
+                        ReasoningLevel::Low,
+                        ReasoningLevel::Medium,
+                        ReasoningLevel::High,
+                    ],
+                ),
+            ],
+            vec![first],
+        );
+
+        let plan = &snapshot.combos()[0];
+        assert_eq!(plan.steps[0].level, ReasoningLevel::Low.rank());
+        assert_eq!(plan.steps[1].level, ReasoningLevel::High.rank());
+        assert_eq!(
+            plan.steps[0].reasoning_fragment(),
+            Some(r#"{"reasoning_effort":"low"}"#)
+        );
+        assert_eq!(
+            plan.steps[1].reasoning_fragment(),
+            Some(r#"{"reasoning_effort":"high"}"#)
+        );
+    }
+
+    #[test]
+    fn a_combo_step_asking_for_more_than_the_model_offers_runs_at_its_maximum() {
+        // The documented substitution rule, now reachable from the configuration as well as from a
+        // `-max` suffix: the request must succeed and reason at the model's ceiling. The provider
+        // is a budget dialect so `max` is a level the dialect can actually send; the substitution
+        // here is about the *model* topping out at `xhigh`, not about an unsendable level.
+        let mut pinned = combo("c1", "coding", &[("p1", "m1")]);
+        pinned.steps[0].level = Some(ReasoningLevel::Max);
+        let snapshot = compile_one_on(
+            Dialect::Anthropic,
+            vec![with_levels(
+                "m1",
+                &[
+                    ReasoningLevel::Low,
+                    ReasoningLevel::High,
+                    ReasoningLevel::XHigh,
+                ],
+            )],
+            vec![pinned],
+        );
+
+        let step = &snapshot.combos()[0].steps[0];
+        assert_eq!(step.level, ReasoningLevel::XHigh.rank());
+        assert_eq!(
+            step.reasoning_fragment(),
+            Some(r#"{"thinking":{"type":"enabled","budget_tokens":131072}}"#),
+            "the fragment must be the model's maximum, never the level that was asked for"
+        );
+    }
+
+    #[test]
+    fn a_combo_step_without_a_level_keeps_the_routing_default() {
+        let snapshot = compile_one(
+            vec![with_levels(
+                "m1",
+                &[
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                ],
+            )],
+            vec![combo("c1", "coding", &[("p1", "m1")])],
+        );
+
+        let step = &snapshot.combos()[0].steps[0];
+        assert_eq!(
+            step.level,
+            ReasoningLevel::from_u8(snapshot.providers()[0].steps[0].default_level)
+                .unwrap()
+                .rank()
+        );
+        assert!(step.reasoning_fragment().is_some());
+    }
+
+    #[test]
     fn an_out_of_range_level_reroutes_to_the_highest_available_one() {
         // `-max` on a model that tops out at `xhigh` must succeed and reason less, and the
         // substitution must be visible rather than silent.
@@ -4327,7 +4426,7 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_declaring_reasoning_seeds_the_generic_level_set() {
+    fn a_provider_declaring_reasoning_seeds_the_dialects_level_set() {
         let mut p = level_provider("p1", vec![with_levels("m1", &[])]);
         p.capabilities = vec![Capability::Chat, Capability::Reasoning];
         let mut config = Config {
@@ -4342,13 +4441,17 @@ mod tests {
             step.levels(),
             vec![
                 ReasoningLevel::None,
+                ReasoningLevel::Minimal,
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
                 ReasoningLevel::High,
                 ReasoningLevel::XHigh,
-                ReasoningLevel::Max,
             ],
-            "the generic fallback must omit the provider-specific tiers"
+            "the seed is the openai dialect's own vocabulary, not a hand-written list"
+        );
+        assert!(
+            !step.supports_level(ReasoningLevel::Max),
+            "a tier the dialect rewrites to xhigh must not be offered"
         );
     }
 
@@ -4406,7 +4509,7 @@ mod tests {
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
                 ReasoningLevel::High,
-                ReasoningLevel::Max,
+                ReasoningLevel::XHigh,
             ],
         );
         declared.default_reasoning_level = Some(ReasoningLevel::Medium);
@@ -4420,7 +4523,7 @@ mod tests {
         });
         declared.reasoning_wire = Some(
             [(
-                ReasoningLevel::Max,
+                ReasoningLevel::XHigh,
                 serde_json::json!({ "reasoning_effort": "high" }),
             )]
             .into_iter()
@@ -4444,8 +4547,8 @@ mod tests {
 
         let direct_step = &decoded.providers()[0].steps[0];
         assert_eq!(direct_step.levels, original.providers()[0].steps[0].levels);
-        assert!(direct_step.supports_level(ReasoningLevel::Max));
-        assert!(!direct_step.supports_level(ReasoningLevel::XHigh));
+        assert!(direct_step.supports_level(ReasoningLevel::XHigh));
+        assert!(!direct_step.supports_level(ReasoningLevel::Max));
         assert_eq!(direct_step.default_level, ReasoningLevel::Medium.rank());
         assert!(direct_step.accepts_modality(InputModality::Image));
         assert!(!direct_step.accepts_modality(InputModality::Audio));
@@ -4463,7 +4566,7 @@ mod tests {
         // ...while the operator's override applies at the level it names, replacing the dialect
         // default there rather than merging with it.
         assert_eq!(
-            direct_step.reasoning_fragment_for(ReasoningLevel::Max),
+            direct_step.reasoning_fragment_for(ReasoningLevel::XHigh),
             Some(r#"{"reasoning_effort":"high"}"#),
             "a per-model override replaces the dialect default wholesale for that level"
         );
@@ -4533,6 +4636,17 @@ mod tests {
             google[ReasoningLevel::High.rank() as usize].as_deref(),
             Some(
                 r#"{"generationConfig":{"thinkingConfig":{"thinkingLevel":"high","thinkingBudget":131072}}}"#
+            )
+        );
+
+        // Antigravity sends the same field one level deeper: its body is an envelope, and a
+        // `generationConfig` at the envelope's top level is a field of nothing — the upstream
+        // answers 400 `Unknown name "generationConfig": Cannot find field.`
+        let antigravity = fragments(Dialect::Antigravity);
+        assert_eq!(
+            antigravity[ReasoningLevel::High.rank() as usize].as_deref(),
+            Some(
+                r#"{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"high","thinkingBudget":131072}}}}"#
             )
         );
     }

@@ -12,11 +12,11 @@ Manarouter protects, how, and — at least as importantly — what it does **not
 
 | Threat | Defence |
 |---|---|
-| A copy of the config directory is leaked or backed up to a shared location | Credentials are encrypted at rest; the configuration file contains references, never values |
+| A copy of the config directory is leaked or backed up to a shared location | Account credentials are encrypted at rest; the configuration file contains references, never values. **Exception:** a provider's static `headers` are stored in the clear — see the limitation below |
 | A leaked database file | No credential material is stored in the database at all |
 | A screenshot or shoulder-surf of the panel | The panel renders only non-reversible fingerprints, never a full key |
 | A typo commits a key to the repository | `scripts/check-secrets.sh` runs on every push and fails the build |
-| A malicious web page the operator visits reaches the panel | The panel is loopback-only by default, requires a password to be reachable otherwise, and checks origin |
+| A malicious web page the operator visits reaches the panel | The panel is loopback-only by default; on a non-loopback bind only loopback and tailnet source addresses are trusted, and the panel checks origin |
 | A compromised panel leads to proxied traffic | The panel and the relay are separate processes on separate ports, and the relay has no admin endpoints |
 | One bad account poisons a whole provider | Health is tracked per account; a provider is only dead when every account is |
 | An attacker with write access to the vault file swaps one credential into another provider's slot | Every ciphertext is bound to its id as AES-GCM associated data |
@@ -31,8 +31,20 @@ These are real limitations. Stating them is the point.
 - **An attacker who can read the relay's memory.** Credentials are held decrypted in the relay so it
   can put them in a header without a syscall. A core dump, a debugger, or a hostile process with
   `ptrace` access can recover them. Credentials fetched from the vault are ordinary `String`s and are
-  **not** zeroed after use; only the vault's own key material is. This is a deliberate trade of a
-  small amount of paranoia for not placing an allocator call on the request path.
+  **not** zeroed after use. Neither is the vault's AES key schedule: `aes-gcm`'s `zeroize` support is
+  not enabled, so the round keys stay in memory for the process's life even though the 32 bytes read
+  from `vault.key` are wiped after use. Since both processes hold a vault handle open for their whole
+  life, that is the same window as the process itself, which is why it is a documented limitation
+  rather than a bug being papered over. A short-lived process that opens the vault once
+  (`mr account add`) does wipe the key bytes.
+- **Provider `headers` are plaintext at rest.** Account credentials go through the vault, but a
+  provider's static `headers` map (`mr provider add --header`, editable in the panel) is written
+  verbatim to `config.json` and to the routing snapshot. It has to be: the relay must be able to put
+  those headers on every request without a per-request decrypt of a whole map, and the catalogue
+  uses header maps for things that are not secrets at all (`anthropic-version`, a tenant id). The
+  practical rule is therefore: **do not put an API key in a provider header.** Put it in an account
+  (`mr account add`), where it is encrypted, fingerprinted, and referenced by id. A credential-shaped
+  header value is a configuration mistake, and `mr provider show --json` will print it back to you.
 - **A malicious upstream.** A provider you route to sees the prompt and the credential you gave it.
   The catalogue's job is to tell you who you are talking to, not to vouch for them.
 - **Traffic analysis by the network.** Upstream connections are TLS, but the *existence* and
@@ -209,9 +221,11 @@ the other. Naming that openly is better than a build that mysteriously cannot be
 
 ## 7. The panel
 
-- **Loopback by default.** `control.host` defaults to `127.0.0.1`. Binding it elsewhere requires
-  also setting a password; `allow_remote_without_password` exists as an explicit opt-in and default
-  to `false`.
+- **Loopback by default.** `control.host` defaults to `127.0.0.1`. When bound to a non-loopback
+  address (for example `0.0.0.0` to serve both `localhost` and the tailnet on one listener), the
+  source address of every request is checked before anything else: only loopback and the Tailscale
+  CGNAT range `100.64.0.0/10` are trusted. A password is still recommended as the second line of
+  defence; `allow_remote_without_password` exists as an explicit opt-in.
 - **The default password mistake is structurally avoided.** One reference router ships with a
   literal default password (`123456`). Rather than defaulting to a password, Manarouter defaults to
   being unreachable from anywhere but loopback. That is a strictly better default: an unreachable

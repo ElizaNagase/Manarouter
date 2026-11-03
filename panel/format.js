@@ -186,12 +186,20 @@ export function describePortChange(ports) {
  * mean "all interfaces"; a browser cannot dial those, so probe loopback instead. Returns null
  * when there is no port to probe (the caller then shows an honest unknown state).
  */
-export function relayProbeUrl(relay) {
+export function relayProbeUrl(relay, pageHost) {
   if (!relay || typeof relay !== 'object') return null;
   const port = relay.running_port ?? relay.port;
   if (port == null || port === '') return null;
   let host = relay.host ?? '';
-  if (host === '' || host === '0.0.0.0' || host === '::' || host === '[::]') host = '127.0.0.1';
+  const wildcard = host === '' || host === '0.0.0.0' || host === '::' || host === '[::]';
+  // The panel and the relay run on the same machine, so the address this page was opened from is
+  // also an address for the relay. That matters when the panel is used from another device (a
+  // tailnet address): probing 127.0.0.1 would test the *browser's* loopback, not the server's, and
+  // report a healthy relay as unreachable.
+  const loopback = host === '127.0.0.1' || host === 'localhost' || host === '[::1]' || host === '::1';
+  const pageIsRemote = typeof pageHost === 'string' && pageHost !== '' &&
+    pageHost !== '127.0.0.1' && pageHost !== 'localhost' && pageHost !== '[::1]';
+  if (wildcard || (loopback && pageIsRemote)) host = pageIsRemote ? pageHost : '127.0.0.1';
   if (host.includes(':') && !(host.startsWith('[') && host.endsWith(']'))) host = `[${host}]`;
   return `http://${host}:${port}/`;
 }
@@ -228,6 +236,109 @@ export function remapParticipants(list, from, to) {
 }
 
 /** Step display label; accepts plain strings defensively (backend may simplify). */
+/**
+ * The reasoning-level spellings the backend understands, in rank order.
+ *
+ * Mirrors `LEVEL_SUFFIXES` in `crates/mr-core/src/snapshot.rs`. `none` is included because it is a
+ * real suffix — `antigravity/claude-opus-4-6-thinking-none` is a model id — even though it means
+ * "do not reason".
+ */
+export const REASONING_LEVELS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultra', 'max'];
+
+/** Keep only canonical level spellings, in the canonical ascending order. */
+function canonicalLevels(list) {
+  if (!Array.isArray(list)) return [];
+  const present = new Set(list.filter((level) => REASONING_LEVELS.includes(level)));
+  return REASONING_LEVELS.filter((level) => present.has(level));
+}
+
+/**
+ * The levels a provider's dialect can send, as the backend reports them.
+ *
+ * The backend computes this from the dialect's wire vocabulary, so it is the same list the
+ * validator accepts and the compiler offers. The control plane annotates *model entries* rather
+ * than the provider object (it serialises the provider from mr-core, and an unknown provider-level
+ * key would survive a round trip through the config's `flatten` catch-all), so the list is read from
+ * the model the picker is editing when the provider itself does not carry it. Falling back to the
+ * whole ladder keeps the panel usable against an older control plane, where no list is reported.
+ */
+export function providerLevels(provider, model = null) {
+  const reported = canonicalLevels(
+    provider?.dialect_reasoning_levels ?? model?.dialect_reasoning_levels,
+  );
+  return reported.length ? reported : REASONING_LEVELS;
+}
+
+/** The levels the model entry itself declares, which is what a save writes. */
+export function declaredLevels(model) {
+  return canonicalLevels(model?.reasoning_levels);
+}
+
+/**
+ * The levels this model offers at runtime, ascending.
+ *
+ * `effective_reasoning_levels` comes from the same mr-core derivation the compiler uses (declared
+ * list, then provider catalogue, then the dialect). An empty array is an answer, not missing data:
+ * it means the model advertises no reasoning at all, so it must not fall through to the provider's
+ * vocabulary. Without the field, the old behaviour is preserved: declared levels, else the
+ * provider's.
+ */
+export function modelLevels(model, provider) {
+  if (Array.isArray(model?.effective_reasoning_levels)) {
+    return canonicalLevels(model.effective_reasoning_levels);
+  }
+  const declared = declaredLevels(model);
+  return declared.length ? declared : providerLevels(provider, model);
+}
+
+/** The provider a combo step names, or `null`. */
+export function stepProvider(step, providers) {
+  if (!step || typeof step !== 'object') return null;
+  const providerId = step.provider ?? step.provider_id;
+  if (!providerId) return null;
+  return (providers ?? []).find((candidate) => candidate?.id === providerId) ?? null;
+}
+
+/**
+ * The provider's model entry for a combo step, or `null`.
+ *
+ * A step names a provider and a model; the reasoning capabilities live on the provider's model
+ * entry, not on the step, so every level question has to go through this join.
+ */
+export function stepModel(step, providers) {
+  if (!step || typeof step !== 'object') return null;
+  const modelId = step.model ?? step.model_id;
+  if (!modelId) return null;
+  const provider = stepProvider(step, providers);
+  const models = Array.isArray(provider?.models) ? provider.models : [];
+  return models.find((candidate) => candidate?.id === modelId) ?? null;
+}
+
+/** True when `name` already ends in a reasoning-level suffix, as in `coding-high`. */
+export function endsInLevelName(name) {
+  if (typeof name !== 'string' || !name) return false;
+  const dash = name.lastIndexOf('-');
+  if (dash <= 0 || dash === name.length - 1) return false;
+  return REASONING_LEVELS.includes(name.slice(dash + 1).toLowerCase());
+}
+
+/**
+ * The level suffixes a combo can be called with (`coding-high`, `coding-low`, …).
+ *
+ * A **union** of the levels the steps' models offer at runtime, not an intersection: a step whose
+ * model does not offer a level still takes part in `<combo>-<level>`, because the relay substitutes
+ * that model's highest available level. Derived levels are included, because they are names the
+ * relay really resolves; a model that offers no levels contributes none.
+ */
+export function comboLevels(steps, providers) {
+  const offered = new Set();
+  for (const step of steps ?? []) {
+    const levels = modelLevels(stepModel(step, providers), stepProvider(step, providers));
+    for (const level of levels) offered.add(level);
+  }
+  return REASONING_LEVELS.filter((level) => offered.has(level));
+}
+
 export function stepLabel(step) {
   if (step == null) return '—';
   if (typeof step === 'string') return step;
@@ -240,15 +351,27 @@ export function stepLabel(step) {
 }
 
 /**
- * hedge.on_winner_fail is an externally tagged enum: {"rerun-excluding":{"max_rounds":2}} |
- * {"pick-highest-passed":null} | {"stable-fallback":{"step":1}}. Tolerate the bare-string form
- * too so the panel keeps working if the backend simplifies it.
+ * hedge.on_winner_fail is an internally tagged enum on the wire:
+ * {"mode":"rerun-excluding","max_rounds":2} |
+ * {"mode":"pick-highest-passed"} |
+ * {"mode":"stable-fallback","step":1}.
+ * Tolerate the bare-string form too so the panel keeps working if the backend simplifies it.
+ * The legacy externally tagged shape {"rerun-excluding":{...}} is also accepted on read so a
+ * panel saved against an older build still round-trips.
  */
 export function parseWinnerFail(v) {
   if (typeof v === 'string') {
     return { mode: v, maxRounds: v === 'rerun-excluding' ? 2 : null, step: null };
   }
   if (v && typeof v === 'object') {
+    // Internally tagged wire form: {"mode": "...", "max_rounds": N, "step": N}
+    if (typeof v.mode === 'string') {
+      const mode = v.mode;
+      const maxRounds = mode === 'rerun-excluding' ? Number(v.max_rounds ?? 2) : null;
+      const step = mode === 'stable-fallback' ? Number(v.step ?? 0) : null;
+      return { mode, maxRounds: Number.isFinite(maxRounds) ? maxRounds : null, step: Number.isFinite(step) ? step : null };
+    }
+    // Legacy externally tagged form: {"rerun-excluding":{"max_rounds":2}} — accepted on read only.
     const mode = Object.keys(v)[0];
     const inner = v[mode];
     if (mode === 'rerun-excluding') return { mode, maxRounds: Number(inner?.max_rounds ?? 2), step: null };
@@ -258,15 +381,12 @@ export function parseWinnerFail(v) {
   return { mode: 'pick-highest-passed', maxRounds: null, step: null };
 }
 
-/** Inverse of parseWinnerFail — canonical wire shape. */
+/** Inverse of parseWinnerFail — canonical internally tagged wire shape. */
 export function buildWinnerFail(mode, { maxRounds = 2, step = 0 } = {}) {
-  switch (mode) {
-    case 'rerun-excluding': return { 'rerun-excluding': { max_rounds: Math.max(1, Math.floor(Number(maxRounds) || 1)) } };
-    case 'stable-fallback': return { 'stable-fallback': { step: Math.max(0, Math.floor(Number(step) || 0)) } };
-    case 'pick-highest-passed': return { 'pick-highest-passed': null };
-    case 'pick-highest-passed-different-provider': return { 'pick-highest-passed-different-provider': null };
-    default: return { 'pick-highest-passed': null };
-  }
+  const base = { mode };
+  if (mode === 'rerun-excluding') base.max_rounds = Math.max(1, Math.floor(Number(maxRounds) || 1));
+  if (mode === 'stable-fallback') base.step = Math.max(0, Math.floor(Number(step) || 0));
+  return base;
 }
 
 /** True when a step is a hedged-race participant (participants = explicit step indices). */

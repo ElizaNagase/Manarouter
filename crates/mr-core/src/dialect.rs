@@ -143,7 +143,68 @@ impl Dialect {
         Self::Antigravity,
         Self::CommandCodeGo,
     ];
+
+    /// The reasoning levels this dialect can put on the wire as *themselves*, ascending.
+    ///
+    /// This is the source of truth the compiler, the validator and the panel all read. Two
+    /// families exist because two kinds of parameter exist:
+    ///
+    /// - The **named-effort** dialects (OpenAI, Copilot, Codex, Command Code) send an effort
+    ///   string, and their APIs define `none`, `minimal`, `low`, `medium`, `high` and `xhigh`.
+    ///   `ultra` and `max` are deliberately absent: the compiler rewrites both to `xhigh` for
+    ///   these dialects, so a model advertising `max` would be claiming a tier the upstream never
+    ///   receives. A request for such a name reroutes to the model's highest offered tier through
+    ///   the ordinary `-<level>` rule instead of being silently lowered.
+    /// - The **budget** dialects (Anthropic, Google, Antigravity) send a number rather than a
+    ///   name. Every tier on the ladder has a budget, so all eight are expressible even though
+    ///   the top few share the provider's ceiling.
+    ///
+    /// Keeping the list here rather than in the compiler is what makes "can this provider send
+    /// this level" one question with one answer: a per-model list, the panel's picker and the
+    /// configuration validator cannot disagree about the vocabulary of a dialect.
+    pub const fn expressible_reasoning_levels(self) -> &'static [ReasoningLevel] {
+        match self {
+            Self::OpenAi | Self::Copilot | Self::CommandCodeGo | Self::Codex => {
+                &NAMED_EFFORT_LEVELS
+            }
+            Self::Anthropic | Self::Google | Self::Antigravity => &ReasoningLevel::ALL,
+        }
+    }
+
+    /// Whether `level` is one this dialect can send without rewriting it into another tier.
+    ///
+    /// The validator refuses configuration that says otherwise, so this predicate is the one
+    /// place "accepted level" and "offered level" are decided.
+    pub fn supports_reasoning_level(self, level: ReasoningLevel) -> bool {
+        self.expressible_reasoning_levels().contains(&level)
+    }
+
+    /// Whether every model this dialect serves reasons by default.
+    ///
+    /// Codex is Responses-API-only and serves reasoning models exclusively, so a model listed
+    /// there with no metadata still gets a level set. The other dialects also serve plain chat
+    /// models, which must not sprout level-qualified names nobody asked for; their providers turn
+    /// levels on by declaring the `Reasoning` capability.
+    #[inline]
+    pub const fn always_reasons(self) -> bool {
+        matches!(self, Self::Codex)
+    }
 }
+
+/// The effort values a named-effort dialect defines.
+///
+/// A module-level constant rather than an inline array so
+/// [`Dialect::expressible_reasoning_levels`] can return a stable slice from a `const fn`; the
+/// order matches [`ReasoningLevel::ALL`] up to `xhigh`, which is what lets the compiler fold the
+/// list into an ascending bitmask without sorting it.
+const NAMED_EFFORT_LEVELS: [ReasoningLevel; 6] = [
+    ReasoningLevel::None,
+    ReasoningLevel::Minimal,
+    ReasoningLevel::Low,
+    ReasoningLevel::Medium,
+    ReasoningLevel::High,
+    ReasoningLevel::XHigh,
+];
 
 /// A capability is a *route*, not a model feature. It decides which client endpoints a provider
 /// can serve, and lets the panel grey out combinations that cannot work.
@@ -607,12 +668,10 @@ fn default_max_rounds() -> u8 {
 impl Default for WinnerFailMode {
     /// The operator's rule: **the winner is the highest-priority participant that passed.**
     ///
-    /// The other three modes stay accepted configuration options, but the one that is *not*
-    /// implemented — `rerun-excluding` spends more upstream requests to find a winner that a fresh
-    /// race might have found, which is the expensive answer to a question the operator did not ask.
-    /// A combo that says nothing about `on_winner_fail` therefore gets the rule the operator
-    /// actually stated, and a combo that asks for `rerun-excluding` is told (in the relay's log)
-    /// that the request is being served as `pick-highest-passed` instead.
+    /// It is also the cheapest of the four modes: the participant that passed the race is already in
+    /// hand, so a combo that says nothing about `on_winner_fail` pays nothing extra for its
+    /// recovery. `PickHighestPassedDifferentProvider` shares that zero-cost shape; `RerunExcluding`
+    /// and `StableFallback` spend new upstream requests, which is why they are an explicit choice.
     fn default() -> Self {
         Self::PickHighestPassed
     }
@@ -1080,9 +1139,9 @@ mod tests {
     #[test]
     fn on_winner_fail_uses_the_internally_tagged_wire_form() {
         // The config file format for `on_winner_fail` is internally tagged on `mode`. This test
-        // pins it because `panel/format.js` still builds and parses the *externally* tagged form
-        // (`{"rerun-excluding": {...}}`), which this type refuses to deserialize. Whoever fixes the
-        // panel should make it emit/accept exactly what is asserted here.
+        // pins it, because the panel writes this field: `parseWinnerFail`/`buildWinnerFail` in
+        // `panel/format.js` now emit and accept exactly this shape (and still *read* the legacy
+        // externally tagged documents written before the fix).
         let rerun = WinnerFailMode::RerunExcluding { max_rounds: 3 };
         let json = serde_json::to_value(&rerun).expect("serialize");
         assert_eq!(
@@ -1100,7 +1159,8 @@ mod tests {
             serde_json::json!({ "mode": "stable-fallback", "step": 2 })
         );
 
-        // The externally tagged shape the panel currently emits is not accepted.
+        // The legacy externally tagged shape is not accepted by this type, and the panel's reader
+        // is the only place that still understands it.
         assert!(serde_json::from_value::<WinnerFailMode>(
             serde_json::json!({ "rerun-excluding": { "max_rounds": 3 } })
         )
@@ -1445,6 +1505,63 @@ mod tests {
         );
         for (route, key) in expected {
             assert_eq!(route.as_config_key(), key, "{route:?}");
+        }
+    }
+
+    #[test]
+    fn a_named_effort_dialect_does_not_offer_a_tier_it_would_rewrite() {
+        // `ultra` and `max` are not effort strings these APIs define; the compiler lowers both to
+        // `xhigh`. Offering them would mean the panel and `/v1/models` advertise a tier the
+        // upstream never sees, so they are excluded from the authoritative set.
+        for dialect in [
+            Dialect::OpenAi,
+            Dialect::Copilot,
+            Dialect::Codex,
+            Dialect::CommandCodeGo,
+        ] {
+            let levels = dialect.expressible_reasoning_levels();
+            assert!(!levels.contains(&ReasoningLevel::Ultra), "{dialect:?}");
+            assert!(!levels.contains(&ReasoningLevel::Max), "{dialect:?}");
+            assert!(levels.contains(&ReasoningLevel::Minimal), "{dialect:?}");
+            assert!(levels.contains(&ReasoningLevel::XHigh), "{dialect:?}");
+            assert!(!dialect.supports_reasoning_level(ReasoningLevel::Max));
+        }
+    }
+
+    #[test]
+    fn a_budget_dialect_can_express_every_tier() {
+        // These dialects send a number, and the ladder has a budget for every tier, so nothing on
+        // the ladder is unsendable even where the top budgets coincide.
+        for dialect in [Dialect::Anthropic, Dialect::Google, Dialect::Antigravity] {
+            assert_eq!(
+                dialect.expressible_reasoning_levels(),
+                &ReasoningLevel::ALL,
+                "{dialect:?}"
+            );
+            for level in ReasoningLevel::ALL {
+                assert!(
+                    dialect.supports_reasoning_level(level),
+                    "{dialect:?} {level:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_dialects_level_list_is_ascending_and_unique() {
+        for dialect in Dialect::ALL {
+            let levels = dialect.expressible_reasoning_levels();
+            assert!(!levels.is_empty(), "{dialect:?}");
+            for pair in levels.windows(2) {
+                assert!(
+                    pair[0].rank() < pair[1].rank(),
+                    "{dialect:?} is not ascending at {pair:?}"
+                );
+            }
+            // Ascending and unique are the same assertion here because the ladder is total, so a
+            // duplicate would have to be non-ascending. This pins the `const` slice order the
+            // compiler relies on instead of sorting at run time.
+            assert!(levels.contains(&ReasoningLevel::None), "{dialect:?}");
         }
     }
 }

@@ -431,7 +431,13 @@ async fn respond(mock: &Mock, headers: &HeaderMap, body: Bytes, fault: Fault) ->
 }
 
 /// An SSE completion whose frames can be cut short by `--die-after`.
-async fn sse_response(_mock: &Mock, id: &str, model: &str, created: u64, fault: &Fault) -> Response {
+async fn sse_response(
+    _mock: &Mock,
+    id: &str,
+    model: &str,
+    created: u64,
+    fault: &Fault,
+) -> Response {
     let chunk = |delta: Value, finish: Value| -> String {
         format!(
             "data: {}\n\n",

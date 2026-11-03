@@ -241,7 +241,14 @@ pub(crate) fn endpoint_failure(status: u16, body: &str) -> Option<(FailureClass,
     let detail = match (code, description) {
         (Some(code), Some(description)) => format!("{code}: {}", clip(&description)),
         (Some(code), None) => code,
-        (None, _) => format!("HTTP {status}"),
+        (None, _) => {
+            let mut d = format!("HTTP {status}");
+            let clipped = clip(body);
+            if !clipped.is_empty() {
+                d.push_str(&format!(" body={clipped:?}"));
+            }
+            d
+        }
     };
     Some((class, clip(&detail).to_string()))
 }

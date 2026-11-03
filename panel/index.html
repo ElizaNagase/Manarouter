@@ -38,7 +38,16 @@
         <ul id="nav-list">
           <li><a href="#/overview"  data-route="overview">Overview</a></li>
           <li><a href="#/providers" data-route="providers">Providers</a></li>
-          <li><a href="#/combos"    data-route="combos">Combos</a></li>
+          <li><a href="#/combos"    data-route="combos">Combos</a>
+            <!-- The live combo visualizer. It sits inside the Combos item so it reads as part of
+                 that entry. Filled by panel/combo-live.js.
+                 The block itself is deliberately not a live region: it is repainted on every poll,
+                 and a politely-announced region rewritten every 1.5 s reads the same sentence over
+                 and over. The announcement lives in the sibling `sr-only` status span, which only
+                 changes when the state or the route does. -->
+            <div id="combo-live" class="combo-live"></div>
+            <span id="combo-live-announce" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></span>
+          </li>
           <li><a href="#/keys"      data-route="keys">Keys</a></li>
           <li><a href="#/aliases"   data-route="aliases">Aliases</a></li>
           <li><a href="#/models"    data-route="models">Models</a></li>

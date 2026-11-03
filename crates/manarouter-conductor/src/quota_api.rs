@@ -285,6 +285,13 @@ async fn get_quota(State(state): State<AppState>) -> ApiResult<Json<Value>> {
             let entry = cached
                 .iter()
                 .find(|e| e.provider_id == provider.id.as_str() && e.account_id == account.id);
+            // An account whose provider reports no allowance is not a quota row. Listing it with a
+            // made-up `0/0` window reads as "exhausted" and sends the operator chasing a number
+            // nobody measured. It stays hidden until it either gains a real fetcher or produces a
+            // cached row.
+            if entry.is_none() && !reports_quota(provider, account) {
+                continue;
+            }
             rows.push(account_row(provider, account, entry, None));
         }
     }
@@ -305,7 +312,7 @@ async fn refresh_all(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         .flat_map(|p| {
             p.accounts
                 .iter()
-                .filter(|a| a.enabled)
+                .filter(|a| a.enabled && reports_quota(p, a))
                 .map(move |a| (p.clone(), a.clone()))
         })
         .collect();
@@ -357,29 +364,64 @@ async fn refresh_account(state: &AppState, provider: &Provider, account: &Accoun
     }
 }
 
+/// Whether this provider/account pair has a quota fetcher that can actually report an allowance.
+///
+/// The generic OpenAI-compatible reader sits in the fallback tier and claims everything, but it can
+/// only answer when the account declares a `quotaEndpoint`. Everything else it claims has no
+/// endpoint to read, which is exactly the "this service does not report quota" case — and the
+/// panel must not invent a window for it.
+///
+/// The provider's base URL has to go into the look-up, not just its id and dialect: those two are
+/// operator-chosen, and a vendor is recognised by the host its traffic goes to. A provider called
+/// `commandcode` on the generic `open-ai` dialect matched no fetcher until the host claim existed, so
+/// this function said "no quota here" about a service that reports one and the account never
+/// appeared on the page.
+fn reports_quota(provider: &Provider, account: &Account) -> bool {
+    let quota_account = mr_core::quota::registry::QuotaAccount::from_account(account);
+    let Some(fetcher) = default_registry().lookup(
+        provider.dialect,
+        provider.id.as_str(),
+        Some(provider.base_url.as_str()),
+        &quota_account,
+    ) else {
+        return false;
+    };
+    if fetcher.id() != mr_core::quota::openai_compat::OpenAiCompat::ID {
+        return true;
+    }
+    account
+        .extra
+        .get(mr_core::quota::registry::QUOTA_ENDPOINT_KEY)
+        .is_some_and(|value| !value.is_null())
+}
+
 async fn fetch_and_store(
     state: &AppState,
     provider: &Provider,
     account: &Account,
 ) -> Result<ProviderQuotaState, String> {
-    let credential = if let Some(reference) = &account.secret_ref {
-        state
-            .vault
-            .lock()
-            .await
-            .get(reference)
-            .map_err(|e| format!("vault read failed: {e}"))?
-    } else {
-        None
-    };
-    if matches!(provider.auth, mr_core::AuthKind::OAuth { .. }) && account.oauth_ref.is_some() {
-        return Err("OAuth quota refresh is not supported by the conductor yet".into());
-    }
+    // A key-based account hands over its stored secret; an OAuth account has no secret to hand
+    // over, so the conductor mints the same short-lived token the relay would. Until this existed
+    // every OAuth provider's quota panel was a dead end.
+    let (credential, minted_context) = crate::oauth_token::credential_and_context(
+        state,
+        provider,
+        account,
+        crate::oauth_token::TokenUse::Quota,
+    )
+    .await?;
     let http = shared_http().map_err(|e| e.to_string())?;
+    // The account may declare nothing about the upstream project while its credential names one,
+    // and that is the usual case: the relay fills Antigravity's envelope from the *token*, so a
+    // quota read that only consults the account asks Google about a different allowance and reports
+    // a healthy window for an account whose every request is refused. The token's context fills the
+    // gaps; an account that does declare a project still wins, because that one is the operator's.
+    let mut quota_account = mr_core::quota::registry::QuotaAccount::from_account(account);
+    for (key, value) in minted_context {
+        quota_account.extra.entry(key).or_insert(value);
+    }
     let mut context = QuotaFetchContext::new(provider.id.as_str(), provider.dialect, http)
-        .with_account(mr_core::quota::registry::QuotaAccount::from_account(
-            account,
-        ))
+        .with_account(quota_account)
         .with_base_url(provider.base_url.clone());
     if let Some(secret) = credential {
         context = context.with_credential(secret);
@@ -426,10 +468,36 @@ fn quota_windows(
             })
             .collect();
     }
+    // Nothing is declared, so the only fact left is the one the upstream just reported: *when* the
+    // window resets. Classify from that rather than assuming a session window. Command Code reports
+    // one dollar pool per billing period, and rendering a pool that resets in three weeks as `5h`
+    // would be exactly the label this module exists to avoid — a window is a duration, not a name.
     vec![mr_core::quota::types::QuotaWindow::from_quota(
-        mr_core::quota::types::WindowFamily::Session5h,
+        observed_family(quota),
         quota,
     )]
+}
+
+/// The window family of a quota that declared no length, read off its reset instant.
+///
+/// The distance to the reset is a *lower bound* on the real window length — a thirty-day window
+/// seen with five days left reads as weekly — so this can only ever classify a window shorter than
+/// it is, never longer, which is the honest direction to be wrong in. With no instant, or one
+/// already in the past, there is nothing to classify by and the session-window assumption stands.
+fn observed_family(quota: &UsageQuota) -> mr_core::quota::types::WindowFamily {
+    use mr_core::quota::types::WindowFamily;
+    let Some(reset_at) = quota.reset_at else {
+        return WindowFamily::Session5h;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as i64)
+        .unwrap_or(0);
+    let remaining_secs = reset_at.saturating_sub(now_ms) / 1000;
+    if remaining_secs <= 0 {
+        return WindowFamily::Session5h;
+    }
+    WindowFamily::from_seconds(remaining_secs as u64)
 }
 
 fn account_row(
@@ -441,16 +509,14 @@ fn account_row(
     let parsed: Value = cached
         .and_then(|entry| serde_json::from_str(&entry.payload).ok())
         .unwrap_or_else(|| json!({}));
+    // No cached reading and no error means this account has not been fetched yet. The row says so
+    // by carrying no windows at all: a fabricated `0/0` window renders as an exhausted account and
+    // an operator acts on a number nobody measured.
     let windows = parsed
         .get("windows")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_else(|| {
-            quota_windows(provider, account, &UsageQuota::unlimited())
-                .iter()
-                .map(|window| serde_json::to_value(window).unwrap_or(Value::Null))
-                .collect()
-        });
+        .unwrap_or_default();
     let details = parsed.get("details").cloned().unwrap_or_else(|| json!([]));
     let windows = windows
         .into_iter()
@@ -671,5 +737,71 @@ mod tests {
         assert_eq!(row["completion_tokens"], Value::Null);
         assert_eq!(row["estimated"], json!(false));
         assert_eq!(row["provider_reported"], json!(false));
+    }
+
+    /// The operator's shape, and the failure it used to cause.
+    ///
+    /// A Command Code connection is naturally configured with a provider id the operator chose
+    /// (`commandcode`) on the generic `open-ai` dialect its OpenAI-compatible surface speaks, which
+    /// matches no fetcher id and no dedicated dialect. The look-up therefore used to stop at the
+    /// generic reader, which can only answer when the account declares a `quotaEndpoint` — so this
+    /// function said "this service reports no quota" about a service that reports a credit pool and
+    /// two rolling windows, and the row was dropped from `GET /api/quota` rather than read.
+    #[test]
+    fn a_provider_recognised_by_its_host_reports_quota_and_the_rest_do_not() {
+        let account = Account::new("work");
+
+        // Command Code, on the exact base URL the operator's config carries.
+        let command_code = Provider::new(
+            "commandcode",
+            mr_core::Dialect::OpenAi,
+            "https://api.commandcode.ai/provider/v1",
+        );
+        assert!(reports_quota(&command_code, &account));
+
+        // A made-up id on somebody else's host is still a service with no reader and no declared
+        // endpoint: the page must not be given an invented window for it.
+        let unknown = Provider::new(
+            "some-openai-clone",
+            mr_core::Dialect::OpenAi,
+            "https://api.openai.com/v1",
+        );
+        assert!(!reports_quota(&unknown, &account));
+
+        // That is the pre-existing escape hatch, and it still works: declare where the quota lives
+        // and the generic reader can answer.
+        let mut declared = Account::new("work");
+        declared.extra.insert(
+            mr_core::quota::registry::QUOTA_ENDPOINT_KEY.to_owned(),
+            json!("https://api.openai.com/v1/credits"),
+        );
+        assert!(reports_quota(&unknown, &declared));
+    }
+
+    /// The label on the one window an undeclared quota produces.
+    ///
+    /// Command Code reports a dollar pool per billing period with its reset twenty days out. That
+    /// used to be labelled `5h` for every provider that declares no window, which told the operator
+    /// a budget they can spend all month was a session allowance.
+    #[test]
+    fn an_undeclared_window_is_classified_by_when_it_resets() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_millis() as i64)
+            .expect("clock after the epoch");
+
+        // Command Code's real shape: a pool that resets in three weeks is a billing period.
+        let billing = UsageQuota::from_counts(39.03, 70.10, Some(now_ms + 20 * 24 * 3_600_000));
+        assert_eq!(observed_family(&billing).label(), "30d");
+
+        // A session window still reads as one, which is what the old assumption was right about.
+        let session = UsageQuota::from_counts(1.0, 5.0, Some(now_ms + 2 * 3_600_000));
+        assert_eq!(observed_family(&session).label(), "5h");
+
+        // Nothing to classify by: no instant, or one already past, keeps the documented assumption.
+        let silent = UsageQuota::from_counts(0.0, 0.0, None);
+        assert_eq!(observed_family(&silent).label(), "5h");
+        let past = UsageQuota::from_counts(1.0, 5.0, Some(now_ms - 3_600_000));
+        assert_eq!(observed_family(&past).label(), "5h");
     }
 }

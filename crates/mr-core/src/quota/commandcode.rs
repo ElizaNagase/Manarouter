@@ -20,6 +20,18 @@
 //! in a `OnceLock`), whitespace- and trailing-slash-normalised, and ignored when empty, so a test
 //! double or a self-hosted proxy can be pointed at without a rebuild and without a restart.
 //!
+//! That override moves where this reader *calls*; it does not move what it *claims*. The vendor is
+//! recognised by the host of the provider's configured base URL ([`API_HOST`], through
+//! [`QuotaFetcher::claims_host`]), because the provider id and the wire dialect are both chosen by
+//! the operator: a Command Code connection configured to use its OpenAI-compatible surface is
+//! naturally called `commandcode` and dialected `open-ai`, which matches neither [`CommandCode::ID`]
+//! nor any dedicated dialect. Recognising the host keeps such an account's quota on the page instead
+//! of letting it fall through to the generic reader, which has no endpoint to read.
+//!
+//! The two are kept apart on purpose: the inference base an operator configures
+//! (`https://api.commandcode.ai/provider/v1`) is not a base for `/alpha/...` — those paths hang off
+//! the host root — so a claim must never be allowed to feed the configured URL into [`url_with`].
+//!
 //! # One account line, several named budgets
 //!
 //! [`QuotaFetcher::fetch`] returns a single [`UsageQuota`] (the trait's shape is one quota per
@@ -57,6 +69,16 @@ pub const API_BASE_ENV: &str = "COMMANDCODE_API_URL";
 /// Where Command Code lives when the environment does not say otherwise.
 pub const DEFAULT_API_BASE: &str = "https://api.commandcode.ai";
 
+/// The host of the `/alpha` surface: the identity this reader recognises its vendor by.
+///
+/// It is deliberately the same string as the default base's host, and it is declared separately
+/// because the two answer different questions. [`DEFAULT_API_BASE`] is where this reader *calls*;
+/// this is what makes [`QuotaFetcher::claims_host`] claim an account whose configured provider id and
+/// dialect the operator chose themselves (`commandcode` over `open-ai`, for example). A build that
+/// repoints the calls through [`API_BASE_ENV`] must still claim the real vendor host, so the two are
+/// not allowed to become one value.
+pub const API_HOST: &str = "api.commandcode.ai";
+
 /// The account-extra key that names the organisation id, so `/alpha/whoami` can be skipped.
 pub const ORG_ID_KEY: &str = "orgId";
 
@@ -93,6 +115,9 @@ impl CommandCode {
 
     /// The default API base, overridable with [`API_BASE_ENV`].
     pub const DEFAULT_API_BASE: &str = DEFAULT_API_BASE;
+
+    /// The host [`QuotaFetcher::claims_host`] claims.
+    pub const API_HOST: &str = API_HOST;
 
     /// The account-extra key that names the organisation id.
     pub const ORG_ID_KEY: &str = ORG_ID_KEY;
@@ -408,7 +433,31 @@ impl QuotaFetcher for CommandCode {
     /// The renamed provider id, and the pre-rename one until the config migration has run. Nothing
     /// else claims these accounts.
     fn supports(&self, _dialect: Dialect, provider_id: &str, _account: &QuotaAccount) -> bool {
-        provider_id == Self::ID || provider_id == LEGACY_PROVIDER_ID
+        provider_id == Self::ID || provider_id == LEGACY_PROVIDER_ID || provider_id == "commandcode"
+    }
+
+    /// Command Code, recognised by where the operator sends its traffic rather than by the name the
+    /// operator gave the connection.
+    ///
+    /// A provider id and a dialect are both chosen: an operator may well call this connection
+    /// `commandcode` and select the generic `open-ai` dialect, because that is the surface this
+    /// vendor's OpenAI-compatible endpoint speaks. Neither name then matches [`Self::ID`], and the
+    /// registry used to hand the account to the generic OpenAI-compatible reader, which has no
+    /// endpoint to read and reported nothing — so a provider that does publish a credits pool and
+    /// two rolling windows disappeared from the quota panel entirely. The host is not a choice, so it
+    /// is the identity that is checked here.
+    ///
+    /// An exact comparison and nothing more: `api.commandcode.ai.example.test` is somebody else's
+    /// host, and a suffix test would hand them this reader. The registry has already lower-cased the
+    /// value and removed the port, path and any brackets, so `api.commandcode.ai` is the whole of
+    /// what this can be asked about.
+    ///
+    /// Note what this does *not* do: it does not change where the calls go. [`QuotaFetcher::fetch`]
+    /// keeps using [`api_base`] (the default [`DEFAULT_API_BASE`] or the [`API_BASE_ENV`] override),
+    /// never the configured OpenAI-compatible inference base — `https://api.commandcode.ai/provider/v1`
+    /// is where inference lives, and `/alpha/billing/credits` is not under it.
+    fn claims_host(&self, host: &str) -> bool {
+        host == API_HOST
     }
 
     async fn fetch(&self, ctx: &QuotaFetchContext) -> Result<UsageQuota> {
@@ -881,7 +930,103 @@ mod tests {
         let account = QuotaAccount::new();
         assert!(CommandCode::new().supports(Dialect::CommandCodeGo, "command-code-go", &account));
         assert!(CommandCode::new().supports(Dialect::CommandCodeGo, "command-code", &account));
+        assert!(CommandCode::new().supports(Dialect::OpenAi, "commandcode", &account));
         assert!(!CommandCode::new().supports(Dialect::CommandCodeGo, "openrouter", &account));
+    }
+
+    #[test]
+    fn the_host_claim_is_exactly_the_vendors_host() {
+        let fetcher = CommandCode::new();
+        // What the registry hands over: the configured base URL's host, lower-cased, port and path
+        // already removed.
+        assert!(fetcher.claims_host(API_HOST));
+        assert!(fetcher.claims_host(CommandCode::API_HOST));
+        assert_eq!(API_HOST, "api.commandcode.ai");
+
+        // Somebody else's host, including one that merely contains the vendor's name. A suffix
+        // match here would let `api.commandcode.ai.example.test` read somebody's quota with this
+        // reader's assumptions, so the claim is an equality test.
+        for host in [
+            "api.commandcode.ai.example.test",
+            "commandcode.ai.example.test",
+            "evil-api.commandcode.ai.evil",
+            "api.openai.com",
+            // Not a host: the registry strips the port before asking, so this never claims.
+            "api.commandcode.ai:443",
+            // A sibling host is a different host; only the API host serves `/alpha`.
+            "commandcode.ai",
+            "www.commandcode.ai",
+            "",
+        ] {
+            assert!(!fetcher.claims_host(host), "claimed {host:?}");
+        }
+        // Uppercase is not the registry's output either; it lower-cases before asking.
+        assert!(!fetcher.claims_host("API.COMMANDCODE.AI"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_configured_inference_base_never_becomes_the_quota_base() {
+        // The operator's configuration points at Command Code's OpenAI-compatible inference surface.
+        // That URL is what lets the registry claim this account; the calls themselves must still go
+        // to `/alpha/...` on the host root, which is why `fetch` reads `api_base()` and not
+        // `ctx.base_url`.
+        //
+        // The environment lock is held because this test asserts what the *default* base is: a
+        // concurrently running override test would otherwise set the variable mid-fetch and the
+        // assertion would fail on a base URL this test never configured.
+        let _guard = env_lock();
+        std::env::remove_var(API_BASE_ENV);
+        let fake = FakeHttp::new(serving());
+        let ctx = context(&fake)
+            .with_base_url("https://api.commandcode.ai/provider/v1")
+            .with_account(
+                QuotaAccount::new().with_extra(ORG_ID_KEY, Value::String("org_abc".to_owned())),
+            );
+        let fetched = CommandCode::new().fetch(&ctx).await;
+
+        let requests = fake.requests();
+        fetched.expect("the vendor's host is only a claim");
+        assert_eq!(requests.len(), 3);
+        for request in &requests {
+            assert!(
+                request.url.starts_with("https://api.commandcode.ai/alpha/"),
+                "{}",
+                request.url
+            );
+            assert!(
+                !request.url.contains("/provider/v1"),
+                "the inference base was used as a quota base: {}",
+                request.url
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_environment_override_still_wins_over_the_configured_base() {
+        // Same rule, from the other side: `COMMANDCODE_API_URL` decides where the calls go even when
+        // the provider has a configured (and host-claimed) base URL. The environment is the test
+        // double's seam, and it must stay authoritative over the configuration.
+        let _guard = env_lock();
+        std::env::set_var(API_BASE_ENV, "https://quota.test");
+        let fake = FakeHttp::new(serving());
+        let ctx = context(&fake)
+            .with_base_url("https://api.commandcode.ai/provider/v1")
+            .with_account(
+                QuotaAccount::new().with_extra(ORG_ID_KEY, Value::String("org_abc".to_owned())),
+            );
+        let fetched = CommandCode::new().fetch(&ctx).await;
+        std::env::remove_var(API_BASE_ENV);
+
+        fetched.expect("the override base answers");
+        for request in fake.requests() {
+            assert!(
+                request.url.starts_with("https://quota.test/alpha/"),
+                "{}",
+                request.url
+            );
+        }
     }
 
     #[test]

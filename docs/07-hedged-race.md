@@ -19,10 +19,11 @@ consequences carefully.
 > that dispatches the participants is
 > [`run_hedge`](../crates/manarouter-relay/src/server.rs).
 >
-> Of the four `on_winner_fail` modes described in §5, only `pick-highest-passed` is implemented;
-> the other three are parsed, warned about, and fall back to it. Winner recovery (§5) and the
-> mid-stream switch (§6) **are** implemented, because the relay wraps the committed winner's body;
-> only session affinity (§8) is not wired. `hedge.enabled` also opts a `priority` combo into the separate
+> All four `on_winner_fail` modes described in §5 are implemented. `pick-highest-passed` is the
+> default and costs nothing; the other three re-dispatch upstream work and therefore only run when
+> the winner actually fails, bounded by `max_rounds` (`rerun-excluding`) or a single round
+> (`stable-fallback`). Winner recovery (§5) and the mid-stream switch (§6) **are** implemented,
+> because the relay wraps the committed winner's body; only session affinity (§8) is not wired. `hedge.enabled` also opts a `priority` combo into the separate
 > sticky-success preference: after a successful call the relay prefers that provider/model for the
 > configured inactivity window (default 1800 seconds), subject to current eligibility. This
 > preference is combo-wide across callers, process-local, bounded, and makes no inference or keepalive
@@ -243,28 +244,33 @@ Ties are always broken by the operator's step order. Never by arrival order, and
 
 ## 5. When the chosen model dies: four modes
 
-> **Status.** One of these four modes is implemented: **`pick-highest-passed`**, which is also the
-> default, so a combo that says nothing about `on_winner_fail` gets it. The other three —
-> `rerun-excluding`, `pick-highest-passed-different-provider` and `stable-fallback` — are accepted
-> configuration that the relay **ignores for now**: it logs a warning naming the configured mode and
-> serves the request as `pick-highest-passed`. They are options, not errors, and they are not
-> silently pretended to work.
->
-> The machinery they need does exist: the relay now watches the committed winner's body (§6), and
-> the participants that passed the race are kept for it to fall back on.
+> **Status.** All four modes are implemented. **`pick-highest-passed`** is the default, so a combo
+> that says nothing about `on_winner_fail` gets it, and it costs no extra upstream work: the
+> participants that passed the race are kept when the winner is committed.
+> `pick-highest-passed-different-provider` keeps the same zero-cost shape and only filters those kept
+> participants to another provider. The remaining two re-dispatch new upstream requests, and only
+> ever run when the committed winner actually fails: `rerun-excluding` up to `max_rounds`,
+> `stable-fallback` for its single nominated step.
+> The relay watches the committed winner's body (§6) and that is what makes any of this reachable.
+> All four are covered by unit tests; none has been exercised against a real provider outage.
 
 `on_winner_fail` is evaluated when the committed winner fails — either before delivering anything, or
 mid-stream. It has four values because there are four genuinely different things an operator might
 want, and guessing between them would be wrong in at least three cases.
 
-### `rerun-excluding` — not implemented yet
+### `rerun-excluding` — implemented
 
-Re-run the whole competition over the remaining participants, **excluding every model that has
-already failed**, up to `max_rounds`.
+Re-run over the remaining participants, **excluding every model that has already failed**, up to
+`max_rounds`.
 
 This is the "run it again" behaviour. It is the most expensive mode and the most robust, because a
-fresh race can find a winner that was not even a participant the first time. `max_rounds` bounds it
-so that a systemic outage cannot turn one client request into an unbounded number of upstream calls.
+fresh attempt can find a winner that was not even a participant the first time. `max_rounds` bounds
+it so that a systemic outage cannot turn one client request into an unbounded number of upstream
+calls; when the budget is spent the response ends with an error rather than a truncated body.
+
+The re-dispatch is sequential over the eligible remaining steps in priority order, not a second
+race: the failure already happened, and spending a full competition on the recovery path would
+multiply the cost of an outage.
 
 ### `pick-highest-passed` — implemented, and the default
 
@@ -272,13 +278,13 @@ Do **not** re-dispatch. Take the highest-priority participant that already **pas
 eligibility gate in the first competition.
 
 **Zero added latency.** This is the right mode when the operator's goal is a fast, safe answer and
-they do not want the router to spend more upstream requests on recovery. It is also the mode the
-relay implements: a combo that names no mode gets this one.
+they do not want the router to spend more upstream requests on recovery. It is also the default:
+a combo that names no mode gets this one.
 
 The "passed" participants are kept when the winner is committed, so the replacement is already
 there — its response is read when the failure happens, not re-requested.
 
-### `pick-highest-passed-different-provider` — not implemented yet
+### `pick-highest-passed-different-provider` — implemented
 
 As above, restricted to participants on a **different provider** than the one that died.
 
@@ -287,7 +293,7 @@ outage, a revoked credential, or a provider-wide quota reset. In that case the s
 same provider will fail in exactly the same way, and picking it wastes the entire retry. Requiring a
 different provider turns a provider outage from a stalled request into a fast, correct fallback.
 
-### `stable-fallback` — not implemented yet
+### `stable-fallback` — implemented
 
 Jump straight to a fixed `step`, given as an index into the combo's **own** step list (the wire form is
 `{"mode": "stable-fallback", "step": N}`). The step is renumbered by the compiler onto the surviving
@@ -452,10 +458,9 @@ Sticky-success reorders where the **sequential** chain begins; it does not run a
 It applies to the race as well: a sticky step is still a participant, and it is still the winner when
 it answers inside the window.
 
-Where a paragraph in this document reads as present-tense behaviour that the relay does not perform —
-the retry pass, and the three `on_winner_fail` modes other than `pick-highest-passed` — the
-implementation status is the note above it, not the tense. The mid-stream boundary in §6 **is**
-implemented.
+Two paragraphs in this document describe behaviour the relay does not perform yet: the distinct
+`first_complete_token` measurement (§4) and session affinity (§8). Both carry their own status note.
+The mid-stream boundary in §6 and all four `on_winner_fail` modes in §5 **are** implemented.
 
 ---
 

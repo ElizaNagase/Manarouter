@@ -31,17 +31,46 @@ The two processes share state through files, not through IPC: the conductor writ
 |---|---|---|
 | **Overview** | Control-plane uptime, relay reachability, snapshot digest and age, configuration counts, and whether a panel password is set | Nothing |
 | **Providers** | Every provider, its dialect, base URL, auth, key strategy, account count, and health | Add, edit, enable/disable, remove; add, enable/disable and remove accounts |
-| **Models** | Discovered and hand-entered models per provider | Hide/show and delete a model; sync and hand-entry live in the Providers drawer |
-| **Combos** | Every combo with its steps **in priority order** | Create, edit, reorder steps, enable/disable, remove |
+| **Models** | Discovered and hand-entered models per provider | Hide/show, delete, and **test** a model (one small live request; the answer or the upstream error is shown as a toast). The test runs on the relay's loopback probe (`POST /control/probe`), so it goes through the ordinary dispatch path — routing table, dialect translation, account selection, cooldowns and fallbacks — and works for every dialect, not only the OpenAI shape. The route refuses non-loopback callers because it skips the client-key check |
+| **Combos** | Every combo with its steps **in priority order**, each step's optional pinned reasoning level, and a **Live health** panel | Create, edit, reorder steps, enable/disable, remove, pin a step's reasoning level, and **check** the steps: one tiny completion per enabled step through the relay probe, in priority order, so the panel shows which step answers right now and which one failed and why |
 | **Keys** | Client keys by label and prefix | Create (plaintext shown once), edit the policy, rotate the secret in place (new plaintext shown once, old secret invalidated after commit), enable/disable, delete |
 | **Aliases** | Alias to target mappings | Add, remove |
-| **Quota** | Per-account windows, cooldowns, reset instants, and usage over time | Nothing (windows are declared in the configuration) |
+| **Quota** | Allowances first — per-account windows, cooldowns and reset instants — then the recent request ledger underneath. Only accounts whose provider actually reports an allowance are listed; an account with no quota fetcher is not shown with an invented `0/0` window | Refresh an account's windows from the provider (key *and* OAuth accounts: the conductor mints the same short-lived token the relay would) |
 | **Settings** | Listen ports, client-key access, upstream proxies, the relay connection pool (including a low-resource profile), quota display, pricing data, the panel password, and the raw configuration | Edit; **ports apply on next restart** |
 | **Documentation** | The top-level files in `docs/`, rendered from markdown | Nothing |
 
 The **Models** view distinguishes discovered from hand-entered metadata explicitly, because a sync
 must never overwrite what a human typed. If the two ever disagreed and the panel did not say which
 was which, the operator would have no way to know why their edit vanished.
+
+## The live combo block
+
+Under the Combos item in the sidebar there is one small block that answers a single question: what is
+a combo doing right now?
+
+It is fed by `GET /api/activity`, which the control plane proxies to the relay's loopback
+`GET /control/activity`. The relay is the only process that can answer: it makes the routing decision
+and it holds the account cooldowns, and neither fact is written to disk. The block polls every 1.5
+seconds through the panel's shared scheduler, which stops entirely while the tab is hidden.
+
+It has four states, and it says which one it is in words rather than by colour alone:
+
+| State | Shows |
+|---|---|
+| **live** | The combo and the `provider/model` the relay committed to, with the word *live* and a pulsing dot. A request stays *live* for as long as the client is still receiving it |
+| **recent** | The newest decision and its age (`12s ago`), because a combo that ran an hour ago is still the answer to "what did it do" |
+| **no combo activity yet** | The relay is reachable and has served no combo since it started |
+| **control plane unreachable** | The panel could not ask. A different sentence from the one above on purpose: "nothing is running" and "I cannot see" are not the same fact, and the panel must not blur them |
+
+The block is a fixed 52 px tall on purpose. It fills and empties as requests come and go, and every
+navigation item below it has to stay exactly where it was; the longest route is clipped with the full
+text in the element's `title`. It is not an `aria-live` region: it is repainted on every poll, and a
+polite region rewritten every 1.5 seconds reads the same sentence over and over. The announcement
+lives in a separate `sr-only` status span that changes only when the state or the route changes.
+
+An entry is finished when the client-facing response body is dropped, so a stream that the client
+abandons is finished promptly rather than waiting for a timer to expire. Restarting the relay forgets
+the whole ring, which is the honest scope of a fact about in-flight work.
 
 ## The design language
 
@@ -103,18 +132,46 @@ request that is mid-answer. Making the restart explicit turns a surprise into a 
 ## Authentication
 
 - Bound to `127.0.0.1` by default, which requires no password.
-- A non-loopback bind **without a password is refused at startup**, with a message saying how to set
-  one. It does not warn and continue (the one way past it is the explicit
-  `control.allow_remote_without_password` opt-out): a panel that silently exposes provider credentials
-  and client keys to the network because the operator did not read a log line is not a defensible
-  default.
+- The listener can be bound to a non-loopback address (for example `0.0.0.0` so both `localhost`
+  and the tailnet reach it), but the source address of every request is checked before anything
+  else: only loopback (`127.0.0.0/8`, `::1`) and the Tailscale/CGNAT range
+  `100.64.0.0/10` (which covers the tailnet address `100.104.1.69`) are trusted. Everything else
+  — any host on the LAN, anything routed from the internet — is refused with `403` before the
+  origin check ever runs, so an external probe learns nothing about the panel.
+- Binding `0.0.0.0` without a password is therefore not the same as exposing the panel to the
+  internet, but a password is still the second line of defence: set it under Settings → Panel
+  password. The one way past the password requirement is the explicit
+  `control.allow_remote_without_password` opt-out.
 - Passwords are stored as **Argon2id** hashes. Session lookup is constant-time, so a timing
   difference cannot be used to probe a token.
 - Every mutating request must carry an acceptable `Origin`, which is checked before the handler runs.
   A cross-origin form post from a page the operator is merely visiting is the realistic attack on
-  a loopback admin interface, and browsers will send it.
+  a loopback admin interface, and browsers will send it. "Acceptable" means loopback, or exactly the
+  host the request was addressed to (its `Host` header): the panel is usable at whatever address it
+  is bound to — a tailnet name or IP included — but a page on any other origin still cannot drive it.
+  A same host on a *different* port is a different origin and is refused.
 - Sessions last 12 hours. Logging out revokes that session; changing the password revokes all of
   them.
+
+### Reaching the panel from another device
+
+Binding the panel to a non-loopback address is what makes it reachable from a phone or laptop on the
+same tailnet, and it is the only way: the panel and the relay are ordinary listeners, so a tailnet
+address or an SSH tunnel works, while a reverse proxy on another host does not change the bind.
+
+Set the addresses in `config.json` (`control.host`, `relay.host`) — Settings → Raw configuration
+edits and validates it in place, or edit the file and restart both services. `mr config` is a stub,
+so there is no command for this yet.
+
+Two things follow from that, and they are deliberate:
+
+- Only loopback and tailnet sources are trusted by source address, so the panel is reachable from a
+  phone or laptop on the same tailnet without exposing it to anything else. Prefer a password in
+  addition: set it under Settings → Panel password.
+- The relay must be reachable from the *browser's* point of view, not the server's. The Overview page
+  probes the relay at the address the panel itself was opened from (falling back to the configured
+  `relay.host`), because probing `127.0.0.1` from a remote browser tests the remote device's loopback
+  and reports a healthy relay as unreachable.
 
 The full threat model is in [Security](21-security.md). Cookie-based authentication against model
 providers is **never** supported, for any provider, and the panel does not offer it.

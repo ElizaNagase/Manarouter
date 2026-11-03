@@ -147,9 +147,8 @@ pub fn pivot_request_to_anthropic(
                         }));
                     }
                 }
-                if blocks.is_empty() {
-                    blocks.push(json!({"type": "text", "text": ""}));
-                }
+                // An assistant turn that translated to nothing is dropped: an empty text block
+                // is itself invalid upstream, and an empty content array is too.
                 push_blocks(&mut messages, "assistant", blocks);
             }
             _ => {
@@ -162,7 +161,8 @@ pub fn pivot_request_to_anthropic(
     // Anthropic rejects an empty messages array, and rejects a request whose only content is a
     // system prompt with no turn at all. A single empty user turn is the minimal valid request.
     if messages.is_empty() {
-        messages.push(json!({"role": "user", "content": [{"type": "text", "text": ""}]}));
+        // A single space, not an empty string: Anthropic rejects empty text blocks outright.
+        messages.push(json!({"role": "user", "content": [{"type": "text", "text": " "}]}));
     }
 
     if !system_parts.is_empty() {
@@ -219,12 +219,20 @@ fn user_content_to_blocks(content: Option<&Value>) -> Vec<Value> {
                 }
             }
             if blocks.is_empty() {
-                blocks.push(json!({"type": "text", "text": ""}));
+                // Same rule as above: never an empty text block.
+                blocks.push(json!({"type": "text", "text": " "}));
             }
             blocks
         }
-        Some(other) => vec![json!({"type": "text", "text": flatten_text(other)})],
-        None => vec![json!({"type": "text", "text": ""})],
+        Some(other) => {
+            let text = flatten_text(other);
+            if text.is_empty() {
+                vec![json!({"type": "text", "text": " "})]
+            } else {
+                vec![json!({"type": "text", "text": text})]
+            }
+        }
+        None => vec![json!({"type": "text", "text": " "})],
     }
 }
 
@@ -289,7 +297,9 @@ fn openai_tool_choice_to_anthropic(tc: &Value) -> Option<Value> {
         Value::String(s) => match s.as_str() {
             "auto" => Some(json!({"type": "auto"})),
             "required" | "any" => Some(json!({"type": "any"})),
-            "none" => None,
+            // `none` must be forwarded, not dropped: omitting the field means `auto`, which is the
+            // exact opposite of "do not call tools".
+            "none" => Some(json!({"type": "none"})),
             _ => Some(json!({"type": "auto"})),
         },
         Value::Object(o) => {
@@ -343,6 +353,12 @@ fn push_block(messages: &mut Vec<Value>, role: &str, block: Value) {
 
 /// Append blocks to the trailing message if the role matches, else start a new turn.
 fn push_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
+    // Anthropic rejects a turn whose content array is empty, and rejects a `text` block whose text
+    // is empty. A placeholder turn that carries nothing is dropped here rather than forwarded to
+    // become an opaque 400 from upstream.
+    if blocks.is_empty() {
+        return;
+    }
     if let Some(last) = messages.last_mut() {
         if last.get("role").and_then(Value::as_str) == Some(role) {
             if let Some(arr) = last.get_mut("content").and_then(Value::as_array_mut) {
@@ -536,9 +552,11 @@ mod tests {
     }
 
     #[test]
-    fn tool_choice_none_is_omitted_because_anthropic_has_no_equivalent() {
+    fn tool_choice_none_is_forwarded_as_none() {
+        // Anthropic does support `{"type":"none"}`. Dropping the field means `auto`, which is the
+        // opposite of what the client asked for, so the tool would be called anyway.
         let out = build(json!({"model": "x", "messages": [], "tool_choice": "none"}));
-        assert!(out.get("tool_choice").is_none());
+        assert_eq!(out["tool_choice"]["type"], "none");
         let out = build(json!({"model": "x", "messages": [], "tool_choice": "required"}));
         assert_eq!(out["tool_choice"]["type"], "any");
         let out = build(json!({

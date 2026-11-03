@@ -78,6 +78,8 @@ export const api = {
   getRaw: (p) => request('GET', p, { rawText: true }),
   post: (p, body = {}) => request('POST', p, { body }),
   put: (p, body = {}) => request('PUT', p, { body }),
-  putRaw: (p, text) => request('PUT', p, { body: String(text), contentType: 'text/plain' }),
+  // The raw-config endpoint is a JSON extractor; a text/plain body is rejected outright. The
+  // body is JSON text here, so the default JSON content type is the correct one.
+  putRaw: (p, text) => request('PUT', p, { body: String(text) }),
   del: (p) => request('DELETE', p),
 };

@@ -24,6 +24,7 @@ import { renderModels } from './view-models.js';
 import { renderQuota } from './view-quota.js';
 import { renderSettings } from './view-settings.js';
 import { renderDocs } from './view-docs.js';
+import { startComboLive } from './combo-live.js';
 
 // ---------------------------------------------------------------------------
 // Shared state & services
@@ -157,6 +158,13 @@ const ctx = {
   },
 };
 
+  // Navigation guard shared by all views. Returns false to abort navigation when a view has
+  // unsaved changes and the operator declines to leave.
+  function navigateGuard() {
+    if (!ctx.leaveGuard) return true;
+    return ctx.leaveGuard();
+  }
+
 // ---------------------------------------------------------------------------
 // Login gate
 // ---------------------------------------------------------------------------
@@ -168,8 +176,13 @@ const dialogRoot = document.getElementById('dialog-root');
 const drawerRoot = document.getElementById('drawer-root');
 const bannerSlot = document.getElementById('banner-slot');
 
+// The sidebar's live combo block. Constructed once and started in enterApp(), so it exists for
+// exactly as long as the shell is on screen — the login screen does not poll the relay.
+const comboLive = startComboLive({ api });
+
 function showLogin(notice = null) {
   poller.stop();
+  comboLive.stop();
   shell.hidden = true;
   loginRoot.hidden = false;
   clear(loginRoot);
@@ -197,6 +210,7 @@ async function enterApp() {
   else renderRoute();
   await Promise.all([refreshHealth(), refreshPorts()]);
   poller.start();
+  comboLive.start();
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +234,10 @@ let routeSeq = 0;
 
 function renderRoute() {
   const gate = !state.session?.authenticated && state.session?.password_required;
-  if (gate) { showLogin(); return; }
+  if (gate) { showLogin(); return;}
+
+  // Abort navigation if the current view has unsaved changes.
+  if (!navigateGuard()) return;
 
   const seq = ++routeSeq; // this render owns <main> until the next navigation
   healthSubs.clear(); // previous view's live subscriptions die here

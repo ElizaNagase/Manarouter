@@ -32,8 +32,10 @@ Combos, account ordering, health, quota, fallback rules — all compiled ahead o
 binary table the relay reads with a single atomic load. Adding a provider or editing a combo does not
 touch the request path.
 
-**The relay's total added latency target is under 150 µs at p50 and 500 µs at p99.** The `tools/bench`
-harness that would assert it in CI against a deterministic mock upstream is not written yet. See
+**The relay's total added latency target is under 150 µs at p50 and 500 µs at p99.** `tools/bench`
+measures the relay's own added latency against a deterministic mock upstream (see
+[`docs/19-latency-benchmarks.md`](docs/19-latency-benchmarks.md) for current numbers); CI builds and
+tests it, but does not yet fail a build on a regression. See
 [`docs/16-latency-engineering.md`](docs/16-latency-engineering.md).
 
 ---
@@ -78,10 +80,11 @@ dispatches every participant at once, the highest-priority one that replied insi
 committed, and the losers are dropped; the sequential and concurrent paths share one attempt
 implementation, so they cannot drift. If the committed winner's body then fails, the relay recovers
 from a participant that passed the same window — invisibly before anything reached the client, with
-a `manarouter.retry` boundary after, and never once a tool call is on the wire. **What does not run
-yet:** the other three `on_winner_fail` modes (re-race without it, take the best that passed *on a
-different provider*, or fall back to a model you nominate); they are accepted configuration that the
-relay ignores, with a warning in the log.
+a `manarouter.retry` boundary after, and never once a tool call is on the wire. All four
+`on_winner_fail` modes run: keep the best that already passed (the default, costs nothing),
+re-run over the remaining participants, take the best that passed *on a different provider*, or
+fall back to a model you nominate. The three that re-dispatch are bounded — `rerun-excluding` by
+`max_rounds`, `stable-fallback` to one round — and only spend that when the winner actually fails.
 [`docs/23-implementation-status.md`](docs/23-implementation-status.md) is the
 authoritative list. Priority combos *do* remember the last successful step for a configurable
 window (`sticky_success_window_secs`, default 1800 s).
@@ -259,8 +262,8 @@ a proxy is not a use the provider has licensed. Both are explained in
 
 Working and tested: the schema, the compiled snapshot format, both dialect layers, the provider
 catalogue, the data plane (relay), the control plane (conductor) and the panel. The known gaps are
-the three unimplemented `on_winner_fail` modes, the fire-and-forget usage writer, and the
-`mr config` / `mr vault` bodies. [`docs/23-implementation-status.md`](docs/23-implementation-status.md)
+the usage writer (which settles synchronously rather than off the request path), the CLI-side
+`mr config` / `mr vault` bodies, and per-account retry inside a single request. [`docs/23-implementation-status.md`](docs/23-implementation-status.md)
 is the audited list,
 with the command that checks each row.
 

@@ -56,7 +56,7 @@ export async function renderOverview(mount, ctx) {
   // --- relay reachability -------------------------------------------------
 
   async function probeRelay() {
-    const url = relayProbeUrl(ctx.state.ports?.relay);
+    const url = relayProbeUrl(ctx.state.ports?.relay, globalThis.location?.hostname);
     relayBox.replaceChildren(h('div', { class: 'relay-up' }, h('h2', {}, 'Relay'), spinner(), ' probing…'));
     if (!url) {
       // Honest unknown: without a port from /api/ports there is nothing to dial.

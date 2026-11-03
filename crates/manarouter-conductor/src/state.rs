@@ -469,18 +469,68 @@ impl AppState {
     ///
     /// On `Ok`, the file, the in-memory configuration, the snapshot on disk and the installed
     /// snapshot all describe the same configuration.
+    ///
+    /// # Incremental validation
+    ///
+    /// The rule enforced here is *"never make the configuration worse"*, not *"it must be
+    /// perfect"*. A problem that already exists in the configuration being replaced was tolerated
+    /// when that configuration was written — the create-provider flow deliberately produces a
+    /// provider with no accounts until the operator adds one — and blocking every unrelated edit on
+    /// it would lock the operator out of the whole control plane (no client keys, no second
+    /// provider, no deletions) until they happened to fix it. Only problems this edit *introduces*
+    /// are refused. The snapshot is still compiled from the full configuration, so the relay's
+    /// guarantee is unchanged; a provider with no accounts simply cannot serve a request.
     pub async fn commit(&self, next: Config) -> Result<(), CommitError> {
-        self.commit_with(next, |cfg| cfg.validate()).await
+        let _mutation = self.mutation_lock.lock().await;
+        self.commit_inner(next).await
+    }
+
+    /// [`Self::commit`] for a caller that already holds [`Self::mutation_lock`].
+    ///
+    /// Taking the lock inside `commit` is what makes serialization the default rather than an
+    /// opt-in a new endpoint can forget; a handler that needs to keep reading and writing inside
+    /// one critical section takes the lock itself and calls this. Calling this *without* holding
+    /// the lock is a lost-update bug, not a crash, so prefer [`Self::commit`].
+    pub async fn commit_locked(&self, next: Config) -> Result<(), CommitError> {
+        self.commit_inner(next).await
     }
 
     /// [`Self::commit`] with a caller-supplied validator.
     ///
-    /// Exactly one caller uses this (the provider-create endpoint in `api.rs`, which permits a
-    /// provider that is *born* without accounts because the panel adds them afterwards — see the
-    /// comment there). Every other mutation calls plain [`Self::commit`]. The compile-before-save
-    /// ordering is identical either way: a custom validator is not a way to write a broken
-    /// configuration, only to permit one shape of a valid one.
+    /// The provider-create endpoint uses this to permit a provider that is *born* without
+    /// accounts because the panel adds them afterwards — see the comment there. The
+    /// compile-before-save ordering is identical: a custom validator is not a way to write a
+    /// broken configuration, only to permit one shape of a valid one.
     pub async fn commit_with<F>(&self, next: Config, validate: F) -> Result<(), CommitError>
+    where
+        F: FnOnce(&Config) -> Vec<String>,
+    {
+        let _mutation = self.mutation_lock.lock().await;
+        self.commit_with_inner(next, validate).await
+    }
+
+    /// [`Self::commit_with`] for a caller that already holds [`Self::mutation_lock`].
+    pub async fn commit_with_locked<F>(&self, next: Config, validate: F) -> Result<(), CommitError>
+    where
+        F: FnOnce(&Config) -> Vec<String>,
+    {
+        self.commit_with_inner(next, validate).await
+    }
+
+    async fn commit_inner(&self, next: Config) -> Result<(), CommitError> {
+        let current = self.config.read().await.clone();
+        self.commit_with_inner(next, move |cfg| {
+            let tolerated: std::collections::HashSet<String> =
+                current.validate().into_iter().collect();
+            cfg.validate()
+                .into_iter()
+                .filter(|problem| !tolerated.contains(problem))
+                .collect()
+        })
+        .await
+    }
+
+    async fn commit_with_inner<F>(&self, next: Config, validate: F) -> Result<(), CommitError>
     where
         F: FnOnce(&Config) -> Vec<String>,
     {
@@ -498,15 +548,34 @@ impl AppState {
         })?;
 
         // (3) Save the configuration atomically.
-        next.save(&self.config_path)
-            .map_err(|e| CommitError::Save(format!("{}: {e}", self.config_path.display())))?;
-
-        // (4) Write the snapshot only now that the configuration it describes is on disk.
-        snapshot.write_to(&self.snapshot_path).map_err(|e| {
-            CommitError::SnapshotWrite(format!("{}: {e}", self.snapshot_path.display()))
+        // The path is logged, not returned: an API error body is shown in the panel and copied
+        // into bug reports, and the absolute path of the operator's config directory is not
+        // something a 500 needs to disclose.
+        next.save(&self.config_path).map_err(|e| {
+            tracing::error!(
+                error = %e,
+                path = %self.config_path.display(),
+                "could not save the configuration"
+            );
+            CommitError::Save(format!("could not save the configuration: {e}"))
         })?;
 
-        // (5) Publish.
+        // (4) Write the snapshot, then (5) publish.
+        //
+        // A snapshot-write failure is deliberately NOT fatal. `config.json` is already saved at
+        // step (3), so the edit is durable; the snapshot is a derived cache that both this process
+        // and the relay can rebuild from the configuration. Treating it as a failed commit used to
+        // make callers roll the vault back, which deleted a secret that the saved configuration
+        // still referenced — a corrupt state that survived restarts. The previous snapshot keeps
+        // serving (stale routing, not an outage) and the next commit rewrites it.
+        if let Err(e) = snapshot.write_to(&self.snapshot_path) {
+            tracing::error!(
+                error = %e,
+                path = %self.snapshot_path.display(),
+                "the routing snapshot could not be written; the configuration was saved and the \
+                 previous snapshot keeps serving until the next successful commit"
+            );
+        }
         self.snapshot.install(snapshot);
         *self.config.write().await = next;
         // (6) Record what we just wrote, so the next read does not reload our own save. Without

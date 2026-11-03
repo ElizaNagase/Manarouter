@@ -96,7 +96,7 @@ Router/
 │   └── check-secrets.sh           ★ CI guard: fails on a credential-shaped string
 ├── tools/
 │   ├── mock-upstream/             deterministic fault-injecting fake provider (detached crate)
-│   └── bench/                     planned; no benchmark harness exists yet
+│   └── bench/                     relay-latency harness (measured; not yet a CI gate)
 └── crates/
     ├── mr-core/                    shared types; no network code at all
     │   └── src/
@@ -157,10 +157,10 @@ client ──► relay :20900
              ├─ 6. socket                  pooled keep-alive connection
              ├─ 7. forward bytes           VERBATIM when the dialects match
              ├─ 8. pipe the response       verbatim, streaming, never buffered whole
-             └─ 9. emit usage              fire-and-forget; dropped rather than backpressured
+             └─ 9. emit usage              settled synchronously at body end (see docs/23 §5)
 ```
 
-Dialect translation is reachable per selected step when the client and upstream shapes differ; translated requests may override the path or force streaming. Matching dialects keep the original bytes. The hedged race runs: participants are dispatched concurrently and the highest-priority one that answers inside the eligibility window wins. The winner's recovery runs too: the relay watches the winner's body and falls back to a participant that passed the same window — silently before any byte reached the client, with the `manarouter.retry` boundary after, and never after a tool-call delta. `docs/16-latency-engineering.md` §6 states the per-step budget.
+Dialect translation is reachable per selected step when the client and upstream shapes differ; translated requests may override the path or force streaming. Matching dialects keep the original bytes. The hedged race runs: participants are dispatched concurrently and the highest-priority one that answers inside the eligibility window wins. The winner's recovery runs too: the relay watches the winner's body and falls back to a participant that passed the same window — silently before any byte reached the client, with the `manarouter.retry` boundary after, and never after a tool-call delta. All four `on_winner_fail` modes are implemented; the three that re-dispatch are bounded. `docs/16-latency-engineering.md` §6 states the per-step budget.
 
 ---
 
@@ -279,9 +279,11 @@ longer true, and the change is deliberate: reasoning is now a **routing** concep
 - A model name may end in a `-<level>` suffix. Which levels a model offers is compiled into the
   snapshot: the operator's explicit `reasoning_levels` wins, else the bundled table
   `catalog/model_meta.json` (keyed `provider/model`, falling back to a provider-agnostic `model`
-  key), else the generic set `none, low, medium, high, xhigh, max` when the model or provider
-  declares the `reasoning` capability (or the dialect serves reasoning models only, currently
-  `codex`). A model that reaches none of those has **no** levels and its name gets no suffix.
+  key), else the dialect's own vocabulary when the model or provider declares the `reasoning`
+  capability (or the dialect serves reasoning models only, currently `codex`). The vocabulary is
+  `Dialect::expressible_reasoning_levels`: named-effort dialects stop at `xhigh`, budget dialects
+  reach `max`. Whatever the source, the result is filtered through that same list. A model that
+  reaches none of those has **no** levels and its name gets no suffix.
 - The router rewrites the upstream body per dialect: `reasoning_effort` for OpenAI-shaped dialects,
   `reasoning.effort` for the Responses dialect, `thinking.budget_tokens` for Anthropic, and
   `generationConfig.thinkingConfig` for Google/Antigravity. Level `none` emits no reasoning field at

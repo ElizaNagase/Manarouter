@@ -781,11 +781,24 @@ fn backup_before_migration(path: &Path, original: &str) -> Result<()> {
 /// Write already-serialised config JSON to `path` atomically: sibling temporary file, `fsync`,
 /// then rename.
 ///
+/// The file is mode 0644 inside a 0700 directory. That is correct **only** because account secrets
+/// are not in it: they live in the vault and appear here as `secret_ref` ids. Provider `headers`
+/// *are* in it verbatim, which is documented in `docs/21-security.md` — do not treat this file as
+/// secret-free.
+///
 /// Shared by [`Config::save`] and the load-time migration so there is exactly one write path, and
 /// therefore exactly one place where a crash could truncate the config. The caller is responsible
 /// for creating the parent directory.
 fn write_config_atomically(path: &Path, json: &str) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
+    // The temporary name must be unique per writer. A fixed `config.json.tmp` is shared by the
+    // conductor and every `mr` command, so two saves that overlap can interleave on one file:
+    // the second truncates what the first is still writing, and the rename then publishes a
+    // document with a hole in it. The snapshot writer already names its temp file with the pid.
+    let temp_name = format!(".{}.{}.tmp", file_name_of(path), std::process::id());
+    let tmp = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => parent.join(temp_name),
+        None => PathBuf::from(temp_name),
+    };
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp)
@@ -800,6 +813,14 @@ fn write_config_atomically(path: &Path, json: &str) -> Result<()> {
     std::fs::rename(&tmp, path)
         .map_err(|e| Error::Config(format!("cannot replace {}: {e}", path.display())))?;
     Ok(())
+}
+
+/// The final path component, for building a sibling temporary name.
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json")
+        .to_owned()
 }
 
 impl Config {
@@ -873,6 +894,19 @@ impl Config {
     /// this targets.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
+        // Enforce the promise the loader makes. A configuration written by a newer binary is
+        // loaded read-only; without this check an older binary would happily rewrite it and drop
+        // or reinterpret whatever it did not understand — the exact failure the version field
+        // exists to prevent. The load-time migration path never reaches here with a newer file,
+        // because it takes the same decision before rewriting.
+        if !self.is_writable() {
+            return Err(Error::Config(format!(
+                "refusing to save: this configuration is format_version {}, newer than this \
+                 binary understands ({}). Upgrade manarouter, or copy the file aside to start \
+                 from a fresh configuration",
+                self.format_version, MAX_KNOWN_FORMAT_VERSION
+            )));
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| Error::Config(format!("cannot create {}: {e}", parent.display())))?;
@@ -880,6 +914,17 @@ impl Config {
         }
         let json = self.to_json()?;
         write_config_atomically(path, &json)
+    }
+
+    /// The problems that must stop a process from starting, excluding advisories.
+    ///
+    /// The relay starts on this rather than on [`Config::validate`], so that a configuration the
+    /// panel and the CLI are happy to write is also a configuration the gateway will boot.
+    pub fn validate_fatal(&self) -> Vec<String> {
+        self.validate()
+            .into_iter()
+            .filter(|problem| !is_advisory(problem))
+            .collect()
     }
 
     /// Save to the conventional location.
@@ -930,6 +975,25 @@ impl Config {
 
         let provider_ids: Vec<crate::ProviderId> =
             self.providers.iter().map(|p| p.id.clone()).collect();
+        // Lookup for the reasoning-level check below: a combo step's level is bounded by the
+        // provider's dialect, and the step itself carries only names.
+        let providers_by_id: BTreeMap<&str, &crate::Provider> =
+            self.providers.iter().map(|p| (p.id.as_str(), p)).collect();
+        // Model ids per provider, for checking combo steps. A provider that lists no models is
+        // left alone: it is the normal state between "provider created" and "models synced", and a
+        // combo is often authored first. A provider that *does* list models, however, must carry
+        // the one a step names — otherwise the compiler substitutes its empty placeholder and the
+        // relay sends `"model": ""` upstream, which fails at request time with no hint why.
+        let models_by_provider: BTreeMap<&str, std::collections::BTreeSet<&str>> = self
+            .providers
+            .iter()
+            .map(|p| {
+                (
+                    p.id.as_str(),
+                    p.models.iter().map(|m| m.id.as_str()).collect(),
+                )
+            })
+            .collect();
         let mut combo_ids = BTreeMap::new();
         for c in &self.combos {
             if combo_ids
@@ -945,6 +1009,36 @@ impl Config {
                     .into_iter()
                     .map(|m| format!("combo {}: {m}", c.id)),
             );
+            for (index, step) in c.steps.iter().enumerate() {
+                let Some(provider) = providers_by_id.get(step.provider.as_str()) else {
+                    continue; // an unknown provider is already reported above
+                };
+                if let Some(level) = step.level {
+                    if let Some(reason) = provider.unsendable_level_reason(level) {
+                        problems.push(format!(
+                            "combo {}: step {} pins reasoning level {:?}, but {reason}",
+                            c.id,
+                            index + 1,
+                            level.as_str(),
+                        ));
+                    }
+                }
+                let Some(models) = models_by_provider.get(step.provider.as_str()) else {
+                    continue;
+                };
+                if models.is_empty() || models.contains(step.model.as_str()) {
+                    continue;
+                }
+                problems.push(format!(
+                    "combo {}: step {} names model {:?}, which provider {} does not offer \
+                     (known models: {})",
+                    c.id,
+                    index + 1,
+                    step.model,
+                    step.provider,
+                    models.iter().copied().collect::<Vec<_>>().join(", "),
+                ));
+            }
         }
 
         // A combo is addressable by id *and* by name, so an alias may target either. Checking only
@@ -1385,6 +1479,24 @@ pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Whether a validation problem is advisory rather than fatal.
+///
+/// Two classes are advisory, and they are spelled *here* so the relay, the CLI and the panel cannot
+/// drift apart on them:
+///
+/// - **A provider with no accounts.** This is the normal state between creating a provider and
+///   adding its first credential. The panel deliberately creates providers this way and the
+///   quickstart does too, so refusing to start on it would mean the product writes configurations
+///   it will not boot.
+/// - **An account with no credential attached** (non-Bearer auth). Worth telling the operator
+///   about, but one broken provider must not take the whole gateway down.
+///
+/// Everything else — an unknown provider, a duplicate id, a bad base URL, a combo with no enabled
+/// steps — is a reason not to start, and a reason not to save.
+pub fn is_advisory(problem: &str) -> bool {
+    problem.contains("has no accounts") || problem.contains("has no credential attached")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1572,6 +1684,35 @@ mod tests {
             problems.iter().any(|m| m.contains("unknown provider")),
             "got {problems:?}"
         );
+    }
+
+    #[test]
+    fn a_combo_step_pinning_a_level_the_dialect_cannot_send_is_reported() {
+        let mut cfg = Config::default();
+        cfg.providers.push(servable_provider("p1"));
+        let mut c = combo("fast", "p1");
+        c.steps[0].level = Some(ReasoningLevel::Max);
+        cfg.combos.push(c);
+
+        let problems = cfg.validate();
+        assert!(
+            problems.iter().any(|m| m.contains("step 1")
+                && m.contains("pins reasoning level")
+                && m.contains("openai")
+                && m.contains("\"max\"")),
+            "got {problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_combo_step_pinning_a_level_the_dialect_can_send_is_clean() {
+        let mut cfg = Config::default();
+        cfg.providers.push(servable_provider("p1"));
+        let mut c = combo("fast", "p1");
+        c.steps[0].level = Some(ReasoningLevel::High);
+        cfg.combos.push(c);
+
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
     }
 
     #[test]

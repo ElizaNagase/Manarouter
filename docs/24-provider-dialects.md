@@ -343,9 +343,9 @@ streams an answer regardless and rejects `store: true` (`responses.rs:71-76`).
 - Fields with no Responses equivalent (`n`, `stop`, `stream_options`) are dropped rather than
   smuggled through, because the upstream rejects what it does not understand
   (`responses.rs:105-108`).
-- Codex is the one dialect `dialect_default_levels` treats as reasoning-only: a model listed
-  under Codex with no declared metadata is still seeded with level-qualified names
-  (`crates/mr-core/src/snapshot.rs:1786-1805`, and the [API reference](18-api-reference.md#model-addressing)).
+- Codex is the one dialect `Dialect::always_reasons` treats as reasoning-only: a model listed
+  under Codex with no declared metadata is still seeded with the dialect's level names
+  (`crates/mr-core/src/dialect.rs`, and the [API reference](18-api-reference.md#model-addressing)).
 
 **Read next.** [Codex](providers/codex.md) for the OAuth flow, the fingerprint headers and the
 `chatgpt-account-id` claim.

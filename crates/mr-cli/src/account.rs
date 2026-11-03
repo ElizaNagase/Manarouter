@@ -4,7 +4,7 @@
 //! id of the form `provider/<p>/account/<a>`, and nothing in this module prints a stored
 //! credential (only a `stored: sk-…wxyz` fingerprint line after a successful add).
 
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 
 use clap::Subcommand;
 
@@ -112,7 +112,11 @@ pub async fn run(cmd: AccountCmd, ctx: &Ctx) -> Result<(), CliError> {
 /// Resolve `--secret` / `--secret-stdin` / `--secret-env` — exactly one, or a usage error
 /// explaining all three. The stdin branch reads from `stdin` so tests can drive the real
 /// `--secret-stdin` path end to end without owning the process's file descriptor 0.
-fn read_secret(args: &AddArgs, mut stdin: impl Read) -> Result<String, CliError> {
+fn read_secret(
+    args: &AddArgs,
+    mut stdin: impl Read,
+    interactive: bool,
+) -> Result<String, CliError> {
     let sources =
         args.secret.is_some() as u8 + args.secret_stdin as u8 + args.secret_env.is_some() as u8;
     if sources == 0 {
@@ -141,19 +145,77 @@ fn read_secret(args: &AddArgs, mut stdin: impl Read) -> Result<String, CliError>
         std::env::var(var)
             .map_err(|_| CliError::validation(format!("environment variable `{var}` is not set")))?
     } else {
-        let mut buf = String::new();
-        stdin.read_to_string(&mut buf).map_err(|e| {
-            CliError::failure(format!("cannot read the credential from stdin: {e}"))
-        })?;
-        // Trim only the line ending a paste adds; interior whitespace is part of the credential.
-        buf.trim_end_matches(['\n', '\r']).to_owned()
+        read_secret_from_stdin(&mut stdin, interactive)?
     };
 
     let secret = secret.trim();
     if secret.is_empty() {
         return Err(CliError::validation("the credential is empty"));
     }
+    // A paste that carried more than one line would otherwise be stored whole and fail later as an
+    // opaque upstream 401. Control characters cannot appear in a credential; neither can the tabs
+    // and newlines a wrapped paste drags in.
+    if secret.chars().any(char::is_control) {
+        return Err(CliError::validation(
+            "the credential contains a control character (a newline or tab), so more than one \
+             line was pasted; nothing was written",
+        )
+        .with_detail("paste only the key itself, then press Enter once"));
+    }
     Ok(secret.to_owned())
+}
+
+/// Read a credential from `--secret-stdin`.
+///
+/// On a terminal the echo is turned off first: `--secret-stdin` exists so the key never appears in
+/// `ps`, and leaving echo on would undo that by putting it in scrollback, in the shell's history
+/// buffer as rendered text, in `tmux` capture, and in anything recording the session. A pipe is
+/// read to EOF exactly as before.
+fn read_secret_from_stdin(stdin: &mut impl Read, interactive: bool) -> Result<String, CliError> {
+    if !interactive {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(stdin, &mut buf).map_err(|e| {
+            CliError::failure(format!("cannot read the credential from stdin: {e}"))
+        })?;
+        // Trim only the line ending a paste adds; interior text is checked by the caller.
+        return Ok(buf.trim_end_matches(['\n', '\r']).to_owned());
+    }
+
+    #[cfg(unix)]
+    {
+        // File descriptor 0, not the generic reader: the interactive branch only runs when stdin
+        // really is the terminal, which is the descriptor the termios calls must act on.
+        let fd = libc::STDIN_FILENO;
+        let mut term: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut term) } == 0 {
+            let original = term;
+            term.c_lflag &= !libc::ECHO;
+            // TCSANOW: the change has to be in effect before the first keystroke is echoed.
+            unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) };
+            eprint!("Paste the credential, then press Enter (input is hidden): ");
+            let mut line = String::new();
+            let read = std::io::BufRead::read_line(
+                &mut std::io::BufReader::new(std::io::stdin()),
+                &mut line,
+            );
+            // Restored unconditionally, before the result is inspected, so an error can never
+            // leave the operator's terminal with echo off.
+            unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
+            eprintln!();
+            read.map_err(|e| {
+                CliError::failure(format!("cannot read the credential from the terminal: {e}"))
+            })?;
+            return Ok(line.trim_end_matches(['\n', '\r']).to_owned());
+        }
+    }
+
+    // A terminal that refused the termios calls (rare, non-POSIX): still accept the input, but say
+    // plainly that it was visible.
+    eprintln!("warning: this terminal cannot hide input, so the credential was echoed as typed");
+    let mut buf = String::new();
+    std::io::Read::read_to_string(stdin, &mut buf)
+        .map_err(|e| CliError::failure(format!("cannot read the credential from stdin: {e}")))?;
+    Ok(buf.trim_end_matches(['\n', '\r']).to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +290,7 @@ fn add_with(ctx: &Ctx, args: AddArgs, stdin: impl Read) -> Result<(), CliError> 
             "no provider with id `{provider_id}`"
         )));
     }
-    let secret = read_secret(&args, stdin)?;
+    let secret = read_secret(&args, stdin, std::io::stdin().is_terminal())?;
 
     let p = cfg
         .providers
@@ -265,7 +327,7 @@ fn add_with(ctx: &Ctx, args: AddArgs, stdin: impl Read) -> Result<(), CliError> 
     let mut vault = ctx.vault()?;
     vault.put(&secret_id, &secret).map_err(CliError::from)?;
     vault.flush().map_err(CliError::from)?;
-    account.secret_ref = Some(secret_id);
+    account.secret_ref = Some(secret_id.clone());
 
     let confirm = confirm_secret(&secret, &label);
     let doc = serde_json::json!({
@@ -279,7 +341,20 @@ fn add_with(ctx: &Ctx, args: AddArgs, stdin: impl Read) -> Result<(), CliError> 
         confirm,
         "the credential is in the vault; only its reference id is in the config".to_owned(),
     ];
-    let out = ctx.save(&cfg)?;
+    // The secret is in the vault before the config that references it exists. If the save is
+    // refused, that entry would be an orphan: no account points at it, so nothing the operator can
+    // run would show or remove it. Delete it on the way out rather than leaving ciphertext behind.
+    let out = match ctx.save(&cfg) {
+        Ok(out) => out,
+        Err(e) => {
+            if let Ok(mut vault) = ctx.vault() {
+                if vault.delete(&secret_id) {
+                    let _ = vault.flush();
+                }
+            }
+            return Err(e);
+        }
+    };
     ctx.finish(&out, human, doc)
 }
 
@@ -470,7 +545,7 @@ mod tests {
 
     #[test]
     fn no_secret_source_is_a_usage_error_naming_all_three() {
-        let err = read_secret(&args(), std::io::empty()).unwrap_err();
+        let err = read_secret(&args(), std::io::empty(), false).unwrap_err();
         assert_eq!(err.exit, crate::output::Exit::Usage);
         let details = err.details.join("\n");
         assert!(details.contains("--secret-stdin"), "{details}");
@@ -483,7 +558,7 @@ mod tests {
         let mut a = args();
         a.secret = Some("abc".into());
         a.secret_stdin = true;
-        let err = read_secret(&a, std::io::empty()).unwrap_err();
+        let err = read_secret(&a, std::io::empty(), false).unwrap_err();
         assert_eq!(err.exit, crate::output::Exit::Usage);
         assert!(
             err.message.contains("mutually exclusive"),
@@ -496,14 +571,14 @@ mod tests {
     fn cli_secret_is_taken_as_given() {
         let mut a = args();
         a.secret = Some("sk-test".into());
-        assert_eq!(read_secret(&a, std::io::empty()).unwrap(), "sk-test");
+        assert_eq!(read_secret(&a, std::io::empty(), false).unwrap(), "sk-test");
     }
 
     #[test]
     fn env_source_missing_is_a_validation_error() {
         let mut a = args();
         a.secret_env = Some("MR_TEST_DEFINITELY_NOT_SET_12345".into());
-        let err = read_secret(&a, std::io::empty()).unwrap_err();
+        let err = read_secret(&a, std::io::empty(), false).unwrap_err();
         assert_eq!(err.exit, crate::output::Exit::Validation);
         assert!(err.message.contains("MR_TEST_DEFINITELY_NOT_SET_12345"));
     }
@@ -512,7 +587,7 @@ mod tests {
     fn empty_credentials_are_refused_with_exit_three() {
         let mut a = args();
         a.secret = Some("   ".into());
-        let err = read_secret(&a, std::io::empty()).unwrap_err();
+        let err = read_secret(&a, std::io::empty(), false).unwrap_err();
         assert_eq!(err.exit, crate::output::Exit::Validation);
     }
 

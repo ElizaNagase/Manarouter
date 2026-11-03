@@ -39,7 +39,7 @@ use std::path::Path as FsPath;
 use std::time::Duration;
 
 use axum::extract::rejection::{JsonRejection, PathRejection};
-use axum::extract::{Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::header::{self, HeaderMap};
 use axum::http::{HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
@@ -64,13 +64,14 @@ use mr_core::{
 };
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::net::SocketAddr;
 
 use crate::auth::{
     cookie_value, hash_password, is_remote_exposed, origin_is_acceptable, SESSION_COOKIE,
     SESSION_TTL,
 };
 use crate::state::{AppState, CommitError, VaultTx};
-use crate::{models_api, quota_api};
+use crate::{activity_api, models_api, quota_api};
 
 /// The path prefix an OpenAI-compatible client is pointed at, and the one it should have used
 /// against the relay instead of the control plane. Recorded as a constant so the routes below, the
@@ -174,6 +175,7 @@ pub(crate) fn guarded_router(state: AppState) -> Router<AppState> {
         // shared table below does not have to be edited for every new endpoint.
         .merge(quota_api::routes())
         .merge(models_api::routes())
+        .merge(activity_api::routes())
         // --- a client pointed at the wrong port gets told which one to use ---
         //
         // Registered before the `/api/{*rest}` catch-all, and before the panel's static fallback
@@ -191,12 +193,29 @@ pub(crate) fn guarded_router(state: AppState) -> Router<AppState> {
 // Request guard
 // ---------------------------------------------------------------------------
 
-/// Order matters: origin first, authentication second.
+/// Order matters: source first, origin second, authentication third.
 ///
-/// Refusing a forged cross-origin request *before* consulting the session means an attacker's
-/// probe learns neither whether a session exists nor whether a password is set — a 403 with a
-/// constant body either way.
+/// Refusing an untrusted caller *before* anything else means an external probe learns nothing
+/// about the panel — not whether it exists, not whether a session cookie is valid, nothing — just
+/// a 403 with a constant body.
 async fn guard(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    // `ConnectInfo` is only present when the server wraps the service with
+    // `into_make_service_with_connect_info` (production). Tests drive the router directly, so
+    // it is absent there — treat that as local and skip the check.
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
+    if let Some(peer) = peer {
+        if !is_trusted_control_peer(peer) {
+            return ApiError::forbidden(
+                "control_rejected",
+                "this control plane only accepts loopback and tailnet callers",
+            )
+            .into_response();
+        }
+    }
+
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
 
@@ -211,7 +230,8 @@ async fn guard(State(state): State<AppState>, req: Request, next: Next) -> Respo
         // The port the browser would have had to match: the one in this request's Host header,
         // falling back to the port this process is actually bound to.
         let port = host_port(headers).unwrap_or_else(|| state.running_control_port());
-        if !origin_is_acceptable(origin, referer, port) {
+        let request_host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+        if !origin_is_acceptable(origin, referer, request_host, port) {
             return ApiError::forbidden(
                 "origin_rejected",
                 "this request came from another origin; the control plane only accepts \
@@ -268,6 +288,32 @@ fn host_port(headers: &HeaderMap) -> Option<u16> {
     let host = headers.get(header::HOST)?.to_str().ok()?;
     let authority: axum::http::uri::Authority = host.parse().ok()?;
     authority.port_u16()
+}
+
+/// Whether a control-plane caller is allowed to reach the panel/API.
+///
+/// Binding `0.0.0.0` is what makes both `localhost` and the tailnet address reach the same
+/// listener, so the bind address alone can no longer be the trust boundary. This is:
+///
+/// * loopback — `127.0.0.0/8`, `::1`, and IPv4-mapped IPv6 loopback;
+/// * the Tailscale/CGNAT range `100.64.0.0/10` — `100.104.1.69` (`pc.nutria-ordinal.ts.net`)
+///   lives here, so the tailnet is trusted.
+///
+/// Everything else (a random host on the LAN, anything routed from the internet) is refused
+/// before the origin check ever runs.
+fn is_trusted_control_peer(peer: SocketAddr) -> bool {
+    let ip = peer.ip();
+    if ip.is_loopback() {
+        return true;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            // 100.64.0.0/10: 100.64.0.0–100.127.255.255
+            let octets = v4.octets();
+            octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127
+        }
+        std::net::IpAddr::V6(_) => false,
+    }
 }
 
 /// The JSON 404 for unknown API paths: the `/api/{*rest}` catch-all in [`guarded_router`] serves
@@ -367,7 +413,16 @@ impl From<CommitError> for ApiError {
             CommitError::Validation(_) => {
                 ApiError::bad("validation_failed", err.message()).with_details(err.details())
             }
-            CommitError::Save(_) => ApiError::internal(err.message()),
+            // The message is already path-free; the operator-facing detail was logged by the
+            // commit path, where the path is useful and the response body is not.
+            CommitError::Save(_) => ApiError {
+                status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                code: "save_failed".to_owned(),
+                message:
+                    "the configuration could not be saved; the previous one is still in effect"
+                        .to_owned(),
+                details: Vec::new(),
+            },
             CommitError::SnapshotWrite(_) => ApiError::internal(err.message()),
         }
     }
@@ -500,11 +555,55 @@ fn redact_config(config: &Config) -> ApiResult<Value> {
 }
 
 /// One provider as responses show it (its headers redacted the same way as in the config view).
-fn provider_view(provider: &mr_core::Provider) -> ApiResult<Value> {
+///
+/// The model entries carry two derived fields the panel's level pickers read:
+/// `dialect_reasoning_levels` (what this provider's dialect can send) and
+/// `effective_reasoning_levels` (what the compiler will actually offer for the model). Both come
+/// from `mr-core`, so the panel cannot offer a tier the validator would refuse or the compiler
+/// would lower. `ModelEntry` has no `flatten` catch-all, so a panel that echoes these fields back
+/// on a save has them ignored rather than persisted as configuration.
+fn provider_view(
+    provider: &mr_core::Provider,
+    default_reasoning_level: mr_core::dialect::ReasoningLevel,
+) -> ApiResult<Value> {
     let mut value = serde_json::to_value(provider)
         .map_err(|e| ApiError::internal(format!("the provider could not be serialised: {e}")))?;
     if let Some(headers) = value.get_mut("headers").and_then(Value::as_object_mut) {
         redact_headers(headers);
+    }
+    let dialect_levels: Vec<&str> = provider
+        .dialect_reasoning_levels()
+        .iter()
+        .map(|level| level.as_str())
+        .collect();
+    if let Some(models) = value.get_mut("models").and_then(Value::as_array_mut) {
+        for entry in models.iter_mut() {
+            let Some(model) = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| provider.models.iter().find(|m| m.id == id))
+            else {
+                continue;
+            };
+            let effective = provider.effective_reasoning_levels(model);
+            let levels: Vec<&str> = effective.iter().map(|level| level.as_str()).collect();
+            // Same fallback the compiler applies: the configured default when the model offers it,
+            // otherwise its highest level, and `none` when it offers no levels at all.
+            let configured = model.default_level(default_reasoning_level);
+            let default = if effective.contains(&configured) {
+                configured.as_str()
+            } else {
+                effective
+                    .last()
+                    .map(|level| level.as_str())
+                    .unwrap_or("none")
+            };
+            if let Some(object) = entry.as_object_mut() {
+                object.insert("dialect_reasoning_levels".into(), json!(dialect_levels));
+                object.insert("effective_reasoning_levels".into(), json!(levels));
+                object.insert("effective_default_reasoning_level".into(), json!(default));
+            }
+        }
     }
     Ok(value)
 }
@@ -1506,7 +1605,18 @@ async fn oauth_complete(
         .oauth_sessions
         .finish_browser(&id, &body.provider_id)
         .await
-        .map_err(ApiError::bad_gateway)?;
+        .map_err(|message| {
+            // The panel shows this in a toast and nothing else records it, so a failed sign-in
+            // used to leave no trace anywhere. The message carries the upstream error code, never
+            // a token.
+            tracing::warn!(
+                platform = %platform,
+                provider = %body.provider_id,
+                reason = %message,
+                "OAuth sign-in did not complete"
+            );
+            ApiError::bad_gateway(message)
+        })?;
     let provider = configured.clone();
     drop(config);
     let account = persist_oauth_account(&state, &provider, tokens, identity).await?;
@@ -1685,7 +1795,7 @@ async fn persist_oauth_account(
         extra: Default::default(),
     };
     provider.accounts.push(account.clone());
-    if let Err(error) = state.commit(config).await {
+    if let Err(error) = state.commit_locked(config).await {
         state.tx_rollback(tx).await;
         let _ = state
             .store
@@ -1706,7 +1816,7 @@ async fn list_providers(State(state): State<AppState>) -> ApiResult<Json<Value>>
     let providers: Vec<Value> = config
         .providers
         .iter()
-        .map(provider_view)
+        .map(|provider| provider_view(provider, config.routing.default_reasoning_level))
         .collect::<ApiResult<Vec<Value>>>()?;
     Ok(Json(json!({"providers": providers})))
 }
@@ -1742,6 +1852,9 @@ async fn create_provider(
         .unwrap_or_default()
         .to_owned();
 
+    // Serialize the read-modify-write. Without this, two concurrent creates both read the same
+    // configuration and the second commit silently drops the first provider (and its vault entry).
+    let _mutation = state.mutation_lock.lock().await;
     let current = state.current_config().await;
     if current.providers.iter().any(|p| p.id.as_str() == id) {
         return Err(ApiError::conflict(format!(
@@ -1759,27 +1872,39 @@ async fn create_provider(
         }
     };
 
+    // Keep the pre-edit configuration: the validator tolerates problems that were already there,
+    // so a second provider can be created while the first still has no account.
+    let previous = current.clone();
     let mut next = current;
-    next.providers.push(prepared);
+    next.providers.push(prepared.clone());
     if let Err(err) = state
-        .commit_with(next, |cfg| validate_new_provider(cfg, &id))
+        .commit_with_locked(next, |cfg| validate_new_provider(&previous, cfg, &id))
         .await
     {
         state.tx_rollback(tx).await;
         return Err(err.into());
     }
 
-    let config = state.current_config().await;
-    let created = config
-        .providers
-        .iter()
-        .find(|p| p.id.as_str() == id)
-        .ok_or_else(|| ApiError::internal("the saved provider could not be read back"))?;
-    Ok((StatusCode::CREATED, Json(provider_view(created)?)).into_response())
+    // Answer from the value just committed; a re-read can race another mutation and turn a
+    // successful create into a 500 (which invites a retry that duplicates the provider).
+    Ok((
+        StatusCode::CREATED,
+        Json(provider_view(
+            &prepared,
+            previous.routing.default_reasoning_level,
+        )?),
+    )
+        .into_response())
 }
 
 /// See [`create_provider`]: the computed waiver for a provider that is *born* empty.
-fn validate_new_provider(config: &Config, new_id: &str) -> Vec<String> {
+///
+/// Two families of problem are tolerated. The first is removed by appending a syntactically
+/// perfect probe account to the provider being created, which by construction can only waive
+/// "this provider has no accounts". The second is every problem the configuration already had
+/// before this edit: creating a second provider must not be refused because the first one is
+/// still waiting for its account.
+fn validate_new_provider(previous: &Config, config: &Config, new_id: &str) -> Vec<String> {
     let as_is = config.validate();
     let mut probe_config = config.clone();
     if let Some(provider) = probe_config
@@ -1795,9 +1920,14 @@ fn validate_new_provider(config: &Config, new_id: &str) -> Vec<String> {
         provider.accounts.push(probe);
     }
     let with_probe = probe_config.validate();
+    let tolerated = previous.validate();
+    // Report a problem only when it survives the probe account *and* was not already true of the
+    // configuration before this edit. Filtering on the probe's absence would do the opposite:
+    // report exactly the problems the probe fixed, and hide every real one.
     as_is
         .into_iter()
-        .filter(|problem| !with_probe.contains(problem))
+        .filter(|problem| !tolerated.contains(problem))
+        .filter(|problem| with_probe.contains(problem))
         .collect()
 }
 
@@ -1866,7 +1996,10 @@ async fn update_provider(
         .iter()
         .find(|p| p.id.as_str() == id)
         .ok_or_else(|| ApiError::internal("the saved provider could not be read back"))?;
-    Ok(Json(provider_view(updated)?))
+    Ok(Json(provider_view(
+        updated,
+        config.routing.default_reasoning_level,
+    )?))
 }
 
 async fn delete_provider(
@@ -1902,14 +2035,23 @@ async fn create_account(
     JsonBody(body): JsonBody,
 ) -> ApiResult<Response> {
     let mut account_body = object_body(body, "account")?;
+    // `secret_ref`/`oauth_ref` are server-owned and are silently dropped rather than rejected:
+    // GET views include them, so the panel echoes them back on an unrelated edit (toggle, label).
+    // A client cannot choose where this account reads its credential from.
+    account_body.remove("secret_ref");
+    account_body.remove("oauth_ref");
     // Server-generated, always: the panel sends `{label, identity, secret}` and a client-chosen
     // id could collide with an existing account of the same provider.
     account_body.insert("id".to_owned(), json!(AccountId::generate().to_string()));
-    let account_id = account_body
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
+
+    // Serialize the read-modify-write so two concurrent account creates cannot lose one another.
+    let _mutation = state.mutation_lock.lock().await;
+    let mut next = state.current_config().await;
+    // Resolve the provider before touching the vault: a 404 must not churn (or orphan) a secret.
+    let position = match next.providers.iter().position(|p| p.id.as_str() == id) {
+        Some(position) => position,
+        None => return Err(ApiError::not_found(format!("no provider with id {id}"))),
+    };
 
     let mut tx = VaultTx::default();
     let mut account_value = Value::Object(account_body);
@@ -1928,28 +2070,15 @@ async fn create_account(
         }
     };
 
-    let mut next = state.current_config().await;
-    let position = match next.providers.iter().position(|p| p.id.as_str() == id) {
-        Some(position) => position,
-        None => {
-            state.tx_rollback(tx).await;
-            return Err(ApiError::not_found(format!("no provider with id {id}")));
-        }
-    };
-    next.providers[position].accounts.push(parsed);
-    if let Err(err) = state.commit(next).await {
+    next.providers[position].accounts.push(parsed.clone());
+    if let Err(err) = state.commit_locked(next).await {
         state.tx_rollback(tx).await;
         return Err(err.into());
     }
 
-    let config = state.current_config().await;
-    let created = config
-        .providers
-        .iter()
-        .find(|p| p.id.as_str() == id)
-        .and_then(|p| p.accounts.iter().find(|a| a.id.as_str() == account_id))
-        .ok_or_else(|| ApiError::internal("the saved account could not be read back"))?;
-    let view = serde_json::to_value(created)
+    // Answer from the value just committed, never from a re-read: a concurrent mutation could have
+    // removed it, and turning a successful write into a 500 invites a retry that duplicates it.
+    let view = serde_json::to_value(&parsed)
         .map_err(|e| ApiError::internal(format!("the account could not be serialised: {e}")))?;
     Ok((StatusCode::CREATED, Json(view)).into_response())
 }
@@ -1960,7 +2089,15 @@ async fn update_account(
     JsonBody(body): JsonBody,
 ) -> ApiResult<Json<Value>> {
     let mut account_body = object_body(body, "account")?;
+    // Server-owned credential references are dropped, never taken from the client: the panel
+    // echoes the GET view back on an unrelated edit (toggle, label), so rejecting them would
+    // break every account edit, and honouring them would let a caller repoint the credential.
+    account_body.remove("secret_ref");
+    account_body.remove("oauth_ref");
     account_body.insert("id".to_owned(), Value::String(account_id.clone()));
+
+    // Serialize the read-modify-write against every other configuration mutation.
+    let _mutation = state.mutation_lock.lock().await;
 
     let mut tx = VaultTx::default();
     let mut account_value = Value::Object(account_body);
@@ -1980,23 +2117,17 @@ async fn update_account(
     };
 
     let mut next = state.current_config().await;
-    if let Err(err) = replace_account(&mut next, &id, &account_id, parsed) {
+    if let Err(err) = replace_account(&mut next, &id, &account_id, parsed.clone()) {
         state.tx_rollback(tx).await;
         return Err(err);
     }
-    if let Err(err) = state.commit(next).await {
+    if let Err(err) = state.commit_locked(next).await {
         state.tx_rollback(tx).await;
         return Err(err.into());
     }
 
-    let config = state.current_config().await;
-    let view = config
-        .providers
-        .iter()
-        .find(|p| p.id.as_str() == id)
-        .and_then(|p| p.accounts.iter().find(|a| a.id.as_str() == account_id))
-        .ok_or_else(|| ApiError::internal("the saved account could not be read back"))?;
-    Ok(Json(serde_json::to_value(view).map_err(|e| {
+    // Answer from the committed value; a re-read can race another mutation and 500 a success.
+    Ok(Json(serde_json::to_value(&parsed).map_err(|e| {
         ApiError::internal(format!("the account could not be serialised: {e}"))
     })?))
 }
@@ -2005,7 +2136,7 @@ fn replace_account(
     config: &mut Config,
     provider_id: &str,
     account_id: &str,
-    account: Account,
+    mut account: Account,
 ) -> ApiResult<()> {
     let provider = config
         .providers
@@ -2017,6 +2148,16 @@ fn replace_account(
         .iter_mut()
         .find(|a| a.id.as_str() == account_id)
         .ok_or_else(|| ApiError::not_found(format!("no account with id {account_id}")))?;
+    // Replacement is wholesale, but the credential references are not client input: a form edit
+    // that carries no new secret must keep the stored one, and the OAuth reference is only ever
+    // written by the authorization flow. Without this a label-only edit would silently detach the
+    // account from its credential (for OAuth, with no fallback at all).
+    if account.secret_ref.is_none() {
+        account.secret_ref = slot.secret_ref.clone();
+    }
+    if account.oauth_ref.is_none() {
+        account.oauth_ref = slot.oauth_ref.clone();
+    }
     *slot = account;
     Ok(())
 }
@@ -2230,6 +2371,11 @@ async fn sync_models(
 
     // Merge. `Manual` entries are the operator's own words and are never overwritten. `Synced`
     // and `Inferred` entries are replaced by what upstream says.
+    //
+    // The lock is taken here, *after* the network call: the discovery round trip can take
+    // seconds, and holding the mutation lock across it would block every other edit. The config
+    // is re-read under the lock, so an edit that landed while we were waiting is preserved.
+    let _mutation = state.mutation_lock.lock().await;
     let mut config = state.current_config().await;
     let provider = config
         .providers
@@ -2291,7 +2437,7 @@ async fn sync_models(
     // `provider` is a borrow of `config`; it simply goes out of scope here (an explicit
     // `drop` on the reference would be a no-op — and clippy says so).
 
-    state.commit(config).await?;
+    state.commit_locked(config).await?;
 
     tracing::info!(provider = %id, added, updated, kept, "model discovery completed");
     Ok(Json(json!({
@@ -2343,6 +2489,9 @@ async fn fetch_model_list(
     url: &str,
     request_headers: &[(String, String)],
 ) -> ApiResult<Vec<(String, Option<u32>, Option<u32>)>> {
+    // A query-string credential lives in `url`. Anything echoed back to the operator must not,
+    // so messages use the scheme+host+path only — the panel shows these strings in a toast.
+    let shown_url = url.split('?').next().unwrap_or(url).to_owned();
     let client = sync_client().map_err(ApiError::internal)?;
     let mut builder = hyper::Request::builder()
         .method(Method::GET)
@@ -2360,14 +2509,17 @@ async fn fetch_model_list(
         Ok(Err(e)) => {
             return Err(ApiError::upstream(
                 StatusCode::BAD_GATEWAY,
-                format!("could not reach {url}: {e}"),
+                format!("could not reach {shown_url}: {e}"),
             ));
         }
         Err(_) => {
             return Err(ApiError::new(
                 StatusCode::GATEWAY_TIMEOUT,
                 "upstream_timeout",
-                format!("{url} did not answer within {}s", SYNC_TIMEOUT.as_secs()),
+                format!(
+                    "{shown_url} did not answer within {}s",
+                    SYNC_TIMEOUT.as_secs()
+                ),
             ));
         }
     };
@@ -2377,7 +2529,7 @@ async fn fetch_model_list(
         Ok(Err(e)) => {
             return Err(ApiError::upstream(
                 StatusCode::BAD_GATEWAY,
-                format!("the response body from {url} could not be read: {e}"),
+                format!("the response body from {shown_url} could not be read: {e}"),
             ));
         }
         Err(_) => {
@@ -2385,7 +2537,7 @@ async fn fetch_model_list(
                 StatusCode::GATEWAY_TIMEOUT,
                 "upstream_timeout",
                 format!(
-                    "the response body from {url} did not finish within {}s",
+                    "the response body from {shown_url} did not finish within {}s",
                     SYNC_TIMEOUT.as_secs()
                 ),
             ));
@@ -2408,7 +2560,7 @@ async fn fetch_model_list(
         ApiError::upstream(
             StatusCode::BAD_GATEWAY,
             format!(
-                "{url} answered 2xx but the body was neither an OpenAI/Anthropic `data` list nor \
+                "{shown_url} answered 2xx but the body was neither an OpenAI/Anthropic `data` list nor \
                  a Google `models` list"
             ),
         )
@@ -2705,7 +2857,7 @@ async fn create_key(
         )));
     }
     next.client_keys.push(key);
-    state.commit(next).await?;
+    state.commit_locked(next).await?;
 
     let config = state.current_config().await;
     let created = config
@@ -2763,7 +2915,7 @@ async fn update_key(
         )
     })?;
     next.client_keys[position] = key;
-    state.commit(next).await?;
+    state.commit_locked(next).await?;
 
     let config = state.current_config().await;
     let updated = config
@@ -2791,7 +2943,7 @@ async fn rotate_key(
     key.key_hash = sha256_hex(&plaintext);
     key.prefix = Some(key_prefix(&plaintext));
     let rotated = key.clone();
-    state.commit(next).await?;
+    state.commit_locked(next).await?;
 
     let mut view = key_view(&rotated)?;
     if let Some(obj) = view.as_object_mut() {
@@ -2812,7 +2964,7 @@ async fn delete_key(
         .position(|k| k.id.as_str() == id)
         .ok_or_else(|| ApiError::not_found(format!("no client key with id {id}")))?;
     config.client_keys.remove(position);
-    state.commit(config).await?;
+    state.commit_locked(config).await?;
 
     // After the commit, as everywhere: the config no longer references the id, so the vault
     // entry can only be an orphan now.
@@ -2938,6 +3090,81 @@ fn resolve_doc(dir: Option<&FsPath>, name: &str) -> ApiResult<std::path::PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The panel's own payload for a new provider: no accounts yet, to be added in the drawer
+    /// right after. `create_provider` must accept it, or the documented flow is impossible.
+    #[test]
+    fn a_provider_born_without_accounts_is_accepted_by_the_create_validator() {
+        let previous = Config::default();
+        let mut next = previous.clone();
+        let provider: mr_core::model::Provider = serde_json::from_value(serde_json::json!({
+            "id": "nvidia",
+            "label": "NVIDIA NIM",
+            "dialect": "open-ai",
+            "base_url": "https://integrate.api.nvidia.com/v1",
+            "auth": {"type": "bearer"}
+        }))
+        .expect("the panel's provider body deserialises");
+        next.providers.push(provider);
+
+        let problems = validate_new_provider(&previous, &next, "nvidia");
+        assert!(problems.is_empty(), "unexpected problems: {problems:?}");
+    }
+
+    /// A provider created with a genuinely broken field is still refused.
+    #[test]
+    fn a_provider_created_with_a_bad_base_url_is_still_refused() {
+        let previous = Config::default();
+        let mut next = previous.clone();
+        let provider: mr_core::model::Provider = serde_json::from_value(serde_json::json!({
+            "id": "broken",
+            "label": "Broken",
+            "dialect": "open-ai",
+            "base_url": "ftp://nope",
+            "auth": {"type": "bearer"}
+        }))
+        .expect("provider deserialises");
+        next.providers.push(provider);
+
+        let problems = validate_new_provider(&previous, &next, "broken");
+        assert!(
+            problems.iter().any(|p| p.contains("base_url")),
+            "expected a base_url problem, got {problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_provider_view_offers_the_dialects_levels_and_marks_the_models_own() {
+        // The panel's two pickers read exactly these fields. If they were computed again in the
+        // panel, the UI and the validator could disagree about what a dialect can send.
+        let provider: Provider = serde_json::from_value(json!({
+            "id": "p1",
+            "dialect": "open-ai",
+            "base_url": "https://api.example.test/v1",
+            "capabilities": ["chat", "reasoning"],
+            "models": [{"id": "m1", "reasoning_levels": ["low", "high"]}]
+        }))
+        .expect("provider deserialises");
+
+        let view = provider_view(&provider, mr_core::dialect::ReasoningLevel::Medium)
+            .unwrap_or_else(|_| panic!("the provider view could not be built"));
+        let entry = &view["models"][0];
+        assert_eq!(
+            entry["dialect_reasoning_levels"],
+            json!(["none", "minimal", "low", "medium", "high", "xhigh"]),
+            "the dialect offers its own vocabulary, not the whole ladder"
+        );
+        assert_eq!(
+            entry["effective_reasoning_levels"],
+            json!(["low", "high"]),
+            "the model's declared list wins"
+        );
+        assert_eq!(
+            entry["effective_default_reasoning_level"], "high",
+            "the configured default is not offered, so the model's ceiling is what runs"
+        );
+    }
+
     use crate::auth::PanelAuth;
     use crate::state::{ServeDirs, StateFiles};
     use axum::body::Body;

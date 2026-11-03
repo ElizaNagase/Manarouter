@@ -317,9 +317,17 @@ pub fn cookie_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
 
 /// Whether an `Origin` or `Referer` header is acceptable for a state-changing request.
 ///
-/// Same-origin, or a loopback origin, is allowed. Anything else is refused. This is what stops a
-/// page the operator visits from using their authenticated session against the API.
-pub fn origin_is_acceptable(origin: Option<&str>, referer: Option<&str>, port: u16) -> bool {
+/// A request is accepted when its origin is loopback, or when it is genuinely same-origin: the
+/// origin's host is the host the request was addressed to (the `Host` header). Anything else is
+/// refused. This is what stops a page the operator visits from using their authenticated session
+/// against the API, while still allowing the panel to be used from a tailnet address or hostname
+/// rather than only from loopback.
+pub fn origin_is_acceptable(
+    origin: Option<&str>,
+    referer: Option<&str>,
+    request_host: Option<&str>,
+    port: u16,
+) -> bool {
     let value = origin.or(referer);
     let Some(value) = value else {
         // No origin header at all: a same-origin `fetch` from a modern browser always sends one, so
@@ -342,18 +350,46 @@ pub fn origin_is_acceptable(origin: Option<&str>, referer: Option<&str>, port: u
         return false;
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // Strip a userinfo component, which must not influence the decision.
-    let authority = authority.rsplit('@').next().unwrap_or(authority);
-    let (host, port_part) = match authority.rsplit_once(':') {
-        Some((h, p)) if !h.contains(']') || h.ends_with(']') => (h, Some(p)),
-        _ => (authority, None),
+    let (host, port_part) = split_host_port(authority);
+    if is_loopback(host) {
+        // A loopback origin is trusted regardless of where the request arrived: the page is on
+        // this machine. The port must still match, or `http://127.0.0.1` (port 80) would be
+        // accepted for a panel on any port, which is a different origin.
+        return match port_part {
+            None => default_port == port,
+            Some(p) => p.parse::<u16>().map(|p| p == port).unwrap_or(false),
+        };
+    }
+    // Not loopback: accept it only if the browser was served from exactly the address it used.
+    // A browser always sends the page's own origin here, so a foreign page cannot match the
+    // `Host` header the request was actually addressed to.
+    let Some(request_host) = request_host else {
+        return false;
     };
-    if !is_loopback(host) {
+    let (srv_host, srv_port) = split_host_port(request_host);
+    if !host.eq_ignore_ascii_case(srv_host) {
         return false;
     }
-    match port_part {
-        None => default_port == port,
-        Some(p) => p.parse::<u16>().map(|p| p == port).unwrap_or(false),
+    match (port_part, srv_port) {
+        (Some(a), Some(b)) => {
+            a.parse::<u16>().ok() == b.parse::<u16>().ok() && a.parse::<u16>().is_ok()
+        }
+        // Both omitted: the origin is on its scheme default and the browser addressed the host
+        // without a port, which is what a reverse proxy on 443 looks like.
+        (None, None) => true,
+        // One names a port and the other does not: the page was not served from the address it is
+        // calling.
+        _ => false,
+    }
+}
+
+/// Split `host[:port]`, keeping a bracketed IPv6 literal intact.
+fn split_host_port(authority: &str) -> (&str, Option<&str>) {
+    // A userinfo component must never influence the decision.
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    match authority.rsplit_once(':') {
+        Some((h, p)) if !h.contains(']') || h.ends_with(']') => (h, Some(p)),
+        _ => (authority, None),
     }
 }
 
@@ -634,15 +670,18 @@ mod tests {
         assert!(origin_is_acceptable(
             Some("http://127.0.0.1:20901"),
             None,
+            None,
             20901
         ));
         assert!(origin_is_acceptable(
             Some("http://localhost:20901"),
             None,
+            None,
             20901
         ));
         assert!(origin_is_acceptable(
             Some("http://[::1]:20901"),
+            None,
             None,
             20901
         ));
@@ -651,7 +690,7 @@ mod tests {
     #[test]
     fn a_missing_origin_is_accepted_because_it_means_a_non_browser_client() {
         // `curl` and the CLI send no Origin. They must still work; they carry the token explicitly.
-        assert!(origin_is_acceptable(None, None, 20901));
+        assert!(origin_is_acceptable(None, None, None, 20901));
     }
 
     #[test]
@@ -661,15 +700,18 @@ mod tests {
         assert!(!origin_is_acceptable(
             Some("https://evil.example"),
             None,
+            None,
             20901
         ));
         assert!(!origin_is_acceptable(
             Some("http://192.168.1.9:20901"),
             None,
+            None,
             20901
         ));
         assert!(!origin_is_acceptable(
             Some("http://127.0.0.1:8080"),
+            None,
             None,
             20901
         ));
@@ -685,7 +727,7 @@ mod tests {
             "http://user@evil.com",
         ] {
             assert!(
-                !origin_is_acceptable(Some(evil), None, 20901),
+                !origin_is_acceptable(Some(evil), None, None, 20901),
                 "{evil} must be refused"
             );
         }
@@ -693,11 +735,13 @@ mod tests {
         assert!(!origin_is_acceptable(
             Some("http://127.0.0.1@evil.com"),
             None,
+            None,
             20901
         ));
         // ...but a legitimate loopback origin with userinfo is still loopback.
         assert!(origin_is_acceptable(
             Some("http://user@127.0.0.1:20901"),
+            None,
             None,
             20901
         ));
@@ -713,7 +757,7 @@ mod tests {
             "http://:20901",
             "http://[::1",
         ] {
-            let _ = origin_is_acceptable(Some(bad), None, 20901);
+            let _ = origin_is_acceptable(Some(bad), None, None, 20901);
         }
     }
 
@@ -722,11 +766,13 @@ mod tests {
         assert!(origin_is_acceptable(
             None,
             Some("http://127.0.0.1:20901/settings"),
+            None,
             20901
         ));
         assert!(!origin_is_acceptable(
             None,
             Some("https://evil.example/page"),
+            None,
             20901
         ));
     }

@@ -96,9 +96,9 @@ mr combo add resilient \
 
 Two participants, not three, and the failure mode is the one that will not hand the retry back to the
 provider that just failed. As in recipe 3, `--on-winner-fail
-pick-highest-passed-different-provider` is not a flag — set `on_winner_fail` in `config.json` — but
-only `pick-highest-passed` is implemented today: every other mode is accepted configuration that the
-relay logs a warning about and then serves as `pick-highest-passed`.
+pick-highest-passed-different-provider` is not a flag — set `on_winner_fail` in `config.json`. All
+four modes are implemented; this one is one of the two that spend nothing extra, because it reuses a
+participant that had already answered instead of issuing a new request.
 
 ---
 

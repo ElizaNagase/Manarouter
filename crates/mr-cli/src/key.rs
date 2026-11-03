@@ -244,6 +244,25 @@ fn sanitized(key: &ClientKey) -> serde_json::Value {
     v
 }
 
+/// Print a freshly created key on its own line, without panicking if nobody is reading.
+///
+/// `println!` panics on a broken pipe (`mr key create --print | head -c 0`), which exits 101 —
+/// outside this tool's documented 0–4 range — *after* the key has been committed and can no longer
+/// be shown. A write error is reported as an ordinary failure that says what actually happened.
+fn print_plaintext(plaintext: &str) -> Result<(), CliError> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    if let Err(e) = writeln!(stdout, "{plaintext}").and_then(|()| stdout.flush()) {
+        return Err(
+            CliError::failure(format!("the key was stored, but printing it failed: {e}"))
+                .with_detail(
+                "the plaintext cannot be shown again; run `mr key rotate` to issue a replacement",
+            ),
+        );
+    }
+    Ok(())
+}
+
 fn create(ctx: &Ctx, args: CreateArgs) -> Result<(), CliError> {
     let mut cfg = ctx.load()?;
     let (key, plaintext) = build_key(&cfg, &args)?;
@@ -253,18 +272,28 @@ fn create(ctx: &Ctx, args: CreateArgs) -> Result<(), CliError> {
     let out = ctx.save(&cfg)?;
 
     if ctx.json {
-        // The one moment plaintext exists, so it belongs in this document: id, prefix, permissions
-        // and the plaintext itself, all fields of the key just created.
+        // `--json` is the path that gets captured in scripts and logs, so it carries the plaintext
+        // only when the operator also asked for it with `--print`. Without that, a key would leak
+        // into every CI log that ran `mr key create --json`.
         let mut doc = key_json;
         if let Some(obj) = doc.as_object_mut() {
-            obj.insert("plaintext".into(), serde_json::Value::String(plaintext));
+            if args.print {
+                obj.insert("plaintext".into(), serde_json::Value::String(plaintext));
+            } else {
+                obj.insert(
+                    "plaintext_omitted".into(),
+                    serde_json::Value::String(
+                        "add --print to include the key in this document; it is shown once".into(),
+                    ),
+                );
+            }
         }
         return ctx.finish(&out, Vec::new(), doc);
     }
     if args.print {
         // Bare stdout — exactly what `$(mr key create --print)` captures. Everything else the
         // operator should know goes to stderr so the capture stays clean.
-        println!("{plaintext}");
+        print_plaintext(&plaintext)?;
         eprintln!(
             "key `{label}` stored; config {}, snapshot {}",
             out.config.display(),
@@ -394,12 +423,21 @@ fn rotate(ctx: &Ctx, id: &str, print: bool) -> Result<(), CliError> {
     if ctx.json {
         let mut doc = key_json;
         if let Some(obj) = doc.as_object_mut() {
-            obj.insert("plaintext".into(), serde_json::Value::String(plaintext));
+            if print {
+                obj.insert("plaintext".into(), serde_json::Value::String(plaintext));
+            } else {
+                obj.insert(
+                    "plaintext_omitted".into(),
+                    serde_json::Value::String(
+                        "add --print to include the key in this document; it is shown once".into(),
+                    ),
+                );
+            }
         }
         return ctx.finish(&out, Vec::new(), doc);
     }
     if print {
-        println!("{plaintext}");
+        print_plaintext(&plaintext)?;
         eprintln!("key `{label}` ({key_id}) rotated; previous key is invalid");
         eprintln!("the replacement is shown once and never again");
         return Ok(());

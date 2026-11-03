@@ -29,9 +29,11 @@
 //! * [`serve`] — binding the control listener and serving `panel/` static assets; the place
 //!   where a bind failure becomes an actionable error instead of a panic.
 
+pub mod activity_api;
 pub mod api;
 pub mod auth;
 pub mod models_api;
+pub mod oauth_token;
 pub mod quota_api;
 pub mod serve;
 pub mod state;

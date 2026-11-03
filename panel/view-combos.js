@@ -19,7 +19,13 @@ import {
 import {
   extractList, stepLabel, moveStep, remapParticipants, remapIndex,
   parseWinnerFail, buildWinnerFail, toggleParticipant,
+  comboLevels, stepModel, stepProvider, modelLevels, endsInLevelName,
 } from './format.js';
+
+// A check's result outlives the selection that produced it: an operator who checks three combos and
+// then scrolls back should still see what came back. Keyed by combo id, then step index. Module
+// scope, because the view can render a selected combo before its own body reaches a later `const`.
+const checked = new Map();
 
 const STRATEGIES = [
   ['priority', 'priority', 'Always start at step 1; on failure fall to step 2, and so on. Deterministic and sticky: the cheapest in upstream spend, and it keeps upstream prompt caches warm because the same model sees the conversation every turn.'],
@@ -34,9 +40,9 @@ const WINNER_METRICS = [
 
 const FAIL_MODES = [
   ['pick-highest-passed', 'use highest-priority that passed', 'Implemented. Do not re-dispatch: answer with the highest-priority participant that already passed the eligibility gate in the first competition. Zero added latency; the right mode when a fast, safe answer matters more than spending more upstream requests on recovery.'],
-  ['rerun-excluding', 're-run excluding failed (not implemented yet)', 'Not implemented yet: the relay accepts this mode, logs that it is unimplemented, and behaves as pick-highest-passed. It is meant to re-run the whole competition over the remaining participants, excluding every model that already failed, up to max_rounds.'],
-  ['pick-highest-passed-different-provider', 'highest passed, different provider (not implemented yet)', 'Not implemented yet: the relay accepts this mode, logs that it is unimplemented, and behaves as pick-highest-passed. It is meant to answer with the highest-priority participant that passed, but only if it comes from a different provider than the one that died.'],
-  ['stable-fallback', 'jump to stable step (not implemented yet)', 'Not implemented yet: the relay accepts this mode, logs that it is unimplemented, and behaves as pick-highest-passed. It is meant to skip the race entirely and go to the chosen stable step.'],
+  ['rerun-excluding', 're-run excluding failed models', 'Implemented. Re-run the whole competition over the remaining participants, excluding every model that already failed, up to max_rounds. Costs extra upstream requests on recovery; max_rounds bounds it so one systemic outage cannot turn one request into unbounded spend.'],
+  ['pick-highest-passed-different-provider', 'highest passed, different provider', 'Implemented. Answer with the highest-priority participant that passed, but only if it comes from a different provider than the one that died. Survives a whole-provider outage or quota reset that a same-provider fallback cannot.'],
+  ['stable-fallback', 'jump to stable step', 'Implemented. On winner failure, skip the race and go straight to the chosen stable step — the operator-trusted model kept available for exactly this case.'],
 ];
 
 export async function renderCombos(mount, ctx, selectedId) {
@@ -133,6 +139,7 @@ export async function renderCombos(mount, ctx, selectedId) {
 
   function renderSummary(target, combo) {
     const levels = comboLevels(combo.steps ?? [], providers);
+    const healthSection = h('section', {});
     const editBtn = h('button', { class: 'btn btn-primary', type: 'button' }, 'Edit combo');
     editBtn.addEventListener('click', () => openEditorDrawer(combo));
     target.replaceChildren(
@@ -147,24 +154,114 @@ export async function renderCombos(mount, ctx, selectedId) {
         h('h3', {}, 'Level-qualified names'),
         levels.length
           ? h('div', { class: 'cmeta' }, ...levels.map((level) => chip(`${combo.name || combo.id}-${level}`, 'chip-neutral', `Available level suffix: ${level}`)))
-          : h('p', { class: 'hint' }, 'No reasoning_levels are declared on these model entries. Derived runtime levels are not included in the combo config response.')),
+          : h('p', { class: 'hint' }, 'These models expose no reasoning levels: nothing is declared on their entries and their provider dialects contribute none.')),
       h('section', {},
         h('h3', {}, 'Steps — priority order'),
         h('ol', { class: 'steps' }, ...(combo.steps ?? []).map((step, i) => {
           const model = stepModel(step, providers);
-          const levelsForStep = Array.isArray(model?.reasoning_levels) ? model.reasoning_levels : [];
+          const levelsForStep = modelLevels(model, stepProvider(step, providers));
           const defaultLevel = model?.default_reasoning_level;
           const offersLevel = defaultLevel && levelsForStep.includes(defaultLevel);
           const canNameComboTier = !endsInLevelName(combo.name || combo.id);
           return h('li', { class: 'step-row' },
             h('span', { class: 'step-pos' }, String(i + 1)),
             h('span', { class: 'step-ref mono' }, stepLabel(step)),
+            step.level ? chip(`at ${step.level}`, 'chip-neutral', 'reasoning level this step runs at') : null,
             ...levelsForStep.map((level) => chip(String(level), 'chip-neutral', 'Reasoning level offered by this model')),
             defaultLevel && !offersLevel ? chip(`default ${defaultLevel}`, 'chip-pink', 'Model-specific default reasoning level') : null,
             step.enabled === false ? chip('off') : null);
         }))),
+      healthSection,
       h('div', { class: 'dialog-actions' }, editBtn),
     );
+    renderHealth(healthSection, combo);
+  }
+
+  /** One step's outcome, as the checker left it. */
+  function stepStatus(comboId, index) {
+    return checked.get(comboId)?.get(index);
+  }
+
+  function statusChip(status) {
+    if (!status) return chip('not checked', 'chip-neutral', 'never probed in this session');
+    if (status.state === 'checking') return chip('checking…', 'chip-neutral');
+    if (status.state === 'ok') return chip(`ok · ${status.ms} ms`, 'chip-green', 'the model answered');
+    return chip(`failed · ${status.code ?? status.status}`, 'chip-pink', status.message ?? 'the model did not answer');
+  }
+
+  // A check is one tiny completion per step, in priority order, and it is always the operator's
+  // click: nothing here runs on page load or on a timer.
+  function renderHealth(section, combo) {
+    const steps = (combo.steps ?? []).map((step, index) => ({ step, index }));
+    const run = h('button', { class: 'btn btn-small', type: 'button' }, 'Check steps');
+    const out = h('div', {});
+
+    const paint = () => {
+      const results = checked.get(combo.id) ?? new Map();
+      const answered = steps.filter(({ index }) => results.get(index)?.state === 'ok');
+      const failed = steps.filter(({ index }) => results.get(index)?.state === 'failed');
+      out.replaceChildren(
+        h('ol', { class: 'steps' }, ...steps.map(({ step, index }) => {
+          const status = results.get(index);
+          return h('li', { class: 'step-row' },
+            h('span', { class: 'step-pos' }, String(index + 1)),
+            h('span', { class: 'step-ref mono' }, stepLabel(step)),
+            step.level ? chip(`at ${step.level}`, 'chip-neutral', 'pinned reasoning level') : null,
+            statusChip(status),
+            status?.message && status.state === 'failed'
+              ? h('span', { class: 'hint' }, status.message)
+              : null);
+        })),
+        steps.length && results.size
+          ? h('p', { class: 'hint' },
+            answered.length
+              ? `${answered.length} of ${steps.length} answering${failed.length ? `, ${failed.length} failing` : ''}.`
+              : `Nothing answered${failed.length ? `: ${failed.map(({ index }) => `step ${index + 1}`).join(', ')}` : ''}.`)
+          : h('p', { class: 'hint' },
+            'Each check sends one trivial completion per enabled step, in priority order.'));
+    };
+
+    run.addEventListener('click', async () => {
+      if (run.disabled) return;
+      run.disabled = true;
+      const results = new Map();
+      checked.set(combo.id, results);
+      try {
+        for (const { step, index } of steps) {
+          if (step.enabled === false) continue;
+          results.set(index, { state: 'checking' });
+          paint();
+          const started = performance.now();
+          try {
+            const answer = await api.post('/api/models/test', {
+              provider: step.provider,
+              model: step.model,
+              prompt: 'Reply with the single word OK.',
+            });
+            results.set(index, {
+              state: 'ok',
+              ms: Math.round(performance.now() - started),
+              answer: answer?.response ?? null,
+            });
+          } catch (err) {
+            results.set(index, {
+              state: 'failed',
+              status: err?.status ?? 'error',
+              code: err?.code ?? 'failed',
+              message: err?.message ?? 'the request failed',
+            });
+          }
+          paint();
+        }
+      } finally {
+        run.disabled = false;
+      }
+    });
+
+    paint();
+    section.replaceChildren(
+      h('div', { class: 'cmeta' }, h('h3', {}, 'Live health'), run),
+      out);
   }
 
   // ------------------------------------------------------------------ editor
@@ -187,6 +284,32 @@ export async function renderCombos(mount, ctx, selectedId) {
       loser_grace_ms: draft.hedge?.loser_grace_ms ?? 0,
     };
     draft.wf = parseWinnerFail(draft.hedge.on_winner_fail); // working form of the tagged enum
+    const savedSnapshot = JSON.stringify(draft);
+    let dirty = false;
+
+    function markDirty() {
+      if (dirty) return;
+      dirty = true;
+      ctx.leaveGuard = () => {
+        return ctx.confirm({
+          title: 'Leave without saving?',
+          message: 'This combo has unsaved changes. Leaving will discard them.',
+          confirmLabel: 'Leave and discard',
+          cancelLabel: 'Stay on this page',
+          danger: false,
+        });
+      };
+      window.addEventListener('beforeunload', onBeforeUnload);
+    }
+    function clearDirty() {
+      dirty = false;
+      ctx.leaveGuard = null;
+      window.removeEventListener('beforeunload', onBeforeUnload);
+    }
+    function onBeforeUnload(e) {
+      e.preventDefault();
+      e.returnValue = '';
+    }
 
     const title = h('h2', { style: 'text-transform:none;letter-spacing:0;font-size:14px;' },
       isNew ? 'New combo' : `Editing ${saved.name || saved.id}`);
@@ -196,7 +319,7 @@ export async function renderCombos(mount, ctx, selectedId) {
     const stratSel = h('select', { class: 'input', 'data-field': 'strategy' });
     for (const [v, lbl] of STRATEGIES) stratSel.append(h('option', { value: v, selected: (draft.strategy ?? 'priority') === v }, lbl));
     const stratHint = h('p', { class: 'hint' });
-    stratSel.addEventListener('change', () => { updateStrategyHint(); });
+    stratSel.addEventListener('change', () => { updateStrategyHint(); markDirty(); });
 
     // --- steps ---
     const stepsOl = h('ol', { class: 'steps' });
@@ -239,31 +362,39 @@ export async function renderCombos(mount, ctx, selectedId) {
       draft.steps.push({ provider, model, enabled: true, note: addNote.value.trim() || undefined });
       addModel.value = ''; addNote.value = '';
       renderSteps(); renderStableSelect(); renderParticipantSummary();
+      markDirty();
     });
 
     // --- hedge ---
     const hedgeToggle = toggle('Enable the hedged race for this combo', { checked: Boolean(draft.hedge?.enabled) });
     const hedgeOn = hedgeToggle.input;
     const stickyWindowInput = h('input', { class: 'input', type: 'number', min: '0', max: '604800', value: draft.sticky_success_window_secs });
+    stickyWindowInput.addEventListener('input', () => markDirty());
     const stickyWindowBox = field('Sticky success window (seconds)', stickyWindowInput, { hint: 'Priority combos only; enabled with hedge. Default 1800s (30 minutes). Combo-wide across callers; inactivity refreshes after a successful response. Set 0 to disable.' });
     const hedgeCount = h('input', { class: 'input', type: 'number', min: '2', max: '255', 'data-field': 'count', value: draft.hedge?.count ?? 3 });
+    hedgeCount.addEventListener('input', () => markDirty());
     const hedgeWindow = h('input', { class: 'input', type: 'number', min: '0', 'data-field': 'window_ms', value: draft.hedge?.window_ms ?? 800 });
+    hedgeWindow.addEventListener('input', () => markDirty());
     const metricSel = h('select', { class: 'input', 'data-field': 'winner_metric' });
     for (const [v, lbl] of WINNER_METRICS) metricSel.append(h('option', { value: v, selected: (draft.hedge?.winner_metric ?? 'first-response-byte') === v }, lbl));
     const metricHint = h('p', { class: 'hint' });
-    metricSel.addEventListener('change', () => { updateMetricHint(); });
+    metricSel.addEventListener('change', () => { updateMetricHint(); markDirty(); });
 
     const failSel = h('select', { class: 'input', 'data-field': 'on_winner_fail' });
     for (const [v, lbl] of FAIL_MODES) failSel.append(h('option', { value: v, selected: draft.wf.mode === v }, lbl));
     const failHint = h('p', { class: 'hint' });
     const maxRounds = h('input', { class: 'input', type: 'number', min: '1', max: '255', 'data-field': 'max_rounds', value: draft.wf.maxRounds ?? 2 });
+    maxRounds.addEventListener('input', () => markDirty());
     const stableSel = h('select', { class: 'input', 'data-field': 'step' });
     const maxRoundsField = field('Max rounds', maxRounds, { hint: 'Bound for re-run excluding.' });
     const stableField = field('Stable step', stableSel, { hint: 'The on-fail model; need not be a race participant.' });
-    failSel.addEventListener('change', () => { draft.wf.mode = failSel.value; renderFailExtras(); updateFailHint(); });
+    failSel.addEventListener('change', () => { draft.wf.mode = failSel.value; renderFailExtras(); updateFailHint(); markDirty(); });
+    stableSel.addEventListener('change', () => { draft.wf.step = Number(stableSel.value); markDirty(); });
     const cancelLosersToggle = toggle('Cancel losing requests once the winner is chosen', { checked: draft.hedge?.cancel_losers ?? true });
     const cancelLosers = cancelLosersToggle.input;
+    cancelLosers.addEventListener('change', () => markDirty());
     const loserGrace = h('input', { class: 'input', type: 'number', min: '0', 'data-field': 'loser_grace_ms', value: draft.hedge?.loser_grace_ms ?? 0 });
+    loserGrace.addEventListener('input', () => markDirty());
     const participantSummary = h('p', { class: 'hint' });
 
     function renderStableSelect() {
@@ -301,7 +432,7 @@ export async function renderCombos(mount, ctx, selectedId) {
         field('Loser grace (ms)', loserGrace, { hint: '0 = cancel immediately.' })),
       participantSummary,
     );
-    hedgeOn.addEventListener('change', () => { hedgeBox.style.opacity = hedgeOn.checked ? '1' : '0.55'; stickyWindowBox.style.opacity = hedgeOn.checked ? '1' : '0.55'; });
+    hedgeOn.addEventListener('change', () => { hedgeBox.style.opacity = hedgeOn.checked ? '1' : '0.55'; stickyWindowBox.style.opacity = hedgeOn.checked ? '1' : '0.55'; markDirty(); });
     hedgeBox.style.opacity = hedgeOn.checked ? '1' : '0.55';
     renderStableSelect(); renderFailExtras(); renderParticipantSummary();
     updateStrategyHint(); updateMetricHint(); updateFailHint();
@@ -310,12 +441,17 @@ export async function renderCombos(mount, ctx, selectedId) {
     const midSel = h('select', { class: 'input', 'data-field': 'midstream_policy' },
       h('option', { value: 'restart', selected: (draft.midstream_policy ?? 'restart') === 'restart' }, 'restart'),
       h('option', { value: 'terminate', selected: draft.midstream_policy === 'terminate' }, 'terminate'));
+    midSel.addEventListener('change', () => markDirty());
     const maxRetries = h('input', { class: 'input', type: 'number', min: '0', 'data-field': 'max_retries', value: draft.max_retries ?? 1 });
+    maxRetries.addEventListener('input', () => markDirty());
     const retryDelay = h('input', { class: 'input', type: 'number', min: '0', 'data-field': 'retry_delay_ms', value: draft.retry_delay_ms ?? 0 });
+    retryDelay.addEventListener('input', () => markDirty());
     const affinityToggle = toggle('Merge identical consecutive messages when translating between dialects', { checked: Boolean(draft.affinity) });
     const affinity = affinityToggle.input;
+    affinity.addEventListener('change', () => markDirty());
     const comboEnabledToggle = toggle('Combo enabled', { checked: draft.enabled ?? true });
     const comboEnabled = comboEnabledToggle.input;
+    comboEnabled.addEventListener('change', () => markDirty());
 
     // --- actions ---
     const saveBtn = h('button', { class: 'btn btn-primary', type: 'button' }, isNew ? 'Create combo' : 'Save combo');
@@ -366,11 +502,13 @@ export async function renderCombos(mount, ctx, selectedId) {
         if (isNew) {
           const created = await api.post('/api/combos', payload);
           ctx.toast.success(`Combo ${created?.id ?? payload.name} created.`);
+          clearDirty();
           closeDrawer();
           ctx.navigate(`#/combos/${encodeURIComponent(created?.id ?? payload.name)}`);
         } else {
           await api.put(`/api/combos/${encodeURIComponent(saved.id)}`, payload);
           ctx.toast.success(`Combo ${payload.name} saved.`);
+          clearDirty();
           closeDrawer();
           ctx.navigate('#/combos');
         }
@@ -398,7 +536,7 @@ export async function renderCombos(mount, ctx, selectedId) {
       }
     });
 
-    revertBtn.addEventListener('click', () => renderEditor(saved));
+    revertBtn.addEventListener('click', () => { clearDirty(); renderEditor(saved); });
 
     const editor = h('form', { class: 'combo-editor', onsubmit: (e) => e.preventDefault() },
       title,
@@ -425,8 +563,8 @@ export async function renderCombos(mount, ctx, selectedId) {
       h('div', { class: 'dialog-actions' }, revertBtn, delBtn, saveBtn),
     );
 
-    nameIn.addEventListener('input', () => { draft.name = nameIn.value; });
-    labelIn.addEventListener('input', () => { draft.label = labelIn.value; });
+    nameIn.addEventListener('input', () => { draft.name = nameIn.value; markDirty(); });
+    labelIn.addEventListener('input', () => { draft.label = labelIn.value; markDirty(); });
 
     target.replaceChildren(editor);
     renderSteps();
@@ -452,11 +590,12 @@ export async function renderCombos(mount, ctx, selectedId) {
         race.addEventListener('change', () => {
           draft.hedge.participants = toggleParticipant(draft.hedge.participants, i);
           renderParticipantSummary();
+          markDirty();
         });
 
         const on = h('input', { type: 'checkbox', 'aria-label': `Step ${i + 1} enabled` });
         on.checked = step.enabled !== false;
-        on.addEventListener('change', () => { draft.steps[i].enabled = on.checked; });
+        on.addEventListener('change', () => { draft.steps[i].enabled = on.checked; markDirty(); });
 
         const up = h('button', { class: 'icon-btn', type: 'button', 'aria-label': `Move step ${i + 1} up` }, icon('up'));
         const down = h('button', { class: 'icon-btn', type: 'button', 'aria-label': `Move step ${i + 1} down` }, icon('down'));
@@ -464,6 +603,36 @@ export async function renderCombos(mount, ctx, selectedId) {
         down.disabled = i === draft.steps.length - 1;
         up.addEventListener('click', () => doMove(i, i - 1));
         down.addEventListener('click', () => doMove(i, i + 1));
+
+        // A step may run at its own tier. The list is the model's effective levels — declared on
+        // the entry, otherwise derived from the provider dialect and capped by what that dialect can
+        // send. Offering a level the model does not offer is how a request becomes a silent
+        // substitution; a level already configured but no longer offered is kept and labelled with
+        // the ceiling it will actually run at, so the value is never silently rewritten.
+        const stepMeta = stepModel(step, providers);
+        const offered = modelLevels(stepMeta, stepProvider(step, providers));
+        const ceiling = offered[offered.length - 1];
+        const levelOptions = [h('option', { value: '' }, 'model default')];
+        for (const level of offered) {
+          levelOptions.push(h('option', {
+            value: level, selected: step.level === level,
+          }, level));
+        }
+        if (step.level && !offered.includes(step.level)) {
+          levelOptions.push(h('option', {
+            value: step.level, selected: true,
+          }, `${step.level} → ${ceiling ?? 'no reasoning'}`));
+        }
+        const levelSelect = h('select', {
+          class: 'input step-level',
+          'aria-label': `Reasoning level for step ${i + 1}`,
+          title: 'Reasoning level this step runs at',
+        }, ...levelOptions);
+        levelSelect.addEventListener('change', () => {
+          if (levelSelect.value) draft.steps[i].level = levelSelect.value;
+          else delete draft.steps[i].level;
+          markDirty();
+        });
 
         const edit = h('button', { class: 'icon-btn', type: 'button', 'aria-label': `Edit step ${i + 1}` }, icon('pencil'));
         edit.addEventListener('click', () => renderStepEdit(i));
@@ -483,6 +652,7 @@ export async function renderCombos(mount, ctx, selectedId) {
           pos,
           h('span', { class: 'icon-btn', 'aria-hidden': 'true', title: 'Drag to reorder (or use the arrows)' }, icon('grip')),
           ref,
+          levelSelect,
           h('label', { class: 'step-flag' }, race, 'race'),
           h('label', { class: 'step-flag' }, on, 'on'),
           up, down, edit, del);
@@ -522,6 +692,7 @@ export async function renderCombos(mount, ctx, selectedId) {
       done.addEventListener('click', () => {
         draft.steps[i] = { ...step, provider: provSel.value || step.provider, model: modelIn.value.trim() || step.model, note: noteIn.value.trim() || undefined };
         renderSteps(); renderStableSelect();
+        markDirty();
       });
       li.replaceChildren(h('div', { class: 'step-edit' },
         h('span', { class: 'step-pos' }, String(i + 1)), provSel, modelIn, noteIn, done));
@@ -540,6 +711,7 @@ export async function renderCombos(mount, ctx, selectedId) {
       draft.wf.step = remapIndex(draft.wf.step, from, to);
       renderSteps(); renderStableSelect(); renderParticipantSummary();
       stepsOl.querySelector(`li[data-idx="${to}"]`)?.focus();
+      markDirty();
     }
 
     function updateStrategyHint() { stratHint.textContent = STRATEGIES.find(([v]) => v === stratSel.value)?.[2] ?? ''; }

@@ -16,7 +16,7 @@ use hyper::Request;
 use mr_core::model::{PricingPlan, PricingSource};
 use serde_json::{json, Value};
 
-use crate::api::{sync_client, ApiError, ApiResult};
+use crate::api::{sync_client, ApiError, ApiResult, JsonBody};
 use crate::state::AppState;
 
 /// Cap on the upstream body read by `/api/models/test`, so a broken or hostile provider cannot
@@ -46,20 +46,28 @@ fn default_test_prompt() -> String {
 
 async fn test_model(
     State(state): State<AppState>,
-    Json(request): Json<ModelTestRequest>,
+    JsonBody(body): JsonBody,
 ) -> ApiResult<Json<Value>> {
+    // Deserialize through the envelope rather than axum's `Json` extractor: a malformed body would
+    // otherwise answer 422 `text/plain`, which the panel cannot parse and shows as a bare status.
+    let request: ModelTestRequest = serde_json::from_value(body).map_err(|e| {
+        ApiError::bad(
+            "invalid_body",
+            format!("the request could not be read: {e}"),
+        )
+    })?;
     let config = state.current_config().await;
     let provider = config
         .providers
         .iter()
         .find(|p| p.id.as_str() == request.provider)
         .ok_or_else(|| ApiError::not_found(format!("no provider with id {}", request.provider)))?;
-    let account = provider
+    provider
         .accounts
         .iter()
         .find(|a| a.enabled)
         .ok_or_else(|| ApiError::bad("no_account", "the provider has no enabled account"))?;
-    let model = provider
+    provider
         .models
         .iter()
         .find(|m| m.id == request.model)
@@ -69,63 +77,47 @@ async fn test_model(
                 "the model is not configured for this provider",
             )
         })?;
-    let secret = if let Some(reference) = &account.secret_ref {
-        state.vault.lock().await.get(reference).map_err(|e| {
-            ApiError::internal(format!("could not read the provider credential: {e}"))
-        })?
-    } else {
-        None
-    };
-    let mut url = format!(
-        "{}/chat/completions",
-        provider.base_url.trim_end_matches('/')
-    );
-    let mut headers = vec![("content-type".to_owned(), "application/json".to_owned())];
-    match &provider.auth {
-        mr_core::AuthKind::Bearer => {
-            if let Some(secret) = secret.as_ref() {
-                headers.push(("authorization".into(), format!("Bearer {secret}")));
-            }
-        }
-        mr_core::AuthKind::ApiKeyHeader { header } => {
-            if let Some(secret) = secret.as_ref() {
-                headers.push((header.clone(), secret.clone()));
-            }
-        }
-        mr_core::AuthKind::Header { name, prefix } => {
-            if let Some(secret) = secret.as_ref() {
-                headers.push((name.clone(), format!("{prefix}{secret}")));
-            }
-        }
-        mr_core::AuthKind::QueryParam { param } => {
-            if let Some(secret) = secret.as_ref() {
-                url = format!("{url}?{param}={}", urlencoding::encode(secret));
-            }
-        }
-        mr_core::AuthKind::OAuth { .. } => {
-            return Err(ApiError::bad(
-                "oauth_unsupported",
-                "model test does not yet mint OAuth credentials",
-            ))
-        }
-    }
-    for (name, value) in &provider.headers {
-        headers.push((name.clone(), value.clone()));
-    }
-    let body = serde_json::to_vec(&json!({
-        "model": model.id,
-        "messages": [{"role":"user", "content": request.prompt}],
-        "max_tokens": 8,
+    // The test runs on the relay, not here. This window used to speak the OpenAI shape itself,
+    // which meant it could only ever test OpenAI-shaped providers and refused every other dialect
+    // — the exact routes an operator most wants to check (Codex, Antigravity, Command Code). The
+    // relay's loopback probe runs the ordinary dispatch path instead: same routing table, same
+    // dialect translation, same account selection and cooldowns a real request gets.
+    let relay = format!("http://127.0.0.1:{}/control/probe", config.relay.port);
+    let payload = serde_json::to_vec(&json!({
+        "model": format!("{}/{}", request.provider, request.model),
+        "prompt": request.prompt,
     }))
-    .map_err(|e| ApiError::internal(format!("could not encode test request: {e}")))?;
-    let (status, response_body) = send_json(&url, &headers, &body).await?;
-    if !status.is_success() {
-        return Err(ApiError::bad_gateway(format!(
-            "upstream model test returned HTTP {status}"
-        )));
-    }
+    .map_err(|e| ApiError::internal(format!("the test request could not be encoded: {e}")))?;
+    let (status, response_body) = send_json(
+        &relay,
+        &[("content-type".to_owned(), "application/json".to_owned())],
+        &payload,
+    )
+    .await
+    .map_err(|_| {
+        ApiError::upstream(
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!(
+                "the relay is not answering on 127.0.0.1:{}; start it and try again",
+                config.relay.port
+            ),
+        )
+    })?;
     let parsed: Value = serde_json::from_slice(&response_body)
-        .map_err(|_| ApiError::bad_gateway("upstream model test returned invalid JSON"))?;
+        .map_err(|_| ApiError::bad_gateway("the model test returned invalid JSON"))?;
+    if !status.is_success() {
+        let message = parsed
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("the relay refused the test");
+        // Pass the relay's own status through: a 429 is a rate limit, not a broken credential, and
+        // the panel should say so with the message the route actually produced.
+        return Err(ApiError::upstream(
+            status,
+            format!("the relay answered {status}: {message}"),
+        ));
+    }
     Ok(Json(
         json!({"provider": request.provider, "model": request.model, "ok": true, "response": parsed.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message")).and_then(|m| m.get("content")).cloned().unwrap_or(Value::Null)}),
     ))
@@ -151,7 +143,7 @@ async fn send_json(
         .body(Full::new(Bytes::copy_from_slice(body)))
         .map_err(|e| ApiError::internal(format!("could not build model request: {e}")))?;
     let response =
-        tokio::time::timeout(std::time::Duration::from_secs(15), client.request(request))
+        tokio::time::timeout(std::time::Duration::from_secs(30), client.request(request))
             .await
             .map_err(|_| ApiError::bad_gateway("model-test upstream timed out"))?
             .map_err(|e| {
@@ -159,7 +151,7 @@ async fn send_json(
             })?;
     let status = response.status();
     let body = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(30),
         Limited::new(response.into_body(), MAX_TEST_RESPONSE_BYTES).collect(),
     )
     .await
@@ -215,7 +207,7 @@ async fn sync_pricing(State(state): State<AppState>) -> ApiResult<Json<Value>> {
             updated += 1;
         }
     }
-    state.commit(config).await?;
+    state.commit_locked(config).await?;
     Ok(Json(
         json!({"updated": updated, "manual_overrides_preserved": true, "preserved": preserved, "message": format!("Updated {updated} models; preserved {preserved} manual overrides.")}),
     ))

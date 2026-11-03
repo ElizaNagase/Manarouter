@@ -15,6 +15,7 @@
 //! panel's `index.html` stays reachable without a session while every `/api` route (including the
 //! `/api/{*rest}` JSON 404 catch-all registered inside the router) is guarded.
 
+use std::net::SocketAddr;
 use std::path::Path as FsPath;
 
 use axum::extract::{Request, State};
@@ -79,10 +80,13 @@ pub async fn serve(state: AppState) -> Result<(), String> {
     );
 
     let application = app(state.clone());
-    axum::serve(listener, application)
-        .with_graceful_shutdown(shutdown_signal(state))
-        .await
-        .map_err(|e| format!("the control plane stopped with an error: {e}"))?;
+    axum::serve(
+        listener,
+        application.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(state))
+    .await
+    .map_err(|e| format!("the control plane stopped with an error: {e}"))?;
     tracing::info!("control plane stopped");
     Ok(())
 }

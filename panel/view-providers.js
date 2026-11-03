@@ -10,11 +10,15 @@
 
 import { api } from './api.js';
 import {
-  h, icon, chip, field, toggle, kv, emptyState, errorBlock, applyFieldErrors, clearFieldErrors,
+  h, icon, chip, field, toggle, kv, emptyState, errorBlock, applyFieldErrors, clearFieldErrors, copyButton,
 } from './dom.js';
 import {
-  deriveProviderHealth, accountState, formatAge, formatCompact,
+  deriveProviderHealth, accountState, formatAge, formatCompact, providerLevels,
 } from './format.js';
+
+// Input modalities an operator can declare per model. Empty means *derive* from the bundled
+// capability table; an explicit list is how an operator corrects the seed.
+const INPUT_MODALITIES = ['text', 'image', 'audio', 'video', 'pdf', 'file'];
 
 // Server- and catalogue-supplied OAuth URLs are bound to an href and to window.open. Only http(s)
 // is safe there: a javascript: or data: URL would execute in the panel's own origin. Anything that
@@ -48,20 +52,41 @@ export function buildRedirectPaste(p, ctx, session) {
     spellcheck: 'false',
     placeholder: 'http://127.0.0.1:1455/auth/callback?code=…&state=…',
   });
+  // The loopback callback can only land on the machine the panel runs on. When the page is open
+  // from anywhere else (a tailnet address, a phone), the redirect is *guaranteed* to fail, so say
+  // so before it happens instead of letting the person think sign-in broke.
+  const pageHost = globalThis.location?.hostname ?? 'localhost';
+  const remote = !['localhost', '127.0.0.1', '[::1]', '::1'].includes(pageHost);
   const submit = h('button', { class: 'btn', type: 'button' }, 'Use this URL');
   const status = h('div', { class: 'muted' });
+  const notice = h('p', { class: 'hint' },
+    remote
+      ? 'You are using the panel from another device, so the sign-in page will end on a URL this '
+        + 'computer cannot open — that is expected. The address bar still holds the one-time code: '
+        + 'copy the whole URL and paste it below.'
+      : 'If the browser did not come back on its own, the address bar still holds the one-time code.');
   const block = h('div', { hidden: true },
-    field('If the browser did not come back, paste the URL you were redirected to', input, {
+    field('Paste the URL you were redirected to', input, {
       hint: 'The address-bar URL works, and so does just the code. It is sent exactly as pasted.',
     }),
+    notice,
     h('div', { class: 'toolbar', style: 'padding:0;border:0;background:none;' }, submit),
     status);
 
-  function show() {
+  function show(redirectUri) {
     input.value = '';
     submit.disabled = false;
     status.replaceChildren();
+    if (redirectUri) input.placeholder = `${redirectUri}?code=…&state=…`;
     block.hidden = false;
+    // One action, not two: a browser that fails to reach the loopback leaves the whole URL on the
+    // clipboard, and pasting it is the entire manual step.
+    if (typeof input.focus === 'function') input.focus();
+    input.addEventListener('paste', () => {
+      setTimeout(() => {
+        if (input.value.includes('code=') && !submit.disabled) submit.click();
+      }, 0);
+    }, { once: true });
   }
 
   function hide() {
@@ -99,6 +124,8 @@ export function buildRedirectPaste(p, ctx, session) {
       status.replaceChildren(h('p', { class: 'muted' }, 'Checking… the sign-in should finish on its own.'));
     } catch (err) {
       // Server message in the form's own error style, plus the retryable input left enabled.
+      // Wipe the pasted code/URL so it cannot outlive this failed attempt.
+      input.value = '';
       status.replaceChildren(errorBlock(err));
       ctx.toast.error('Could not use the pasted URL', err);
       submit.disabled = false;
@@ -122,6 +149,38 @@ const KEY_STRATEGIES = ['priority', 'round-robin', 'random', 'least-used'];
 const DELETE_PROVIDER_CONFIRM_KEY = 'manarouter.confirm.deleteProvider';
 // Sourced from catalog/providers.toml and the OAuth dialect docs. These are documented production
 // endpoints, but remain suggestions: account-specific gateways or a deliberate proxy can differ.
+// Provider presets, split into two clearly separated categories so that NVIDIA NIM, Codex,
+// Copilot, Antigravity and Command Code (developer platforms / enterprise endpoints) are never
+// mixed together with the standard OpenAI/Anthropic LLM APIs.
+// Selecting one pre-fills dialect, base URL, and auth kind. You still need to add an account
+// with the actual API key afterward (the panel never stores plaintext keys).
+const PROVIDER_PRESETS = {
+  // Standard LLM APIs — bearer auth, OpenAI/Anthropic-shaped endpoints.
+  providers: [
+    { name: 'Custom (manual)', dialect: 'open-ai', baseUrl: '', auth: 'bearer', hint: 'Fill everything in yourself.' },
+    { name: 'OpenAI', dialect: 'open-ai', baseUrl: 'https://api.openai.com/v1', auth: 'bearer', hint: 'api.openai.com. Add your OpenAI API key as an account secret after saving.' },
+    { name: 'OpenRouter', dialect: 'open-ai', baseUrl: 'https://openrouter.ai/api/v1', auth: 'bearer', hint: 'openrouter.ai. Add your OpenRouter API key as an account secret after saving.' },
+    { name: 'Groq', dialect: 'open-ai', baseUrl: 'https://api.groq.com/openai/v1', auth: 'bearer', hint: 'groq.com. Add your Groq API key as an account secret after saving.' },
+    { name: 'Together AI', dialect: 'open-ai', baseUrl: 'https://api.together.xyz/v1', auth: 'bearer', hint: 'together.xyz. Add your Together API key as an account secret after saving.' },
+    { name: 'Mistral', dialect: 'open-ai', baseUrl: 'https://api.mistral.ai/v1', auth: 'bearer', hint: 'mistral.ai. Add your Mistral API key as an account secret after saving.' },
+    { name: 'DeepSeek', dialect: 'open-ai', baseUrl: 'https://api.deepseek.com/v1', auth: 'bearer', hint: 'deepseek.com. Add your DeepSeek API key as an account secret after saving.' },
+    { name: 'Fireworks AI', dialect: 'open-ai', baseUrl: 'https://api.fireworks.ai/inference/v1', auth: 'bearer', hint: 'fireworks.ai. Add your Fireworks API key as an account secret after saving.' },
+    { name: 'Perplexity', dialect: 'open-ai', baseUrl: 'https://api.perplexity.ai', auth: 'bearer', hint: 'perplexity.ai. Add your Perplexity API key as an account secret after saving.' },
+    { name: 'Cohere', dialect: 'open-ai', baseUrl: 'https://api.cohere.ai/v1', auth: 'bearer', hint: 'cohere.ai. Add your Cohere API key as an account secret after saving.' },
+    { name: 'Anthropic', dialect: 'anthropic', baseUrl: 'https://api.anthropic.com/v1', auth: 'bearer', hint: 'api.anthropic.com. Add your Anthropic API key as an account secret after saving.' },
+    { name: 'Google Gemini', dialect: 'google', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', auth: 'bearer', hint: 'generativelanguage.googleapis.com. Add your Google API key as an account secret after saving.' },
+  ],
+  // Developer platforms and enterprise endpoints — OAuth or dedicated infrastructure,
+  // visually separated from the standard LLM APIs above.
+  platforms: [
+    { name: 'NVIDIA NIM', dialect: 'open-ai', baseUrl: 'https://integrate.api.nvidia.com/v1', auth: 'bearer', hint: 'NVIDIA NIM inference endpoints. Add your NVIDIA API key as an account secret after saving.' },
+    { name: 'Codex', dialect: 'codex', baseUrl: 'https://chatgpt.com/backend-api/codex', auth: 'oauth', hint: 'OpenAI Codex — OAuth sign-in from the panel.' },
+    { name: 'Copilot', dialect: 'copilot', baseUrl: 'https://api.githubcopilot.com', auth: 'oauth', hint: 'GitHub Copilot — OAuth sign-in from the panel.' },
+    { name: 'Antigravity', dialect: 'antigravity', baseUrl: 'https://cloudcode-pa.googleapis.com', auth: 'oauth', hint: 'Google Antigravity / Cloud Code — OAuth sign-in from the panel.' },
+    { name: 'Command Code', dialect: 'command-code-go', baseUrl: 'https://api.commandcode.ai', auth: 'bearer', hint: 'Command Code — bearer auth.' },
+  ],
+};
+
 const DIALECT_BASE_URLS = {
   codex: 'https://chatgpt.com/backend-api/codex',
   antigravity: 'https://cloudcode-pa.googleapis.com',
@@ -139,12 +198,38 @@ const AUTH_KINDS = [
 export async function renderProviders(mount, ctx) {
   let providers = [];
   let drawerId = null;
+  let drawerOpen = false;
   // Keep in-progress inline number edits across any redraw caused by a refresh or another action.
   const inlineDrafts = new Map();
 
   const tableWrap = h('div', { class: 'table-scroll' });
   const count = h('span', { class: 'count' });
   const newBtn = h('button', { class: 'btn btn-primary', type: 'button' }, 'New provider');
+  // Per-account quota cache: key = "providerId|accountId" -> { remaining, total, windows, error, fetched_at }
+  const quotaCache = new Map();
+  let quotaLoaded = false;
+
+  async function loadQuota() {
+    if (quotaLoaded) return quotaCache;
+    quotaLoaded = true;
+    try {
+      const data = await api.get('/api/quota');
+      const entries = Array.isArray(data) ? data
+        : Array.isArray(data?.accounts) ? data.accounts
+          : Array.isArray(data?.results) ? data.results
+            : [];
+      for (const entry of entries) {
+        if (!entry || typeof entry !== 'object') continue;
+        const provider = typeof entry.provider === 'string' ? entry.provider : entry.provider?.id;
+        const account = typeof entry.account === 'string' ? entry.account : entry.account?.id;
+        if (!provider || !account) continue;
+        quotaCache.set(`${provider}|${account}`, entry);
+      }
+    } catch {
+      // Quota endpoint may not be available in older builds — that's fine, we just skip quota display.
+    }
+    return quotaCache;
+  }
   const refreshBtn = h('button', { class: 'btn', type: 'button' }, 'Refresh');
   // The preference is an explicit opt-out from warnings, never an automatic delete action. Keeping
   // the checkbox in the list toolbar also makes reversing it discoverable without opening a drawer.
@@ -177,7 +262,7 @@ export async function renderProviders(mount, ctx) {
   function refreshInlineDrawer(providerId) {
     const p = providers.find((provider) => provider.id === providerId);
     const body = mount.querySelector('.drawer .drawer-body');
-    if (p && drawerId === providerId && body) renderDetail(body, p);
+    if (p && drawerId === providerId && body) { renderDetail(body, p); }
   }
 
   async function reload(force = false) {
@@ -212,24 +297,25 @@ export async function renderProviders(mount, ctx) {
       const openBtn = h('button', { class: 'btn btn-sm', type: 'button' }, 'Open');
       openBtn.addEventListener('click', (e) => { e.stopPropagation(); openDetailDrawer(p); });
 
-      // An OAuth provider with no accounts cannot serve anything, and the fix is a single action.
-      // Surfacing it on the row means "sign in" is one click from the list rather than: open the
-      // drawer, scroll to Accounts, find Connect account.
-      const needsOauth = p.auth?.type === 'oauth' && accounts.length === 0;
+      // A provider with no accounts cannot serve anything, and the fix is a single action.
+      // Surfacing it on the row means adding credentials is one click from the list rather than:
+      // open the drawer, scroll to Accounts, find Add account / Connect.
+      const needsAccount = accounts.length === 0;
 
       const tr = h('tr', { class: 'row-click', tabindex: '0' },
-        h('td', { class: 'mono' }, p.id),
+        h('td', { class: 'mono' }, p.id, ' ', copyButton(p.id, { className: 'btn btn-sm icon-btn', title: 'Copy provider ID' })),
         h('td', {}, p.label ?? ''),
         h('td', {}, chip(p.dialect ?? '—')),
         h('td', {}, accountSummary(accounts, enabledCount)),
         h('td', { class: 'num' }, String(models.length)),
         h('td', {}, chip(health.label, health.cls, `health: ${health.key}`)),
         h('td', { class: 'actions' },
-          ...(needsOauth
+          ...(needsAccount
             ? [(() => {
-                const connect = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, 'Connect');
-                connect.addEventListener('click', (e) => { e.stopPropagation(); openDetailDrawer(p); });
-                return connect;
+                const label = p.auth?.type === 'oauth' ? 'Connect' : 'Add account';
+                const btn = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, label);
+                btn.addEventListener('click', (e) => { e.stopPropagation(); openAccountDrawer(p.id); });
+                return btn;
               })()]
             : []),
           openBtn),
@@ -271,17 +357,19 @@ export async function renderProviders(mount, ctx) {
 
   function closeDrawer() {
     drawerId = null;
+    drawerOpen = false;
     mount.querySelector('.drawer')?.remove();
   }
 
-  function drawerShell(title) {
+  function drawerShell(title, ariaLabel) {
     const head = h('div', { class: 'drawer-head' },
       h('h2', {}, title),
       h('span', { class: 'spacer' }));
     const body = h('div', { class: 'drawer-body' });
-    const drawer = h('div', { class: 'drawer', role: 'region', 'aria-label': 'Provider detail' }, head, body);
+    const drawer = h('div', { class: 'drawer', role: 'region', 'aria-label': ariaLabel ?? title }, head, body);
     drawer.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
     mount.append(drawer);
+    drawerOpen = true;
     return { drawer, head, body };
   }
 
@@ -289,8 +377,9 @@ export async function renderProviders(mount, ctx) {
     closeDrawer();
     drawerId = provider.id;
     const { head, body } = drawerShell(provider.label ? `${provider.label} (${provider.id})` : String(provider.id));
+    head.append(copyButton(provider.id, { className: "btn btn-sm", title: "Copy provider ID" }));
     head.append(closeButton());
-    renderDetail(body, provider);
+    await renderDetail(body, provider);
   }
 
   function closeButton() {
@@ -299,7 +388,7 @@ export async function renderProviders(mount, ctx) {
     return b;
   }
 
-  function renderDetail(body, p) {
+  async function renderDetail(body, p) {
     const health = deriveProviderHealth(p);
 
     body.replaceChildren();
@@ -379,12 +468,17 @@ export async function renderProviders(mount, ctx) {
     });
 
     // --- accounts ---
+    await loadQuota();
     const accounts = Array.isArray(p.accounts) ? p.accounts : [];
     const accSection = h('section', {}, h('h3', {}, `Accounts (${accounts.length})`));
     if (accounts.length) {
       const tb = h('tbody');
       for (const a of accounts) {
         const s = accountState(a);
+        const quota = quotaCache.get(`${p.id}|${a.id}`);
+        const quotaChip = quota && quota.windows && quota.windows.length
+          ? quotaChipFrom(quota.windows)
+          : null;
         const toggle = h('button', {
           class: 'btn btn-sm', type: 'button',
           'aria-label': `${a.enabled === false ? 'Enable' : 'Disable'} account ${a.id}`,
@@ -397,10 +491,10 @@ export async function renderProviders(mount, ctx) {
         tb.append(h('tr', {},
           h('td', { class: 'mono' }, a.id ?? ''),
           h('td', {}, a.label ?? a.identity ?? ''),
-          h('td', {}, chip(s.label, s.cls, `state: ${s.key}`)),
+          h('td', {}, chip(s.label, s.cls, `state: ${s.key}`), quotaChip),
           buildInlineAccountNumber(p, a, 'priority', 'priority'),
           buildInlineAccountNumber(p, a, 'weight', 'weight'),
-          h('td', { class: 'actions' }, toggle, del)));
+          h('td', { class: 'actions' }, toggle, buildInlineAccountSecret(p, a), del)));
       }
       accSection.append(h('div', { class: 'table-scroll', style: 'max-height:200px;' },
         h('table', { class: 'tbl' },
@@ -433,6 +527,13 @@ export async function renderProviders(mount, ctx) {
           class: 'icon-btn danger', type: 'button', 'aria-label': `Delete model ${m.id}`,
         }, icon('trash'));
         del.addEventListener('click', () => deleteModel(p, m));
+        // Labelled, not a bare triangle: this is the first thing an operator wants when a model
+        // stops answering, and an icon-only button in a dense table reads as decoration.
+        const test = h('button', {
+          class: 'btn btn-sm btn-test', type: 'button',
+          'aria-label': `Test model ${m.id}`, title: 'Send one tiny completion through the router',
+        }, icon('play'), h('span', {}, 'Test'));
+        test.addEventListener('click', () => testModel(p, m, test));
         const metadata = [];
         if (Array.isArray(m.reasoning_levels) && m.reasoning_levels.length) {
           metadata.push(...m.reasoning_levels.map((level) => chip(String(level), 'chip-neutral', 'reasoning level')));
@@ -443,20 +544,23 @@ export async function renderProviders(mount, ctx) {
         const pricing = modelPricing(m);
         if (pricing) metadata.push(chip(pricing, 'chip-neutral', 'pricing per million tokens'));
         const idCell = h('td', {},
-          h('span', { class: 'mono', style: 'overflow-wrap:anywhere;' }, m.id),
+          h('span', { class: 'mono', style: 'overflow-wrap:anywhere;' }, m.id, ' ', copyButton(m.id, { className: 'btn btn-sm icon-btn', title: 'Copy model ID' })),
           metadata.length ? h('div', { style: 'display:flex;gap:4px;flex-wrap:wrap;margin-top:4px;' }, metadata) : null);
         tb.append(h('tr', {},
           idCell,
           h('td', {}, chip(m.source ?? 'synced', 'chip-neutral', 'source')),
           m.hidden ? h('td', {}, chip('hidden')) : h('td', {}),
           buildInlineModelNumber(p, m, 'context_length', 'context length'),
-          h('td', { class: 'actions' }, toggle, del)));
+          buildInlineModelReasoning(p, m),
+          buildInlineModelModalities(p, m),
+          h('td', { class: 'actions' }, test, toggle, del)));
       }
       modelSection.append(h('div', { class: 'table-scroll', style: 'max-height: min(48vh, 460px); overflow:auto;' },
         h('table', { class: 'tbl' },
           h('thead', {}, h('tr', {},
             h('th', { scope: 'col' }, 'Model'), h('th', { scope: 'col' }, 'Source'),
             h('th', { scope: 'col' }, ''), h('th', { scope: 'col' }, 'Ctx'),
+            h('th', { scope: 'col' }, 'Default level'), h('th', { scope: 'col' }, 'Input modalities'),
             h('th', { scope: 'col' }, ''))),
           tb)));
     } else {
@@ -487,8 +591,8 @@ export async function renderProviders(mount, ctx) {
     ]));
     body.append(
       timeoutSection,
-      h('section', {}, h('h3', {}, 'Headers'), mapKvSection(p.headers)),
-      h('section', {}, h('h3', {}, 'Route overrides'), mapKvSection(p.route_overrides)),
+      buildKvEditor('Headers', p.headers ?? {}, (next) => updateProviderField(p, { headers: next })),
+      buildKvEditor('Route overrides', p.route_overrides ?? {}, (next) => updateProviderField(p, { route_overrides: next })),
     );
   }
 
@@ -501,6 +605,50 @@ export async function renderProviders(mount, ctx) {
     return `$${rate(input)} / $${rate(output)} / 1M in/out`;
   }
 
+  /// Send one small request to this model and report what came back.
+  ///
+  /// The panel test speaks the OpenAI shape, which is what most providers accept unchanged. The
+  /// Test one model with a tiny completion, through the relay's loopback probe.
+  ///
+  /// The probe runs the ordinary dispatch path, so this is a real end-to-end check for every
+  /// dialect — not only the OpenAI shape — and it fails for the reason a real request would fail
+  /// (a dead credential, a cooling account, a model the account does not offer). The button keeps
+  /// the verdict beside it so several models can be compared without chasing toasts.
+  async function testModel(p, m, button) {
+    if (button.disabled) return; // one test per model at a time
+    const label = button.querySelector('span');
+    button.disabled = true;
+    if (label) label.textContent = 'Testing…';
+    const started = performance.now();
+    try {
+      const result = await api.post('/api/models/test', {
+        provider: p.id,
+        model: m.id,
+        prompt: 'Reply with the single word OK.',
+      });
+      const ms = Math.round(performance.now() - started);
+      const answer = typeof result?.response === 'string' ? result.response.trim() : '';
+      if (label) label.textContent = 'OK';
+      button.title = answer
+        ? `Answered in ${ms} ms: ${answer.slice(0, 200)}`
+        : `Answered with no text in ${ms} ms`;
+      // The answer goes in the message: a toast's second argument is an error's detail list, not
+      // free text, so anything passed there would simply vanish.
+      ctx.toast.success(answer
+        ? `${p.id} / ${m.id} answered: “${answer.slice(0, 120)}”`
+        : `${p.id} / ${m.id} answered with no text.`);
+    } catch (err) {
+      if (label) label.textContent = 'failed';
+      button.title = err?.message ?? 'the model did not answer';
+      button.title = err?.message ?? 'the model did not answer';
+      ctx.toast.error(`${p.id} / ${m.id} did not answer`, err);
+    } finally {
+      // The verdict stays until the next test, so the button keeps telling the truth rather than
+      // resetting to a neutral label that hides what just happened.
+      button.disabled = false;
+    }
+  }
+
   async function updateProviderField(p, patch, errorTitle = 'Could not update the provider') {
     try {
       await api.put(`/api/providers/${encodeURIComponent(p.id)}`, { ...p, ...patch });
@@ -510,6 +658,79 @@ export async function renderProviders(mount, ctx) {
       ctx.toast.error(errorTitle, err);
       return false;
     }
+  }
+
+  /// Replace an existing account's credential without deleting and re-adding it.
+  ///
+  /// A key rotation is the normal case (a leaked key, a new quota period), and until now the only
+  /// way to do it in the panel was delete + add, which lost the account's id, priority, weight and
+  /// quota history. The new secret goes through the same server-side vault path as a create: it is
+  /// sent once, extracted to the vault, and answered with a `secret_ref` — never echoed back.
+  ///
+  /// The editor opens as a full-width row underneath the account rather than inside the actions
+  /// cell: the drawer is ~490px wide and six columns plus an input pushed the table into a
+  /// horizontal scrollbar that squeezed the id column to one character per line.
+  function buildInlineAccountSecret(p, account) {
+    const cell = h('td', { class: 'actions' });
+    // An icon button, not a labelled one: the account table is already crowded. The label lives in
+    // aria-label/title, which is what a screen reader announces.
+    const edit = h('button', {
+      class: 'icon-btn', type: 'button',
+      'aria-label': `Replace the API key for account ${account.id}`,
+      title: 'Replace API key',
+    }, icon('key'));
+    cell.append(edit);
+
+    edit.addEventListener('click', () => {
+      const row = cell.closest('tr');
+      if (!row) return;
+      // Only one editor at a time: a second click must not stack rows.
+      row.nextElementSibling?.classList.contains('inline-editor') && row.nextElementSibling.remove();
+
+      const input = h('input', {
+        class: 'input mono', type: 'password', autocomplete: 'new-password',
+        placeholder: 'new API key', 'aria-label': 'New API key', style: 'width:220px',
+      });
+      const save = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, 'Save');
+      const cancel = h('button', { class: 'btn btn-sm', type: 'button' }, 'Cancel');
+      const editorRow = h('tr', { class: 'inline-editor' },
+        h('td', { colspan: '6' },
+          h('div', { style: 'display:flex;gap:6px;align-items:center;flex-wrap:wrap;' },
+            h('span', { class: 'hint' }, `New key for ${account.label ?? account.id}:`),
+            input, save, cancel)));
+      row.after(editorRow);
+      input.focus();
+      const close = () => editorRow.remove();
+      cancel.addEventListener('click', close);
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') close();
+        if (e.key === 'Enter') save.click();
+      });
+      save.addEventListener('click', async () => {
+        const key = input.value.trim();
+        if (!key) {
+          ctx.toast.warning('Enter the new API key.');
+          return;
+        }
+        save.disabled = true;
+        save.textContent = 'Saving…';
+        try {
+          // Field names are the Account struct's; the server extracts `secret` into the vault and
+          // answers with a secret_ref, exactly as a create does.
+          await api.put(`/api/providers/${encodeURIComponent(p.id)}/accounts/${encodeURIComponent(account.id)}`,
+            { ...account, secret: key });
+          // The plaintext must not outlive the request.
+          input.value = '';
+          ctx.toast.success('Key replaced.');
+          await reload(true);
+        } catch (err) {
+          save.disabled = false;
+          save.textContent = 'Save';
+          ctx.toast.error('Could not replace the key', err);
+        }
+      });
+    });
+    return cell;
   }
 
   function buildInlineAccountNumber(p, account, key, label) {
@@ -532,7 +753,9 @@ export async function renderProviders(mount, ctx) {
   function buildInlineNumericCell(value, label, slot, persist, reportError, { compact = false, suffix = '', allowNegative = false } = {}) {
     const cell = h('td', { class: compact ? 'num' : '' });
     const showValue = (n) => n == null ? '—' : `${compact ? formatCompact(Number(n)) : n}${suffix}`;
-    const edit = h('button', { class: 'btn btn-sm', type: 'button', 'aria-label': `Edit ${label}` }, 'Edit');
+    const edit = compact
+      ? h('button', { class: 'icon-btn', type: 'button', 'aria-label': `Edit ${label}`, title: `Edit ${label}` }, icon('pencil'))
+      : h('button', { class: 'btn btn-sm', type: 'button', 'aria-label': `Edit ${label}` }, 'Edit');
     const renderView = () => cell.replaceChildren(h('span', { class: 'mono' }, showValue(value)), edit);
     const draft = inlineDrafts.get(slot);
     if (draft !== undefined) renderEditor(draft);
@@ -584,6 +807,137 @@ export async function renderProviders(mount, ctx) {
     edit.addEventListener('click', () => {
       renderEditor(inlineDrafts.get(slot) ?? value ?? '');
     });
+    return cell;
+  }
+
+  // --------------------------------------------------------------------------- Per-model overrides
+
+  /// Inline select for a model's `default_reasoning_level`.
+  ///
+  /// Blank means *inherit global* — the tier falls through to `routing.default_reasoning_level`
+  /// in the configuration (default `high`). Picking a level writes an explicit per-model default.
+  function buildInlineModelReasoning(p, model) {
+    const key = 'default_reasoning_level';
+    const slot = `model:${p.id}:${model.id}:${key}`;
+    const cell = h('td', { class: 'num' });
+    const value = model[key] ?? null;
+    const edit = h('button', { class: 'icon-btn', type: 'button', 'aria-label': `Edit default reasoning level for ${model.id}`, title: `Edit default reasoning level` }, icon('pencil'));
+    const renderView = () => cell.replaceChildren(h('span', { class: 'mono' }, value ?? 'inherit global'), edit);
+    const draft = inlineDrafts.get(slot);
+    if (draft !== undefined) renderEditor(draft);
+    else renderView();
+
+    function renderEditor(initial) {
+      // Only the levels this provider's dialect can send are offered: anything else would be
+      // refused when the filter is saved. A stored value outside the list is kept as an option so
+      // editing another field cannot silently rewrite it.
+      const levels = providerLevels(p, model);
+      const choices = !initial || levels.includes(initial) ? levels : [...levels, initial];
+      const select = h('select', { class: 'input', 'aria-label': 'Default reasoning level' },
+        h('option', { value: '', selected: !initial }, 'inherit global'),
+        ...choices.map((level) => h('option', { value: level, selected: initial === level }, level)));
+      const save = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, 'Save');
+      const cancel = h('button', { class: 'btn btn-sm', type: 'button' }, 'Cancel');
+      cell.replaceChildren(h('div', { style: 'display:flex;gap:4px;align-items:center;' }, select, save, cancel));
+      select.value = initial ?? '';
+      const restore = () => {
+        inlineDrafts.delete(slot);
+        renderView();
+      };
+      const finish = async () => {
+        const next = select.value || null;
+        inlineDrafts.set(slot, next);
+        save.disabled = true;
+        try {
+          await persist(next);
+          inlineDrafts.delete(slot);
+          refreshInlineDrawer(p.id);
+        } catch (err) {
+          save.disabled = false;
+          ctx.toast.error(`Could not update default reasoning level for ${model.id}`, err);
+        }
+      };
+      save.addEventListener('click', finish);
+      select.addEventListener('change', finish);
+      cancel.addEventListener('click', restore);
+    }
+
+    async function persist(next) {
+      const value = next instanceof Set ? Array.from(next) : next;
+      await api.post(`/api/providers/${encodeURIComponent(p.id)}/models`, { ...model, [key]: value });
+      await reload(true);
+    }
+
+    edit.addEventListener('click', () => renderEditor(value));
+    return cell;
+  }
+
+  /// Inline chips for a model's `input_modalities`.
+  ///
+  /// Empty means *derive* from the bundled capability table. Toggling a chip writes an explicit
+  /// per-model list.
+  function buildInlineModelModalities(p, model) {
+    const key = 'input_modalities';
+    const slot = `model:${p.id}:${model.id}:${key}`;
+    const cell = h('td', {});
+    const value = new Set(model[key] ?? []);
+    const edit = h('button', { class: 'icon-btn', type: 'button', 'aria-label': `Edit input modalities for ${model.id}`, title: `Edit input modalities` }, icon('pencil'));
+    const renderView = () => {
+      const chips = model[key]?.length
+        ? model[key].map((mod) => chip(String(mod), 'chip-neutral', 'input modality'))
+        : [h('span', { class: 'muted' }, 'automatic')];
+      cell.replaceChildren(h('div', { style: 'display:flex;gap:4px;flex-wrap:wrap;' }, ...chips), edit);
+    };
+    const draft = inlineDrafts.get(slot);
+    if (draft !== undefined) renderEditor(draft);
+    else renderView();
+
+    function renderEditor(initial) {
+      const chips = INPUT_MODALITIES.map((mod) => {
+        const btn = h('button', {
+          class: 'chip' + (initial.has(mod) ? ' chip-active' : ''),
+          type: 'button',
+          'aria-pressed': initial.has(mod) ? 'true' : 'false',
+        }, mod);
+        btn.addEventListener('click', () => {
+          const next = new Set(initial);
+          if (next.has(mod)) next.delete(mod); else next.add(mod);
+          inlineDrafts.set(slot, next);
+          renderEditor(next);
+        });
+        return btn;
+      });
+      const save = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, 'Save');
+      const cancel = h('button', { class: 'btn btn-sm', type: 'button' }, 'Cancel');
+      cell.replaceChildren(h('div', { style: 'display:flex;gap:4px;flex-wrap:wrap;align-items:center;' }, chips, save, cancel));
+      const restore = () => {
+        inlineDrafts.delete(slot);
+        renderView();
+      };
+      const finish = async () => {
+        const next = inlineDrafts.get(slot) ?? new Set();
+        save.disabled = true;
+        // Clear the draft before saving so the re-render after persist renders the view,
+        // not the editor.
+        inlineDrafts.delete(slot);
+        try {
+          await persist(next);
+        } catch (err) {
+          save.disabled = false;
+          ctx.toast.error(`Could not update input modalities for ${model.id}`, err);
+        }
+      };
+      save.addEventListener('click', finish);
+      cancel.addEventListener('click', restore);
+    }
+
+    async function persist(next) {
+      const value = next instanceof Set ? Array.from(next) : next;
+      await api.post(`/api/providers/${encodeURIComponent(p.id)}/models`, { ...model, [key]: value });
+      await reload(true);
+    }
+
+    edit.addEventListener('click', () => renderEditor(value));
     return cell;
   }
 
@@ -645,6 +999,76 @@ export async function renderProviders(mount, ctx) {
     const type = auth.type ?? 'bearer';
     const extra = auth.header ?? auth.name ?? auth.param ?? auth.platform ?? '';
     return extra ? `${type} (${extra})` : type;
+  }
+
+  // Inline-editable key/value section (headers, route overrides).
+  // Each entry is a key + value input with a delete button; "Add entry" appends a blank row.
+  // Saves the whole map back to the provider via PUT /api/providers/{id}.
+  function buildKvEditor(title, currentMap, onSave) {
+    const entries = Object.entries(currentMap ?? {});
+    const list = h('div', { class: 'stack' });
+    const status = h('div');
+
+    function draw() {
+      list.replaceChildren();
+      if (!entries.length) {
+        list.append(h('p', { class: 'hint' }, 'none'));
+      }
+      for (const [index, [key, value]] of entries.entries()) {
+        const keyIn = h('input', { class: 'input mono', type: 'text', value: key, 'aria-label': `Key ${index + 1}` });
+        const valIn = h('input', { class: 'input mono', type: 'text', value: String(value ?? ''), 'aria-label': `Value ${index + 1}` });
+        const remove = h('button', { class: 'btn btn-sm', type: 'button' }, 'Remove');
+        remove.addEventListener('click', () => {
+          entries.splice(index, 1);
+          draw();
+        });
+        const row = h('div', { class: 'card', style: 'margin:8px 0;padding:10px;' },
+          h('div', { class: 'grid-2' },
+            field('Key', keyIn),
+            field('Value', valIn)),
+          remove);
+        list.append(row);
+      }
+    }
+    draw();
+
+    const add = h('button', { class: 'btn', type: 'button' }, 'Add entry');
+    add.addEventListener('click', () => {
+      entries.push(['', '']);
+      draw();
+    });
+
+    const save = h('button', { class: 'btn btn-primary', type: 'button' }, 'Save');
+    save.addEventListener('click', async () => {
+      const next = {};
+      let invalid = false;
+      for (const row of list.querySelectorAll('.card')) {
+        const [keyIn, valIn] = row.querySelectorAll('input');
+        const k = keyIn.value.trim();
+        if (!k) { invalid = true; break; }
+        next[k] = valIn.value;
+      }
+      if (invalid) {
+        status.replaceChildren(h('div', { class: 'form-errors', role: 'alert' }, 'Every entry needs a non-empty key.'));
+        return;
+      }
+      save.disabled = true;
+      try {
+        await onSave(next);
+        status.replaceChildren();
+        ctx.toast.success(`${title} saved.`);
+      } catch (err) {
+        status.replaceChildren(errorBlock(err));
+        save.disabled = false;
+      }
+    });
+
+    return h('section', {},
+      h('h3', {}, title),
+      h('p', { class: 'hint' }, 'Add, edit, or remove entries. Empty keys are not allowed.'),
+      list,
+      h('div', { class: 'dialog-actions', style: 'margin-top:8px;' }, add, save),
+      status);
   }
 
   function mapKvSection(map) {
@@ -712,35 +1136,124 @@ export async function renderProviders(mount, ctx) {
     }
   }
 
+  // ------------------------------------------------------------------ quota chip
+
+  function quotaChipFrom(windows) {
+    // Show the most constrained window: min remaining percent across windows.
+    let minPercent = 100;
+    let minLabel = '';
+    for (const w of windows ?? []) {
+      if (!w || typeof w !== 'object') continue;
+      const remaining = w.remaining ?? null;
+      const total = w.total ?? null;
+      if (remaining == null || total == null || total <= 0) continue;
+      const pct = Math.min(100, Math.max(0, Math.round((remaining / total) * 100)));
+      if (pct < minPercent) {
+        minPercent = pct;
+        minLabel = w.family ?? 'window';
+      }
+    }
+    if (minPercent === 100 && minLabel === '') return null;
+    const cls = minPercent <= 10 ? 'chip-red' : minPercent <= 30 ? 'chip-amber' : 'chip-green';
+    return chip(`quota ${minLabel}: ${minPercent}% left`, cls, `${minPercent}% of quota remaining`);
+  }
+
   // ------------------------------------------------------------------ forms
 
-  function buildAccountForm(p) {
-    if (p.auth?.type === 'oauth') return buildOAuthAccountForm(p);
+  function buildAccountForm(p, onConnected, describedBy) {
+    if (p.auth?.type === 'oauth') return buildOAuthAccountForm(p, onConnected);
     const label = h('input', { class: 'input', type: 'text', 'data-field': 'label' });
     const identity = h('input', { class: 'input mono', type: 'text', 'data-field': 'identity', placeholder: 'e.g. work@account' });
-    const secret = h('input', { class: 'input mono', type: 'password', 'data-field': 'secret', autocomplete: 'off' });
-    const add = h('button', { class: 'btn', type: 'submit' }, 'Add account');
+    const secret = h('input', { class: 'input mono', type: 'password', 'data-field': 'secret', autocomplete: 'new-password', ...(describedBy ? { 'aria-describedby': describedBy } : {}) });
+    const revealSecret = h('button', {
+      class: 'btn btn-sm', type: 'button',
+      'aria-pressed': 'false',
+      'aria-label': 'Show secret',
+    }, 'Show');
+    let secretShown = false;
+    revealSecret.addEventListener('click', () => {
+      secretShown = !secretShown;
+      secret.type = secretShown ? 'text' : 'password';
+      revealSecret.textContent = secretShown ? 'Hide' : 'Show';
+      revealSecret.setAttribute('aria-pressed', String(secretShown));
+      revealSecret.textContent = secretShown ? 'Hide' : 'Show';
+      revealSecret.setAttribute('aria-label', secretShown ? 'Hide secret' : 'Show secret');
+      if (secretShown) {
+        // Auto re-hide so a revealed secret never outlives the moment.
+        setTimeout(() => {
+          secretShown = false;
+          secret.type = 'password';
+          revealSecret.textContent = 'Show';
+          revealSecret.setAttribute('aria-pressed', 'false');
+          revealSecret.setAttribute('aria-label', 'Show secret');
+        }, 10000);
+      }
+    });
+    const secretBox = field('Secret / API key', secret);
+    secretBox.append(revealSecret);
+    secretBox.classList.add('secret-field');
+    // Local servers (Ollama, llama.cpp) really do accept requests with no credential, so the
+    // requirement needs an explicit, visible opt-out rather than a silent empty submit. Without
+    // this an account created with a blank key only fails later, inside a request, as an opaque
+    // upstream 401 or an endless "no usable account".
+    const keyless = h('input', { type: 'checkbox', 'data-field': 'keyless' });
+    keyless.addEventListener('change', () => {
+      secret.disabled = keyless.checked;
+      revealSecret.disabled = keyless.checked;
+      if (keyless.checked) secret.value = '';
+      else secret.focus();
+    });
+    const keylessRow = h('label', { class: 'checkbox-row' },
+      keyless,
+      h('span', {}, 'This provider needs no API key (local Ollama or llama.cpp)'));
+    const add = h('button', { class: 'btn btn-primary', type: 'submit' }, 'Add account');
     const form = h('form', { novalidate: true },
       h('div', { class: 'grid-fields' },
         field('Label', label),
         field('Identity (optional)', identity),
-        field('Secret / API key', secret)),
+        secretBox),
+      keylessRow,
       add);
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       clearFieldErrors(form);
+      const key = secret.value.trim();
+      if (!key && !keyless.checked) {
+        applyFieldErrors(form, {
+          message: 'This account has no key.',
+          details: [{
+            field: 'secret',
+            message: 'Enter the API key, or tick "This provider needs no API key" if the server accepts requests without one.',
+          }],
+        });
+        secret.focus();
+        return;
+      }
       add.disabled = true;
+      add.textContent = 'Adding…';
       try {
         // Field names are the Account struct's (mr-core/src/model.rs); the secret is sent once
         // and stored server-side as a secret_ref. Validation errors land next to their fields.
         await api.post(`/api/providers/${encodeURIComponent(p.id)}/accounts`,
-          { label: label.value || null, identity: identity.value || null, secret: secret.value || null });
+          { label: label.value || null, identity: identity.value || null, secret: keyless.checked ? null : key });
+        // Clear the plaintext from the DOM immediately — it must not linger on screen.
+        secret.value = '';
         ctx.toast.success('Account added.');
-        await reload(true);
+        if (onConnected) {
+          // The caller owns navigation: it closes this drawer, refreshes, and opens the detail
+          // view exactly once. Wrapped so a navigation failure can never turn a successful
+          // account create into a failure toast.
+          try { await onConnected(); } catch {
+            ctx.toast.warning('Account added. Could not open the provider drawer — open it from the list.');
+          }
+          return;
+        }
       } catch (err) {
         applyFieldErrors(form, err);
-        if (!err.details?.length) ctx.toast.error('Could not add the account', err);
+        const msg = err.message ? err.message : 'Could not add the account';
+        if (!err.details?.length) ctx.toast.error(msg, err);
         add.disabled = false;
+        add.textContent = 'Add account';
       }
     });
     return form;
@@ -755,7 +1268,7 @@ export async function renderProviders(mount, ctx) {
   /// The device code exists for the cases where a redirect cannot work at all: a headless server, a
   /// container, or a browser on a different host. Offering only the redirect would make those
   /// deployments impossible to log in from the panel.
-  function buildOAuthAccountForm(p) {
+  function buildOAuthAccountForm(p, onConnected) {
     const status = h('p', { class: 'muted' }, 'OAuth credentials are stored only in the encrypted local vault.');
     const progress = h('p', { class: 'muted' });
     const actions = h('div', { class: 'toolbar', style: 'padding:0;border:0;background:none;' });
@@ -765,50 +1278,49 @@ export async function renderProviders(mount, ctx) {
     const redirectPaste = buildRedirectPaste(p, ctx, session);
     const form = h('div', {}, status, actions, progress, redirectPaste.block);
 
-    let details = null;
+    // One-click: the Connect button appears immediately. Discovery runs in the background only
+    // to learn whether a device-code fallback is offered; it never blocks the button.
+    const connect = h('button', { class: 'btn btn-primary', type: 'button', 'aria-label': 'Connect (opens provider sign-in in a new window)' }, 'Connect');
+    actions.append(connect);
 
-    // Discover what this platform can do before drawing buttons, so the panel never offers a flow
-    // that would fail. Until that answers, no button exists — a button that 404s is worse than a
-    // brief absence.
+    let details = null;
     (async () => {
       try {
         const { platforms = [] } = await api.get('/api/oauth');
         details = platforms.find((x) => x.id === p.auth.platform) || null;
-      } catch {
-        details = null;
-      }
-      if (!details) {
-        form.replaceChildren(h('p', { class: 'muted' },
-          `OAuth platform “${p.auth.platform}” is unavailable in this build.`));
-        return;
-      }
+      } catch { details = null; }
+      if (!details) return;
       const flows = Array.isArray(details.flows) && details.flows.length ? details.flows : [details.flow];
-      actions.replaceChildren(
-        ...(flows.includes('browser')
-          ? [actionButton('Connect with browser', 'btn btn-primary', () => runBrowser() )]
-          : []),
-        ...(flows.includes('device')
-          ? [actionButton(flows.includes('browser') ? 'Use a device code instead' : 'Connect with a device code',
-              flows.includes('browser') ? 'btn' : 'btn btn-primary', () => runDevice())]
-          : []),
-      );
+      // If this platform only supports device code, relabel the primary button.
+      if (!flows.includes('browser') && flows.includes('device')) {
+        connect.textContent = 'Connect with a device code';
+      }
     })();
 
-    function actionButton(label, cls, onClick) {
-      const b = h('button', { class: cls, type: 'button' }, label);
-      b.addEventListener('click', () => {
-        for (const el of actions.querySelectorAll('button')) el.disabled = true;
-        onClick()
-          .catch((err) => {
-            // `details` carries the server's own explanation where there is one.
-            ctx.toast.error('OAuth sign-in failed', err);
-            progress.replaceChildren(errorBlock(err));
-          })
-          .finally(() => {
-            for (const el of actions.querySelectorAll('button')) el.disabled = false;
-          });
-      });
-      return b;
+    connect.addEventListener('click', () => {
+      connect.disabled = true;
+      startFlow()
+        .catch((err) => {
+          connect.disabled = false;
+          ctx.toast.error('OAuth sign-in failed', err);
+          progress.replaceChildren(errorBlock(err));
+        });
+    });
+
+    async function startFlow() {
+      // details.id is the same platform id stored on the provider (p.auth.platform), so we don't
+      // need to wait for discovery to start the browser flow.
+      const platformId = (details && details.id) || p.auth.platform;
+      let flows;
+      if (details) {
+        flows = Array.isArray(details.flows) && details.flows.length ? details.flows : [details.flow];
+        if (flows.includes('browser')) return runBrowser(platformId);
+        if (flows.includes('device')) return runDevice(platformId);
+        throw new Error('No OAuth flow available for this platform.');
+      }
+      // Discovery hasn't answered yet: try browser first, fall back to device code on error.
+      try { return await runBrowser(platformId); }
+      catch { return await runDevice(platformId); }
     }
 
     /// Open the provider's page, then wait for the loopback callback.
@@ -817,23 +1329,37 @@ export async function renderProviders(mount, ctx) {
     /// back, which is what makes this a single click: the operator approves in the tab and this
     /// resolves on its own. The window is opened before the await so the browser does not treat it
     /// as a popup triggered by nothing.
-    async function runBrowser() {
-      const start = await api.post(`/api/oauth/${encodeURIComponent(details.id)}/authorize`, { provider_id: p.id });
+    async function runBrowser(platformId) {
+      const start = await api.post(`/api/oauth/${encodeURIComponent(platformId)}/authorize`, { provider_id: p.id });
       session.id = start.session_id;
       const authorizeUrl = httpUrl(start.authorization_url);
-      if (authorizeUrl) window.open(authorizeUrl, '_blank', 'noopener,noreferrer');
+      if (!authorizeUrl) {
+        // No URL to open means the browser flow cannot proceed. Fail fast instead of waiting
+        // forever for a /complete that will never arrive.
+        session.id = null;
+        throw new Error('The provider did not return a sign-in URL. Try again, or use a device code if available.');
+      }
+      window.open(authorizeUrl, '_blank', 'noopener,noreferrer');
       // Immediate, not after a timeout: the person who knows the capture failed can act now. The
       // /complete call below is already queued and will resolve once the pasted URL is accepted.
-      redirectPaste.show();
+      let redirectUri = null;
+      try {
+        redirectUri = new URL(authorizeUrl).searchParams.get('redirect_uri');
+      } catch { redirectUri = null; }
+      redirectPaste.show(redirectUri);
       progress.replaceChildren(
         h('span', {}, 'Waiting for you to finish signing in… '),
-        h('a', { href: httpUrl(start.authorization_url) ?? '#', target: '_blank', rel: 'noopener noreferrer' }, 'Reopen the page'),
+        h('a', { href: authorizeUrl, target: '_blank', rel: 'noopener noreferrer' }, 'Reopen the page'),
       );
       try {
         const done = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/complete`, { provider_id: p.id });
         progress.replaceChildren(h('span', {}, 'Connected.'));
         ctx.toast.success(`Connected ${done.account?.label || 'OAuth account'}.`);
-        await reload(true);
+        // If the drawer was closed mid-flow, don't reopen it or navigate — the user explicitly
+        // dismissed it. Otherwise hand off to the single navigation helper.
+        if (drawerOpen && onConnected) {
+          try { await onConnected(); } catch { /* afterAccountConnected reports its own failures */ }
+        }
       } finally {
         // Success, failure or a flow abandoned by closing the drawer: no stale paste form is left
         // behind, and a later attempt starts from a clean block.
@@ -842,15 +1368,17 @@ export async function renderProviders(mount, ctx) {
       }
     }
 
-    async function runDevice() {
-      const start = await api.post(`/api/oauth/${encodeURIComponent(details.id)}/device-code`, { provider_id: p.id });
+    async function runDevice(platformId) {
+      const start = await api.post(`/api/oauth/${encodeURIComponent(platformId)}/device-code`, { provider_id: p.id });
+      const verificationUrl = httpUrl(start.verification_uri);
       progress.replaceChildren(
         h('span', {}, 'Open '),
-        h('a', { href: httpUrl(start.verification_uri) ?? '#', target: '_blank', rel: 'noopener noreferrer' }, start.verification_uri),
+        verificationUrl
+          ? h('a', { href: verificationUrl, target: '_blank', rel: 'noopener noreferrer' }, start.verification_uri)
+          : h('span', { class: 'muted' }, start.verification_uri),
         h('span', {}, ' and enter this code: '),
         h('strong', { class: 'mono', style: 'letter-spacing:2px;font-size:15px;' }, start.user_code),
       );
-      const verificationUrl = httpUrl(start.verification_uri);
       if (verificationUrl) window.open(verificationUrl, '_blank', 'noopener,noreferrer');
       const ttl = Number(start.expires_in_seconds);
       const deadline = Date.now() + (Number.isFinite(ttl) && ttl > 0 ? ttl * 1000 : 300000);
@@ -861,7 +1389,9 @@ export async function renderProviders(mount, ctx) {
         if (result.status === 'complete') {
           progress.replaceChildren(h('span', {}, 'Connected.'));
           ctx.toast.success(`Connected ${result.account?.label || 'OAuth account'}.`);
-          await reload(true);
+          if (drawerOpen && onConnected) {
+            try { await onConnected(); } catch { /* afterAccountConnected reports its own failures */ }
+          }
           return;
         }
         if (result.status === 'failed') throw new Error(result.message);
@@ -904,6 +1434,59 @@ export async function renderProviders(mount, ctx) {
     return form;
   }
 
+  /// The single place that leaves the account drawer after a successful connect.
+  ///
+  /// Exactly one close, one refresh, one detail render — the flow used to do all three twice,
+  /// which showed the drawer flicker and cost an extra round trip. A refresh failure is reported
+  /// as a warning and never contradicts the success the operator just saw.
+  async function afterAccountConnected(providerId) {
+    closeDrawer();
+    let refreshed = true;
+    try {
+      await reload(true);
+    } catch {
+      refreshed = false;
+      ctx.toast.warning('Account added, but the provider list could not be refreshed. Reload the page to see it.');
+    }
+    const fresh = providers.find((x) => x.id === providerId);
+    if (fresh) openDetailDrawer(fresh);
+    else if (refreshed) ctx.toast.warning(`Account added, but provider ${providerId} was not in the refreshed list.`);
+  }
+
+  // After creating a provider, go straight to adding its first account so the operator can paste
+  // the API key right away instead of hunting for the field in another drawer.
+  async function openAccountDrawer(providerId) {
+    const p = providers.find((x) => x.id === providerId);
+    if (!p) {
+      // Provider not in the local snapshot (a concurrent reload can clobber it). Never fail
+      // silently: tell the operator how to get to the drawer by hand.
+      ctx.toast.warning(`Provider ${providerId} created. Open its drawer to add an account.`);
+      return;
+    }
+    closeDrawer();
+    // Keep drawerId null so the account form's own reload does not re-open the detail drawer
+    // mid-flow; navigation after account creation is handled explicitly below.
+    drawerId = null;
+    const isOAuth = p.auth?.type === 'oauth';
+    const { head, body, drawer } = drawerShell(`Add your first account to ${providerId}`, `Add account to ${providerId}`);
+    head.append(closeButton());
+    const connected = () => afterAccountConnected(providerId);
+    if (!isOAuth) {
+      const hintId = `account-hint-${providerId}`;
+      body.append(h('p', { class: 'hint', id: hintId },
+        'Enter the API key for this provider. It is stored in the encrypted vault as a secret '
+        + 'reference — never as plaintext.'));
+      body.append(buildAccountForm(p, connected, hintId));
+    } else {
+      body.append(buildAccountForm(p, connected));
+    }
+    // Move focus into the drawer so a keyboard/screen-reader user lands on the primary input.
+    requestAnimationFrame(() => {
+      const first = drawer.querySelector('input, button');
+      if (first) first.focus();
+    });
+  }
+
   /** Create (p === null) or edit an existing provider. */
   function openFormDrawer(p) {
     closeDrawer();
@@ -915,6 +1498,12 @@ export async function renderProviders(mount, ctx) {
     const labelIn = h('input', { class: 'input', type: 'text', 'data-field': 'label', value: p?.label ?? '' });
     const dialectIn = h('select', { class: 'input', 'data-field': 'dialect' },
       ...DIALECTS.map((d) => h('option', { value: d, selected: (p?.dialect ?? 'open-ai') === d }, d)));
+    const presetSel = h('select', { class: 'input', 'data-field': 'preset', 'aria-label': 'Provider preset' },
+      h('optgroup', { label: 'Standard LLM APIs' },
+        ...PROVIDER_PRESETS.providers.map((p) => h('option', { value: p.name, selected: isEdit ? false : p.name === 'Custom (manual)' }, p.name))),
+      h('optgroup', { label: 'Platforms & enterprise' },
+        ...PROVIDER_PRESETS.platforms.map((p) => h('option', { value: p.name, selected: isEdit ? false : false }, p.name))));
+    const presetHint = h('p', { class: 'hint' });
     const baseUrl = h('input', { class: 'input mono', type: 'text', 'data-field': 'base_url', value: p?.base_url ?? '', placeholder: 'https://…' });
     const note = h('input', { class: 'input', type: 'text', 'data-field': 'note', value: p?.note ?? '' });
 
@@ -939,6 +1528,26 @@ export async function renderProviders(mount, ctx) {
       else if (t === 'oauth') authBox.append(field('Platform', authPlatform, { hint: 'OAuth platform id, e.g. codex.' }));
     }
     renderAuthParams();
+
+    // Preset behavior: applying a preset sets dialect, base URL, and auth kind.
+    presetSel.addEventListener('change', () => {
+      const preset = [
+        ...PROVIDER_PRESETS.providers,
+        ...PROVIDER_PRESETS.platforms,
+      ].find((pr) => pr.name === presetSel.value);
+      if (!preset) return;
+      if (!isEdit) {
+        dialectIn.value = preset.dialect;
+        baseUrl.value = preset.baseUrl;
+        authSel.value = preset.auth;
+        renderAuthParams();
+      }
+      presetHint.textContent = preset.hint;
+    });
+    presetHint.textContent = [
+      ...PROVIDER_PRESETS.providers,
+      ...PROVIDER_PRESETS.platforms,
+    ].find((pr) => pr.name === presetSel.value)?.hint ?? '';
 
     const timeouts = h('div', { class: 'grid-fields' });
     const tFields = {};
@@ -984,6 +1593,7 @@ export async function renderProviders(mount, ctx) {
         field('Provider Name', labelIn)),
       h('div', { class: 'grid-fields' },
         field('Dialect', dialectIn),
+        field('Preset', presetSel, { hint: presetHint }),
         h('div', { class: 'field' }, h('label', {}, 'Key strategy'),
           h('div', { style: 'display:flex;gap:8px;align-items:center;' },
             keyStrat, h('span', { class: 'hint' }, 'Selects the account key rotation mode.')))),
@@ -1032,9 +1642,24 @@ export async function renderProviders(mount, ctx) {
           await api.post('/api/providers', payload);
           ctx.toast.success(`Provider ${payload.id} created.`);
         }
+
+        // The write above is committed once it succeeds. Refresh failures and post-create
+        // navigation failures are reported separately — they never mask a successful create.
+        if (!isEdit) {
+          closeDrawer();
+          try { await reload(true); } catch (reloadErr) {
+            ctx.toast.warning(`Provider ${payload.id} created, but the provider list could not be refreshed.`);
+          }
+          try { await openAccountDrawer(payload.id); } catch (navErr) {
+            ctx.toast.error(`Provider ${payload.id} created. Could not open the account drawer — open it from the provider list.`);
+          }
+          return;
+        }
         drawerId = payload.id;
         await reload(true);
       } catch (err) {
+        // A failure here means the provider write itself failed — only then do we treat it as
+        // an edit/create error and re-enable the button.
         applyFieldErrors(form, err);
         if (!err.details?.length) ctx.toast.error('Could not save the provider', err);
         save.disabled = false;

@@ -389,6 +389,23 @@ impl RelayState {
     /// Re-read the configuration and recompile.
     pub fn reload(&self) -> mr_core::error::Result<u64> {
         let config = Config::load_default()?;
+        // A reload must not install what startup would refuse, or the same file would work until
+        // the next restart and then brick the gateway. Advisories are logged and tolerated, exactly
+        // as at startup.
+        for advisory in config
+            .validate()
+            .into_iter()
+            .filter(|p| mr_core::config::is_advisory(p))
+        {
+            tracing::warn!(problem = %advisory, "configuration advisory");
+        }
+        let problems = config.validate_fatal();
+        if !problems.is_empty() {
+            return Err(mr_core::error::Error::Config(format!(
+                "refusing to reload an invalid configuration: {}",
+                problems.join("; ")
+            )));
+        }
         let snapshot = RoutingSnapshot::compile(&config)?;
         let digest = snapshot.digest();
         if let Err(e) = snapshot.write_to(&mr_core::config::snapshot_path()) {

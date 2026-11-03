@@ -247,9 +247,11 @@ pub struct SaveOutcome {
 /// Everything else — unknown providers, duplicate ids, unreachable aliases, a combo with no
 /// enabled steps — is a reason not to write.
 pub fn partition_problems(all: Vec<String>) -> (Vec<String>, Vec<String>) {
+    // The classification lives in mr-core so the CLI, the panel's commit and the relay cannot
+    // disagree about which problems are survivable.
     let (advisories, problems) = all
         .into_iter()
-        .partition(|p| p.contains("has no accounts") || p.contains("has no credential attached"));
+        .partition(|p| mr_core::config::is_advisory(p));
     (problems, advisories)
 }
 

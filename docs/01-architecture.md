@@ -50,11 +50,11 @@ hedge participant selection — is genuinely *outside* the router. It is resolve
 relay executes a table-driven procedure with no interpretation, no allocation, and no branch that
 depends on configuration structure.
 
-One part of that table is compiled but only partly executed: the hedged race is resolved into the
-snapshot, `hedge_decide` is called from the request path, and the participants are dispatched
-concurrently. Of the four winner-fail modes only `pick-highest-passed` is implemented; a winner that
-dies mid-body is recovered from a participant that passed the same window, under the combo's
-`midstream_policy`. See §4 and
+The table is executed as written, with one exception: session affinity is compiled into the plan and
+never read. The hedged race does run — `hedge_decide` is called from the request path and the
+participants are dispatched concurrently — and all four winner-fail modes are implemented: a winner
+that dies mid-body is recovered from a participant that passed the same window, or by a bounded
+re-dispatch, under the combo's `midstream_policy`. See §4 and
 [`23-implementation-status.md`](23-implementation-status.md).
 
 The tradeoff is honest and worth stating: **the relay is fast at the cost of being dumb.** It cannot

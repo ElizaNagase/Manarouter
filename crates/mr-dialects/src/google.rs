@@ -351,6 +351,178 @@ fn mime_from_url(url: &str) -> &'static str {
     }
 }
 
+/// The schema keywords Gemini's `Schema` message understands.
+///
+/// Gemini's function parameters are a proto, not JSON Schema: an unknown key is a hard 400 for the
+/// whole request ("Invalid value at request.tools[0].function_declarations[31]…"), so a client that
+/// sends a perfectly valid OpenAI tool schema — `additionalProperties`, `$ref`, `const`, a union
+/// `type` — would lose every call in that request. Everything outside this list is dropped rather
+/// than forwarded.
+const GEMINI_SCHEMA_KEYS: &[&str] = &[
+    "type",
+    "format",
+    "description",
+    "nullable",
+    "enum",
+    "items",
+    "properties",
+    "required",
+    "maxItems",
+    "minItems",
+    "minimum",
+    "maximum",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "anyOf",
+    "propertyOrdering",
+];
+
+/// Rewrite one JSON Schema node into the subset Gemini accepts.
+///
+/// Two rewrites are not cosmetic:
+///
+/// * `enum` is `repeated string` in the proto. A schema listing `[8, 17, 21, 25]` — which is
+///   ordinary for a numeric option — is rejected outright, so the values are rendered as their
+///   JSON text and the type becomes `STRING`. The model then answers `"8"`; a caller that wants the
+///   number back must convert, but a request that 400s returns nothing at all.
+/// * `type` is a single enum value, not a list. A union such as `["string", "null"]` becomes
+///   `STRING` plus `nullable: true`, which is the same meaning expressed the way the proto allows.
+fn gemini_schema(schema: &Value) -> Option<Value> {
+    gemini_schema_at(schema, 0)
+}
+
+fn gemini_schema_at(schema: &Value, depth: usize) -> Option<Value> {
+    // A pathological or self-referential client schema must not recurse without bound; the depth
+    // cap turns that into a dropped node, which the model reads as "any value here".
+    if depth > 24 {
+        return None;
+    }
+    let object = schema.as_object()?;
+    let mut out = Map::new();
+
+    for (key, value) in object {
+        match key.as_str() {
+            "type" => {
+                let (kind, nullable) = gemini_type(value);
+                if let Some(kind) = kind {
+                    out.insert("type".into(), json!(kind));
+                }
+                if nullable {
+                    out.insert("nullable".into(), json!(true));
+                }
+            }
+            "enum" => {
+                let Some(values) = value.as_array() else {
+                    continue;
+                };
+                let rendered: Vec<Value> = values.iter().map(enum_text).collect();
+                if !rendered.is_empty() {
+                    out.insert("enum".into(), Value::Array(rendered));
+                }
+            }
+            // `const` is JSON Schema's single-value enum; the proto has no such keyword.
+            "const" => {
+                out.insert("enum".into(), json!([enum_text(value)]));
+            }
+            "properties" => {
+                let Some(map) = value.as_object() else {
+                    continue;
+                };
+                let mut props = Map::new();
+                for (name, child) in map {
+                    // A property is never dropped: the boolean form of JSON Schema (`"x": true`)
+                    // has no object to rewrite, and a `required` entry pointing at a property that
+                    // is not in `properties` is itself a 400.
+                    let child = gemini_schema_at(child, depth + 1).unwrap_or_else(|| json!({}));
+                    props.insert(name.clone(), child);
+                }
+                out.insert("properties".into(), Value::Object(props));
+            }
+            "items" => {
+                if let Some(child) = gemini_schema_at(value, depth + 1) {
+                    out.insert("items".into(), child);
+                }
+            }
+            "anyOf" => {
+                let Some(variants) = value.as_array() else {
+                    continue;
+                };
+                let kept: Vec<Value> = variants
+                    .iter()
+                    .filter_map(|child| gemini_schema_at(child, depth + 1))
+                    .collect();
+                if !kept.is_empty() {
+                    out.insert("anyOf".into(), Value::Array(kept));
+                }
+            }
+            "required" => {
+                // Keep only names that exist in this object's `properties`; the proto resolves
+                // `required` against them, and a name with no schema is rejected.
+                let Some(names) = value.as_array() else {
+                    continue;
+                };
+                let declared: Vec<Value> = names
+                    .iter()
+                    .filter(|name| {
+                        name.as_str().is_some_and(|n| {
+                            object.get("properties").and_then(|p| p.get(n)).is_some()
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                if !declared.is_empty() {
+                    out.insert("required".into(), Value::Array(declared));
+                }
+            }
+            other if GEMINI_SCHEMA_KEYS.contains(&other) => {
+                // Scalars the proto defines directly: `description`, bounds, `format`.
+                out.insert(other.to_owned(), value.clone());
+            }
+            _ => {}
+        }
+    }
+
+    // The proto only allows an enum on a string, so an enum decides the type *after* every key has
+    // been read: a client is free to write `type` before or after `enum`, and a type that survived
+    // the loop would otherwise win by ordering alone.
+    if out.contains_key("enum") {
+        out.insert("type".into(), json!("STRING"));
+    }
+
+    Some(Value::Object(out))
+}
+
+/// A JSON type as `(type, nullable)`.
+///
+/// A single type is passed through exactly as written — Gemini accepts `string` and `STRING`
+/// alike, and rewriting the case of a value the client already sent would be change for its own
+/// sake. A *list* of types is legal JSON Schema and illegal here, so the first concrete type wins
+/// and a `null` in the list becomes `nullable`.
+fn gemini_type(value: &Value) -> (Option<String>, bool) {
+    if let Some(raw) = value.as_str() {
+        return (Some(raw.to_owned()), false);
+    }
+    if let Some(list) = value.as_array() {
+        let nullable = list.iter().any(|entry| entry.as_str() == Some("null"));
+        let kind = list
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|raw| *raw != "null")
+            .map(str::to_owned);
+        return (kind, nullable);
+    }
+    (None, false)
+}
+
+/// An enum value as the string the proto requires.
+fn enum_text(value: &Value) -> Value {
+    match value {
+        Value::String(text) => json!(text),
+        other => json!(other.to_string()),
+    }
+}
+
 /// The pivot `tools` array as Gemini `functionDeclarations`.
 fn function_declarations(pivot: &PivotRequest) -> Option<Value> {
     let mut decls: Vec<Value> = Vec::new();
@@ -380,11 +552,9 @@ fn function_declarations(pivot: &PivotRequest) -> Option<Value> {
                 decl.insert("description".into(), json!(d));
             }
         }
-        // The JSON Schema travels as-is: `parameters` is the same schema dialect, and
-        // re-encoding it would only risk dropping keywords the model reads.
         if let Some(params) = func.get("parameters") {
-            if params.is_object() {
-                decl.insert("parameters".into(), params.clone());
+            if let Some(sanitized) = gemini_schema(params) {
+                decl.insert("parameters".into(), sanitized);
             }
         }
         decls.push(Value::Object(decl));
@@ -1188,6 +1358,163 @@ mod tests {
         assert_eq!(decl["description"], "Look up weather");
         assert_eq!(decl["parameters"]["properties"]["city"]["type"], "string");
         assert_eq!(out["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
+    }
+
+    /// The failure that prompted this: Gemini answers 400 for the whole request when a function
+    /// parameter lists integer enum values, because its `Schema.enum` is `repeated string`.
+    #[test]
+    fn a_numeric_enum_is_rendered_as_strings() {
+        let out = build(json!({
+            "model": "x",
+            "messages": [],
+            "tools": [{"type": "function", "function": {
+                "name": "set_limit",
+                "parameters": {"type": "object", "properties": {
+                    "turns": {"type": "integer", "enum": [8, 17, 21, 25]}
+                }}
+            }}]
+        }));
+        let turns =
+            &out["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["turns"];
+        assert_eq!(turns["enum"], json!(["8", "17", "21", "25"]));
+        assert_eq!(
+            turns["type"], "STRING",
+            "the proto only allows an enum on a string, so the enum decides the type"
+        );
+    }
+
+    /// Key order must not decide the outcome: a client that writes `enum` before `type` still needs
+    /// the enum to win.
+    #[test]
+    fn an_enum_decides_the_type_whatever_the_key_order() {
+        let out = build(json!({
+            "model": "x",
+            "messages": [],
+            "tools": [{"type": "function", "function": {
+                "name": "f",
+                "parameters": {"type": "object", "properties": {
+                    "turns": {"enum": [8, 17], "type": "integer"}
+                }}
+            }}]
+        }));
+        let turns =
+            &out["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["turns"];
+        assert_eq!(turns["type"], "STRING");
+        assert_eq!(turns["enum"], json!(["8", "17"]));
+    }
+
+    /// A schema written for OpenAI routinely carries keywords Gemini's proto has never heard of,
+    /// and one unknown key fails the entire request rather than the one tool.
+    #[test]
+    fn keywords_google_does_not_understand_are_dropped() {
+        let out = build(json!({
+            "model": "x",
+            "messages": [],
+            "tools": [{"type": "function", "function": {
+                "name": "search",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "definitions": {"unused": {"type": "string"}},
+                    "properties": {
+                        "q": {"type": "string", "minLength": 1, "$comment": "free text"},
+                        "tags": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+                    },
+                    "required": ["q"]
+                }
+            }}]
+        }));
+        let params = &out["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert_eq!(params["properties"]["q"]["minLength"], 1);
+        assert!(params["properties"]["q"].get("$comment").is_none());
+        assert!(params["properties"]["tags"].get("uniqueItems").is_none());
+        assert!(params.get("additionalProperties").is_none());
+        assert!(params.get("$schema").is_none());
+        assert!(params.get("definitions").is_none());
+        assert_eq!(params["required"], json!(["q"]));
+        assert_eq!(params["properties"]["tags"]["items"]["type"], "string");
+    }
+
+    /// `required` is resolved against `properties` by the proto, so a name with no schema is a 400
+    /// even though the schema itself was legal JSON Schema.
+    #[test]
+    fn required_names_without_a_schema_are_dropped() {
+        let out = build(json!({
+            "model": "x",
+            "messages": [],
+            "tools": [{"type": "function", "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}, "b": true},
+                    "required": ["a", "b", "missing"]
+                }
+            }}]
+        }));
+        let params = &out["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert_eq!(params["required"], json!(["a", "b"]));
+        assert_eq!(
+            params["properties"]["b"],
+            json!({}),
+            "the boolean form has no keywords to carry, but the property must still exist"
+        );
+    }
+
+    #[test]
+    fn a_union_type_becomes_one_type_plus_nullable() {
+        let out = build(json!({
+            "model": "x",
+            "messages": [],
+            "tools": [{"type": "function", "function": {
+                "name": "f",
+                "parameters": {"type": "object", "properties": {
+                    "note": {"type": ["null", "string"]}
+                }}
+            }}]
+        }));
+        let note = &out["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["note"];
+        assert_eq!(note["type"], "string");
+        assert_eq!(note["nullable"], true);
+    }
+
+    #[test]
+    fn const_becomes_a_single_valued_enum() {
+        let out = build(json!({
+            "model": "x",
+            "messages": [],
+            "tools": [{"type": "function", "function": {
+                "name": "f",
+                "parameters": {"type": "object", "properties": {
+                    "kind": {"const": "exact"}
+                }}
+            }}]
+        }));
+        let kind = &out["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["kind"];
+        assert_eq!(kind["enum"], json!(["exact"]));
+        assert_eq!(kind["type"], "STRING");
+    }
+
+    #[test]
+    fn nested_objects_and_arrays_are_rewritten_at_every_level() {
+        let out = build(json!({
+            "model": "x",
+            "messages": [],
+            "tools": [{"type": "function", "function": {
+                "name": "f",
+                "parameters": {"type": "object", "properties": {
+                    "rows": {"type": "array", "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {"pick": {"type": "integer", "enum": [1, 2]}}
+                    }}
+                }}
+            }}]
+        }));
+        let item = &out["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["rows"]
+            ["items"];
+        assert_eq!(item["properties"]["pick"]["enum"], json!(["1", "2"]));
+        assert!(item.get("additionalProperties").is_none());
     }
 
     #[test]

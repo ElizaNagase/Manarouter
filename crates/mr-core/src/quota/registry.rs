@@ -7,12 +7,25 @@
 //!
 //! # Lookup order
 //!
-//! Three tiers, asked in this order, and within a tier in registration order:
+//! Four questions, asked in this order, and within a tier in registration order:
 //!
 //! 1. [`QuotaTier::Provider`] — a fetcher for one exact provider id (`openrouter`, `codex`, …).
-//! 2. [`QuotaTier::Dialect`] — a fetcher for a whole wire dialect (`anthropic`, `google`, …).
-//! 3. [`QuotaTier::Fallback`] — the generic OpenAI-compatible reader, which reads an endpoint the
+//! 2. [`QuotaTier::Provider`], by **claimed host** — the same tier again, through
+//!    [`QuotaFetcher::claims_host`] against the host of the provider's configured base URL.
+//! 3. [`QuotaTier::Dialect`] — a fetcher for a whole wire dialect (`anthropic`, `google`, …).
+//! 4. [`QuotaTier::Fallback`] — the generic OpenAI-compatible reader, which reads an endpoint the
 //!    operator declared on the account.
+//!
+//! The claimed host sits between the id and the dialect because the only two things the tiers
+//! around it read are *chosen by the operator*, and a chosen name is not an identity: an operator
+//! may call their Command Code connection `commandcode` (not the `command-code` or
+//! `command-code-go` id a fetcher was registered under) and route it over the generic `open-ai`
+//! dialect rather than Command Code's own wire dialect. The host the traffic is sent to is the one
+//! thing an operator does not get to choose, so a fetcher that recognises its vendor's host is
+//! consulted before the dialect tier can hand the account to a reader that knows nothing about the
+//! vendor. It sits *after* the exact id because an exact id is a deliberate statement about one
+//! specific provider, and an operator who wrote one should not be overruled by a host a proxy
+//! happens to share.
 //!
 //! A look-up for a provider with no dedicated fetcher therefore *stops* at a dialect fetcher if one
 //! claims that dialect; only a dialect no fetcher claims reaches the fallback. The first fetcher in
@@ -236,9 +249,33 @@ pub trait QuotaFetcher: Send + Sync + std::fmt::Debug {
     /// Whether this fetcher should serve `account`.
     ///
     /// Usually an exact provider-id match; a dialect fetcher checks `dialect`; the fallback returns
-    /// `true` for anything, which is safe because it is only consulted after the other two tiers.
+    /// `true` for anything, which is safe because it is only consulted after the provider tier (by
+    /// id and by claimed host) and the dialect tier have both had their say.
     /// `account` is available so a fetcher can recognise an operator-declared endpoint.
     fn supports(&self, dialect: Dialect, provider_id: &str, account: &QuotaAccount) -> bool;
+
+    /// Whether this fetcher recognises a provider by the host its configured base URL points at.
+    ///
+    /// `supports` answers "am I the reader written for this provider" from a provider id and a wire
+    /// dialect, and the operator chooses both. Nothing stops an operator from calling their Command
+    /// Code connection `commandcode` — an id no fetcher was registered under — and routing it over
+    /// the generic `open-ai` dialect, and a reader that only ever looks at those two names then
+    /// misses a provider that *does* report quota, which is how a working integration disappears
+    /// from the panel. The vendor's host is not operator-chosen, so a fetcher that knows its
+    /// vendor's host says so here and is consulted for a provider no exact id claimed (see the
+    /// module docs for where that sits in the precedence order).
+    ///
+    /// `host` is already parsed and normalised by the registry: the scheme, any userinfo, the port,
+    /// the path and the query are gone, IPv6 brackets are stripped, and the value is lower-cased,
+    /// with any trailing dots removed ([`base_url_host`]). Match it **exactly**, or through an
+    /// explicit rule the implementation documents in words: a suffix test against the whole value
+    /// lets a stranger's hostname (`api.commandcode.ai.example.test`) claim the vendor.
+    ///
+    /// The default is `false`, so a fetcher opts in and every existing reader keeps the precedence
+    /// it had before this method existed.
+    fn claims_host(&self, _host: &str) -> bool {
+        false
+    }
 
     /// Read the quota, or fail.
     ///
@@ -258,7 +295,59 @@ pub enum QuotaTier {
     Fallback,
 }
 
-/// Provider id → fetcher, with the tiered lookup described in the module docs.
+/// The host named by a configured base URL, or `None` when the value names no host.
+///
+/// This is what hands [`QuotaFetcher::claims_host`] its argument. It exists because the host is the
+/// one part of a provider's configuration an operator does not invent: the provider id and the
+/// dialect are chosen, and a fetcher that guards on those alone misses a vendor whose operator
+/// picked a different name.
+///
+/// The parse is deliberately tolerant, because a base URL in a config file is typed by a person: the
+/// scheme is optional (`api.commandcode.ai/v1` is as good as `https://api.commandcode.ai/v1`), and
+/// userinfo, port, path, query and fragment are all dropped.
+///
+/// It is stricter than it looks about what comes back, and that is the point: the result is the
+/// *host* and nothing else, lower-cased, with IPv6 brackets stripped (`[2001:db8::1]:20900` gives
+/// `2001:db8::1`) and trailing dots removed (an FQDN root dot is not part of the name, so
+/// `api.commandcode.ai.` and `api.commandcode.ai` are the same host). Nothing here does suffix or
+/// wildcard matching — a claim is an equality test against this value, so `commandcode.ai.example.test`
+/// and every other lookalike is simply a different host.
+///
+/// `None` for an empty or whitespace-only value and for a value with no host part at all (`https://`,
+/// `https:///v1`). A malformed authority that still has characters in it (`a:b`) is returned as-is
+/// rather than guessed at: it cannot equal a real host, so it claims nothing, which is the honest
+/// outcome for a base URL that is not a URL.
+pub fn base_url_host(base_url: &str) -> Option<String> {
+    let trimmed = base_url.trim();
+    // Look for `://` rather than splitting on the first `:`, so a bare `api.example.test:8443` is not
+    // read as a URL whose scheme is `api.example.test`.
+    let rest = match trimmed.find("://") {
+        Some(index) => &trimmed[index + 3..],
+        None => trimmed,
+    };
+    // The authority ends at the first `/`, `?` or `#`; the rest is the request, not the host.
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    // `user:password@host`: everything up to the last `@` is userinfo, and userinfo may itself carry
+    // an `@` in a password, hence the last one.
+    let authority = match authority.rfind('@') {
+        Some(index) => &authority[index + 1..],
+        None => authority,
+    };
+    // An IPv6 literal keeps its own colons, so it is read between its brackets; every other form has
+    // at most one colon and it introduces a port.
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => match authority.split_once(':') {
+            Some((host, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => host,
+            _ => authority,
+        },
+    };
+    let host = host.trim_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// Provider id (and vendor host) → fetcher, with the precedence described in the module docs.
 ///
 /// [`QuotaRegistry::with_generic_fallback`] (and therefore [`QuotaRegistry::default`]) starts with
 /// the built-in [`GenericOpenAiCompat`] in the fallback tier, so a registry is usable before Phase C
@@ -340,14 +429,45 @@ impl QuotaRegistry {
         }
     }
 
-    /// The fetcher that should serve this account: exact provider id, then dialect, then fallback.
+    /// The fetcher that should serve this account.
+    ///
+    /// Precedence, and why it is that order (the module docs say the same thing at length):
+    ///
+    /// 1. an **exact provider id** in [`QuotaTier::Provider`] — an id an operator wrote on purpose
+    ///    outranks everything else, so a proxy that happens to share a vendor's host cannot steal
+    ///    the account from the reader that id names;
+    /// 2. a **claimed host** in [`QuotaTier::Provider`] — [`QuotaFetcher::claims_host`] against
+    ///    [`base_url_host`] of `base_url`, which is how a vendor is recognised when the operator
+    ///    chose a different id and a generic dialect;
+    /// 3. the **[`QuotaTier::Dialect`]** fetchers;
+    /// 4. the **[`QuotaTier::Fallback`]** reader, which claims anything left.
+    ///
+    /// `base_url` is the provider's configured base URL, the one the relay sends inference to. Pass
+    /// `None` when the caller genuinely has no base URL (a test, or a look-up that only asks about
+    /// ids): a look-up with no base URL can only be answered by the other three steps, which is
+    /// exactly the pre-host-claim behaviour. A base URL that is empty, `://`-mangled or otherwise
+    /// hostless is treated as `None` rather than as an error — the panel must still be able to ask
+    /// "would anyone claim this provider" about a configuration that is broken for other reasons.
     pub fn lookup(
         &self,
         dialect: Dialect,
         provider_id: &str,
+        base_url: Option<&str>,
         account: &QuotaAccount,
     ) -> Option<Arc<dyn QuotaFetcher>> {
-        for tier in [QuotaTier::Provider, QuotaTier::Dialect, QuotaTier::Fallback] {
+        for fetcher in self.tier(QuotaTier::Provider) {
+            if fetcher.supports(dialect, provider_id, account) {
+                return Some(Arc::clone(fetcher));
+            }
+        }
+        if let Some(host) = base_url.and_then(base_url_host) {
+            for fetcher in self.tier(QuotaTier::Provider) {
+                if fetcher.claims_host(&host) {
+                    return Some(Arc::clone(fetcher));
+                }
+            }
+        }
+        for tier in [QuotaTier::Dialect, QuotaTier::Fallback] {
             for fetcher in self.tier(tier) {
                 if fetcher.supports(dialect, provider_id, account) {
                     return Some(Arc::clone(fetcher));
@@ -368,7 +488,12 @@ impl QuotaRegistry {
     /// Look up and fetch in one step, mapping "nothing claims this account" onto
     /// [`Error::NotFound`].
     pub async fn fetch(&self, ctx: &QuotaFetchContext) -> Result<UsageQuota> {
-        let Some(fetcher) = self.lookup(ctx.dialect, &ctx.provider_id, &ctx.account) else {
+        let Some(fetcher) = self.lookup(
+            ctx.dialect,
+            &ctx.provider_id,
+            ctx.base_url.as_deref(),
+            &ctx.account,
+        ) else {
             return Err(Error::NotFound(format!(
                 "no quota fetcher is registered for provider {:?} (dialect {:?})",
                 ctx.provider_id, ctx.dialect
@@ -404,6 +529,13 @@ impl Default for QuotaRegistry {
 /// All provider fetchers go in [`QuotaTier::Provider`], keyed by their exact `id`. No two of them
 /// share one, which matters because [`QuotaRegistry::register`] only warns on a duplicate and lets
 /// the earlier registration win.
+///
+/// That same tier also carries the **host claims**: a reader whose vendor is recognisable by the host
+/// of the base URL overrides [`QuotaFetcher::claims_host`] and is consulted for a provider whose
+/// configured id and dialect match nothing (`CommandCode` claiming `api.commandcode.ai` is the case
+/// that made this necessary). A host claim must live in the provider tier, because that is the only
+/// tier `lookup` asks it in: a dialect-tier claim would be a claim about a wire shape, which is what
+/// `supports` already is.
 ///
 /// The generic reader is installed with [`QuotaRegistry::set_fallback`], not registered *after* the
 /// placeholder: [`GenericOpenAiCompat`] and [`openai_compat::OpenAiCompat`] both claim the id
@@ -810,6 +942,55 @@ mod tests {
     }
 
     #[test]
+    fn every_oauth_platform_is_claimed_by_a_real_quota_fetcher() {
+        // The panel offers a Refresh button on every account row. An OAuth platform without a
+        // fetcher turns that button into an error the operator cannot act on, so the set of
+        // platforms and the set of fetchers is checked against each other here rather than
+        // discovered in production.
+        use crate::dialect::AuthKind;
+
+        let registry = default_registry();
+        let catalogue = crate::catalog::catalog();
+        let mut checked = 0;
+        for platform in crate::oauth::platforms() {
+            let provider = catalogue
+                .all()
+                .iter()
+                .find(|provider| {
+                    matches!(&provider.auth, AuthKind::OAuth { platform: id } if id == platform.id())
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no catalogue provider uses the OAuth platform `{}`",
+                        platform.id()
+                    )
+                });
+            let account = QuotaAccount::new();
+            let fetcher = registry
+                .lookup(provider.dialect, &provider.id, None, &account)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no quota fetcher claims provider `{}` (OAuth platform `{}`)",
+                        provider.id,
+                        platform.id()
+                    )
+                });
+            assert_ne!(
+                fetcher.id(),
+                "openai-compat",
+                "provider `{}` (OAuth platform `{}`) falls through to the generic OpenAI                  compatibility fetcher, which never reports a subscription window",
+                provider.id,
+                platform.id()
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 3,
+            "expected every OAuth platform to be checked, saw {checked}"
+        );
+    }
+
+    #[test]
     fn lookup_prefers_provider_then_dialect_then_fallback() {
         let mut registry = QuotaRegistry::empty();
         registry.register(
@@ -831,7 +1012,7 @@ mod tests {
         let account = QuotaAccount::new();
         let found = |dialect, provider: &str| {
             registry
-                .lookup(dialect, provider, &account)
+                .lookup(dialect, provider, None, &account)
                 .map(|fetcher| fetcher.id())
                 .map(str::to_owned)
         };
@@ -869,7 +1050,7 @@ mod tests {
         );
         assert_eq!(
             ordered
-                .lookup(Dialect::OpenAi, "anything", &account)
+                .lookup(Dialect::OpenAi, "anything", None, &account)
                 .expect("dialect match")
                 .id(),
             "first"
@@ -880,7 +1061,7 @@ mod tests {
     fn an_empty_registry_misses_and_the_default_holds_the_fallback() {
         let empty = QuotaRegistry::empty();
         assert!(empty
-            .lookup(Dialect::OpenAi, "anything", &QuotaAccount::new())
+            .lookup(Dialect::OpenAi, "anything", None, &QuotaAccount::new())
             .is_none());
         assert!(empty.ids().is_empty());
 
@@ -888,7 +1069,7 @@ mod tests {
         assert_eq!(default.ids(), vec![GenericOpenAiCompat::ID]);
         assert_eq!(
             default
-                .lookup(Dialect::OpenAi, "anything", &QuotaAccount::new())
+                .lookup(Dialect::OpenAi, "anything", None, &QuotaAccount::new())
                 .expect("fallback claims everything")
                 .id(),
             GenericOpenAiCompat::ID
@@ -902,7 +1083,7 @@ mod tests {
         assert_eq!(registry.ids(), vec!["mine"]);
         assert_eq!(
             registry
-                .lookup(Dialect::Google, "x", &QuotaAccount::new())
+                .lookup(Dialect::Google, "x", None, &QuotaAccount::new())
                 .expect("fallback")
                 .id(),
             "mine"
@@ -1189,10 +1370,11 @@ mod tests {
             ("glm-cn", "glm"),
             ("xao", "xai-oauth"),
             ("command-code", "command-code-go"),
+            ("commandcode", "command-code-go"),
         ] {
             assert_eq!(
                 registry
-                    .lookup(Dialect::OpenAi, provider_id, &account)
+                    .lookup(Dialect::OpenAi, provider_id, None, &account)
                     .unwrap_or_else(|| panic!("no fetcher for {provider_id:?}"))
                     .id(),
                 expected,
@@ -1201,7 +1383,7 @@ mod tests {
         }
 
         let unknown = registry
-            .lookup(Dialect::OpenAi, "definitely-not-a-provider", &account)
+            .lookup(Dialect::OpenAi, "definitely-not-a-provider", None, &account)
             .expect("the fallback claims everything");
         assert_eq!(unknown.id(), crate::quota::openai_compat::OpenAiCompat::ID);
         assert!(
@@ -1232,5 +1414,169 @@ mod tests {
             !debug.contains("GenericOpenAiCompat"),
             "the placeholder is still the winning fallback: {debug}"
         );
+    }
+
+    // --- The host claim: an operator-chosen id and dialect are not a vendor identity -----------
+
+    /// A `/alpha/billing/credits` reply carrying both a credit pool and both windows, so the Command
+    /// Code reader has something to report when a test drives the whole `fetch` path.
+    const COMMAND_CODE_CREDITS: &str = r#"{
+        "credits": { "monthlyCredits": 10, "purchasedCredits": 5, "freeCredits": 1.5 },
+        "windowLimits": {
+            "fiveHour": { "cap": 50, "used": 12.5, "resetAt": "2026-10-16T05:00:00Z" },
+            "weekly": { "cap": 200, "used": 40, "resetAt": 1760000000000 }
+        }
+    }"#;
+
+    #[test]
+    fn base_url_host_tolerates_a_base_url_a_person_typed() {
+        // Every form an operator has plausibly put in a `base_url`, and what the claim is tested
+        // against: the host alone, lower-cased. Nothing else from the URL survives, so no claim can
+        // be satisfied by a path, a port or a query string.
+        for (input, expected) in [
+            (
+                "https://api.commandcode.ai/provider/v1",
+                Some("api.commandcode.ai"),
+            ),
+            (
+                "HTTPS://API.CommandCode.AI:8443/v1?token=abc#frag",
+                Some("api.commandcode.ai"),
+            ),
+            // No scheme at all: a config file may carry the authority and path only.
+            ("api.commandcode.ai/provider/v1", Some("api.commandcode.ai")),
+            // Userinfo is not the host, and a password may contain `@`.
+            (
+                "user:p@ss@api.commandcode.ai/v1",
+                Some("api.commandcode.ai"),
+            ),
+            (
+                "https://user:pass@api.commandcode.ai:443/",
+                Some("api.commandcode.ai"),
+            ),
+            // An FQDN root dot is not part of the name.
+            ("https://api.commandcode.ai.", Some("api.commandcode.ai")),
+            ("http://localhost:20901/", Some("localhost")),
+            // IPv6 literals keep their own colons and lose their brackets.
+            ("[::1]:20900", Some("::1")),
+            ("https://[2001:DB8::1]:20900/v1", Some("2001:db8::1")),
+            // A host that merely *contains* the vendor's name is a different host; the claim is an
+            // equality test, so this can never satisfy one.
+            (
+                "https://api.commandcode.ai.example.test/v1",
+                Some("api.commandcode.ai.example.test"),
+            ),
+            // Nothing usable: no host to test a claim against.
+            ("", None),
+            ("   ", None),
+            ("https://", None),
+            ("https:///v1", None),
+        ] {
+            assert_eq!(
+                base_url_host(input),
+                expected.map(str::to_owned),
+                "host of {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_configured_host_claims_command_code_under_any_id_and_dialect() {
+        // The failure this repairs: the operator's provider is `commandcode` over the generic
+        // `open-ai` dialect, which matches no fetcher id and no dedicated dialect, so the look-up
+        // used to fall through to the generic reader and the provider vanished from the panel.
+        let registry = default_registry();
+        let account = QuotaAccount::new();
+        let command_code_base = "https://api.commandcode.ai/provider/v1";
+        let found = |provider_id: &str, base_url: Option<&str>| {
+            registry
+                .lookup(Dialect::OpenAi, provider_id, base_url, &account)
+                .map(|fetcher| fetcher.id())
+                .unwrap_or("none")
+        };
+
+        assert_eq!(
+            found("commandcode", Some(command_code_base)),
+            "command-code-go"
+        );
+        // A made-up id on the vendor's host is still the vendor: the host is the identity.
+        assert_eq!(
+            found("whatever-the-operator-called-it", Some(command_code_base)),
+            "command-code-go"
+        );
+        // A different host under the same explicitly chosen id is still the vendor: the operator
+        // named it `commandcode`, so that exact id wins over any host. The fetcher still talks to
+        // its own `/alpha` base, never the configured inference base.
+        assert_eq!(
+            found("commandcode", Some("https://api.openai.com/v1")),
+            "command-code-go"
+        );
+        // No base URL at all: the exact provider id `commandcode` still matches the vendor, because
+        // the operator chose that id themselves. Host claiming is only a backup for operators who
+        // named their connection something else.
+        assert_eq!(found("commandcode", None), "command-code-go");
+    }
+
+    #[test]
+    fn an_exact_provider_id_wins_over_a_claimed_host() {
+        // Precedence, stated as behaviour: an operator who names a provider id outranks a host that
+        // a proxy or a shared gateway happens to have in common with another vendor.
+        let registry = default_registry();
+        let account = QuotaAccount::new();
+        assert_eq!(
+            registry
+                .lookup(
+                    Dialect::OpenAi,
+                    "cursor",
+                    Some("https://api.commandcode.ai/provider/v1"),
+                    &account,
+                )
+                .expect("the exact id claims it")
+                .id(),
+            "cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_hands_the_context_base_url_to_the_lookup_and_not_to_the_vendor() {
+        // The conductor calls `fetch`, not `lookup`, so the claim has to work through this path.
+        // It also pins the other half of the design: the configured base URL decides *who answers*
+        // and nothing else — Command Code's own calls stay on its `/alpha` base, never on the
+        // inference base `https://api.commandcode.ai/provider/v1`.
+        let fake = Arc::new(FakeHttp::serving(COMMAND_CODE_CREDITS));
+        let context = QuotaFetchContext::new("commandcode", Dialect::OpenAi, http_double(&fake))
+            .with_base_url("https://api.commandcode.ai/provider/v1")
+            .with_credential("cc-secret");
+
+        let quota = default_registry()
+            .fetch(&context)
+            .await
+            .expect("the vendor's host claims the account");
+        assert_eq!(
+            quota.source.as_deref(),
+            Some(crate::quota::commandcode::CommandCode::ID)
+        );
+        // remaining = 10 + 5 + 1.5, period spend unknown through one canned reply, so the pool is
+        // the headline: 0 used of 16.5.
+        assert_eq!(quota.used, 0.0);
+        assert_eq!(quota.total, 16.5);
+
+        let requests = fake.requests();
+        assert!(!requests.is_empty(), "the reader made its calls");
+        for request in &requests {
+            // Every call hangs off the host root (`/alpha/...`), never under the configured
+            // inference path. The exact host is pinned by `commandcode.rs`, which owns the
+            // environment override and the lock around it; here the point is that the inference
+            // base was used to *choose* this reader and not to *call* it.
+            assert!(
+                request.url.contains("/alpha/"),
+                "not an /alpha surface call: {}",
+                request.url
+            );
+            assert!(
+                !request.url.contains("/provider/v1"),
+                "the inference base must not become a quota base: {}",
+                request.url
+            );
+        }
     }
 }

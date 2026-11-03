@@ -5,7 +5,7 @@
 // provider allowance.
 
 import { api } from './api.js';
-import { h, emptyState, errorBlock, toggle } from './dom.js';
+import { h, chip, emptyState, errorBlock, toggle } from './dom.js';
 import {
   QUOTA_FAMILIES, formatQuotaAge, formatQuotaUsage, formatPercent, formatResetIn,
 } from './format.js';
@@ -71,7 +71,7 @@ export async function renderQuota(mount, ctx) {
   function render() {
     const toolbar = h('div', { class: 'toolbar' });
     const refreshButton = h('button', {
-      class: 'btn primary',
+      class: 'btn btn-primary',
       type: 'button',
       disabled: refreshAllBusy || busyAccounts.size > 0,
       onclick: refreshAll,
@@ -98,14 +98,15 @@ export async function renderQuota(mount, ctx) {
     children.push(h('p', { class: 'quota-legend' },
       h('span', { class: 'swatch', 'aria-hidden': 'true' }), ' remaining', ' · gray = used'));
 
-    children.push(renderUsage());
-
+    // Allowances first, traffic second: the question this page answers is "how much is left",
+    // and the request ledger is the supporting detail underneath it.
     if (!accountRows.length) {
-      children.push(emptyState('No provider accounts found.',
-        'Add an account before fetching provider quota.'));
+      children.push(emptyState('No provider reports a quota.',
+        'Add an account, or check a provider whose upstream exposes its remaining allowance.'));
     } else {
       for (const row of accountRows) children.push(renderAccount(row));
     }
+    children.push(renderUsage());
     mount.replaceChildren(...children);
   }
 
@@ -170,6 +171,8 @@ export async function renderQuota(mount, ctx) {
     const title = `${provider.id} · ${label}`;
     const card = h('section', { class: 'card quota-account' });
     const header = h('div', { class: 'toolbar' }, h('h2', {}, title));
+    const neverFetched = record?.fetched_at == null ? chip('never fetched', 'chip-amber', 'No provider quota snapshot cached yet') : null;
+    if (neverFetched) header.append(neverFetched);
     const refreshButton = h('button', {
       class: 'btn',
       type: 'button',
@@ -378,24 +381,15 @@ function recordsFrom(data) {
 }
 
 function buildAccountRows(providers, records) {
+  // The control plane decides which accounts have a quota worth showing: it omits the ones whose
+  // provider reports no allowance at all. Rendering every configured account here would put those
+  // back on the page with invented `0/0` windows, so the rows come from the quota response.
   const rows = [];
-  const seen = new Set();
-  for (const provider of providers) {
-    for (const account of provider.accounts ?? []) {
-      if (!account?.id) continue;
-      const key = recordKey(provider.id, account.id);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      rows.push({ provider, account, key });
-    }
-  }
+  const byProvider = new Map(providers.map((provider) => [provider.id, provider]));
   for (const [key, record] of records) {
-    if (seen.has(key)) continue;
-    const provider = { id: record.provider || '(unknown provider)' };
-    const account = {
-      id: record.account,
-      label: record.label || record.account,
-    };
+    const provider = byProvider.get(record.provider) ?? { id: record.provider || '(unknown provider)' };
+    const account = (provider.accounts ?? []).find((candidate) => candidate.id === record.account)
+      ?? { id: record.account, label: record.label || record.account };
     rows.push({ provider, account, key });
   }
   return rows;

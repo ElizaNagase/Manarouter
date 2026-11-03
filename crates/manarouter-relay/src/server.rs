@@ -21,9 +21,11 @@
 //! What the race does with a winner that dies mid-stream lives in [`crate::recovery`]. The commit
 //! happens when the upstream response arrives, before the body streams, so the relay wraps the
 //! winner's body: a failure after that point is recovered from a participant that already passed
-//! the race, under the combo's `midstream_policy`. Of the four `WinnerFailMode`s only
-//! `pick-highest-passed` is implemented; the others are accepted configuration and are reported in
-//! the log.
+//! the race, under the combo's `midstream_policy`. All four `WinnerFailMode`s are implemented:
+//! `pick-highest-passed` (the default) spends no extra upstream work because the participants that
+//! passed the race are already in hand, `pick-highest-passed-different-provider` filters those same
+//! participants to another provider, and `rerun-excluding` and `stable-fallback` re-dispatch, bounded
+//! by `max_rounds` (one round for `stable-fallback`).
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -32,15 +34,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body as AxumBody;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
+use axum::Json;
 use axum::Router;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, BodyStream, StreamBody};
 use mr_core::dialect::{AuthKind, Dialect, InputModality, ReasoningLevel, RouteKind};
+use mr_core::ids::ProviderId;
 use mr_core::oauth::platform as oauth_platform;
 use mr_core::oauth::refresh::Refresher;
 use mr_core::secret::Vault;
@@ -50,6 +54,7 @@ use mr_dialects::{translate_request, TranslateCtx};
 
 use crate::model_scan::{scan_request_head, RequestHead};
 use crate::proxy::{self, ProxyEndpoint};
+use crate::recovery::RerunFactory;
 use crate::select::{self, Health};
 use crate::state::{AuthOutcome, ProxyLease, RelayState, RouteTable};
 use crate::upstream::{UpstreamError, UpstreamRequest};
@@ -130,6 +135,12 @@ pub struct AppState {
     pub quota: Arc<crate::quota::QuotaManager>,
     /// Bounded combo-wide successful-step memory; reset when the relay process restarts.
     pub sticky_success: Arc<crate::sticky::StickySuccess>,
+    /// The last few combo decisions, for the panel's live view.
+    ///
+    /// An `Arc` swapped nowhere and locked briefly: it is read by `GET /control/activity` and
+    /// written once per combo request, so it costs one uncontended lock on a path that has
+    /// already done several orders of magnitude more work.
+    pub activity: Arc<crate::activity::ActivityLog>,
 }
 
 /// Build the route table.
@@ -149,6 +160,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/messages", any(dispatch_anthropic))
         .route("/v1/messages/count_tokens", any(dispatch_anthropic))
         .route("/v1/models", any(list_models))
+        .route("/control/probe", post(control_probe))
+        .route("/control/activity", get(control_activity))
         .with_state(state)
 }
 
@@ -162,6 +175,112 @@ async fn healthz() -> impl IntoResponse {
         StatusCode::OK,
         [("content-type", "application/json")],
         r#"{"status":"ok"}"#,
+    )
+}
+
+/// What the control plane asks a probe to run.
+#[derive(Debug, serde::Deserialize)]
+struct ProbeRequest {
+    /// The model or combo name, exactly as a client would send it.
+    model: String,
+    /// The prompt. Kept tiny: a probe answers "did this route work", not "is this model clever".
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+/// `POST /control/probe` — run one real request for the control plane.
+///
+/// The panel's "test model" and the combo health check used to speak the OpenAI shape themselves,
+/// which meant they could only ever test OpenAI-shaped dialects and refused everything else. That
+/// made the checks useless for exactly the routes worth checking (Codex, Antigravity, Command
+/// Code). This endpoint runs the request through the same dispatch a client uses — routing table,
+/// dialect translation, account selection, cooldowns, fallbacks — and returns the ordinary OpenAI
+/// response, so a check means "this route answers right now" rather than "this route is shaped
+/// like the tester".
+///
+/// **Loopback only.** The instance binds a LAN or tailnet interface in normal use, and this route
+/// deliberately skips the client-key check, so anything that is not a local caller is refused
+/// before the body is read. A local process already runs as the operator and can read the vault.
+async fn control_probe(
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    State(app): State<AppState>,
+    Json(body): Json<ProbeRequest>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            [("content-type", "application/json")],
+            r#"{"error":{"code":"probe_not_local","message":"the probe endpoint only accepts loopback callers"}}"#,
+        )
+            .into_response();
+    }
+    let prompt = body
+        .prompt
+        .filter(|prompt| !prompt.trim().is_empty())
+        .unwrap_or_else(|| "Reply with the single word OK.".to_owned());
+    let payload = serde_json::json!({
+        "model": body.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 32,
+        "stream": false,
+    });
+    let Ok(bytes) = serde_json::to_vec(&payload) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(uri) = "/v1/chat/completions".parse::<Uri>() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    dispatch_routed(
+        DispatchRequest {
+            app,
+            client_dialect: Dialect::OpenAi,
+            method: Method::POST,
+            uri,
+            headers: HeaderMap::new(),
+            body: AxumBody::from(bytes),
+            pre_authorized: true,
+        },
+        0,
+        None,
+    )
+    .await
+}
+
+/// `GET /control/activity` — the relay's own view of what its combos are doing.
+///
+/// The panel asks this while a request is streaming, so the answer has to come from the process
+/// that made the decision: only the relay knows which step it committed to, and only the body it
+/// handed to the client knows when it stopped being in flight.
+///
+/// **Loopback only**, for the same reason as the probe: it bypasses the client-key check, and the
+/// relay may bind a LAN or tailnet interface. What it returns is bounded and boring on purpose —
+/// combo and model names, the step chosen, timestamps, and the account ids currently cooling down.
+/// No credential, no label, no URL, no request body.
+async fn control_activity(
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    State(app): State<AppState>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            [("content-type", "application/json")],
+            r#"{"error":{"code":"activity_not_local","message":"the activity endpoint only accepts loopback callers"}}"#,
+        )
+            .into_response();
+    }
+    let entries: Vec<serde_json::Value> = app
+        .activity
+        .snapshot()
+        .iter()
+        .map(crate::activity::Entry::to_json)
+        .collect();
+    // The cooldown map is reported as the relay holds it, expired-but-not-yet-cleared entries
+    // included: the relay's own selection uses `until_ms` against its clock, and hiding a stale
+    // entry here would make this view disagree with the decisions it is meant to explain.
+    let cooldowns = crate::select::Health::snapshot(&app.health);
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({ "entries": entries, "cooldowns": cooldowns }),
     )
 }
 
@@ -488,6 +607,43 @@ fn merge_reasoning(
 }
 
 /// The shared path for every model route.
+/// Ask an OpenAI-shaped upstream to report token usage on a stream.
+///
+/// Without `stream_options.include_usage` the final chunk of a stream carries no usage at all, so a
+/// streamed request is billed as zero tokens against a token cap. A body that is not streaming, or
+/// that already states a preference, is returned untouched — including one that does not parse: it
+/// is the client's request verbatim, and rewriting it into an error because the router could not
+/// see through it would be a worse answer than a miscount.
+fn with_stream_usage(body: Bytes) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    if value.get("stream") != Some(&serde_json::Value::Bool(true)) {
+        return body;
+    }
+    if value.pointer("/stream_options/include_usage").is_some() {
+        return body;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return body;
+    };
+    match object.get_mut("stream_options") {
+        Some(serde_json::Value::Object(options)) => {
+            options.insert("include_usage".into(), serde_json::Value::Bool(true));
+        }
+        _ => {
+            object.insert(
+                "stream_options".into(),
+                serde_json::json!({"include_usage": true}),
+            );
+        }
+    }
+    match serde_json::to_vec(&value) {
+        Ok(encoded) => Bytes::from(encoded),
+        Err(_) => body,
+    }
+}
+
 fn inject_antigravity_project(
     outgoing: &[u8],
     tokens: Option<&mr_core::oauth::TokenSet>,
@@ -529,6 +685,12 @@ struct DispatchRequest {
     headers: HeaderMap,
     /// The request body, still unread.
     body: AxumBody,
+    /// Whether this request already proved it may run, so the key check is skipped.
+    ///
+    /// Only the loopback control-plane probe sets this, and the probe handler refuses anything that
+    /// did not arrive over the loopback interface. It is not a bypass of the *routing* rules: the
+    /// request goes through the same resolution, dialects, accounts and fallbacks a client would.
+    pre_authorized: bool,
 }
 
 async fn dispatch(
@@ -547,6 +709,7 @@ async fn dispatch(
             uri,
             headers,
             body,
+            pre_authorized: false,
         },
         0,
         None,
@@ -658,12 +821,21 @@ async fn dispatch_routed(
         uri,
         headers,
         body,
+        pre_authorized,
     } = request;
     let started = std::time::Instant::now();
 
     // --- Authentication, before anything reads the body. ---
+    //
+    // The control-plane probe has already been authenticated by its own handler, which refuses
+    // every caller that is not on the loopback interface. Representing that as the `Open` outcome
+    // is exact: no client key was presented, nothing is metered, and the request is admitted.
     let presented = presented_key(&headers);
-    let auth = authenticate_request(&app.relay, app.no_key_required, presented.as_deref());
+    let auth = if pre_authorized {
+        AuthOutcome::Open
+    } else {
+        authenticate_request(&app.relay, app.no_key_required, presented.as_deref())
+    };
     if !auth.is_allowed() {
         return auth_error(&auth, client_dialect);
     }
@@ -860,11 +1032,19 @@ async fn dispatch_routed(
     // The model the request should be retried against when no step can carry its modality.
     let mut fallback_target: Option<String> = None;
 
+    // What this request is filed under, when it is combo activity at all: the combo it resolved to
+    // and the name the client actually sent. A direct model is `None`, so the recording helpers
+    // below are no-ops for it — a plain model request is not a combo decision.
+    let activity = combo.map(|combo| (combo.name.as_str(), model_name));
+    // The last step the relay actually dispatched. Reported when no step answers, so the entry
+    // still names a step rather than an empty string.
+    let mut attempted: Option<String> = None;
+
     // The inputs every attempt needs. The same context serves the ordinary chain below and the
     // hedged race, so the two cannot drift apart.
     let attempt_ctx = AttemptContext {
         app: &app,
-        table: &table,
+        table: Arc::clone(&table),
         now_ms,
         combo,
         client_dialect,
@@ -907,8 +1087,16 @@ async fn dispatch_routed(
                     "hedged race"
                 );
                 match run_hedge(&attempt_ctx, &participants, &combo.hedge).await {
-                    HedgeOutcome::Won(response) => return response,
-                    HedgeOutcome::Fatal(response) => return response,
+                    HedgeOutcome::Won { response, winner } => {
+                        return served_combo(&app, activity, winner, now_ms, response);
+                    }
+                    HedgeOutcome::Fatal {
+                        response,
+                        attempted: step,
+                    } => {
+                        failed_combo(&app, activity, Some(&step), now_ms);
+                        return response;
+                    }
                     HedgeOutcome::NoWinner {
                         last_failure: failure,
                         fallback_target: target,
@@ -925,6 +1113,9 @@ async fn dispatch_routed(
                         // steps that were not in the race, so a failed race does not send the
                         // same request to the same provider twice.
                         raced = participants.clone();
+                        if activity.is_some() {
+                            attempted = participants.last().map(|step| participant_id(step));
+                        }
                     }
                 }
             }
@@ -937,8 +1128,28 @@ async fn dispatch_routed(
             continue;
         }
         let is_sticky = sticky_step_is(combo, sticky_index, step);
+        if activity.is_some() {
+            attempted = Some(participant_id(step));
+        }
         match attempt_step(&attempt_ctx, step, is_sticky).await {
-            Attempt::Answer(response) => return response,
+            Attempt::Answer(response) => {
+                // A non-hedge step has no replacement, but the body still needs to be buffered to
+                // event boundaries so that a mid-stream death never hands the client half a frame.
+                let wrapped = crate::recovery::wrap(
+                    response,
+                    Vec::new(),
+                    crate::recovery::RecoveryConfig {
+                        policy: combo.map(|c| c.midstream_policy).unwrap_or_default(),
+                        mode: mr_core::dialect::WinnerFailMode::PickHighestPassed,
+                        client_dialect,
+                        winner_id: participant_id(step),
+                        announceable: false,
+                        rerun_factory: None,
+                        rerun_max_rounds: 0,
+                    },
+                );
+                return served_combo(&app, activity, participant_id(step), now_ms, wrapped);
+            }
             Attempt::Failed {
                 response,
                 sticky_cleared,
@@ -959,7 +1170,10 @@ async fn dispatch_routed(
                     fallback_target = target;
                 }
             }
-            Attempt::Fatal { response } => return response,
+            Attempt::Fatal { response } => {
+                failed_combo(&app, activity, attempted.as_deref(), now_ms);
+                return response;
+            }
         }
     }
 
@@ -999,6 +1213,9 @@ async fn dispatch_routed(
                         uri,
                         headers,
                         body: AxumBody::from(retry_body),
+                        // The re-entry is the same request, so it keeps whatever authorization
+                        // the original carried — including the control-plane probe's.
+                        pre_authorized,
                     },
                     fallback_depth + 1,
                     Some(table),
@@ -1019,14 +1236,27 @@ async fn dispatch_routed(
     // Every step was tried. Where a provider gave a specific error, that is more informative than
     // anything synthesized here, so it is returned. Where the accounts were the problem, the answer
     // is our own 429 with the earliest known recovery.
+    failed_combo(&app, activity, attempted.as_deref(), now_ms);
     match last_failure {
         Some(r) => r,
         None => {
+            // The wait is named in the message, not only in `Retry-After`. A header is invisible to
+            // whoever reads the error body, and "cooling down" without a duration reads as broken:
+            // the operator cannot tell a four-second backoff from a four-day one.
+            let message = match app.health.earliest_reset() {
+                Some(until) if until > now_ms => format!(
+                    "every step for this model has an account cooling down or unavailable; the \
+                     earliest of them recovers in {}",
+                    humanize_wait(until.saturating_sub(now_ms) / 1000)
+                ),
+                _ => "every step for this model has an account cooling down or unavailable"
+                    .to_owned(),
+            };
             let mut response = error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 client_dialect,
                 "no_usable_accounts",
-                "every step for this model has an account cooling down or unavailable",
+                &message,
             );
             if let Some(until) = app.health.earliest_reset() {
                 let secs = until.saturating_sub(now_ms) / 1000;
@@ -1038,6 +1268,33 @@ async fn dispatch_routed(
             }
             response
         }
+    }
+}
+
+/// A duration in the units a person reads, for a message that has to stay short.
+///
+/// One unit of detail below the largest: an hour and four minutes is `1h 4m`, not `3844s`, because
+/// the reader's question is "should I wait, or should I go and fix something".
+fn humanize_wait(secs: u64) -> String {
+    if secs == 0 {
+        return "moments".to_owned();
+    }
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let (minutes, rest) = (secs / 60, secs % 60);
+    if minutes < 60 {
+        return if rest == 0 {
+            format!("{minutes}m")
+        } else {
+            format!("{minutes}m {rest}s")
+        };
+    }
+    let (hours, rest) = (minutes / 60, minutes % 60);
+    if rest == 0 {
+        format!("{hours}h")
+    } else {
+        format!("{hours}h {rest}m")
     }
 }
 
@@ -1092,7 +1349,7 @@ struct AttemptContext<'a> {
     /// The relay's shared state.
     app: &'a AppState,
     /// The routing table the request is pinned to.
-    table: &'a RouteTable,
+    table: Arc<RouteTable>,
     /// The wall clock the account selection uses.
     now_ms: u64,
     /// The combo the request resolved to, when it resolved to one.
@@ -1131,6 +1388,161 @@ struct AttemptContext<'a> {
     sticky_index: Option<usize>,
 }
 
+/// What one candidate account can contribute to an attempt.
+///
+/// The distinction is the whole point of this type: a credential that cannot be resolved is a
+/// statement about *one account*, so it moves the step to its next candidate, while a vault that
+/// cannot be read is a statement about the relay and ends the request.
+enum AccountCredential {
+    /// The account can serve. `credential` is what goes on the wire, if anything.
+    Usable {
+        credential: Option<String>,
+        /// Platform-specific headers an OAuth credential contributes, beyond its bearer token.
+        oauth_headers: Vec<(HeaderName, HeaderValue)>,
+        /// The full token set, for the steps that need more than the access token itself.
+        oauth_tokens: Option<mr_core::oauth::TokenSet>,
+    },
+    /// This account's credential cannot be used; the step should try its next candidate.
+    Unusable(CredentialMiss),
+    /// The vault could not be read at all, so no account's credential can be judged.
+    VaultUnreadable(mr_core::error::Error),
+}
+
+/// Why one account's credential could not be used.
+enum CredentialMiss {
+    /// Nothing is stored under the account's vault reference — the normal state between adding an
+    /// account and attaching its key, and not something waiting can fix.
+    Missing,
+    /// Something is referenced but cannot be turned into a usable credential: the OAuth metadata is
+    /// missing or mismatched, the platform is not in this build, or the refresh was rejected.
+    Unusable,
+}
+
+/// Resolve one account's credential, without treating a missing one as an error.
+///
+/// Separate from [`attempt_step`] so each per-account case — a missing secret, an OAuth reference
+/// with no metadata, a refresh the provider rejected — can be exercised without a live upstream.
+async fn account_credential(
+    app: &AppState,
+    step: &StepPlan,
+    account: &mr_core::snapshot::AccountPlan,
+) -> AccountCredential {
+    let Some(oauth_ref) = account.oauth_ref.as_deref() else {
+        return match account.secret_ref.as_deref() {
+            Some(id) => match app.vault.get(id) {
+                Ok(Some(value)) => AccountCredential::Usable {
+                    credential: Some(value),
+                    oauth_headers: Vec::new(),
+                    oauth_tokens: None,
+                },
+                // A miss deserves a second look at the file. The relay's vault is a snapshot taken
+                // when the process started, while the panel and `mr` write credentials into that
+                // same vault at any moment — so "nothing under this reference" can simply mean
+                // "nothing there when we started". Re-reading once turns a permanent-looking
+                // failure into a credential that works as soon as it is added, without waiting for
+                // a restart nobody knows to perform.
+                Ok(None) => match app.vault.refreshed() {
+                    Ok(fresh) => match fresh.get(id) {
+                        Ok(Some(value)) => {
+                            tracing::info!(
+                                account = %account.id,
+                                "credential was stored after the relay started; using it"
+                            );
+                            AccountCredential::Usable {
+                                credential: Some(value),
+                                oauth_headers: Vec::new(),
+                                oauth_tokens: None,
+                            }
+                        }
+                        Ok(None) => {
+                            tracing::warn!(account = %account.id, "no credential in the vault for this account");
+                            AccountCredential::Unusable(CredentialMiss::Missing)
+                        }
+                        Err(e) => AccountCredential::VaultUnreadable(e),
+                    },
+                    // The file could not be re-read at all: that is a vault problem, not a missing
+                    // secret, and it is reported as such.
+                    Err(e) => AccountCredential::VaultUnreadable(e),
+                },
+                Err(e) => AccountCredential::VaultUnreadable(e),
+            },
+            // A compiled static account always names a vault slot — `account_plan` resolves the
+            // conventional id for it — so an account with no reference at all has nothing to
+            // attach, which is the same problem as a reference with nothing stored under it.
+            None => AccountCredential::Unusable(CredentialMiss::Missing),
+        };
+    };
+
+    let oauth_id = mr_core::OAuthCredentialId::from_raw(oauth_ref);
+    let AuthKind::OAuth { platform } = &step.auth else {
+        tracing::error!(account = %account.id, "OAuth account is attached to non-OAuth provider auth");
+        return AccountCredential::Unusable(CredentialMiss::Unusable);
+    };
+    let record = match app.oauth_store.get_oauth_credential(&oauth_id) {
+        Ok(Some(record)) if record.platform == *platform => record,
+        _ => {
+            tracing::warn!(account = %account.id, "OAuth credential metadata is missing or mismatched");
+            return AccountCredential::Unusable(CredentialMiss::Unusable);
+        }
+    };
+    let Some(oauth_platform) = oauth_platform(platform) else {
+        tracing::error!(platform, "OAuth platform is not available in this build");
+        return AccountCredential::Unusable(CredentialMiss::Unusable);
+    };
+    let Some(refresher) = app.oauth_refreshers.get(platform) else {
+        tracing::warn!(
+            platform,
+            "no OAuth refresher is registered for this platform"
+        );
+        return AccountCredential::Unusable(CredentialMiss::Unusable);
+    };
+    match refresher.ensure_fresh(&record.vault_ref, false).await {
+        Ok(tokens) => AccountCredential::Usable {
+            credential: Some(tokens.access_token.clone()),
+            oauth_headers: oauth_platform.apply_credential(&tokens),
+            oauth_tokens: Some(tokens),
+        },
+        Err(failure) => {
+            // A refresh the provider rejected is this account's problem. A sibling account may
+            // hold a credential that works, so the step moves on rather than failing outright.
+            tracing::warn!(platform, class = %failure.class, "OAuth credential refresh failed");
+            AccountCredential::Unusable(CredentialMiss::Unusable)
+        }
+    }
+}
+
+/// The client-facing reason a step had candidate accounts but no usable credential among them.
+///
+/// Both causes are reported rather than only the first, because one step can mix them and naming a
+/// single one would describe a different problem from the one that exists.
+fn no_credential_message(
+    provider: &mr_core::snapshot::ProviderPlan,
+    model: &str,
+    missing: usize,
+    unusable: usize,
+) -> String {
+    let mut causes = Vec::with_capacity(2);
+    if missing == 1 {
+        causes.push("1 account has no credential in the vault".to_owned());
+    } else if missing > 1 {
+        causes.push(format!(
+            "{missing} accounts have no credential in the vault"
+        ));
+    }
+    if unusable == 1 {
+        causes.push("1 account's credential cannot be used".to_owned());
+    } else if unusable > 1 {
+        causes.push(format!("{unusable} accounts' credentials cannot be used"));
+    }
+    format!(
+        "no account for model \"{model}\" on `{}` has a usable credential: {}; attach one with \
+         `mr account add {} --secret-stdin`",
+        provider.id,
+        causes.join(", "),
+        provider.id
+    )
+}
+
 /// Run one attempt at one step.
 ///
 /// This is the body of the step loop, extracted so that the same code can run in the ordinary
@@ -1143,7 +1555,7 @@ struct AttemptContext<'a> {
 /// outcome carries a `sticky_cleared` flag rather than the caller deciding it.
 async fn attempt_step(actx: &AttemptContext<'_>, step: &StepPlan, is_sticky_step: bool) -> Attempt {
     let app = actx.app;
-    let table = actx.table;
+    let table = actx.table.clone();
     // The cooldown view is taken per attempt rather than once for the whole request, so that a
     // race sees the accounts that the other participants just cooled down.
     let health = app.health.view();
@@ -1199,14 +1611,15 @@ async fn attempt_step(actx: &AttemptContext<'_>, step: &StepPlan, is_sticky_step
     }
 
     let account_counter = table.advance_rr(&unique_counter_key(step));
-    let Some(account) = select::pick_account(
+    let candidates = select::account_candidates(
         provider,
         provider.key_strategy,
         account_counter,
         &health,
         now_ms,
         &step.model,
-    ) else {
+    );
+    if candidates.is_empty() {
         if is_sticky_step {
             if let Some(combo) = combo {
                 app.sticky_success.clear(&combo.id);
@@ -1217,91 +1630,67 @@ async fn attempt_step(actx: &AttemptContext<'_>, step: &StepPlan, is_sticky_step
             sticky_cleared,
             fallback_target: fallback_target.take(),
         };
-    };
+    }
 
+    // --- The credential, for each candidate until one can serve. ---
+    //
     // The credential comes from the vault, never from the configuration, and is never logged.
     // OAuth references resolve to a full token set and platform-specific request headers.
-    let mut oauth_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
-    let mut oauth_tokens: Option<mr_core::oauth::TokenSet> = None;
-    let credential = if let Some(oauth_ref) = account.oauth_ref.as_deref() {
-        let oauth_id = mr_core::OAuthCredentialId::from_raw(oauth_ref);
-        let AuthKind::OAuth { platform } = &step.auth else {
-            tracing::error!(account = %account.id, "OAuth account is attached to non-OAuth provider auth");
-            return Attempt::Skip {
-                sticky_cleared,
-                fallback_target: fallback_target.take(),
-            };
-        };
-        let record = match app.oauth_store.get_oauth_credential(&oauth_id) {
-            Ok(Some(record)) if record.platform == *platform => record,
-            _ => {
-                tracing::warn!(account = %account.id, "OAuth credential metadata is missing or mismatched");
-                return Attempt::Skip {
-                    sticky_cleared,
-                    fallback_target: fallback_target.take(),
-                };
+    //
+    // A credential is a property of the *account*, so an account without one is skipped and the
+    // next candidate is tried. Failing the step here would refuse a request a sibling account can
+    // serve perfectly well, which is the whole point of a provider holding several keys. Cooling
+    // the account down would be wrong as well: a missing credential will not reappear with time,
+    // and the cooldown would keep excluding an account that is fine from every later request.
+    let mut without_credential = 0usize;
+    let mut unusable_credential = 0usize;
+    let mut chosen = None;
+    for candidate in candidates {
+        match account_credential(app, step, candidate).await {
+            AccountCredential::Usable {
+                credential,
+                oauth_headers,
+                oauth_tokens,
+            } => {
+                chosen = Some((candidate, credential, oauth_headers, oauth_tokens));
+                break;
             }
-        };
-        let Some(oauth_platform) = oauth_platform(platform) else {
-            tracing::error!(platform, "OAuth platform is not available in this build");
-            return Attempt::Skip {
-                sticky_cleared,
-                fallback_target: fallback_target.take(),
-            };
-        };
-        let Some(refresher) = app.oauth_refreshers.get(platform) else {
-            return Attempt::Skip {
-                sticky_cleared,
-                fallback_target: fallback_target.take(),
-            };
-        };
-        match refresher.ensure_fresh(&record.vault_ref, false).await {
-            Ok(tokens) => {
-                oauth_headers = oauth_platform.apply_credential(&tokens);
-                oauth_tokens = Some(tokens.clone());
-                Some(tokens.access_token.clone())
-            }
-            Err(failure) => {
-                tracing::warn!(platform, class = %failure.class, "OAuth credential refresh failed");
-                return Attempt::Skip {
-                    sticky_cleared,
-                    fallback_target: fallback_target.take(),
+            AccountCredential::Unusable(CredentialMiss::Missing) => without_credential += 1,
+            AccountCredential::Unusable(CredentialMiss::Unusable) => unusable_credential += 1,
+            AccountCredential::VaultUnreadable(e) => {
+                // A vault that cannot be decrypted is not an account problem: every account would
+                // fail the same way, and reporting it as one account's failure would hide the real
+                // cause behind a symptom.
+                tracing::error!(error = %e, "the credential vault could not be read");
+                return Attempt::Fatal {
+                    response: error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        client_dialect,
+                        "vault_error",
+                        "the credential vault could not be read",
+                    ),
                 };
             }
         }
-    } else {
-        match account.secret_ref.as_deref() {
-            Some(id) => match app.vault.get(id) {
-                Ok(Some(v)) => Some(v),
-                Ok(None) => {
-                    tracing::warn!(account = %account.id, "no credential in the vault for this account");
-                    let reason = select::CooldownReason::AuthFailed;
-                    app.health.cool_down(
-                        account.id.as_str(),
-                        select::cooldown_until(reason, 0, None, quota),
-                        reason,
-                    );
-                    return Attempt::Skip {
-                        sticky_cleared,
-                        fallback_target: fallback_target.take(),
-                    };
-                }
-                Err(e) => {
-                    // A vault that cannot be decrypted is not an account problem, and cooling the
-                    // account down would hide the real cause behind a symptom.
-                    tracing::error!(error = %e, "the credential vault could not be read");
-                    return Attempt::Fatal {
-                        response: error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            client_dialect,
-                            "vault_error",
-                            "the credential vault could not be read",
-                        ),
-                    };
-                }
-            },
-            None => None,
-        }
+    }
+    let Some((account, credential, oauth_headers, oauth_tokens)) = chosen else {
+        // Every candidate was unusable for the same kind of reason, and it is not a cooldown: no
+        // amount of waiting produces a credential. Saying so sends the operator to the account that
+        // needs one; blaming a cooldown would send them to look at the wrong state.
+        return Attempt::Failed {
+            response: Some(error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                client_dialect,
+                "no_usable_accounts",
+                &no_credential_message(
+                    provider,
+                    &step.model,
+                    without_credential,
+                    unusable_credential,
+                ),
+            )),
+            sticky_cleared,
+        };
     };
 
     // --- Dialect translation, per step, because the upstream dialect belongs to the provider
@@ -1346,6 +1735,13 @@ async fn attempt_step(actx: &AttemptContext<'_>, step: &StepPlan, is_sticky_step
             ),
             None => (bytes.clone(), false, None, None, false),
         };
+    // Ask for usage on streams. An OpenAI-compatible upstream reports none unless it is asked, and
+    // the relay then records the request as costing zero tokens — which the quota layer sums as
+    // zero, so every token cap silently stops binding for streamed traffic. Only a body that is
+    // already streaming is touched.
+    if matches!(step.dialect, Dialect::OpenAi | Dialect::Copilot) {
+        outgoing = with_stream_usage(outgoing);
+    }
     if step.dialect == Dialect::Antigravity {
         match inject_antigravity_project(&outgoing, oauth_tokens.as_ref()) {
             Ok(body) => outgoing = body.into(),
@@ -1609,7 +2005,12 @@ type PendingAttempt<'a> = Pin<Box<dyn Future<Output = (usize, Attempt)> + Send +
 /// The outcome of a hedged race.
 enum HedgeOutcome {
     /// A participant won; the response is ready for the client.
-    Won(Response),
+    Won {
+        /// The winner's client-facing response.
+        response: Response,
+        /// The winner, as `provider/model`, so the decision can be recorded.
+        winner: String,
+    },
     /// No participant produced an answer; the caller continues with the ordinary chain.
     NoWinner {
         /// The last failure seen, to report if the ordinary chain also fails.
@@ -1621,7 +2022,12 @@ enum HedgeOutcome {
         sticky_cleared: bool,
     },
     /// A participant failed in a way that ends the request rather than the race.
-    Fatal(Response),
+    Fatal {
+        /// The response the client receives.
+        response: Response,
+        /// The participant whose failure ended the race, as `provider/model`.
+        attempted: String,
+    },
 }
 
 /// How a race participant is named in the recovery boundary.
@@ -1631,17 +2037,62 @@ fn participant_id(step: &StepPlan) -> String {
     format!("{}/{}", step.provider_id, step.model)
 }
 
+/// File a served combo answer and keep its record open for as long as the client's body.
+///
+/// `activity` is `None` for a direct model, so this is a no-op there: a name that did not resolve
+/// to a combo is not a combo decision, and pretending otherwise would fill the panel with requests
+/// the operator never created a route for.
+///
+/// The guard is attached to the body rather than dropped here because "in flight" means "the client
+/// is still receiving it". Dropping it at the return would mark the decision finished before the
+/// first byte went out.
+fn served_combo(
+    app: &AppState,
+    activity: Option<(&str, &str)>,
+    step: String,
+    started_at: u64,
+    response: Response,
+) -> Response {
+    let Some((combo, requested)) = activity else {
+        return response;
+    };
+    let guard = app.activity.begin(combo, requested, &step, started_at);
+    crate::activity::watch(response, guard)
+}
+
+/// File a combo decision that ended without an answer.
+///
+/// `attempted` is `None` when no step was ever dispatched — every step was skipped for a modality
+/// the route cannot carry. There is no decision to report then: the request was rerouted rather
+/// than committed to a step, and an entry naming an untried step would be a fabrication.
+fn failed_combo(
+    app: &AppState,
+    activity: Option<(&str, &str)>,
+    attempted: Option<&str>,
+    started_at: u64,
+) {
+    let (Some((combo, requested)), Some(step)) = (activity, attempted) else {
+        return;
+    };
+    app.activity.failed(combo, requested, step, started_at);
+}
+
 /// The participants that passed the race, in priority order, ready to answer in the winner's place.
 ///
 /// "Passed" is the eligibility gate, not "answered eventually": a participant that replied after
 /// the window keeps no priority protection, and the operator's rule is about the ones that fit the
 /// latency requirement. The winner itself is not in the list — it is the one that died.
+///
+/// When `exclude_provider` is `Some` (for `pick-highest-passed-different-provider`), replacements
+/// backed by that provider are dropped: a whole-provider outage must not be answered by a sibling
+/// model on the same provider.
 fn passed_replacements(
     outcomes: &mut [Option<Attempt>],
     states: &[select::Participant],
     winner: usize,
     window_ms: u64,
     participants: &[&StepPlan],
+    exclude_provider: Option<ProviderId>,
 ) -> Vec<crate::recovery::Replacement> {
     let mut passed = Vec::new();
     for (index, outcome) in outcomes.iter_mut().enumerate() {
@@ -1650,6 +2101,13 @@ fn passed_replacements(
         }
         if !states[index].replied_in_window(window_ms) {
             continue;
+        }
+        // `pick-highest-passed-different-provider`: skip a sibling on the same provider as the
+        // one that died, since it would fail in exactly the same way.
+        if let Some(ref excluded) = exclude_provider {
+            if participants[index].provider_id == *excluded {
+                continue;
+            }
         }
         // The answer is already in the race's result set; only its body has not been read.
         if let Some(Attempt::Answer(response)) = outcome.take() {
@@ -1660,6 +2118,90 @@ fn passed_replacements(
         }
     }
     passed
+}
+
+/// An owned snapshot of everything `attempt_step` needs, so that a fallback task spawned for
+/// `rerun-excluding` or `stable-fallback` can run without borrowing the live request's context.
+///
+/// All fields are `'static` (the relay state is `Arc`-backed and the per-request scalars are
+/// copied), so the whole struct can be moved into a `tokio::spawn`'d task.
+#[derive(Clone)]
+struct OwnedAttempt {
+    app: AppState,
+    table: Arc<RouteTable>,
+    now_ms: u64,
+    combo: Option<mr_core::snapshot::ComboPlan>,
+    client_dialect: Dialect,
+    method: Method,
+    headers: HeaderMap,
+    head: RequestHead,
+    bytes: Bytes,
+    model_name: String,
+    route: RouteKind,
+    uri: Uri,
+    level_override: Option<ReasoningLevel>,
+    quota: mr_core::config::QuotaConfig,
+    ticket: Option<std::sync::Arc<crate::quota::QuotaTicket>>,
+    started: std::time::Instant,
+    auth_done: std::time::Duration,
+    scan_done: std::time::Duration,
+    lookup_done: std::time::Duration,
+    sticky_index: Option<usize>,
+}
+
+/// Build an `OwnedAttempt` from the borrowed `AttemptContext`, copying out the per-request values
+/// that a spawned fallback task needs to own.
+fn owned_from_actx(actx: &AttemptContext<'_>) -> OwnedAttempt {
+    OwnedAttempt {
+        app: actx.app.clone(),
+        table: actx.table.clone(),
+        now_ms: actx.now_ms,
+        combo: actx.combo.cloned(),
+        client_dialect: actx.client_dialect,
+        method: actx.method.clone(),
+        headers: actx.headers.clone(),
+        head: actx.head,
+        bytes: actx.bytes.clone(),
+        model_name: actx.model_name.to_owned(),
+        route: actx.route,
+        uri: actx.uri.clone(),
+        level_override: actx.level_override,
+        quota: actx.quota.clone(),
+        ticket: actx.ticket.clone(),
+        started: actx.started,
+        auth_done: actx.auth_done,
+        scan_done: actx.scan_done,
+        lookup_done: actx.lookup_done,
+        sticky_index: actx.sticky_index,
+    }
+}
+
+/// Run one attempt from owned data, rebuilding the borrowed `AttemptContext` for the duration of
+/// the call. Used by the fallback tasks for `rerun-excluding` and `stable-fallback`.
+async fn attempt_from_owned(owned: &OwnedAttempt, step: &StepPlan, is_sticky: bool) -> Attempt {
+    let ctx = AttemptContext {
+        app: &owned.app,
+        table: owned.table.clone(),
+        now_ms: owned.now_ms,
+        combo: owned.combo.as_ref(),
+        client_dialect: owned.client_dialect,
+        method: &owned.method,
+        headers: &owned.headers,
+        head: owned.head,
+        bytes: &owned.bytes,
+        model_name: &owned.model_name,
+        route: owned.route,
+        uri: &owned.uri,
+        level_override: owned.level_override,
+        quota: &owned.quota,
+        ticket: owned.ticket.clone(),
+        started: owned.started,
+        auth_done: owned.auth_done,
+        scan_done: owned.scan_done,
+        lookup_done: owned.lookup_done,
+        sticky_index: owned.sticky_index,
+    };
+    attempt_step(&ctx, step, is_sticky).await
 }
 
 /// Run a hedged race over a combo's participants.
@@ -1675,9 +2217,7 @@ fn passed_replacements(
 /// The commit below happens when the upstream response arrives, which is before the body streams.
 /// The winner's body is therefore wrapped by [`crate::recovery`], so that a winner which dies
 /// while its body streams can be replaced by a participant that passed the race — the
-/// highest-priority one, which is the operator's rule. Of the four `WinnerFailMode`s only
-/// `pick-highest-passed` is implemented; the others are accepted configuration and are reported in
-/// the log.
+/// highest-priority one, which is the operator's rule.
 async fn run_hedge(
     actx: &AttemptContext<'_>,
     participants: &[&StepPlan],
@@ -1746,7 +2286,10 @@ async fn run_hedge(
         // A fatal failure — a broken proxy — ends the request rather than the race. The other
         // participants are dropped with it.
         if let Attempt::Fatal { response } = attempt {
-            return HedgeOutcome::Fatal(response);
+            return HedgeOutcome::Fatal {
+                response,
+                attempted: participant_id(participants[participant]),
+            };
         }
 
         outcomes[participant] = Some(attempt);
@@ -1771,19 +2314,114 @@ async fn run_hedge(
             // winner that dies while its body streams. The participants that are still pending are
             // dropped with the race, exactly as before — their upstream connections are closed,
             // which is the documented cost of a hedge and does not change.
-            let replacements =
-                passed_replacements(&mut outcomes, &states, winner, window_ms, participants);
+            let exclude_provider = match &hedge.on_winner_fail {
+                mr_core::dialect::WinnerFailMode::PickHighestPassedDifferentProvider => {
+                    Some(participants[winner].provider_id.clone())
+                }
+                _ => None,
+            };
+            let replacements = passed_replacements(
+                &mut outcomes,
+                &states,
+                winner,
+                window_ms,
+                participants,
+                exclude_provider,
+            );
 
-            // Only one winner-fail mode is implemented. The other three stay accepted
-            // configuration, and the relay says so rather than pretending.
-            let mode = &hedge.on_winner_fail;
-            if !matches!(mode, mr_core::dialect::WinnerFailMode::PickHighestPassed) {
-                tracing::warn!(
-                    mode = mode.as_str(),
-                    "the configured winner-fail mode is not implemented yet; the race is served as \
-                     pick-highest-passed, which takes the highest-priority participant that passed"
-                );
-            }
+            // What happens when the committed winner dies after this point. Only
+            // `pick-highest-passed` costs zero extra upstream work — its replacements are already
+            // in hand. The other two implemented modes re-dispatch new upstream requests, which is
+            // deliberately more expensive and only runs when the winner actually fails.
+            let mode = hedge.on_winner_fail.clone();
+            let rerun_max_rounds = match mode {
+                mr_core::dialect::WinnerFailMode::RerunExcluding { max_rounds } => max_rounds,
+                // `stable-fallback` nominates exactly one step, so a single round is all it can
+                // ever need.
+                mr_core::dialect::WinnerFailMode::StableFallback { .. } => 1,
+                _ => 0,
+            };
+            // The step `stable-fallback` names, if the operator chose that mode. Ignoring it would
+            // silently turn the mode into a one-round `rerun-excluding`, i.e. a different promise
+            // than the documented "the same deterministic fallback every time".
+            let stable_step = match mode {
+                mr_core::dialect::WinnerFailMode::StableFallback { step } => Some(step),
+                _ => None,
+            };
+            let rerun_factory = if rerun_max_rounds > 0
+                && !matches!(
+                    mode,
+                    mr_core::dialect::WinnerFailMode::PickHighestPassedDifferentProvider
+                ) {
+                // `rerun-excluding` and `stable-fallback` need new upstream dispatches. Build the
+                // factory now so the recovery body can spawn it when the winner fails. A different
+                // provider is also excluded there: a whole-provider outage is exactly what this
+                // mode exists to survive.
+                let rerun_provider = match mode {
+                    mr_core::dialect::WinnerFailMode::PickHighestPassedDifferentProvider => {
+                        Some(participants[winner].provider_id.clone())
+                    }
+                    _ => None,
+                };
+                let owned = owned_from_actx(actx);
+                let remaining: Vec<StepPlan> = participants
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != winner)
+                    .filter(|(i, _step)| {
+                        // Exclude models that definitively failed in this round; pending ones were
+                        // dropped when the winner committed and are re-dispatched here.
+                        !matches!(outcomes[*i], Some(Attempt::Failed { .. }))
+                    })
+                    .filter(|(_, step)| rerun_provider.as_ref() != Some(&step.provider_id))
+                    // `stable-fallback` names one step, and only that step is the fallback. Without
+                    // this it silently degrades into a one-round `rerun-excluding`, which promises
+                    // "something that passed", not "the same deterministic fallback every time".
+                    .filter(|(i, _)| match stable_step {
+                        Some(nominated) => actx
+                            .combo
+                            .map(|combo| {
+                                combo.hedge.participants.get(*i).copied() == Some(nominated)
+                            })
+                            .unwrap_or(false),
+                        None => true,
+                    })
+                    .map(|(_, s)| (*s).clone())
+                    .collect();
+                let factory: RerunFactory = Box::new(move || {
+                    let owned = owned.clone();
+                    let remaining = remaining.clone();
+                    Box::pin(async move {
+                        let mut found: Vec<crate::recovery::Replacement> = Vec::new();
+                        for step in remaining {
+                            let is_sticky =
+                                sticky_step_is(owned.combo.as_ref(), owned.sticky_index, &step);
+                            let attempt = attempt_from_owned(&owned, &step, is_sticky).await;
+                            if let Attempt::Answer(response) = attempt {
+                                found.push(crate::recovery::Replacement {
+                                    id: participant_id(&step),
+                                    body: response.into_body(),
+                                });
+                                break; // highest-priority one wins
+                            }
+                        }
+                        Ok::<Vec<crate::recovery::Replacement>, axum::Error>(found)
+                    })
+                        as Pin<
+                            Box<
+                                dyn Future<
+                                        Output = Result<
+                                            Vec<crate::recovery::Replacement>,
+                                            axum::Error,
+                                        >,
+                                    > + Send,
+                            >,
+                        >
+                });
+                Some(factory)
+            } else {
+                None
+            };
 
             let policy = actx
                 .combo
@@ -1792,13 +2430,23 @@ async fn run_hedge(
             let winner_id = participant_id(participants[winner]);
             // The winner's body is wrapped so that the relay owns the stream: a failure after the
             // response arrived can then be recovered instead of ending the client's answer.
-            return HedgeOutcome::Won(crate::recovery::wrap(
+            let wrapped = crate::recovery::wrap(
                 response,
                 replacements,
-                policy,
-                actx.client_dialect,
-                winner_id,
-            ));
+                crate::recovery::RecoveryConfig {
+                    policy,
+                    mode,
+                    client_dialect: actx.client_dialect,
+                    winner_id: winner_id.clone(),
+                    announceable: false,
+                    rerun_factory,
+                    rerun_max_rounds,
+                },
+            );
+            return HedgeOutcome::Won {
+                response: wrapped,
+                winner: winner_id,
+            };
         }
     }
 
@@ -2526,13 +3174,27 @@ fn translate_stream_chunk(
     // U+FFFD; only complete lines are decoded, so the character arrives intact with the next frame.
     pending.extend_from_slice(chunk);
 
+    // When both ends speak the same dialect the bytes are passed through untouched, so the
+    // upstream's own framing — `event:` names, separators — is what the client expects. Once
+    // anything is translated it is not: the translator emits complete frames of its own, in the
+    // *client's* dialect, and an upstream frame marker forwarded alongside them describes an event
+    // that does not exist. That is the difference between a chat client receiving chat chunks and
+    // it receiving `event: response.created` with no data at all.
+    let pass_through = ctx.upstream_dialect == ctx.client_dialect;
+
     let mut out = Vec::new();
     while let Some(idx) = pending.iter().position(|b| *b == b'\n') {
         let line = String::from_utf8_lossy(&pending[..=idx]).into_owned();
         pending.drain(..=idx);
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
-            out.push(Ok(Bytes::from_static(b"\n")));
+            // The blank line that ends an upstream event. Translated frames already end with their
+            // own separator, so forwarding this one dispatches an extra, empty event between them,
+            // and a client that parses each event's data reads an empty string. Only a pass-through
+            // needs it, where it separates the upstream's own frames.
+            if pass_through {
+                out.push(Ok(Bytes::from_static(b"\n")));
+            }
             continue;
         }
         let data = trimmed.strip_prefix("data: ").or_else(|| {
@@ -2553,20 +3215,54 @@ fn translate_stream_chunk(
                         if line.is_empty() {
                             continue;
                         }
-                        out.push(Ok(Bytes::from(format!("{line}\n\n"))));
+                        out.push(Ok(translated_frame(&line)));
                     }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "could not translate an event-stream frame");
                 }
             },
-            // Comments (`: ping`), `event:` and `id:` lines carry no payload to translate and are
-            // forwarded as they are. Command Code metadata JSON is intentionally suppressed.
+            // Command Code metadata JSON is intentionally suppressed.
             None if ctx.upstream_dialect == Dialect::CommandCodeGo => {}
-            None => out.push(Ok(Bytes::from(format!("{trimmed}\n")))),
+            // A comment is a keep-alive: no payload, ignored by every SSE parser.
+            None if trimmed.starts_with(':') => out.push(Ok(Bytes::from(format!("{trimmed}\n")))),
+            None if pass_through => out.push(Ok(Bytes::from(format!("{trimmed}\n")))),
+            // `event:`, `id:` and `retry:` name a frame in the *upstream's* dialect. The translated
+            // output's frames are named after the client's, so keeping these would either mislabel a
+            // chunk or — with no `data:` to join — hand a strict client an event whose data is empty
+            // and unparseable, which surfaces as malformed server-sent event JSON.
+            None => {}
         }
     }
     out
+}
+
+/// One translated frame, on the wire exactly once.
+///
+/// Two things go wrong if this is spliced naively. A frame the dialect layer rendered already ends
+/// with its blank line, so appending another separator dispatches an extra empty event between
+/// frames — an event whose `data` is the empty string, which a client that parses every event
+/// cannot read. And a translator that hands back a bare payload still has to become an SSE frame:
+/// without the `data:` field the line is not a field at all, so the client silently receives
+/// nothing. Both are invisible in a test that only checks the payloads are present.
+fn translated_frame(line: &str) -> Bytes {
+    if line.ends_with("\n\n") {
+        return Bytes::from(line.to_owned());
+    }
+    let mut frame = String::with_capacity(line.len() + 8);
+    if !line.starts_with("data:")
+        && !line.starts_with("event:")
+        && !line.starts_with(':')
+        && !line.starts_with("id:")
+    {
+        frame.push_str("data: ");
+    }
+    frame.push_str(line);
+    if !frame.ends_with('\n') {
+        frame.push('\n');
+    }
+    frame.push('\n');
+    Bytes::from(frame)
 }
 
 /// Headers that describe the connection between the relay and the provider, hoisted so the direct
@@ -2700,9 +3396,12 @@ pub async fn serve(state: AppState, addr: SocketAddr) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::from_std(listener)?;
     tracing::info!(%addr, "relay listening");
 
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
 }
 
 /// Resolve when the process is asked to stop.
@@ -2740,6 +3439,27 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_requests_request_usage_and_leave_everything_else_alone() {
+        let out = with_stream_usage(Bytes::from_static(br#"{"model":"m","stream":true}"#));
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("still json");
+        assert_eq!(value["stream_options"]["include_usage"], true);
+        assert_eq!(value["model"], "m");
+
+        // A non-streaming request reports usage in its own body; nothing to ask for.
+        let plain = Bytes::from_static(br#"{"model":"m"}"#);
+        assert_eq!(with_stream_usage(plain.clone()), plain);
+
+        // An explicit choice is respected rather than overridden.
+        let chosen =
+            Bytes::from_static(br#"{"stream":true,"stream_options":{"include_usage":false}}"#);
+        assert_eq!(with_stream_usage(chosen.clone()), chosen);
+
+        // A body the router cannot read is forwarded verbatim, never turned into an error.
+        let opaque = Bytes::from_static(b"not json at all");
+        assert_eq!(with_stream_usage(opaque.clone()), opaque);
+    }
 
     #[test]
     fn antigravity_project_is_injected_for_translated_and_raw_envelopes() {
@@ -3091,7 +3811,9 @@ mod tests {
                     id: "m2".into(),
                     ..dm()
                 };
-                m.reasoning_levels = vec![ReasoningLevel::Low, ReasoningLevel::Max];
+                // `xhigh`, not `max`: the openai dialect rewrites `max` to `xhigh`, so the compiler
+                // never offers `max` and the listing must not name a tier it cannot send.
+                m.reasoning_levels = vec![ReasoningLevel::Low, ReasoningLevel::XHigh];
                 m
             },
         ];
@@ -3116,7 +3838,7 @@ mod tests {
         // The union of both steps, which is what a combo pinned to that tier can actually run.
         assert!(ids.contains(&"coding-low".to_string()));
         assert!(ids.contains(&"coding-high".to_string()));
-        assert!(ids.contains(&"coding-max".to_string()));
+        assert!(ids.contains(&"coding-xhigh".to_string()));
         assert!(!ids.contains(&"coding-medium".to_string()));
     }
 
@@ -3231,6 +3953,18 @@ mod tests {
         assert!(r.headers().contains_key("www-authenticate"));
     }
 
+    /// A wait is reported in the units a person plans around.
+    #[test]
+    fn a_wait_is_reported_in_readable_units() {
+        assert_eq!(humanize_wait(0), "moments");
+        assert_eq!(humanize_wait(45), "45s");
+        assert_eq!(humanize_wait(60), "1m");
+        assert_eq!(humanize_wait(90), "1m 30s");
+        assert_eq!(humanize_wait(3600), "1h");
+        assert_eq!(humanize_wait(3844), "1h 4m");
+        assert_eq!(humanize_wait(86_400), "24h");
+    }
+
     #[test]
     fn every_dialect_has_a_default_upstream_path() {
         // A dialect with no path would build a URL ending at the base and send the request to the
@@ -3283,6 +4017,142 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("finish_reason"), "{text:?}");
         assert!(text.contains("[DONE]"), "{text:?}");
+    }
+
+    /// A Responses upstream's frame markers must not reach a chat client's stream.
+    ///
+    /// The live codex endpoint frames its stream with `event:` lines — `response.created`,
+    /// `response.in_progress`, `response.output_item.added` — and only the payload under
+    /// `response.output_text.delta` is a delta. Forwarding those names put a chat client in front of
+    /// events in a dialect it does not speak: an `event:` line with no `data:` of its own, dispatched
+    /// by the blank line that follows. A client that parses every event's data reads an empty string,
+    /// and the whole turn dies as "malformed server-sent event JSON". The translated frames carry the
+    /// client's own framing, so the upstream's is dropped.
+    #[test]
+    fn a_responses_upstream_does_not_leak_frame_names_into_a_chat_stream() {
+        let ctx = TranslateCtx {
+            route: RouteKind::ChatCompletions,
+            client_dialect: Dialect::OpenAi,
+            upstream_dialect: Dialect::Codex,
+            upstream_model: "gpt-6-luna",
+            client_streaming: true,
+            session_id: None,
+        };
+        mr_dialects::reset_stream_state();
+        let mut translator = mr_dialects::commandcode::Translator::new();
+        let mut pending = Vec::new();
+        let chunk = Bytes::from_static(
+            b"event: response.created\n\nevent: response.in_progress\n\nevent: \
+response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Hi\"}\n\n",
+        );
+        let out = translate_stream_chunk(&ctx, &mut translator, &mut pending, &chunk);
+        let text = out
+            .into_iter()
+            .map(Result::unwrap)
+            .map(|b| String::from_utf8(b.to_vec()).unwrap())
+            .collect::<String>();
+
+        assert!(
+            !text.contains("event:"),
+            "a chat client must not see the upstream's frame names: {text:?}"
+        );
+        assert!(
+            !text.contains("\n\n\n"),
+            "no empty event may be dispatched: {text:?}"
+        );
+        assert_eq!(
+            text.matches("data: ").count(),
+            1,
+            "one delta, one frame: {text:?}"
+        );
+        assert!(text.contains("\"content\":\"Hi\""), "{text:?}");
+    }
+
+    /// The same bytes pass through untouched when the client speaks the upstream's dialect.
+    #[test]
+    fn a_responses_client_keeps_the_upstreams_frame_markers() {
+        let ctx = TranslateCtx {
+            route: RouteKind::Responses,
+            client_dialect: Dialect::Codex,
+            upstream_dialect: Dialect::Codex,
+            upstream_model: "gpt-6-luna",
+            client_streaming: true,
+            session_id: None,
+        };
+        let mut translator = mr_dialects::commandcode::Translator::new();
+        let mut pending = Vec::new();
+        let chunk = Bytes::from_static(
+            b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
+        );
+        let out = translate_stream_chunk(&ctx, &mut translator, &mut pending, &chunk);
+        let text = out
+            .into_iter()
+            .map(Result::unwrap)
+            .map(|b| String::from_utf8(b.to_vec()).unwrap())
+            .collect::<String>();
+        assert!(text.contains("event: response.created"), "{text:?}");
+        assert!(
+            text.contains("\n\n"),
+            "the separator is part of the framing: {text:?}"
+        );
+    }
+
+    /// A translator that hands back a bare payload still becomes a frame on the wire.
+    ///
+    /// Copilot's stream is OpenAI SSE end to end, so its translator passes the payload through
+    /// untouched — no `data:` field, no separator. Written straight out, the client would read a
+    /// line that is not an SSE field at all and receive an empty answer with a 200 status.
+    #[test]
+    fn a_bare_payload_is_wrapped_into_a_data_frame() {
+        let ctx = TranslateCtx {
+            route: RouteKind::ChatCompletions,
+            client_dialect: Dialect::OpenAi,
+            upstream_dialect: Dialect::Copilot,
+            upstream_model: "gpt-6-luna",
+            client_streaming: true,
+            session_id: None,
+        };
+        let mut translator = mr_dialects::commandcode::Translator::new();
+        let mut pending = Vec::new();
+        let out = translate_stream_chunk(
+            &ctx,
+            &mut translator,
+            &mut pending,
+            &Bytes::from_static(b"data: {\"id\":\"x\",\"choices\":[]}\n\n"),
+        );
+        let text = out
+            .into_iter()
+            .map(Result::unwrap)
+            .map(|b| String::from_utf8(b.to_vec()).unwrap())
+            .collect::<String>();
+        assert_eq!(text, "data: {\"id\":\"x\",\"choices\":[]}\n\n");
+    }
+
+    /// A keep-alive comment is neither a frame name nor a payload, and every parser ignores it.
+    #[test]
+    fn a_keep_alive_comment_reaches_the_client_without_a_translation() {
+        let ctx = TranslateCtx {
+            route: RouteKind::ChatCompletions,
+            client_dialect: Dialect::OpenAi,
+            upstream_dialect: Dialect::Codex,
+            upstream_model: "gpt-6-luna",
+            client_streaming: true,
+            session_id: None,
+        };
+        let mut translator = mr_dialects::commandcode::Translator::new();
+        let mut pending = Vec::new();
+        let out = translate_stream_chunk(
+            &ctx,
+            &mut translator,
+            &mut pending,
+            &Bytes::from_static(b": keep-alive\n"),
+        );
+        let text = out
+            .into_iter()
+            .map(Result::unwrap)
+            .map(|b| String::from_utf8(b.to_vec()).unwrap())
+            .collect::<String>();
+        assert_eq!(text, ": keep-alive\n");
     }
 
     /// Two Command Code answers in flight on the gateway at once must not share translation state.
@@ -4453,6 +5323,7 @@ mod tests {
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
             oauth_store: store,
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
         };
         (state, text_seen, vision_seen)
     }
@@ -4608,6 +5479,7 @@ mod tests {
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
             oauth_store: store,
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
         };
         (state, seen)
     }
@@ -4830,6 +5702,7 @@ mod tests {
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
             oauth_store: store,
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
         };
         (state, upstream_seen)
     }
@@ -5088,6 +5961,7 @@ mod tests {
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
             oauth_store: store,
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
         };
         (state, first_seen, second_seen)
     }
@@ -5230,6 +6104,7 @@ mod tests {
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
             oauth_store: store,
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
         };
 
         // Two requests, each baking its own nonce into the prompt, dispatched together.
@@ -5429,6 +6304,7 @@ mod tests {
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
             oauth_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
         };
 
         let response = dispatch(
@@ -5553,6 +6429,7 @@ mod tests {
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
             oauth_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
         };
 
         let response = dispatch(
@@ -5777,6 +6654,7 @@ mod tests {
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
             oauth_store: store,
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
         }
     }
 
@@ -5955,6 +6833,25 @@ mod tests {
         delay_ms: u64,
         body: String,
     ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        upstream_writing(delay_ms, body, false).await
+    }
+
+    /// An upstream that writes `body` and then ends the response properly.
+    ///
+    /// The declared length is exact, so the client sees an end-of-stream rather than an error: this
+    /// is what a provider that stops mid-event looks like when nothing on the wire reports a fault.
+    async fn ending_upstream(
+        delay_ms: u64,
+        body: String,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        upstream_writing(delay_ms, body, true).await
+    }
+
+    async fn upstream_writing(
+        delay_ms: u64,
+        body: String,
+        ends_cleanly: bool,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5970,12 +6867,15 @@ mod tests {
                     .unwrap()
                     .push(String::from_utf8_lossy(&request).to_string());
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                // The declared length is longer than what is sent, so the body ends in an error
-                // rather than in an end-of-stream.
+                // Unless the upstream ends cleanly, the declared length is longer than what is sent,
+                // so the body ends in an error rather than in an end-of-stream.
+                let declared = if ends_cleanly {
+                    body.len()
+                } else {
+                    body.len() + 64
+                };
                 let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
-                    body.len() + 64,
-                    body
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {declared}\r\n\r\n{body}"
                 );
                 let _ = socket.write_all(head.as_bytes()).await;
                 let _ = socket.flush().await;
@@ -6087,6 +6987,11 @@ mod tests {
         policy: MidstreamPolicy,
         /// The configured winner-fail mode.
         on_winner_fail: WinnerFailMode,
+        /// Whether the winner's body ends in an error (`true`) or in a clean end-of-stream.
+        ///
+        /// A clean end is how a provider that simply stops writing looks, and it is the case no
+        /// failover can recover: there is no error to react to, only a truncated tail on the wire.
+        winner_ends_cleanly: bool,
     }
 
     impl Default for RecoverySpec {
@@ -6102,6 +7007,7 @@ mod tests {
                 replacement_dialect: Dialect::OpenAi,
                 policy: MidstreamPolicy::Restart,
                 on_winner_fail: WinnerFailMode::PickHighestPassed,
+                winner_ends_cleanly: false,
             }
         }
     }
@@ -6112,8 +7018,13 @@ mod tests {
     /// participant, so the winner is committed on priority and the replacement is already in the
     /// race's result set when it is. That is the situation `pick-highest-passed` is for.
     async fn recovery_state(spec: RecoverySpec) -> (AppState, Arc<std::sync::Mutex<Vec<String>>>) {
-        let (winner_url, winner_seen) =
-            dying_upstream(spec.winner_delay_ms, spec.winner_body.clone()).await;
+        let winner_body = spec.winner_body.clone();
+        let winner = if spec.winner_ends_cleanly {
+            ending_upstream(spec.winner_delay_ms, winner_body).await
+        } else {
+            dying_upstream(spec.winner_delay_ms, winner_body).await
+        };
+        let (winner_url, winner_seen) = winner;
         let (replacement_url, _replacement_seen) =
             sse_upstream(spec.replacement_delay_ms, "second").await;
 
@@ -6176,6 +7087,7 @@ mod tests {
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
             oauth_store: store,
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
         };
         (state, winner_seen)
     }
@@ -6244,6 +7156,62 @@ mod tests {
         );
     }
 
+    /// Half an event must never reach the client, whether it is left dangling or spliced.
+    ///
+    /// A body arrives in chunks and a chunk boundary falls anywhere, including mid-`data:` line.
+    /// Forwarding that fragment is harmless while one upstream keeps writing — the client buffers
+    /// until the line ends. It stops being harmless the moment the relay splices, because the retry
+    /// boundary starts with `event:`, so a dangling line is concatenated with it. The client then
+    /// receives one line that is not JSON at all, which is the reported failure: "malformed
+    /// server-sent event JSON" whenever a combo step died mid-frame.
+    #[tokio::test]
+    async fn a_winner_that_dies_mid_event_never_hands_the_client_half_a_frame() {
+        let spec = RecoverySpec {
+            // The dead model's last bytes stop inside the delta: no closing brace, no newline.
+            winner_body: "data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\
+                          \"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\
+                          \"content\":\"half an answer\""
+                .to_owned(),
+            ..RecoverySpec::default()
+        };
+        let (state, _seen) = recovery_state(spec).await;
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(streaming_body()),
+        )
+        .await;
+
+        let (text, error) = drain(response).await;
+        assert_eq!(error, None, "the stream ended in an error: {text}");
+
+        // Every payload the client is asked to parse is a JSON document, and the splice happened.
+        assert!(text.contains("second"), "no replacement answer: {text}");
+        for line in text.lines() {
+            let Some(payload) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if payload == "[DONE]" {
+                continue;
+            }
+            serde_json::from_str::<serde_json::Value>(payload).unwrap_or_else(|e| {
+                panic!(
+                    "the client was handed a malformed data line ({e}): {payload:?}\nin:\n{text}"
+                )
+            });
+        }
+
+        // The fragment itself is dropped: it is not an event, so nothing reconstructable is lost.
+        assert!(
+            !text.contains("half an answer"),
+            "a partial event reached the client: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn a_winner_that_dies_mid_stream_is_announced_and_replaced() {
         let (state, _seen) = recovery_state(RecoverySpec::default()).await;
@@ -6276,6 +7244,58 @@ mod tests {
         );
         // And the replacement's answer follows it.
         assert!(text.contains("second"), "{text}");
+    }
+
+    /// A stream that simply stops mid-event, with nothing on the wire reporting a fault.
+    ///
+    /// There is no error to fail over on, so the only thing that matters is what the client is
+    /// handed: a truncated `data:` line at end-of-stream is exactly what the OpenAI client parses
+    /// and rejects ("malformed server-sent event JSON"), with no fault anywhere else to blame.
+    #[tokio::test]
+    async fn a_stream_that_ends_inside_an_event_drops_the_fragment() {
+        let spec = RecoverySpec {
+            winner_ends_cleanly: true,
+            // Two whole events, then a third that stops inside the content string.
+            winner_body: "data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\
+                          \"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\
+                          \"content\":\"whole\"}}]}\n\n\
+                          data: {\"id\":\"cmpl-2\",\"object\":\"chat.completion.chunk\",\
+                          \"choices\":[{\"index\":0,\"delta\":{\"content\":\"half an answer\""
+                .to_owned(),
+            ..RecoverySpec::default()
+        };
+        let (state, _seen) = recovery_state(spec).await;
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(streaming_body()),
+        )
+        .await;
+
+        let (text, error) = drain(response).await;
+        assert_eq!(error, None, "a clean end should not be an error: {text}");
+        assert!(text.contains("whole"), "the whole event was lost: {text}");
+        for line in text.lines() {
+            let Some(payload) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if payload == "[DONE]" {
+                continue;
+            }
+            serde_json::from_str::<serde_json::Value>(payload).unwrap_or_else(|e| {
+                panic!(
+                    "the client was handed a malformed data line ({e}): {payload:?}\nin:\n{text}"
+                )
+            });
+        }
+        assert!(
+            !text.contains("half an answer"),
+            "the truncated event reached the client: {text}"
+        );
     }
 
     #[tokio::test]
@@ -6348,8 +7368,7 @@ mod tests {
         };
         let (state, _seen) = recovery_state(spec).await;
 
-        // The log is captured for the duration of the request: the mode is not implemented, and the
-        // operator has to be told that the request was served as `pick-highest-passed`.
+        // `rerun-excluding` is now implemented: it should not produce an "unimplemented" warning.
         let log = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -6376,13 +7395,281 @@ mod tests {
 
         let logged = String::from_utf8_lossy(&log.lock().unwrap()).to_string();
         assert!(
-            logged.contains("rerun-excluding"),
-            "the unimplemented mode was not reported: {logged}"
+            !logged.contains("not implemented yet"),
+            "rerun-excluding is implemented and should not warn: {logged}"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // A provider with several accounts, only some of which have a credential
+    // -----------------------------------------------------------------------------------------
+
+    /// A fake upstream that records the `Authorization` header of every call.
+    ///
+    /// The header is the only place an OpenAI-compatible upstream sees which credential it was
+    /// given, so recording it is how a test proves *which* account served a request rather than
+    /// merely that the request was served.
+    async fn upstream_recording_auth() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let app = Router::new().fallback(any(move |request_headers: HeaderMap| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let presented = request_headers
+                    .get(http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                sink.lock().unwrap().push(presented);
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// A state whose provider holds two accounts at the same priority.
+    ///
+    /// `stored` names the accounts whose credential is actually in the vault, so a test can build
+    /// the reported shape — the first account has no credential, the second does — and the
+    /// degenerate one where neither has anything attached.
+    async fn two_account_state(
+        stored: &[&str],
+    ) -> (
+        AppState,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tempfile::TempDir,
+    ) {
+        let (url, seen) = upstream_recording_auth().await;
+        let mut provider = provider_serving("p", &url, "m", &[InputModality::Text]);
+
+        // The configuration order is the priority order, so the account the operator listed first
+        // is the one the bug stopped at.
+        let names = ["first", "second"];
+        provider.accounts = names
+            .iter()
+            .map(|name| {
+                let mut account = mr_core::model::Account::new(*name);
+                account.secret_ref = Some(format!("{name}-credential"));
+                account
+            })
+            .collect();
+
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        for name in stored {
+            opened
+                .put(&format!("{name}-credential"), &format!("sk-{name}"))
+                .unwrap();
+        }
+        let vault = Arc::new(opened);
+
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: store,
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+        };
+        (state, seen, dir)
+    }
+
+    fn two_account_body() -> AxumBody {
+        AxumBody::from(
+            serde_json::json!({
+                "model": "p/m",
+                "messages": [{"role": "user", "content": "hello"}],
+            })
+            .to_string(),
+        )
+    }
+
+    /// The reported bug: the first account has no credential and the second does.
+    ///
+    /// A missing secret is a property of one account, not a failure of the step. The relay must
+    /// walk to the sibling that has one, exactly as the operator's ordering says.
+    #[tokio::test]
+    async fn an_account_without_a_credential_does_not_stop_the_step() {
+        let (state, seen, _dir) = two_account_state(&["second"]).await;
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            two_account_body(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let called = seen.lock().unwrap().clone();
+        assert_eq!(
+            called.len(),
+            1,
+            "one attempt, on the usable sibling: {called:?}"
+        );
+        assert_eq!(
+            called[0], "Bearer sk-second",
+            "the request must carry the sibling's credential"
+        );
+    }
+
+    /// The same, with both accounts usable: the operator's first choice still wins.
+    ///
+    /// Falling through must not become "skip the first account": the ordering is the operator's
+    /// decision, and it is only the *unusable* entries that are stepped over.
+    #[tokio::test]
+    async fn an_account_with_a_credential_is_still_preferred_when_the_first_one_has_one() {
+        let (state, seen, _dir) = two_account_state(&["first", "second"]).await;
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            two_account_body(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let called = seen.lock().unwrap().clone();
+        assert_eq!(called, vec!["Bearer sk-first".to_owned()]);
+    }
+
+    /// A credential stored while the relay is running must be usable without a restart.
+    ///
+    /// This is the shape the panel produces: the relay starts, the operator adds a provider, then
+    /// pastes its key. The relay's vault is a snapshot from startup, so the account reported "no
+    /// credential in the vault" — accurately, about a file it had not looked at again — until the
+    /// process was restarted. The miss path re-reads it now, which is what this proves: the state's
+    /// own vault does not hold the secret, the file does, and the request goes through.
+    #[tokio::test]
+    async fn a_credential_stored_after_startup_is_used_without_a_restart() {
+        let (state, seen, dir) = two_account_state(&[]).await;
+
+        // Standing in for `mr account add` in another process: a second handle writes the secret
+        // and the relay's own snapshot never saw it.
+        {
+            let mut writer = mr_core::secret::Vault::open(dir.path()).unwrap();
+            writer.put("second-credential", "sk-late").unwrap();
+            writer.flush().unwrap();
+        }
+        assert!(
+            state.vault.get("second-credential").unwrap().is_none(),
+            "the relay's snapshot must not contain the late credential, or this proves nothing"
+        );
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            two_account_body(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec!["Bearer sk-late".to_owned()]
+        );
+    }
+
+    /// When no account has a credential the refusal must name that, not a cooldown.
+    ///
+    /// The distinction is the whole report: "cooling down" sends the operator to look at health
+    /// and wait, while "no credential" sends them to the account that needs one. Nothing is
+    /// cooled down either — a secret does not reappear with time, so excluding the accounts from
+    /// later requests would hide the problem rather than surface it.
+    #[tokio::test]
+    async fn a_step_where_no_account_has_a_credential_says_so() {
+        let (state, seen, _dir) = two_account_state(&[]).await;
+        let health = Arc::clone(&state.health);
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            two_account_body(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the upstream must not be called"
+        );
+        let (text, _) = drain(response).await;
+        assert!(
+            text.contains("no credential") || text.contains("no usable credential"),
+            "the refusal must name the missing credential: {text}"
         );
         assert!(
-            logged.contains("not implemented yet"),
-            "the unimplemented mode was not reported: {logged}"
+            !text.contains("cooling down"),
+            "a missing credential is not a cooldown: {text}"
         );
+        assert!(
+            health.view().is_empty(),
+            "a missing credential must not put an account in cooldown: {:?}",
+            health.view()
+        );
+    }
+
+    /// The message counts both causes, because one step can mix them.
+    #[test]
+    fn the_refusal_counts_missing_and_unusable_accounts_separately() {
+        let config = mr_core::config::Config {
+            providers: vec![provider_serving(
+                "p",
+                "http://127.0.0.1:1",
+                "m",
+                &[InputModality::Text],
+            )],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let provider = &snapshot.providers()[0];
+
+        let one = no_credential_message(provider, "m", 1, 0);
+        assert!(one.contains("1 account has no credential"), "{one}");
+
+        let many = no_credential_message(provider, "m", 3, 2);
+        assert!(many.contains("3 accounts have no credential"), "{many}");
+        assert!(
+            many.contains("2 accounts' credentials cannot be used"),
+            "{many}"
+        );
+
+        // The suggestion names the provider, so it is actionable without reading the config.
+        assert!(many.contains("mr account add p --secret-stdin"), "{many}");
     }
 
     /// A tracing writer that keeps what it is given, so a test can read the log.
@@ -6406,5 +7693,175 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Combo activity
+    // -----------------------------------------------------------------------------------------
+
+    /// A relay whose only route is one combo over one fake provider.
+    ///
+    /// The provider id is the shape a real one takes (`openai-codex`), because the recorded step is
+    /// `provider/model` and a fixture with a bare `p/m` would not catch a formatting mistake there.
+    async fn combo_state() -> (AppState, Arc<std::sync::Mutex<Vec<String>>>) {
+        let (url, seen) = fake_upstream().await;
+        let provider = provider_serving("openai-codex", &url, "gpt-6-luna", &[InputModality::Text]);
+        let combo = mr_core::model::Combo::new(
+            "expensivesmart",
+            mr_core::model::ComboStep::new("openai-codex", "gpt-6-luna"),
+        );
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            combos: vec![combo],
+            ..Default::default()
+        };
+
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let vault = Arc::new(opened);
+
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: store,
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+        };
+        (state, seen)
+    }
+
+    /// A chat request for one model name, in the shape a client sends.
+    fn chat_body(model: &str) -> String {
+        serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        .to_string()
+    }
+
+    async fn chat(state: AppState, model: &str) -> Response {
+        dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            HeaderMap::new(),
+            AxumBody::from(chat_body(model)),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_combo_request_is_recorded_with_the_step_it_chose_and_stays_open_until_the_body_ends()
+    {
+        let (state, seen) = combo_state().await;
+        let activity = Arc::clone(&state.activity);
+
+        let response = chat(state, "expensivesmart").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        let open = activity.snapshot();
+        assert_eq!(open.len(), 1, "one combo decision, one entry");
+        assert_eq!(open[0].combo, "expensivesmart");
+        assert_eq!(open[0].requested, "expensivesmart");
+        assert_eq!(open[0].step, "openai-codex/gpt-6-luna");
+        assert!(open[0].started_at > 0);
+        assert!(
+            open[0].finished_at.is_none(),
+            "the body has not been read or dropped yet, so the request is still in flight"
+        );
+        assert!(open[0].outcome.is_none());
+
+        drop(response);
+
+        let closed = activity.snapshot();
+        assert!(closed[0].finished_at.is_some(), "the body was dropped");
+        assert_eq!(closed[0].outcome, Some(crate::activity::Outcome::Ok));
+    }
+
+    #[tokio::test]
+    async fn a_plain_model_request_is_not_combo_activity() {
+        let (state, seen) = combo_state().await;
+        let activity = Arc::clone(&state.activity);
+
+        let response = chat(state, "openai-codex/gpt-6-luna").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        drop(response);
+
+        assert!(
+            activity.snapshot().is_empty(),
+            "a direct model is not a combo decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_activity_endpoint_refuses_callers_that_are_not_on_loopback() {
+        let (state, _seen) = combo_state().await;
+        let response = control_activity(
+            ConnectInfo(std::net::SocketAddr::from(([10, 1, 2, 3], 4000))),
+            State(state),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn the_activity_endpoint_reports_the_entries_and_the_current_cooldowns() {
+        let (state, _seen) = combo_state().await;
+        state.health.cool_down(
+            "01a18287-8246-7280-b00a-a7be06b51e4d",
+            1_793_641_349_000,
+            select::CooldownReason::RateLimited,
+        );
+        // Held for the length of the test: the decision is in flight until the guard drops.
+        let _in_flight = state.activity.begin(
+            "expensivesmart",
+            "expensivesmart",
+            "openai-codex/gpt-6-luna",
+            1_793_641_349_000,
+        );
+
+        let response = control_activity(
+            ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 4000))),
+            State(state),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["entries"][0]["combo"], "expensivesmart");
+        assert_eq!(json["entries"][0]["requested"], "expensivesmart");
+        assert_eq!(json["entries"][0]["step"], "openai-codex/gpt-6-luna");
+        assert_eq!(json["entries"][0]["started_at"], 1_793_641_349_000u64);
+        assert!(json["entries"][0]["finished_at"].is_null());
+        assert!(json["entries"][0]["outcome"].is_null());
+
+        let cooldown = &json["cooldowns"]["01a18287-8246-7280-b00a-a7be06b51e4d"];
+        assert_eq!(cooldown["until_ms"], 1_793_641_349_000u64);
+        assert_eq!(cooldown["reason"], "rate_limited");
+        assert_eq!(cooldown["failures"], 1);
+
+        // The cooldown block is ids and numbers only. A label, a URL or a secret here would be a
+        // disclosure the panel never needed.
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains("sk-"), "{text}");
+        assert!(!text.contains("http"), "{text}");
     }
 }

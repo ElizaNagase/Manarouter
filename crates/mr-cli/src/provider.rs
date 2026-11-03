@@ -397,10 +397,13 @@ fn status(p: &Provider) -> &'static str {
     if !p.enabled {
         return "disabled";
     }
+    // An OAuth account has no `secret_ref` at all — its credential is an `oauth_ref` into the
+    // vault's OAuth record — so checking only the secret said "no credential" for every provider
+    // the operator had actually signed in to.
     let has_secret = p
         .accounts
         .iter()
-        .any(|a| a.enabled && a.secret_ref.is_some());
+        .any(|a| a.enabled && (a.secret_ref.is_some() || a.oauth_ref.is_some()));
     if has_secret {
         "ready"
     } else {
@@ -642,7 +645,15 @@ pub(crate) mod net {
 
     /// Response bodies are capped: a probe that needs more than 16 KiB is the wrong probe, and an
     /// unbounded body read is how a hostile upstream runs you out of memory.
+    ///
+    /// The cap is a *probe* cap. A model catalogue is not a probe — it is the data the command
+    /// exists to fetch — and reusing this limit there truncated infron's 513-model reply mid-string,
+    /// which `parse_models` then reported as "the /models response is not JSON". See
+    /// [`CATALOGUE_MAX_BODY`].
     const MAX_BODY: usize = 16 * 1024;
+
+    /// The cap for a model catalogue: large enough for a vendor's whole list, still bounded.
+    pub const CATALOGUE_MAX_BODY: usize = 8 * 1024 * 1024;
 
     /// A reply a probe can print honestly: status, bounded body, wall time.
     pub struct Reply {
@@ -709,6 +720,22 @@ pub(crate) mod net {
         body: Option<String>,
         timeout: Duration,
     ) -> Result<Reply, CliError> {
+        request_bounded(client, method, url, headers, body, timeout, MAX_BODY).await
+    }
+
+    /// The same request with a caller-chosen body cap.
+    ///
+    /// Exists because one cap cannot serve both callers: a probe prints its reply and wants to stay
+    /// small, while a catalogue fetch has to read the whole list whatever its size.
+    pub async fn request_bounded(
+        client: &HttpClient,
+        method: http::Method,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<String>,
+        timeout: Duration,
+        max_body: usize,
+    ) -> Result<Reply, CliError> {
         use http::{header, HeaderName, HeaderValue, Request};
 
         let uri: http::Uri = url
@@ -751,7 +778,7 @@ pub(crate) mod net {
         let mut collected: Vec<u8> = Vec::with_capacity(1024);
         // The deadline covers the whole read, not each frame: a hostile upstream that drips one
         // byte per timeout window must not hold the probe open.
-        while collected.len() < MAX_BODY {
+        while collected.len() < max_body {
             let left = timeout.saturating_sub(started.elapsed());
             if left.is_zero() {
                 return Err(CliError::failure(format!(
@@ -769,7 +796,7 @@ pub(crate) mod net {
                 })?;
             let Some(frame) = frame else { break };
             if let Ok(data) = frame.into_data() {
-                let take = (MAX_BODY - collected.len()).min(data.len());
+                let take = (max_body - collected.len()).min(data.len());
                 collected.extend_from_slice(&data[..take]);
             }
         }
@@ -781,7 +808,13 @@ pub(crate) mod net {
     }
 }
 
-/// Credential for a provider: the first enabled account's vault secret, else a provider-wide one.
+/// Credential for a provider: the first enabled account that actually has one, else a
+/// provider-wide one.
+///
+/// Accounts are walked rather than read positionally for the same reason the relay walks them: an
+/// account with no secret attached yet — the state `mr provider add` leaves behind — is a property
+/// of that account, and a later account holding a key is enough for the provider to work. Stopping
+/// at the first empty slot reported "no usable credential" for a provider that had one.
 pub(crate) fn credential(ctx: &Ctx, p: &Provider) -> Result<String, CliError> {
     let vault = ctx.vault()?;
     if p.accounts.is_empty() {

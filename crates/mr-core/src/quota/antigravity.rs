@@ -11,11 +11,18 @@
 //! What matters most here is the same sentinel rule as everywhere else, and it bites hardest on
 //! this provider:
 //!
-//! * **`remainingFraction` absent is "unknown", never "exhausted".** The catalog endpoint
-//!   (`fetchAvailableModels`) is a catalog/eligibility view and routinely omits the fraction for a
-//!   model whose bucket has not started. Upstream sets `fractionReported = false` and the zero
-//!   that lands in `remaining` is a sentinel; this port uses [`UsageQuota::from_usage_unreported`]
-//!   for exactly that case. A bespoke `0/0` would render as an exhausted account.
+//! * **A spent bucket is not always spelled `remainingFraction: 0`.** `retrieveUserQuota` says it
+//!   that way, but the catalog endpoint (`fetchAvailableModels`) drops the zero and keeps only the
+//!   `resetTime` for the same model. A reader that trusts the fraction alone therefore reports an
+//!   untouched window for an account whose every chat model answers `429 RESOURCE_EXHAUSTED` —
+//!   and the operator is sent looking for a request-shape bug that does not exist.
+//!   [`reported_fraction`] is the one place that resolves both spellings, and it is what every
+//!   bucket reader below goes through.
+//! * **A bucket with neither a fraction nor a reset instant is "unknown", never "exhausted".** The
+//!   reset instant only exists for a window that has been consumed and will refill, so its absence
+//!   is the honest "nothing was measured" case. Upstream sets `fractionReported = false` and the
+//!   zero that lands in `remaining` is a sentinel; this port uses
+//!   [`UsageQuota::from_usage_unreported`] for exactly that case.
 //! * **A reported `1.0` with no `resetTime` is unlimited**, not a full bucket with a missing
 //!   reset.
 //! * **`total` is the normalised `1000` base**, so `remaining = round(1000 × fraction)`. That is
@@ -505,12 +512,13 @@ fn catalog_windows(catalog: &Value, live: Option<&Value>) -> Vec<Window> {
                 continue;
             }
 
-            // A live bucket with no fraction means "not started", not "empty": it must not
-            // overwrite a reported catalog row, or a healthy account would read as unknown. Same
-            // rule the live-only loop below applies to buckets the catalog never named.
+            // A live bucket that measured nothing at all — no fraction, no reset instant — means
+            // "not started", not "empty": it must not overwrite a reported catalog row, or a
+            // healthy account would read as unknown. Same rule the live-only loop below applies to
+            // buckets the catalog never named.
             let live_bucket = live_buckets
                 .get(model_key)
-                .filter(|bucket| fraction(bucket).is_some());
+                .filter(|bucket| reported_fraction(bucket).is_some());
             let (source, bucket) = match live_bucket {
                 Some(bucket) => (SOURCE_LIVE, bucket),
                 None => (SOURCE_CATALOG, quota_info),
@@ -524,8 +532,8 @@ fn catalog_windows(catalog: &Value, live: Option<&Value>) -> Vec<Window> {
         }
     }
 
-    // Live buckets the catalog has not caught up with yet. A bucket whose fraction is absent has
-    // not started; upstream skips it rather than inventing a row.
+    // Live buckets the catalog has not caught up with yet. A bucket that measured nothing has not
+    // started; upstream skips it rather than inventing a row.
     //
     // The keys are collected as owned strings rather than borrowed ones: the loop below pushes onto
     // `out`, and a borrow of `out` cannot coexist with that mutable borrow.
@@ -534,7 +542,7 @@ fn catalog_windows(catalog: &Value, live: Option<&Value>) -> Vec<Window> {
         if known.iter().any(|key| key == model_key) {
             continue;
         }
-        if fraction(bucket).is_none() {
+        if reported_fraction(bucket).is_none() {
             continue;
         }
         out.push(bucket_window(
@@ -554,7 +562,7 @@ fn bucket_window(
     source: &'static str,
     scope: &'static str,
 ) -> Window {
-    let reported = fraction(bucket);
+    let reported = reported_fraction(bucket);
     let reset = bucket.get("resetTime").cloned().unwrap_or(Value::Null);
     let reset_at = crate::quota::types::parse_reset_time(&reset);
 
@@ -657,8 +665,9 @@ fn weekly_window(group: &Value) -> Option<Window> {
         .filter(|name| !name.is_empty())?;
     let slug = slugify_group(display_name)?;
 
-    // An absent fraction means the weekly window has not started; upstream skips the row.
-    let reported = fraction(bucket)?;
+    // A bucket with no fraction and no reset instant has not started; upstream skips the row. One
+    // that names a reset instant is spent and must be reported as such.
+    let reported = reported_fraction(bucket)?;
     let reset = bucket.get("resetTime").cloned().unwrap_or(Value::Null);
     let reset_at = crate::quota::types::parse_reset_time(&reset);
     let unlimited = reset_at.is_none() && reported >= 1.0;
@@ -693,6 +702,23 @@ fn fraction(bucket: &Value) -> Option<f64> {
         _ => return None,
     };
     number.is_finite().then(|| number.clamp(0.0, 1.0))
+}
+
+/// The remainder a bucket implies, in either spelling Google uses for a spent window.
+///
+/// An explicit `remainingFraction` is the measurement and is taken as given. Its absence is only
+/// "unknown" when the bucket carries no `resetTime` either: a bucket that names a reset instant has
+/// been consumed and will refill, and the catalog endpoint sends exactly that shape — `resetTime`
+/// with the zero fraction dropped — for every model the account has used up. This was read as an
+/// untouched window for a long time, which is why a fully spent free-tier account rendered as
+/// `0/1000` while every inference call was refused with `429 RESOURCE_EXHAUSTED`.
+fn reported_fraction(bucket: &Value) -> Option<f64> {
+    fraction(bucket).or_else(|| {
+        bucket
+            .get("resetTime")
+            .filter(|value| !value.is_null())
+            .map(|_| 0.0)
+    })
 }
 
 /// The group display name as a quota-key slug, upstream's `slugifyGroupWeeklyKey`.
@@ -902,8 +928,11 @@ mod tests {
         }
     }"#;
 
-    /// A catalog whose only model never reported a fraction.
-    const CATALOG_UNREPORTED: &str = r#"{
+    /// The catalog spelling of a spent bucket: the reset instant, with the zero fraction dropped.
+    /// This is the shape a live free-tier account returns for every chat model once its allowance
+    /// is gone — verified against `cloudcode-pa.googleapis.com` while `generateContent` answered
+    /// `429 RESOURCE_EXHAUSTED` for all of them.
+    const CATALOG_SPENT: &str = r#"{
         "models": {
             "gemini-3-pro": {
                 "displayName": "Gemini 3 Pro",
@@ -911,6 +940,18 @@ mod tests {
             }
         }
     }"#;
+
+    /// The same model, same reset, measured by `retrieveUserQuota`, which does spell the zero out.
+    const LIVE_SPENT: &str = r#"{
+        "buckets": [
+            {"modelId": "gemini-3-pro", "remainingFraction": 0,
+             "resetTime": "2026-01-02T03:04:05Z"}
+        ]
+    }"#;
+
+    /// A bucket that measured nothing: no fraction, no reset instant. `retrieveUserQuota` lists a
+    /// model this way before its window has started.
+    const LIVE_NOT_STARTED: &str = r#"{"buckets": [{"modelId": "gemini-3-pro"}]}"#;
 
     /// A catalog whose only model has a full fraction and no reset instant.
     const CATALOG_UNLIMITED: &str = r#"{
@@ -953,23 +994,66 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_fraction_is_a_sentinel_not_exhaustion() {
-        let catalog = payload(CATALOG_UNREPORTED);
-        let quota = parse(&catalog, None, None).expect("a bucket with no fraction is still a row");
+    fn a_bucket_that_names_only_a_reset_is_spent() {
+        let catalog = payload(CATALOG_SPENT);
+        let quota = parse(&catalog, None, None).expect("a spent bucket is still a row");
 
+        // The reset instant is the measurement: Google only names one for a window that has been
+        // consumed and will refill, so this bucket is a reported zero, not an omitted value.
+        assert!(quota.fraction_reported);
+        assert_eq!(quota.total, 1000.0);
+        assert_eq!(quota.used, 1000.0);
+        assert_eq!(quota.remaining, 0.0);
+        assert_eq!(quota.remaining_percentage, 0.0);
+        assert_eq!(quota.reported_percentage(), Some(0.0));
+        assert!(quota.is_exhausted(), "the account is out of allowance");
+        assert_eq!(quota.source.as_deref(), Some("fetchAvailableModels"));
+        assert_eq!(
+            quota.reset_at,
+            parse_reset_time(
+                &payload(CATALOG_SPENT)["models"]["gemini-3-pro"]["quotaInfo"]["resetTime"]
+            )
+        );
+    }
+
+    /// The two endpoints spell the same exhausted bucket differently. Reading them differently is
+    /// what made a spent account look untouched in the panel while every request was refused.
+    #[test]
+    fn the_catalog_and_live_spellings_of_a_spent_bucket_agree() {
+        let from_catalog = parse(&payload(CATALOG_SPENT), None, None).expect("catalog row");
+        let from_live = parse(&payload("{}"), Some(&payload(LIVE_SPENT)), None).expect("live row");
+
+        assert_eq!(from_catalog.used, from_live.used);
+        assert_eq!(from_catalog.total, from_live.total);
+        assert_eq!(from_catalog.remaining, from_live.remaining);
+        assert_eq!(from_catalog.reset_at, from_live.reset_at);
+        assert!(from_catalog.fraction_reported && from_live.fraction_reported);
+        assert!(from_catalog.is_exhausted() && from_live.is_exhausted());
+        // …and the live row still says which call produced it.
+        assert_eq!(from_live.source.as_deref(), Some("retrieveUserQuota"));
+    }
+
+    #[test]
+    fn a_bucket_that_measured_nothing_is_a_sentinel_not_exhaustion() {
+        // No fraction and no reset instant: nothing was measured, so nothing may be claimed.
+        let live = payload(LIVE_NOT_STARTED);
+        assert!(
+            parse(&payload("{}"), Some(&live), None).is_none(),
+            "a bucket that never started is not a quota row"
+        );
+
+        let window = bucket_window(
+            "gemini-3-pro",
+            &payload(r#"{"modelId": "gemini-3-pro"}"#),
+            SOURCE_LIVE,
+            "gemini",
+        );
+        let quota = window.to_usage_quota();
         assert!(!quota.fraction_reported, "a 0 here is a sentinel");
         assert_eq!(quota.total, 0.0);
         assert_eq!(quota.used, 0.0);
-        assert_eq!(quota.remaining, 0.0);
-        assert_eq!(quota.remaining_percentage, 0.0);
-        assert!(
-            !quota.is_exhausted(),
-            "an omitted fraction is not exhaustion"
-        );
+        assert!(!quota.is_exhausted());
         assert_eq!(quota.reported_percentage(), None);
-        assert_eq!(quota.source.as_deref(), Some("fetchAvailableModels"));
-        // The reset instant upstream did send is still carried.
-        assert!(quota.reset_at.is_some());
     }
 
     #[test]
@@ -1046,6 +1130,36 @@ mod tests {
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].key.as_deref(), Some("gemini_weekly"));
         assert_eq!(windows[0].remaining, 750.0);
+    }
+
+    /// The weekly summary drops the zero too when it is spent; the reset instant still says so.
+    #[test]
+    fn a_spent_weekly_bucket_without_a_fraction_is_still_reported() {
+        let summary = payload(
+            r#"{
+                "groups": [
+                    {"displayName": "Claude and GPT models", "buckets": [
+                        {"bucketId": "3p-weekly", "displayName": "Weekly Limit Remaining",
+                         "resetTime": "2026-11-02T10:26:08Z"}
+                    ]}
+                ]
+            }"#,
+        );
+        let windows = parse_weekly_summary(&summary);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].used, 1000.0);
+        assert_eq!(windows[0].remaining, 0.0);
+        assert!(
+            windows[0].fraction_reported,
+            "the reset instant proves it was measured"
+        );
+
+        let quota = parse(&payload("{}"), None, Some(&summary)).expect("weekly row alone answers");
+        assert!(quota.is_exhausted());
+        assert_eq!(
+            quota.reset_at,
+            parse_reset_time(&json!("2026-11-02T10:26:08Z"))
+        );
     }
 
     #[test]

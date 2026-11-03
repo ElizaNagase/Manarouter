@@ -47,8 +47,9 @@ use std::task::{Context, Poll};
 use axum::body::Body as AxumBody;
 use axum::response::Response;
 use bytes::Bytes;
+use futures_util::Future;
 use http_body::Frame;
-use mr_core::dialect::{Dialect, MidstreamPolicy};
+use mr_core::dialect::{Dialect, MidstreamPolicy, WinnerFailMode};
 
 /// A participant that passed the race and can answer in the winner's place.
 ///
@@ -115,6 +116,31 @@ pub fn decide(
     }
 }
 
+/// A factory that spawns the fallback work for a winner-fail mode that needs new upstream
+/// dispatches (`rerun-excluding`, `stable-fallback`). It returns a fresh future each call so the
+/// recovery body can poll it to completion in [`RecoveryBody::poll_frame`]. `recovery` does not
+/// depend on the relay's request-context types: the factory is built in `server.rs`, which owns
+/// `attempt_step`, and invoked here only when the committed winner actually fails.
+pub type RerunFactory = Box<
+    dyn FnMut() -> Pin<Box<dyn Future<Output = Result<Vec<Replacement>, axum::Error>> + Send>>
+        + Send,
+>;
+
+/// The in-flight fallback future type, factored out so clippy doesn't complain about the
+/// nested `Pin<Box<dyn Future<...>>>` type in field declarations.
+type RerunFuture = Pin<Box<dyn Future<Output = Result<Vec<Replacement>, axum::Error>> + Send>>;
+
+/// What `fail` should do next.
+enum FailOutcome {
+    /// Switched to a replacement body; keep polling.
+    Switched,
+    /// No replacement is ready and the mode may re-dispatch: the caller should spawn/poll the
+    /// rerun factory.
+    NeedRerun,
+    /// End the request with an error.
+    Refused(axum::Error),
+}
+
 /// The frames that mark a mid-stream switch, in the client's dialect.
 ///
 /// The retry event is informational: a client that ignores unknown SSE events — as the
@@ -146,6 +172,26 @@ fn terminating_frame(client_dialect: Dialect) -> String {
         // The OpenAI Chat Completions stream ends its turn with a final choice carrying
         // `finish_reason` and an empty delta.
         _ => mr_dialects::sse::data_frame(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+    }
+}
+
+/// The index just past the last complete event in `bytes`, if there is one.
+///
+/// An event ends at a blank line, and the blank line can be spelled either way — Google's own
+/// streams use CRLF, OpenAI's use LF — so both are looked for and the later of the two wins. A
+/// buffer with no blank line holds no complete event.
+fn last_event_end(bytes: &[u8]) -> Option<usize> {
+    let crlf = bytes
+        .windows(4)
+        .rposition(|window| window == b"\r\n\r\n")
+        .map(|at| at + 4);
+    let lf = bytes
+        .windows(2)
+        .rposition(|window| window == b"\n\n")
+        .map(|at| at + 2);
+    match (crlf, lf) {
+        (Some(crlf), Some(lf)) => Some(crlf.max(lf)),
+        (crlf, lf) => crlf.or(lf),
     }
 }
 
@@ -252,6 +298,25 @@ enum Source {
     Replacement(usize),
 }
 
+/// Configuration for a `RecoveryBody`, grouped so neither `new` nor `wrap` exceeds clippy's
+/// argument limit.
+pub struct RecoveryConfig {
+    /// The combo's mid-stream policy.
+    pub policy: MidstreamPolicy,
+    /// The winner-fail mode: what to do when replacements run out.
+    pub mode: WinnerFailMode,
+    /// The dialect the client speaks.
+    pub client_dialect: Dialect,
+    /// The id of the committed winner.
+    pub winner_id: String,
+    /// Whether the client-facing body is an event stream, and can therefore carry a boundary.
+    pub announceable: bool,
+    /// A factory that re-dispatches fallback work when replacements run out.
+    pub rerun_factory: Option<RerunFactory>,
+    /// The maximum number of re-dispatch rounds allowed.
+    pub rerun_max_rounds: u8,
+}
+
 /// The winner's body, watched.
 ///
 /// It forwards every chunk unchanged, notices when the upstream body errors, remembers whether
@@ -266,12 +331,20 @@ pub struct RecoveryBody {
     next: usize,
     /// The combo's mid-stream policy.
     policy: MidstreamPolicy,
+    /// The winner-fail mode: what to do when replacements run out.
+    mode: WinnerFailMode,
     /// The dialect the client speaks.
     client_dialect: Dialect,
     /// The id of the participant whose body is being streamed.
     current_id: String,
-    /// The id of the committed winner.
+    /// The id of the committed winner, used in error messages.
     winner_id: String,
+    /// Whether the client-facing body is an event stream, and can therefore carry a boundary.
+    announceable: bool,
+    /// The last bytes written, kept to know whether the wire is at an event boundary.
+    carry: Vec<u8>,
+    /// Whether the bytes written so far end at an event boundary, so a boundary frame can follow.
+    boundary_safe: bool,
     /// How many bytes have reached the client.
     written: u64,
     /// Whether a tool-call delta has been seen.
@@ -280,41 +353,76 @@ pub struct RecoveryBody {
     guard: ToolCallGuard,
     /// The frames waiting to be written — the retry boundary.
     pending: VecDeque<Bytes>,
-    /// Whether the client-facing body is an event stream, and can therefore carry a boundary.
-    announceable: bool,
+    /// Bytes from the current source that do not yet form a complete event.
+    ///
+    /// Held back so that nothing partial is ever on the wire: a fragment cannot be parsed, and once
+    /// the relay splices, a fragment is concatenated with the boundary that follows it.
+    tail: Vec<u8>,
+    /// The current source ended cleanly and its held tail has been dealt with; the next poll ends
+    /// the body.
+    finished: bool,
     /// Whether the body has ended.
     ended: bool,
     /// Which body is being streamed.
     source: Source,
+    /// A factory that re-dispatches fallback work when replacements run out, for modes that need
+    /// new upstream requests. `None` for `pick-highest-passed` and
+    /// `PickHighestPassedDifferentProvider` (their replacements are pre-built).
+    rerun_factory: Option<RerunFactory>,
+    /// The in-flight fallback future, once spawned.
+    rerun_future: Option<RerunFuture>,
+    /// How many re-dispatch rounds have been used so far (bounds `rerun-excluding`).
+    rerun_rounds: u32,
+    /// The maximum number of re-dispatch rounds allowed. `1` for `stable-fallback`
+    /// (one fallback step), `max_rounds` for `rerun-excluding`.
+    rerun_max_rounds: u8,
 }
 
 impl RecoveryBody {
     /// Build the wrapper.
-    pub fn new(
-        winner: AxumBody,
-        replacements: Vec<Replacement>,
-        policy: MidstreamPolicy,
-        client_dialect: Dialect,
-        winner_id: String,
-        announceable: bool,
-    ) -> Self {
+    pub fn new(winner: AxumBody, replacements: Vec<Replacement>, config: RecoveryConfig) -> Self {
+        let RecoveryConfig {
+            policy,
+            mode,
+            client_dialect,
+            winner_id,
+            announceable,
+            rerun_factory,
+            rerun_max_rounds,
+        } = config;
         Self {
             current_id: winner_id.clone(),
             winner,
             replacements,
             next: 0,
             policy,
+            mode,
             client_dialect,
-            winner_id,
             written: 0,
             tool_call: false,
             guard: ToolCallGuard::new(),
             pending: VecDeque::new(),
+            tail: Vec::new(),
+            finished: false,
             announceable,
+            carry: Vec::with_capacity(4),
+            // Nothing has been written yet, which is the one state a boundary may always follow.
+            boundary_safe: true,
             ended: false,
             source: Source::Winner,
+            winner_id,
+            rerun_factory,
+            rerun_future: None,
+            rerun_rounds: 0,
+            rerun_max_rounds,
         }
     }
+
+    /// How much of an unterminated event is held before it is forwarded anyway.
+    ///
+    /// Eight mebibytes is far more than any real event and small enough that a misbehaving upstream
+    /// costs memory instead of hanging the answer.
+    const TAIL_LIMIT: usize = 8 * 1024 * 1024;
 
     /// Whether there is still a participant to fall back to.
     fn has_replacement(&self) -> bool {
@@ -322,30 +430,165 @@ impl RecoveryBody {
     }
 
     /// Note the bytes that reached the client, and look for a tool-call delta in them.
-    fn observe(&mut self, frame: &Frame<Bytes>) {
-        let Some(data) = frame.data_ref() else {
+    fn observe_bytes(&mut self, data: &[u8]) {
+        if data.is_empty() {
             return;
-        };
+        }
         self.written += data.len() as u64;
         if self.guard.observe(data) {
             self.tool_call = true;
         }
+        // Whether the wire now sits at an event boundary decides whether the boundary frame can be
+        // written at all: anything else would be spliced into the middle of a line or an event.
+        self.carry.extend_from_slice(data);
+        if self.carry.len() > 4 {
+            let excess = self.carry.len() - 4;
+            self.carry.drain(..excess);
+        }
+        self.boundary_safe = self.carry.ends_with(b"\n\n") || self.carry.ends_with(b"\r\n\r\n");
+    }
+
+    /// Whether an event on this body ends at a blank line.
+    ///
+    /// The OpenAI and Anthropic event streams are blank-line delimited. Command Code's
+    /// newline-delimited JSON surface is not — there one line is one event — so holding bytes until
+    /// a blank line would hold the answer until the stream ended.
+    ///
+    /// `announceable` is used rather than the stricter `stream_framed` because some upstreams serve
+    /// SSE without declaring `text/event-stream` (plain text, no content type). Buffering those to
+    /// blank lines is safe: `TAIL_LIMIT` caps the hold, and any stream that announces itself as an
+    /// event stream is line-oriented enough that a blank line eventually arrives.
+    fn events_are_blank_line_delimited(&self) -> bool {
+        self.announceable && self.client_dialect != Dialect::CommandCodeGo
+    }
+
+    /// Split the bytes that may be forwarded now from an event that is still arriving.
+    ///
+    /// An event stream is delimited, not framed: a chunk boundary can fall anywhere, and a fragment
+    /// forwarded as-is is harmless only until the next byte is written by *somebody else*. The
+    /// relay does exactly that when a step fails mid-stream, so the fragment is held instead: the
+    /// client never sees an event that is not complete, and the boundary that follows always starts
+    /// on a line of its own.
+    fn take_complete_events(&mut self, data: &[u8]) -> Bytes {
+        if !self.events_are_blank_line_delimited() {
+            return Bytes::copy_from_slice(data);
+        }
+        self.tail.extend_from_slice(data);
+        let Some(end) = last_event_end(&self.tail) else {
+            // An upstream that never terminates an event must not be able to stall the answer
+            // indefinitely: past the limit the held bytes are forwarded and the count restarts.
+            if self.tail.len() > Self::TAIL_LIMIT {
+                tracing::warn!(
+                    held = self.tail.len(),
+                    "forwarding an event that has not been terminated"
+                );
+                return Bytes::from(std::mem::take(&mut self.tail));
+            }
+            return Bytes::new();
+        };
+        let ready: Vec<u8> = self.tail.drain(..end).collect();
+        Bytes::from(ready)
+    }
+
+    /// A frame from the current source, as far as it can be forwarded now.
+    ///
+    /// `None` means the bytes are only part of an event that has not finished arriving: they are
+    /// held, and the caller should poll again rather than write anything.
+    fn forwardable(&mut self, frame: Frame<Bytes>) -> Option<Frame<Bytes>> {
+        let Some(data) = frame.data_ref() else {
+            // Trailers carry no event payload and cannot be half of one.
+            return Some(frame);
+        };
+        if !self.events_are_blank_line_delimited() {
+            // Nothing is being re-framed, so the bytes go straight through as they arrived.
+            self.observe_bytes(data);
+            return Some(frame);
+        }
+        let ready = self.take_complete_events(data);
+        if ready.is_empty() {
+            return None;
+        }
+        self.observe_bytes(&ready);
+        Some(Frame::data(ready))
+    }
+
+    /// Drop whatever the source that just failed had half-written.
+    ///
+    /// It belongs to a stream that is gone and can never be completed, so it is not an event and
+    /// nothing parseable is lost by dropping it.
+    fn discard_tail(&mut self, from: &str) {
+        if self.tail.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            from,
+            dropped = self.tail.len(),
+            "dropping the partly written event of the stream that failed"
+        );
+        self.tail.clear();
+    }
+
+    /// The bytes still held when the source ended cleanly.
+    ///
+    /// A whole line is forwarded: the event simply arrived without its terminating blank line, and
+    /// a client at end of stream can still use it. A fragment is dropped, because a truncated JSON
+    /// payload is the very thing this module now refuses to hand a client.
+    fn finish_tail(&mut self) -> Option<Bytes> {
+        if self.tail.is_empty() {
+            return None;
+        }
+        let held = std::mem::take(&mut self.tail);
+        if held.ends_with(b"\n") {
+            return Some(Bytes::from(held));
+        }
+        tracing::warn!(
+            dropped = held.len(),
+            "an event stream ended in the middle of an event; the fragment was dropped"
+        );
+        None
     }
 
     /// The winner's body failed. Decide what to do, and set up the next body.
     ///
     /// `from` is the participant whose body just died: the winner, or a replacement that failed in
     /// its turn.
-    fn fail(&mut self, err: axum::Error, from: &str) -> Result<(), axum::Error> {
+    ///
+    /// Returns [`FailOutcome::NeedRerun`] when the configured winner-fail mode may re-dispatch new
+    /// upstream requests (`rerun-excluding` or `stable-fallback`) and no replacement is ready yet.
+    fn fail(&mut self, err: axum::Error, from: &str) -> FailOutcome {
+        // Nothing of the failed source is still in flight: a half-written event dies with it.
+        self.discard_tail(from);
         let action = decide(
             self.written,
             self.tool_call,
             self.has_replacement(),
             self.policy,
-            self.announceable,
+            // A boundary can only be written where an event ends. When the wire is mid-line the
+            // splice is refused instead of corrupting the client's parse — the whole reason this
+            // module exists is to fail legibly rather than hand out a document that cannot be read.
+            self.announceable && self.boundary_safe,
         );
         match action {
             RecoveryAction::Refuse => {
+                // A winner-fail mode that re-dispatches can recover even when there is no
+                // pre-built replacement: it asks for new upstream requests instead. That is only
+                // sane when no tool-call delta has been emitted, nothing has already been switched
+                // to, and we are not refusing because bytes are on the wire under `terminate`.
+                let can_rerun = !self.tool_call
+                    && !self.has_replacement()
+                    && !(self.written > 0 && self.policy == MidstreamPolicy::Terminate)
+                    // New requests replace the answer, so either nothing is on the wire yet or the
+                    // switch can be announced where the client is listening for an event boundary.
+                    && (self.written == 0 || (self.announceable && self.boundary_safe))
+                    && self.rerun_rounds < self.rerun_max_rounds as u32
+                    && matches!(
+                        self.mode,
+                        WinnerFailMode::RerunExcluding { .. }
+                            | WinnerFailMode::StableFallback { .. }
+                    );
+                if can_rerun {
+                    return FailOutcome::NeedRerun;
+                }
                 let reason = if self.tool_call {
                     "a tool-call delta was already emitted, and splicing two models' tool calls \
                      would assemble a call that may be valid and wrong"
@@ -358,8 +601,13 @@ impl RecoveryBody {
                              on the wire"
                         }
                         MidstreamPolicy::Restart => {
-                            "the client's body is not an event stream, so a switch cannot be \
-                             announced and two documents cannot be spliced"
+                            if self.announceable {
+                                "the client's stream stopped in the middle of an event, so a \
+                                 switch cannot be announced without breaking its parse"
+                            } else {
+                                "the client's body is not an event stream, so a switch cannot be \
+                                 announced and two documents cannot be spliced"
+                            }
                         }
                     }
                 };
@@ -369,7 +617,7 @@ impl RecoveryBody {
                     tool_call = self.tool_call,
                     "the winning model's stream failed and the request could not be recovered"
                 );
-                Err(axum::Error::new(std::io::Error::other(format!(
+                FailOutcome::Refused(axum::Error::new(std::io::Error::other(format!(
                     "the upstream stream failed and the request could not be recovered: {reason}: \
                      {err}"
                 ))))
@@ -385,7 +633,7 @@ impl RecoveryBody {
                     "the upstream stream failed before anything reached the client; continuing \
                      with the participant that passed"
                 );
-                Ok(())
+                FailOutcome::Switched
             }
             RecoveryAction::Restart => {
                 let index = self.next;
@@ -401,9 +649,47 @@ impl RecoveryBody {
                     "the upstream stream failed mid-stream; continuing with the participant \
                      that passed"
                 );
-                Ok(())
+                FailOutcome::Switched
             }
         }
+    }
+}
+
+/// The terminal error for a response whose fallback chain could not continue.
+///
+/// The original upstream error has already been consumed by `fail`; what matters to the client is
+/// that the stream ended because every option was exhausted, not that it merely stopped.
+fn fallback_gave_up() -> axum::Error {
+    axum::Error::new(std::io::Error::other(
+        "every upstream that passed the race has now failed, and no fallback round remains",
+    ))
+}
+
+impl RecoveryBody {
+    /// Start the next fallback round.
+    ///
+    /// Returns `None` when a round was started and the caller should keep polling. Returns the
+    /// error to end the body with when it cannot: no fallback was configured, or the configured
+    /// round budget is spent. The factory is deliberately *not* taken — a replacement can die as
+    /// well, and a body that keeps polling a dead source with no factory left either spins inside
+    /// `poll_frame` (pinning a worker) or ends the stream with no error and no retry boundary.
+    fn start_rerun(&mut self) -> Option<axum::Error> {
+        let rounds = self.rerun_rounds;
+        if rounds >= u32::from(self.rerun_max_rounds) {
+            tracing::warn!(
+                rounds,
+                limit = self.rerun_max_rounds,
+                "the fallback retry budget is spent; ending the response with an error"
+            );
+            return Some(fallback_gave_up());
+        }
+        let Some(factory) = self.rerun_factory.as_mut() else {
+            return Some(fallback_gave_up());
+        };
+        self.rerun_rounds = rounds + 1;
+        let future = factory();
+        self.rerun_future = Some(future);
+        None
     }
 }
 
@@ -420,9 +706,53 @@ impl http_body::Body for RecoveryBody {
             if me.ended {
                 return Poll::Ready(None);
             }
+            // The source ended cleanly and its held tail has already been written: this poll is the
+            // end of the body, one step after the last frame so the frame above is not lost.
+            if me.finished {
+                me.ended = true;
+                return Poll::Ready(None);
+            }
+
+            // Drive an in-flight fallback future (rerun-excluding / stable-fallback) to
+            // completion before streaming anything else: its replacements become the body.
+            if let Some(fut) = me.rerun_future.as_mut() {
+                match Pin::new(fut).poll(cx) {
+                    Poll::Ready(Ok(replacements)) => {
+                        me.rerun_future = None;
+                        if replacements.is_empty() {
+                            me.ended = true;
+                            return Poll::Ready(Some(Err(axum::Error::new(
+                                std::io::Error::other(
+                                    "the winning model's stream failed and no replacement \
+                                 could be dispatched",
+                                ),
+                            ))));
+                        }
+                        let from = me.current_id.clone();
+                        let to = replacements[0].id.clone();
+                        me.replacements = replacements;
+                        me.next = 1;
+                        me.source = Source::Replacement(0);
+                        me.current_id = to.clone();
+                        // `fail` only allows a rerun once something is on the wire when the switch
+                        // can be announced, so this is the same condition, stated where it matters.
+                        if me.written > 0 && me.announceable && me.boundary_safe {
+                            me.pending
+                                .extend(retry_boundary(me.client_dialect, &from, &to));
+                        }
+                        continue;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        me.ended = true;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
 
             // The boundary goes out before the replacement's first byte: it is what tells the
-            // client that the model it was talking to just changed.
+            // client that the model it was talking to just changed. `fail` has already dropped
+            // anything the failed source had half-written, so this always starts a fresh event.
             if let Some(frame) = me.pending.pop_front() {
                 me.written += frame.len() as u64;
                 return Poll::Ready(Some(Ok(Frame::data(frame))));
@@ -430,47 +760,69 @@ impl http_body::Body for RecoveryBody {
 
             match me.source {
                 Source::Winner => match Pin::new(&mut me.winner).poll_frame(cx) {
-                    Poll::Ready(Some(Ok(frame))) => {
-                        me.observe(&frame);
-                        return Poll::Ready(Some(Ok(frame)));
-                    }
+                    Poll::Ready(Some(Ok(frame))) => match me.forwardable(frame) {
+                        Some(frame) => return Poll::Ready(Some(Ok(frame))),
+                        None => continue,
+                    },
                     Poll::Ready(Some(Err(err))) => {
                         let from = me.winner_id.clone();
                         match me.fail(err, &from) {
-                            Ok(()) => continue,
-                            Err(err) => {
+                            FailOutcome::Switched => continue,
+                            FailOutcome::NeedRerun => match me.start_rerun() {
+                                None => continue,
+                                Some(err) => {
+                                    me.ended = true;
+                                    return Poll::Ready(Some(Err(err)));
+                                }
+                            },
+                            FailOutcome::Refused(err) => {
                                 me.ended = true;
                                 return Poll::Ready(Some(Err(err)));
                             }
                         }
                     }
                     Poll::Ready(None) => {
-                        me.ended = true;
-                        return Poll::Ready(None);
+                        me.finished = true;
+                        if let Some(frame) = me.finish_tail() {
+                            me.observe_bytes(&frame);
+                            return Poll::Ready(Some(Ok(Frame::data(frame))));
+                        }
+                        continue;
                     }
                     Poll::Pending => return Poll::Pending,
                 },
                 Source::Replacement(index) => {
                     match Pin::new(&mut me.replacements[index].body).poll_frame(cx) {
-                        Poll::Ready(Some(Ok(frame))) => {
-                            me.observe(&frame);
-                            return Poll::Ready(Some(Ok(frame)));
-                        }
+                        Poll::Ready(Some(Ok(frame))) => match me.forwardable(frame) {
+                            Some(frame) => return Poll::Ready(Some(Ok(frame))),
+                            None => continue,
+                        },
                         Poll::Ready(Some(Err(err))) => {
                             // The replacement died too: fall through to the next participant that
                             // passed, in priority order.
                             let from = me.current_id.clone();
                             match me.fail(err, &from) {
-                                Ok(()) => continue,
-                                Err(err) => {
+                                FailOutcome::Switched => continue,
+                                FailOutcome::NeedRerun => match me.start_rerun() {
+                                    None => continue,
+                                    Some(err) => {
+                                        me.ended = true;
+                                        return Poll::Ready(Some(Err(err)));
+                                    }
+                                },
+                                FailOutcome::Refused(err) => {
                                     me.ended = true;
                                     return Poll::Ready(Some(Err(err)));
                                 }
                             }
                         }
                         Poll::Ready(None) => {
-                            me.ended = true;
-                            return Poll::Ready(None);
+                            me.finished = true;
+                            if let Some(frame) = me.finish_tail() {
+                                me.observe_bytes(&frame);
+                                return Poll::Ready(Some(Ok(Frame::data(frame))));
+                            }
+                            continue;
                         }
                         Poll::Pending => return Poll::Pending,
                     }
@@ -500,9 +852,7 @@ impl http_body::Body for RecoveryBody {
 pub fn wrap(
     response: Response,
     replacements: Vec<Replacement>,
-    policy: MidstreamPolicy,
-    client_dialect: Dialect,
-    winner_id: String,
+    config: RecoveryConfig,
 ) -> Response {
     let (parts, body) = response.into_parts();
 
@@ -522,14 +872,11 @@ pub fn wrap(
         None => true,
     };
 
-    let body = RecoveryBody::new(
-        body,
-        replacements,
-        policy,
-        client_dialect,
-        winner_id,
+    let config = RecoveryConfig {
         announceable,
-    );
+        ..config
+    };
+    let body = RecoveryBody::new(body, replacements, config);
     Response::from_parts(parts, AxumBody::new(body))
 }
 
@@ -607,6 +954,138 @@ mod tests {
             decide(0, false, true, MidstreamPolicy::Restart, false),
             RecoveryAction::Silent
         );
+    }
+
+    /// Both spellings of the blank line that ends an event, and no complete event without one.
+    #[test]
+    fn an_event_ends_at_a_blank_line_in_either_spelling() {
+        assert_eq!(last_event_end(b"data: {}\n\n"), Some(10));
+        assert_eq!(last_event_end(b"data: {}\r\n\r\n"), Some(12));
+        // A fragment holds no complete event, however many lines it has.
+        assert_eq!(last_event_end(b"data: {\"a\":"), None);
+        assert_eq!(last_event_end(b"data: {}\n"), None);
+        // The last event wins, so a buffer of several is forwarded up to the final blank line.
+        assert_eq!(last_event_end(b"data: {}\n\ndata: {}\n\nrest"), Some(20));
+    }
+
+    /// A configuration for a body whose framing the test controls.
+    fn body_config(announceable: bool) -> RecoveryConfig {
+        RecoveryConfig {
+            policy: MidstreamPolicy::Restart,
+            mode: WinnerFailMode::PickHighestPassed,
+            client_dialect: Dialect::OpenAi,
+            winner_id: "first/race-model".to_owned(),
+            announceable,
+            rerun_factory: None,
+            rerun_max_rounds: 1,
+        }
+    }
+
+    /// A body that yields the given frames in order.
+    fn body_of(frames: Vec<Result<Bytes, std::io::Error>>) -> AxumBody {
+        AxumBody::from_stream(futures_util::stream::iter(frames))
+    }
+
+    /// Everything the body writes, and the error that ended it.
+    async fn drain_body(mut body: RecoveryBody) -> (String, Option<String>) {
+        use http_body_util::BodyExt as _;
+        let mut text = String::new();
+        loop {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        text.push_str(&String::from_utf8_lossy(data));
+                    }
+                }
+                Some(Err(err)) => return (text, Some(err.to_string())),
+                None => return (text, None),
+            }
+        }
+    }
+
+    /// A chunk boundary in the middle of an event delays the event, it does not split it.
+    #[tokio::test]
+    async fn an_event_reaches_the_client_whole() {
+        let winner = body_of(vec![
+            Ok(Bytes::from_static(b"data: {\"delta\":")),
+            Ok(Bytes::from_static(b"\"one\"}\n")),
+            Ok(Bytes::from_static(b"\ndata: {\"delta\":\"two\"}\n\n")),
+        ]);
+        let (text, error) =
+            drain_body(RecoveryBody::new(winner, Vec::new(), body_config(true))).await;
+
+        assert_eq!(error, None);
+        assert_eq!(
+            text,
+            "data: {\"delta\":\"one\"}\n\ndata: {\"delta\":\"two\"}\n\n"
+        );
+    }
+
+    /// A document that is not an event stream is never held back waiting for a blank line.
+    #[tokio::test]
+    async fn a_document_that_is_not_an_event_stream_is_forwarded_as_it_arrives() {
+        let winner = body_of(vec![
+            Ok(Bytes::from_static(b"{\"a\":1}")),
+            Ok(Bytes::from_static(b"{\"b\":2}")),
+        ]);
+        let (text, error) =
+            drain_body(RecoveryBody::new(winner, Vec::new(), body_config(false))).await;
+
+        assert_eq!(error, None);
+        assert_eq!(text, "{\"a\":1}{\"b\":2}");
+    }
+
+    /// An event-stream-like body that doesn't declare `text/event-stream` is still buffered to
+    /// blank lines: `announceable` alone is enough. A whole trailing line is forwarded at end of
+    /// stream, a fragment is dropped.
+    #[tokio::test]
+    async fn an_announceable_stream_buffers_to_blank_lines() {
+        let winner = body_of(vec![
+            Ok(Bytes::from_static(b"data: {\"delta\":\"whole\"}\n\n")),
+            Ok(Bytes::from_static(b"data: {\"delta\":\"partial")),
+        ]);
+        let (text, error) =
+            drain_body(RecoveryBody::new(winner, Vec::new(), body_config(true))).await;
+
+        assert_eq!(error, None);
+        // The whole event went out; the partial line was held and dropped at end of stream.
+        assert_eq!(text, "data: {\"delta\":\"whole\"}\n\n");
+    }
+
+    /// When the wire stops mid-line, a splice would corrupt the client's parse: refuse instead.
+    ///
+    /// This is the case the reported failure came from. Nothing can be un-written, so the answer has
+    /// to end with a legible error rather than with a line that is half one document and half the
+    /// next.
+    #[tokio::test]
+    async fn a_splice_into_a_half_written_line_is_refused() {
+        let winner = body_of(vec![
+            Ok(Bytes::from_static(b"data: {\"delta\":\"half")),
+            Err(std::io::Error::other("the upstream died mid-frame")),
+        ]);
+        let replacement = body_of(vec![Ok(Bytes::from_static(
+            b"data: {\"delta\":\"second\"}\n\n",
+        ))]);
+        let (text, error) = drain_body(RecoveryBody::new(
+            winner,
+            vec![Replacement {
+                id: "second/race-model".to_owned(),
+                body: replacement,
+            }],
+            body_config(false),
+        ))
+        .await;
+
+        assert!(
+            error.is_some(),
+            "the splice should have been refused: {text}"
+        );
+        assert!(text.contains("half"), "{text}");
+        assert!(
+            !text.contains("second"),
+            "the splice happened anyway: {text}"
+        );
+        assert!(!text.contains("manarouter.retry"), "{text}");
     }
 
     #[test]
