@@ -151,6 +151,20 @@ impl Body {
     pub fn is_complete(&self) -> bool {
         matches!(self, Body::Complete(_) | Body::Empty)
     }
+
+    /// The bytes of the first frame, if the body already holds it.
+    ///
+    /// The frame pulled to measure TTFB is stored here until the body is polled, so a caller that
+    /// only wants to *read* it — an error body's reset instant, say — can do so without consuming
+    /// anything and without the risk that comes with buffering a stream. `None` means the answer is
+    /// not available cheaply yet; a caller must then fall back rather than wait.
+    pub fn first_frame_bytes(&self) -> Option<&Bytes> {
+        match self {
+            Body::Complete(bytes) => Some(bytes),
+            Body::Streaming { first, .. } => first.as_ref().and_then(|f| f.data_ref()),
+            Body::Empty => None,
+        }
+    }
 }
 
 impl http_body::Body for Body {

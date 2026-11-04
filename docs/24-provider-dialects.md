@@ -441,6 +441,14 @@ that knows where an answer ends (`commandcode.rs:3-8`).
 - `params.stream` is always `true`, whatever the client asked for. A non-streaming client still
   opens an SSE connection upstream, and `to_pivot_response` exists to fold such a stream back into
   one JSON object (`commandcode.rs:12-15`, `commandcode.rs:80-83`).
+- `params.messages` accepts exactly three roles: `user`, `assistant` and `tool`. Both
+  instruction spellings — `system` and OpenAI's successor `developer` — are instruction
+  messages, lifted into `params.system` and never emitted as messages. A reasoning client sends
+  `developer`, so treating only `system` as an instruction forwarded `{"role":"developer"}` at
+  index 0 and the upstream rejected the whole request with a 400 naming
+  `params.messages[0].role`. Any other unrecognised role is carried as `user` rather than
+  forwarded, because a role the wire does not define is a guaranteed 400 for a field the operator
+  cannot see. The legacy `function` role is mapped onto `tool`.
 - Tool declarations use `input_schema`, not `parameters`, and are **not** wrapped in
   `{type:"function", function:{…}}` — the upstream silently ignores a tool it cannot read
   (`commandcode.rs:16-18`).

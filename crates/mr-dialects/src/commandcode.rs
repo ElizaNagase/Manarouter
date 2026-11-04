@@ -121,7 +121,14 @@ pub fn build_envelope(ctx: &TranslateCtx<'_>, obj: &Map<String, Value>) -> Value
             .unwrap_or("user");
 
         // A system prompt is a top-level envelope field, never a message.
-        if role == "system" {
+        //
+        // `developer` is OpenAI's successor to `system` and is what reasoning clients actually
+        // send (the pi-ai adapter picks it with `model.reasoning && supportsDeveloperRole`).
+        // `params.messages` accepts exactly three roles — `user`, `assistant` and `tool` — so
+        // forwarding an instruction message verbatim produced `{"role":"developer"}` at index 0 and
+        // the upstream rejected the entire request with a 400 naming `params.messages[0].role`.
+        // Both instruction spellings are lifted here, so the wire never carries either.
+        if role == "system" || role == "developer" {
             let text = content_to_string(message.get("content").unwrap_or(&Value::Null));
             if !text.is_empty() {
                 system.push(text);
@@ -129,7 +136,9 @@ pub fn build_envelope(ctx: &TranslateCtx<'_>, obj: &Map<String, Value>) -> Value
             continue;
         }
 
-        if role == "tool" {
+        // `function` is the pre-`tool` spelling of a tool result; it carries `name` and
+        // `content` and no `tool_call_id`, which the branch below already tolerates.
+        if role == "tool" || role == "function" {
             let id = message
                 .get("tool_call_id")
                 .and_then(Value::as_str)
@@ -182,8 +191,16 @@ pub fn build_envelope(ctx: &TranslateCtx<'_>, obj: &Map<String, Value>) -> Value
                 "input": tool_input(args),
             }));
         }
-        // The role is passed through unvalidated, so an unfamiliar `developer` role survives
-        // instead of being silently rewritten into `user`.
+        // Anything left is `user` or `assistant`, or a role the upstream has never heard of.
+        // Emitting an unknown role unmodified guarantees a 400 that names a field the operator
+        // cannot see, so an unknown one is carried as `user` — the same content, a role the wire
+        // accepts. `assistant` is the only other role the envelope allows, and it must not be
+        // invented for a message the client marked as user intent.
+        let role = if role == "assistant" {
+            "assistant"
+        } else {
+            "user"
+        };
         cc_messages.push(json!({"role": role, "content": parts}));
     }
 
@@ -283,14 +300,9 @@ fn content_to_string(v: &Value) -> String {
                         } else if let Some(image) = part.get("image_url") {
                             let url = image
                                 .as_str()
-                                .map(str::to_string)
-                                .or_else(|| {
-                                    image.get("url").and_then(Value::as_str).map(str::to_string)
-                                })
+                                .or_else(|| image.get("url").and_then(Value::as_str))
                                 .unwrap_or_default();
-                            out.push_str("[Image URL: ");
-                            out.push_str(&url);
-                            out.push(']');
+                            out.push_str(&image_placeholder(url));
                         }
                     }
                     _ => {}
@@ -300,6 +312,38 @@ fn content_to_string(v: &Value) -> String {
         }
         other => other.to_string(),
     }
+}
+
+/// Keep an image reference bounded when this dialect cannot carry image content.
+///
+/// A data URL contains the complete base64 image in the URL itself. Putting that URL into a text
+/// placeholder makes the upstream tokenize the binary payload as ordinary text — roughly one token
+/// per byte — even though nothing downstream can use it. Keep the media-type prefix, but never copy
+/// the payload. Remote URLs remain useful to the model, while unusually long ones are bounded too.
+fn image_placeholder(url: &str) -> String {
+    const MAX_REMOTE_URL_CHARS: usize = 512;
+    const MAX_DATA_PREFIX_CHARS: usize = 256;
+
+    if url
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    {
+        let metadata = url[5..].split(',').next().unwrap_or_default();
+        let mut prefix = String::from("data:");
+        for ch in metadata.chars().take(MAX_DATA_PREFIX_CHARS) {
+            prefix.push(ch);
+        }
+        if metadata.chars().count() > MAX_DATA_PREFIX_CHARS {
+            prefix.push('…');
+        }
+        return format!("[Image URL: {prefix},…]");
+    }
+
+    let mut bounded = url.chars().take(MAX_REMOTE_URL_CHARS).collect::<String>();
+    if url.chars().count() > MAX_REMOTE_URL_CHARS {
+        bounded.push('…');
+    }
+    format!("[Image URL: {bounded}]")
 }
 
 /// Turn an OpenAI tool-call `arguments` value into the envelope's `input` object.
@@ -1465,6 +1509,74 @@ mod tests {
         );
     }
 
+    /// The failure this reproduces: a reasoning client sends its instructions as `developer`,
+    /// the builder forwarded the role, and the upstream answered 400 with
+    /// `params.messages[0].role`. The instruction must leave the message list, exactly like
+    /// `system`.
+    #[test]
+    fn developer_instructions_are_lifted_like_system() {
+        let out = build(json!({
+            "model": "x",
+            "messages": [
+                {"role": "developer", "content": [{"type": "text", "text": "be terse"}]},
+                {"role": "user", "content": "hi"},
+                {"role": "developer", "content": "and careful"},
+                {"role": "assistant", "content": "hello"},
+            ],
+        }));
+        assert_eq!(out["params"]["system"], "be terse\nand careful");
+        let messages = out["params"]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn legacy_function_results_become_tool_results() {
+        let out = build(json!({
+            "model": "x",
+            "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "call_1", "function": {"name": "bash", "arguments": "{}"}}
+                ]},
+                {"role": "function", "name": "bash", "content": "ok"},
+            ],
+        }));
+        let messages = out["params"]["messages"].as_array().unwrap();
+        let result = &messages[2];
+        assert_eq!(result["role"], "tool");
+        assert_eq!(result["content"][0]["type"], "tool-result");
+        assert_eq!(result["content"][0]["toolName"], "bash");
+        assert_eq!(result["content"][0]["output"]["value"], "ok");
+    }
+
+    /// Whatever the client sends, the wire carries only the three roles the upstream defines.
+    #[test]
+    fn no_request_can_put_an_unknown_role_on_the_wire() {
+        let out = build(json!({
+            "model": "x",
+            "messages": [
+                {"role": "operator", "content": "who am I"},
+                {"role": "tool_result", "content": "loose"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"content": "no role at all"},
+            ],
+        }));
+        let messages = out["params"]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 5);
+        for message in messages {
+            let role = message["role"].as_str().unwrap();
+            assert!(
+                matches!(role, "user" | "assistant" | "tool"),
+                "{role} is not a role the upstream accepts"
+            );
+        }
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "who am I");
+    }
+
     #[test]
     fn tools_use_input_schema_and_drop_the_function_wrapper() {
         let out = build(json!({
@@ -1551,6 +1663,23 @@ mod tests {
             out["params"]["messages"][0]["content"][0]["text"],
             "see [Image URL: http://x/y.png]"
         );
+    }
+
+    #[test]
+    fn data_image_urls_never_copy_the_base64_payload_into_text() {
+        let payload = "A".repeat(100_000);
+        let url = format!("data:image/jpeg;base64,{payload}");
+        let out = build(json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": url}}
+            ]}],
+        }));
+        let text = out["params"]["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(text, "[Image URL: data:image/jpeg;base64,…]");
+        assert!(text.len() < 100);
     }
 
     #[test]

@@ -19,7 +19,7 @@ import {
 import {
   extractList, stepLabel, moveStep, remapParticipants, remapIndex,
   parseWinnerFail, buildWinnerFail, toggleParticipant,
-  comboLevels, stepModel, stepProvider, modelLevels, endsInLevelName,
+  comboLevels, stepModel, stepProvider, modelLevels, providerLevels, endsInLevelName,
 } from './format.js';
 
 // A check's result outlives the selection that produced it: an operator who checks three combos and
@@ -610,18 +610,26 @@ export async function renderCombos(mount, ctx, selectedId) {
         // substitution; a level already configured but no longer offered is kept and labelled with
         // the ceiling it will actually run at, so the value is never silently rewritten.
         const stepMeta = stepModel(step, providers);
-        const offered = modelLevels(stepMeta, stepProvider(step, providers));
+        const stepProviderEntry = stepProvider(step, providers);
+        const offered = modelLevels(stepMeta, stepProviderEntry);
         const ceiling = offered[offered.length - 1];
+        // Every level the provider's dialect can put on the wire is selectable, so a level can be
+        // pinned by hand even when the model entry advertises none (a model synced without declared
+        // levels used to leave "model default" as the only choice). A level the model does not
+        // offer is still honest: the label says what it will actually run at, which is the ceiling
+        // the relay substitutes.
+        const sendable = providerLevels(stepProviderEntry, stepMeta);
         const levelOptions = [h('option', { value: '' }, 'model default')];
-        for (const level of offered) {
+        for (const level of sendable) {
           levelOptions.push(h('option', {
-            value: level, selected: step.level === level,
-          }, level));
+            value: level,
+            selected: step.level === level,
+          }, offered.includes(level) ? level : `${level} → ${ceiling ?? 'no reasoning'}`));
         }
-        if (step.level && !offered.includes(step.level)) {
+        if (step.level && !sendable.includes(step.level)) {
           levelOptions.push(h('option', {
             value: step.level, selected: true,
-          }, `${step.level} → ${ceiling ?? 'no reasoning'}`));
+          }, `${step.level} → unsendable on this provider`));
         }
         const levelSelect = h('select', {
           class: 'input step-level',

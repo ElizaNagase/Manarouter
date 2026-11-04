@@ -37,3 +37,6 @@ __pycache__/
 # --- local backups ---
 *.bak
 plan.md.bak
+
+# --- sweep output ---
+/issues.md

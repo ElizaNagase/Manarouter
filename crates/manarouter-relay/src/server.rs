@@ -1131,7 +1131,41 @@ async fn dispatch_routed(
         if activity.is_some() {
             attempted = Some(participant_id(step));
         }
-        match attempt_step(&attempt_ctx, step, is_sticky).await {
+        // One step can hold several accounts, and an account that is throttled or spent is not a
+        // failed *step*: the sibling accounts are still there to serve the request. The attempt
+        // cools the account it used down before returning, so retrying the same step resolves its
+        // candidates again and lands on the next account. Bounded by the number of accounts, so a
+        // provider whose every account refuses costs one attempt each and then falls through to
+        // the next step as before.
+        let account_retries = table
+            .snapshot
+            .providers()
+            .get(step.provider_index as usize)
+            .map(|provider| provider.accounts.len().saturating_sub(1).min(8))
+            .unwrap_or(0);
+        let mut retries_left = account_retries;
+        let mut attempt = attempt_step(&attempt_ctx, step, is_sticky).await;
+        loop {
+            let retry = match &attempt {
+                // A body to hand the client means the upstream answered and refused. That answer is
+                // worth retrying only while another account of this step is still usable.
+                Attempt::Failed { .. } => {
+                    retries_left > 0 && step_has_a_live_account(&app, &table, step, now_ms)
+                }
+                _ => false,
+            };
+            if !retry {
+                break;
+            }
+            retries_left -= 1;
+            tracing::debug!(
+                provider = %step.provider_id,
+                model = %step.model,
+                "retrying the same step on another account"
+            );
+            attempt = attempt_step(&attempt_ctx, step, is_sticky).await;
+        }
+        match attempt {
             Attempt::Answer(response) => {
                 // A non-hedge step has no replacement, but the body still needs to be buffered to
                 // event boundaries so that a mid-stream death never hands the client half a frame.
@@ -1644,17 +1678,19 @@ async fn attempt_step(actx: &AttemptContext<'_>, step: &StepPlan, is_sticky_step
     // and the cooldown would keep excluding an account that is fine from every later request.
     let mut without_credential = 0usize;
     let mut unusable_credential = 0usize;
-    let mut chosen = None;
+    // Every candidate with a usable credential, in selection order. The loop below takes them one
+    // at a time: an account that is throttled, spent, or unreachable is cooled down and the *next
+    // one on the same step* is tried, because a provider holding five accounts is exactly the
+    // situation where one exhausted account must not fail the request. Stopping at the first
+    // failure is what made a Codex account with a spent window hide four siblings with quota.
+    let mut usable_candidates = Vec::new();
     for candidate in candidates {
         match account_credential(app, step, candidate).await {
             AccountCredential::Usable {
                 credential,
                 oauth_headers,
                 oauth_tokens,
-            } => {
-                chosen = Some((candidate, credential, oauth_headers, oauth_tokens));
-                break;
-            }
+            } => usable_candidates.push((candidate, credential, oauth_headers, oauth_tokens)),
             AccountCredential::Unusable(CredentialMiss::Missing) => without_credential += 1,
             AccountCredential::Unusable(CredentialMiss::Unusable) => unusable_credential += 1,
             AccountCredential::VaultUnreadable(e) => {
@@ -1673,7 +1709,11 @@ async fn attempt_step(actx: &AttemptContext<'_>, step: &StepPlan, is_sticky_step
             }
         }
     }
-    let Some((account, credential, oauth_headers, oauth_tokens)) = chosen else {
+    // The first candidate in selection order, not the last: round-robin and priority both encode
+    // the operator's intent in this order.
+    let Some((account, credential, oauth_headers, oauth_tokens)) =
+        usable_candidates.into_iter().next()
+    else {
         // Every candidate was unusable for the same kind of reason, and it is not a cooldown: no
         // amount of waiting produces a credential. Saying so sends the operator to the account that
         // needs one; blaming a cooldown would send them to look at the wrong state.
@@ -1936,14 +1976,40 @@ async fn attempt_step(actx: &AttemptContext<'_>, step: &StepPlan, is_sticky_step
                 }
                 sticky_cleared = true;
             }
-            let reason = classify_status(response.status);
+            // A refusal body can carry the account's own recovery instant, and that is worth more
+            // than a status-code guess: it is the difference between parking a spent account for
+            // the minute it takes to be refused again and parking it until it can actually serve.
+            // Read this before the body is handed to the client — after that it is the client's.
+            let mut reason = classify_status(response.status);
+            let mut named_wait = retry_after_ms(&response.headers);
+            // Only a refusal is read, and only a refusal small enough to be a refusal: a provider
+            // that answers a 429 or a 402 with a stream is not describing a quota window, and
+            // buffering it would trade this bug for a memory one.
+            let refusal_wait = if matches!(
+                response.status,
+                StatusCode::TOO_MANY_REQUESTS
+                    | StatusCode::PAYMENT_REQUIRED
+                    | StatusCode::FORBIDDEN
+            ) {
+                response
+                    .body
+                    .first_frame_bytes()
+                    .and_then(|bytes| exhausted_by_body(bytes))
+            } else {
+                None
+            };
+            if let Some((named, wait)) = refusal_wait {
+                reason = named;
+                named_wait = wait.or(named_wait);
+            }
+            let rebuilt = response;
             app.health.cool_down(
                 account.id.as_str(),
-                select::cooldown_until(reason, 0, retry_after_ms(&response.headers), quota),
+                select::cooldown_until(reason, 0, named_wait, quota),
                 reason,
             );
             Attempt::Failed {
-                response: Some(build_response(response, None)),
+                response: Some(build_response(rebuilt, None)),
                 sticky_cleared,
             }
         }
@@ -2610,6 +2676,50 @@ fn auth_error(outcome: &AuthOutcome, dialect: Dialect) -> Response {
     response
 }
 
+/// What a 429 body says about *when* the account recovers.
+///
+/// A bare 429 is a throttle: the provider wants a moment. A 429 that carries a spent window is a
+/// different thing — the budget is gone until the instant the provider names. Codex says so with
+/// `{"error":{"type":"usage_limit_reached","resets_in_seconds":1233929}}`, and OpenAI's own
+/// `rate_limit_reached` details carry the same shape. Treating those as an ordinary throttle parks
+/// the account for the configured minute, it comes back, is refused again, and the request fails
+/// while a sibling account with quota sits unused.
+///
+/// Returns the reason plus the millisecond wait the body states. The wait is clamped to a day, the
+/// same cap `retry_after_ms` applies, so a bogus value cannot park an account indefinitely.
+fn exhausted_by_body(body: &[u8]) -> Option<(select::CooldownReason, Option<u64>)> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let error = value.get("error").unwrap_or(&value);
+    let kind = error.get("type").or_else(|| error.get("code"))?.as_str()?;
+    let exhausted = matches!(
+        kind,
+        "usage_limit_reached" | "rate_limit_reached" | "insufficient_quota"
+    );
+    if !exhausted {
+        return None;
+    }
+    let seconds = error
+        .get("resets_in_seconds")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            // Some upstreams name an absolute instant in seconds instead of a delay.
+            error
+                .get("resets_at")
+                .and_then(serde_json::Value::as_u64)
+                .map(|at| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    at.saturating_sub(now)
+                })
+        });
+    Some((
+        select::CooldownReason::QuotaExhausted,
+        seconds.map(|s| s.min(86_400).saturating_mul(1000)),
+    ))
+}
+
 /// Which cooldown a status code deserves.
 fn classify_status(status: StatusCode) -> select::CooldownReason {
     match status.as_u16() {
@@ -3136,24 +3246,27 @@ async fn build_client_response(
 
     let mut response = Response::new(body);
     *response.status_mut() = status;
+    // The content type describes the body *this* function produced, not the one the upstream sent,
+    // and the two disagree whenever the request was translated. A non-streaming client gets a
+    // single folded JSON document no matter that the upstream only ever streams; forwarding
+    // `text/event-stream` alongside it was actively harmful, because the recovery layer keys its
+    // event framing on that type and would hold the document waiting for a blank-line-terminated
+    // event that never comes, then drop the whole answer at end of stream. Codex and Command Code
+    // both stream unconditionally, so both produced an empty 200 for every non-streaming client.
+    let translated_content_type = if ctx.client_streaming {
+        "text/event-stream; charset=utf-8"
+    } else {
+        "application/json; charset=utf-8"
+    };
     for (name, value) in headers.iter() {
         let lower = name.as_str().to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&lower.as_str())
-            || (ctx.upstream_dialect == Dialect::CommandCodeGo && lower == "content-type")
-        {
+        if HOP_BY_HOP.contains(&lower.as_str()) {
             continue;
         }
         response.headers_mut().append(name.clone(), value.clone());
     }
-    if ctx.upstream_dialect == Dialect::CommandCodeGo {
-        let content_type = if ctx.client_streaming {
-            "text/event-stream; charset=utf-8"
-        } else {
-            "application/json; charset=utf-8"
-        };
-        if let Ok(value) = HeaderValue::from_str(content_type) {
-            response.headers_mut().insert("content-type", value);
-        }
+    if let Ok(value) = HeaderValue::from_str(translated_content_type) {
+        response.headers_mut().insert("content-type", value);
     }
     response
 }
@@ -3278,6 +3391,26 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
     "content-length",
 ];
+
+/// Whether a step still has an account that has not been cooled down.
+///
+/// Used after a failed attempt to decide whether retrying the *same* step can reach a different
+/// account. The failed account is cooled down before this runs, so its own entry excludes it.
+fn step_has_a_live_account(
+    app: &AppState,
+    table: &RouteTable,
+    step: &StepPlan,
+    now_ms: u64,
+) -> bool {
+    let health = app.health.view();
+    table
+        .snapshot
+        .providers()
+        .get(step.provider_index as usize)
+        .is_some_and(|provider| {
+            select::step_has_usable_account(provider, &health, now_ms, &step.model)
+        })
+}
 
 fn build_response(
     upstream: crate::upstream::UpstreamResponse,
@@ -4998,6 +5131,58 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
     fn an_absent_retry_after_is_none() {
         assert_eq!(retry_after_ms(&HeaderMap::new()), None);
     }
+    #[test]
+    fn a_codex_usage_limit_is_a_spent_window_and_its_reset_is_honoured() {
+        // The exact body Codex returns, captured from a free account whose window was spent. Before
+        // this, the 429 was classified as a throttle: the account came back after a minute only to
+        // be refused again, while a sibling account with quota sat unused.
+        let body = br#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"free","resets_at":1795016770,"limit_window_minutes":43200,"resets_in_seconds":1233929}}"#;
+        let (reason, wait) = exhausted_by_body(body).expect("a spent window");
+        assert_eq!(reason, select::CooldownReason::QuotaExhausted);
+        // The body says ~14 days; the account is parked for the cap of one day instead. Long enough
+        // that it stops poisoning requests, short enough that a wrong or stale instant cannot hide a
+        // recovered account for a fortnight. Retrying once a day costs one refused request.
+        assert_eq!(wait, Some(86_400_000));
+    }
+
+    #[test]
+    fn an_ordinary_throttle_is_still_a_throttle() {
+        // A 429 that only says "slow down" must not be read as a spent window: the difference is
+        // whether waiting can help, and it decides how long the account is parked.
+        assert_eq!(
+            exhausted_by_body(br#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#),
+            None
+        );
+        assert_eq!(exhausted_by_body(b"not json at all"), None);
+        assert_eq!(exhausted_by_body(b""), None);
+        assert_eq!(exhausted_by_body(br#"{"error":{}}"#), None);
+    }
+
+    #[test]
+    fn a_reset_stated_as_an_instant_is_converted_to_a_wait() {
+        // OpenAI states an instant rather than a delay on some endpoints. Reading it as a delay
+        // would park the account until 1970.
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        let body = format!(r#"{{"error":{{"type":"usage_limit_reached","resets_at":{future}}}}}"#);
+        let (_, wait) = exhausted_by_body(body.as_bytes()).expect("a spent window");
+        let wait = wait.expect("a wait");
+        assert!(
+            (500_000..=600_000).contains(&wait),
+            "expected roughly ten minutes, got {wait} ms"
+        );
+    }
+
+    #[test]
+    fn a_window_longer_than_a_day_is_capped() {
+        // The same cap `retry_after_ms` applies: a bogus value must not park an account for a year.
+        let body = br#"{"error":{"type":"usage_limit_reached","resets_in_seconds":999999999}}"#;
+        let (_, wait) = exhausted_by_body(body).expect("a spent window");
+        assert_eq!(wait, Some(86_400_000));
+    }
 
     #[test]
     fn status_codes_map_to_the_cooldowns_they_deserve() {
@@ -6243,6 +6428,120 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 "{label} lost the cache write split: {body}"
             );
         }
+    }
+
+    /// A non-streaming client talking to a stream-only upstream must receive the folded answer.
+    ///
+    /// Codex and Command Code both stream unconditionally: a client asking for a single JSON
+    /// document gets one synthesised by the relay, which consumes the upstream's SSE and folds it.
+    /// That folded body is JSON, but the response kept the upstream's `text/event-stream` content
+    /// type. The recovery layer keys its event framing on that type, so it held the document
+    /// waiting for a blank-line-terminated event that never arrives, then dropped the whole thing
+    /// at end of stream — an empty 200 with no body and no error. Every non-streaming call through
+    /// a stream-only provider failed this way.
+    /// A `Dialect::Codex` upstream that answers with a plain Responses event stream.
+    async fn codex_stream_upstream() -> String {
+        let app = axum::Router::new().fallback(move || async move {
+            let lines = vec![
+                r#"{"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}"#
+                    .to_owned(),
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[]}}"#.to_owned(),
+                r#"{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"hello from codex"}"#.to_owned(),
+                r#"{"type":"response.output_text.done","item_id":"msg_1","output_index":0,"content_index":0,"text":"hello from codex"}"#.to_owned(),
+                r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":11,"output_tokens":4,"total_tokens":15}}}"#.to_owned(),
+            ];
+            let stream = futures_util::stream::iter(
+                lines
+                    .into_iter()
+                    .map(|line| Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {line}\n\n")))),
+            );
+            let mut response = Response::new(AxumBody::from_stream(stream));
+            response
+                .headers_mut()
+                .insert("content-type", "text/event-stream".parse().unwrap());
+            response
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_folded_answer_keeps_its_body_and_is_labelled_json() {
+        let base_url = codex_stream_upstream().await;
+        let mut provider = mr_core::model::Provider::new("cmd", Dialect::Codex, &base_url);
+        let mut account = mr_core::model::Account::new("cmd");
+        account.secret_ref = Some("test-credential".to_owned());
+        provider.accounts = vec![account];
+        let mut entry = dm();
+        entry.id = "m".to_owned();
+        provider.models = vec![entry];
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = mr_core::secret::Vault::open(dir.path()).unwrap();
+        vault.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(vault),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: store,
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+        };
+
+        // Deliberately *not* streaming: this is the path that folded the answer into nothing.
+        // A Responses-shaped request, because Codex speaks only that shape.
+        let body = serde_json::json!({
+            "model": "cmd/m",
+            "input": "fold1x",
+        })
+        .to_string();
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(body),
+        )
+        .await;
+
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let body = body_text(response).await;
+        assert_eq!(status, StatusCode::OK, "the folded request failed: {body}");
+        assert!(
+            content_type.contains("application/json"),
+            "a folded answer is JSON, but it is labelled {content_type:?}: {body}"
+        );
+        assert!(
+            !body.trim().is_empty(),
+            "the folded answer was empty; the document was dropped instead of delivered"
+        );
+        // The upstream's own content must survive the fold, not merely the envelope around it.
+        assert!(
+            body.contains("chat.completion"),
+            "the folded body is not a completion document: {body}"
+        );
     }
 
     /// A streaming answer's usage must land in the ledger with its cache split and its window.

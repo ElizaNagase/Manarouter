@@ -13,7 +13,7 @@ import {
   h, icon, chip, field, toggle, kv, emptyState, errorBlock, applyFieldErrors, clearFieldErrors, copyButton,
 } from './dom.js';
 import {
-  deriveProviderHealth, accountState, formatAge, formatCompact, providerLevels,
+  deriveProviderHealth, accountState, formatAge, formatCompact, providerLevels, declaredLevels,
 } from './format.js';
 
 // Input modalities an operator can declare per model. Empty means *derive* from the bundled
@@ -509,7 +509,10 @@ export async function renderProviders(mount, ctx) {
           ? 'Connect an account below to let this provider serve requests.'
           : 'Add an account to give this provider credentials.'));
     }
-    accSection.append(buildAccountForm(p));
+    // A successful add has to leave the page showing the account it just created. Without a
+    // callback the old flow stopped at a disabled "Adding…" button, and the account only appeared
+    // after the drawer was closed and re-opened by hand.
+    accSection.append(buildAccountForm(p, () => afterAccountConnected(p.id)));
     body.append(accSection);
 
     // --- models ---
@@ -551,6 +554,7 @@ export async function renderProviders(mount, ctx) {
           h('td', {}, chip(m.source ?? 'synced', 'chip-neutral', 'source')),
           m.hidden ? h('td', {}, chip('hidden')) : h('td', {}),
           buildInlineModelNumber(p, m, 'context_length', 'context length'),
+          buildInlineModelLevels(p, m),
           buildInlineModelReasoning(p, m),
           buildInlineModelModalities(p, m),
           h('td', { class: 'actions' }, test, toggle, del)));
@@ -560,7 +564,8 @@ export async function renderProviders(mount, ctx) {
           h('thead', {}, h('tr', {},
             h('th', { scope: 'col' }, 'Model'), h('th', { scope: 'col' }, 'Source'),
             h('th', { scope: 'col' }, ''), h('th', { scope: 'col' }, 'Ctx'),
-            h('th', { scope: 'col' }, 'Default level'), h('th', { scope: 'col' }, 'Input modalities'),
+            h('th', { scope: 'col' }, 'Levels'), h('th', { scope: 'col' }, 'Default level'),
+            h('th', { scope: 'col' }, 'Input modalities'),
             h('th', { scope: 'col' }, ''))),
           tb)));
     } else {
@@ -865,6 +870,91 @@ export async function renderProviders(mount, ctx) {
     async function persist(next) {
       const value = next instanceof Set ? Array.from(next) : next;
       await api.post(`/api/providers/${encodeURIComponent(p.id)}/models`, { ...model, [key]: value });
+      await reload(true);
+    }
+
+    edit.addEventListener('click', () => renderEditor(value));
+    return cell;
+  }
+
+  /// Inline chips for a model's **declared** `reasoning_levels`.
+  ///
+  /// Separate from `buildInlineModelReasoning` on purpose: that one picks the *default* tier, this
+  /// one decides *which tiers the model offers at all*. The drawer previously exposed only the
+  /// former, so an operator could choose a default from the dialect's vocabulary but had no way to
+  /// grant or remove a level on a particular model — the declared list could only be edited on the
+  /// Models page, behind a collapsed "Configure" panel.
+  ///
+  /// Off means *derive* (the bundled capability table, then the dialect). On writes an explicit
+  /// list, which always wins over the derived one.
+  function buildInlineModelLevels(p, model) {
+    const key = 'reasoning_levels';
+    const slot = `model:${p.id}:${model.id}:${key}`;
+    const cell = h('td', {});
+    const offered = providerLevels(p, model);
+    const declared = declaredLevels(model);
+    const value = new Set(declared);
+    const edit = h('button', {
+      class: 'icon-btn', type: 'button',
+      'aria-label': `Edit supported reasoning levels for ${model.id}`,
+      title: 'Edit supported reasoning levels',
+    }, icon('pencil'));
+    const renderView = () => {
+      const chips = declared.length
+        ? declared.map((level) => chip(String(level), 'chip-neutral', 'reasoning level'))
+        : [h('span', { class: 'muted' }, 'automatic')];
+      cell.replaceChildren(h('div', { style: 'display:flex;gap:4px;flex-wrap:wrap;' }, ...chips), edit);
+    };
+    const draft = inlineDrafts.get(slot);
+    if (draft !== undefined) renderEditor(draft);
+    else renderView();
+
+    function renderEditor(initial) {
+      const chips = offered.map((level) => {
+        // A declared level this dialect cannot send would be dropped on save. Keep it visible and
+        // marked rather than letting the checkbox imply it survives.
+        const unsendable = initial.has(level) && !offered.includes(level);
+        const btn = h('button', {
+          class: 'chip' + (initial.has(level) ? ' chip-active' : ''),
+          type: 'button',
+          'aria-pressed': initial.has(level) ? 'true' : 'false',
+          title: unsendable ? `${level} is not sendable on this provider` : level,
+        }, level);
+        btn.addEventListener('click', () => {
+          const next = new Set(initial);
+          if (next.has(level)) next.delete(level); else next.add(level);
+          inlineDrafts.set(slot, next);
+          renderEditor(next);
+        });
+        return btn;
+      });
+      const save = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, 'Save');
+      const cancel = h('button', { class: 'btn btn-sm', type: 'button' }, 'Cancel');
+      cell.replaceChildren(h('div', {},
+        h('div', { style: 'display:flex;gap:4px;flex-wrap:wrap;align-items:center;' }, chips, save, cancel),
+        h('p', { class: 'hint', style: 'margin:4px 0 0;' }, `None checked means automatic (${offered.join(', ')}).`)));
+      const restore = () => {
+        inlineDrafts.delete(slot);
+        renderView();
+      };
+      const finish = async () => {
+        const next = inlineDrafts.get(slot) ?? new Set();
+        save.disabled = true;
+        inlineDrafts.delete(slot);
+        try {
+          await persist(next);
+        } catch (err) {
+          save.disabled = false;
+          ctx.toast.error(`Could not update reasoning levels for ${model.id}`, err);
+        }
+      };
+      save.addEventListener('click', finish);
+      cancel.addEventListener('click', restore);
+    }
+
+    async function persist(next) {
+      const list = Array.from(next);
+      await api.post(`/api/providers/${encodeURIComponent(p.id)}/models`, { ...model, [key]: list });
       await reload(true);
     }
 

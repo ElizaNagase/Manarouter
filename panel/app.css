@@ -203,6 +203,25 @@ body {
   white-space: nowrap;
 }
 
+/* Resting the pointer on the block opens it in place. The fixed height above is what keeps every
+ * nav item below exactly where it was while requests come and go; hover is a deliberate act, so
+ * the block is allowed to grow (and to wrap the route it could only ellipsize) for as long as the
+ * pointer stays. Nothing is hidden behind a tooltip any more. */
+.combo-live:hover {
+  height: auto;
+  min-height: 52px;
+  overflow: visible;
+}
+
+.combo-live:hover .combo-live-combo,
+.combo-live:hover .combo-live-route,
+.combo-live:hover .combo-live-empty {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 /* In flight: a green edge and the word itself, plus a dot that pulses while it is true. The
  * animation is decoration — removing it (reduced motion, or a browser that will not run it)
  * leaves the word "live", which is the part that means something. */
@@ -417,6 +436,26 @@ table.tbl {
 .chip-red   { color: var(--red);   border-color: color-mix(in srgb, var(--red) 45%, transparent);   background: var(--red-dim); }
 .chip-pink  { color: var(--pink);  border-color: color-mix(in srgb, var(--pink) 40%, transparent);  background: var(--pink-dim); }
 .chip-neutral { color: var(--tx2); }
+/* A chip that is also a button, and whether it is currently on.
+ *
+ * The modality editor is a row of toggle chips, so "selected" has to be visible without reading
+ * the label: the state lives in the fill, not in the text. `chip-active` had no rule at all, so
+ * every chip in that editor rendered identically and an operator could not tell which modalities
+ * were already enabled. */
+button.chip {
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.6;
+}
+button.chip:hover { border-color: var(--tx3); color: var(--tx1); }
+.chip-active,
+button.chip.chip-active {
+  color: var(--bg0);
+  border-color: var(--pink);
+  background: var(--pink);
+  font-weight: 600;
+}
 
 /* ---------- buttons ---------- */
 

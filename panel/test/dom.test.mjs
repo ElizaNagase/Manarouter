@@ -64,7 +64,7 @@ globalThis.document = {
 };
 globalThis.window = { addEventListener() {} };
 
-const { field, toggle } = await import('../dom.js');
+const { field, toggle, chip } = await import('../dom.js');
 
 function walk(node, out = []) {
   out.push(node);
@@ -184,3 +184,27 @@ test('toggle() hint goes on its own line inside the row', () => {
   assert.equal(text(hints[0]), 'Combo-wide; 0 disables.');
   assert.ok(row.children.includes(hints[0]));
 });
+
+// The modality picker in view-providers.js is a row of toggle chips, and it marks the selected
+// ones with `chip-active`. That class had no rule in app.css, so every chip rendered identically
+// and an operator could not see which modalities were already enabled — the control looked broken
+// because it gave no feedback at all. These two checks pin both halves: the markup carries the
+// state, and the stylesheet actually styles it.
+test('a selected modality chip is distinguishable from an unselected one', () => {
+  const on = chip('image', 'chip-active');
+  const off = chip('image');
+  assert.equal(on.className, 'chip chip-active');
+  assert.equal(off.className, 'chip chip-neutral');
+  assert.notEqual(on.className, off.className);
+});
+
+test('the stylesheet defines the chip-active state the picker relies on', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const css = await readFile(new URL('../app.css', import.meta.url), 'utf8');
+  assert.match(
+    css,
+    /\.chip-active\s*,?[\s\S]{0,120}?\{[^}]*background:/,
+    'app.css must give .chip-active its own fill; without it a toggle chip cannot show its state',
+  );
+});
+

@@ -183,6 +183,33 @@ The response carries `currentTier`, `allowedTiers`, `ineligibleTiers`, `cloudaic
 `paidTier`. Antigravity sends `"ideType": "ANTIGRAVITY"` and a real `platform` (`WINDOWS` / `MACOS`)
 instead of the `UNSPECIFIED` placeholders — see §5 for why that matters.
 
+### The client fingerprint: who the caller says it is
+
+Cloud Code decides which tiers exist by **classifying the caller**, not only by reading the
+account. Two inputs do that classifying, and both must match the real IDE:
+
+1. The `User-Agent` on the call. The IDE sends
+   `antigravity/ide/<version> darwin/arm64`; the platform token is pinned to the native desktop
+   fingerprint. Manarouter sends exactly the string its quota reader sends, built from
+   `IDE_FALLBACK_VERSION` in `crates/mr-core/src/quota/antigravity.rs`, so the login and the
+   metering paths present one client rather than two.
+2. The host asked first: `daily-cloudcode-pa.googleapis.com`, then production, then the daily
+   sandbox (OmniRoute's order). The host that answered `loadCodeAssist` is reused for
+   `onboardUser` and the operation poll, so one login never straddles two backends.
+
+Get this wrong and the answer is *not* an auth error. A request that does not identify itself
+as the Antigravity suite is answered as the retired **Gemini Code Assist for individuals**
+client: `allowedTiers` carries only `standard-tier`, and `free-tier` appears under
+`ineligibleTiers` with `reasonCode: "UNSUPPORTED_CLIENT"` and the message *“This client is no
+longer supported for Gemini Code Assist for individuals. To continue using Gemini, please migrate
+to the Antigravity suite…”*.
+
+That message invites two wrong conclusions — that the account must enable Cloud billing, or that
+Google has withdrawn the free tier — and both were drawn once in this tree. The control is that
+the same Google account, with the same public client id and the same five scopes, onboards
+normally through OmniRoute. A tier verdict that disagrees with a working reference implementation
+is a statement about the request, not about the account.
+
 ### `onboardUser` and the `Precondition Failed` trap
 
 > **The trap: for a `free-tier` account, omit the `project` field entirely.** Supplying it causes the

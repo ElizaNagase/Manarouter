@@ -52,6 +52,25 @@ fn platform_name() -> &'static str {
     "PLATFORM_UNSPECIFIED"
 }
 
+/// The `User-Agent` every Cloud Code call presents.
+///
+/// The onboarding endpoints classify the caller by this header, and that classification decides
+/// which tiers exist at all. Sent without one, the backend answers for the retired "Gemini Code
+/// Assist for individuals" client, so a free-tier account comes back with only `standard-tier` in
+/// `allowedTiers` and an `ineligibleTiers` entry for `free-tier` with
+/// `reasonCode: "UNSUPPORTED_CLIENT"` — which reads as an account that must enable billing, and
+/// is really a caller that never said who it was.
+///
+/// The quota reader has always sent this header (it is the fingerprint OmniRoute presents); the
+/// login path did not, which is why an account that already served requests through this instance
+/// could not be added back.
+fn cloud_code_user_agent() -> String {
+    format!(
+        "antigravity/ide/{} darwin/arm64",
+        crate::quota::antigravity::IDE_FALLBACK_VERSION
+    )
+}
+
 fn token_set_from(
     body: &str,
     previous_refresh: Option<&str>,
@@ -143,7 +162,14 @@ fn store_cloudcode_context(tokens: &mut TokenSet, project_id: &str, tier: Option
 /// `reasonCode` and a `reasonMessage`). The message below is the difference between "requires a
 /// paid-tier project" — which sends an operator looking for billing — and the truth observed on
 /// 2026-11-01, where the free tier was refused with `UNSUPPORTED_CLIENT` and a note to migrate to
-/// the Antigravity suite. Only Google can decide that; our job is not to hide it.
+/// the Antigravity suite, which means the caller was not recognised as that suite at all.
+///
+/// The second reading is the one that was measured on 2026-11-01 and first logged as Google's
+/// verdict on the account. It was not: the same account onboards and serves through OmniRoute,
+/// because Cloud Code classifies the caller from the User-Agent and the host. This path sent
+/// neither the IDE fingerprint nor the daily host while the quota reader sent both, which is why
+/// an account that already served requests could not be added back. The refusal text is still
+/// quoted verbatim when a tier genuinely is unavailable; only Google decides that part.
 fn tier_refusal(load_code_assist: &Value, chosen_tier: &str) -> String {
     let allowed: Vec<&str> = load_code_assist
         .get("allowedTiers")
@@ -300,6 +326,44 @@ impl Antigravity {
             ClientTier::Ide => crate::published::ANTIGRAVITY_CLIENT_SECRET,
             ClientTier::GeminiCli => crate::published::GEMINI_CLI_CLIENT_SECRET,
         }
+    }
+
+    /// Ask `loadCodeAssist` on each Cloud Code host until one answers, returning the host that did.
+    ///
+    /// The hosts are not interchangeable. OmniRoute tries the daily host before production, and the
+    /// daily host is where the Antigravity client is onboarded; production answers a caller it
+    /// cannot classify with the legacy client's tier set. The host that answered the tier question
+    /// is reused for `onboardUser` and the operation poll, so one login never straddles two
+    /// backends.
+    async fn load_code_assist(
+        &self,
+        http: &dyn OAuthHttp,
+        authorization: &str,
+        user_agent: &str,
+        body: &str,
+    ) -> Result<(String, Value)> {
+        let mut last_failure = None;
+        for base in crate::quota::antigravity::DISCOVERY_BASE_URLS {
+            let url = format!("{base}/v1internal:loadCodeAssist");
+            let reply = http
+                .post_json(
+                    &url,
+                    &[("Authorization", authorization), ("User-Agent", user_agent)],
+                    body.to_owned(),
+                )
+                .await?;
+            if let Some((class, detail)) = endpoint_failure(reply.status, &reply.body) {
+                last_failure = Some((class, detail));
+                continue;
+            }
+            let value: Value = serde_json::from_str(&reply.body)
+                .map_err(|_| oauth_error("Cloud Code loadCodeAssist response is not JSON"))?;
+            return Ok((base.to_owned(), value));
+        }
+        Err(match last_failure {
+            Some((class, detail)) => oauth_failure(class, Self::ID, detail),
+            None => oauth_error("Cloud Code loadCodeAssist answered on no host"),
+        })
     }
 }
 
@@ -470,26 +534,17 @@ impl OAuthPlatform for Antigravity {
     }
 
     async fn complete_login_with(&self, tokens: &mut TokenSet, http: &dyn OAuthHttp) -> Result<()> {
-        let body = serde_json::json!({
-            "metadata": {
-                "ideType": if self.tier == ClientTier::Ide { "ANTIGRAVITY" } else { "IDE_UNSPECIFIED" },
-                "platform": platform_name(),
-                "pluginType": "GEMINI"
-            }
-        }).to_string();
+        let metadata = serde_json::json!({
+            "ideType": if self.tier == ClientTier::Ide { "ANTIGRAVITY" } else { "IDE_UNSPECIFIED" },
+            "platform": platform_name(),
+            "pluginType": "GEMINI"
+        });
+        let body = serde_json::json!({ "metadata": metadata }).to_string();
         let authorization = format!("Bearer {}", tokens.access_token);
-        let reply = http
-            .post_json(
-                "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
-                &[("Authorization", authorization.as_str())],
-                body,
-            )
+        let user_agent = cloud_code_user_agent();
+        let (base, value) = self
+            .load_code_assist(http, &authorization, &user_agent, &body)
             .await?;
-        if let Some((class, detail)) = endpoint_failure(reply.status, &reply.body) {
-            return Err(oauth_failure(class, Self::ID, detail));
-        }
-        let value: Value = serde_json::from_str(&reply.body)
-            .map_err(|_| oauth_error("Cloud Code loadCodeAssist response is not JSON"))?;
         if let Some(project) = value
             .get("cloudaicompanionProject")
             .filter(|p| !p.is_null())
@@ -526,8 +581,11 @@ impl OAuthPlatform for Antigravity {
         .to_string();
         let reply = http
             .post_json(
-                "https://cloudcode-pa.googleapis.com/v1internal:onboardUser",
-                &[("Authorization", authorization.as_str())],
+                &format!("{base}/v1internal:onboardUser"),
+                &[
+                    ("Authorization", authorization.as_str()),
+                    ("User-Agent", user_agent.as_str()),
+                ],
                 onboard_body,
             )
             .await?;
@@ -547,9 +605,15 @@ impl OAuthPlatform for Antigravity {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
-            let url = format!("https://cloudcode-pa.googleapis.com/v1internal/{name}");
+            let url = format!("{base}/v1internal/{name}");
             let reply = http
-                .get(&url, &[("Authorization", authorization.as_str())])
+                .get(
+                    &url,
+                    &[
+                        ("Authorization", authorization.as_str()),
+                        ("User-Agent", user_agent.as_str()),
+                    ],
+                )
                 .await?;
             if let Some((class, detail)) = endpoint_failure(reply.status, &reply.body) {
                 return Err(oauth_failure(class, Self::ID, detail));
@@ -629,15 +693,23 @@ mod tests {
     struct FakeHttp {
         replies: std::sync::Mutex<Vec<std::result::Result<HttpReply, String>>>,
         requests: std::sync::Mutex<Vec<(String, String)>>,
+        user_agents: std::sync::Mutex<Vec<String>>,
     }
     impl FakeHttp {
         fn new(replies: Vec<HttpReply>) -> Self {
             Self {
                 replies: std::sync::Mutex::new(replies.into_iter().map(Ok).collect()),
                 requests: Default::default(),
+                user_agents: Default::default(),
             }
         }
-        fn take(&self, url: &str, body: String) -> Result<HttpReply> {
+        fn take(&self, url: &str, body: String, headers: &[(&str, &str)]) -> Result<HttpReply> {
+            let agent = headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                .map(|(_, value)| (*value).to_owned())
+                .unwrap_or_default();
+            self.user_agents.lock().unwrap().push(agent);
             self.requests.lock().unwrap().push((url.into(), body));
             self.replies.lock().unwrap().remove(0).map_err(oauth_error)
         }
@@ -647,21 +719,21 @@ mod tests {
         async fn post_form(
             &self,
             url: &str,
-            _: &[(&str, &str)],
+            headers: &[(&str, &str)],
             pairs: &[(&str, &str)],
         ) -> Result<HttpReply> {
-            self.take(url, super::super::flow::form_body(pairs))
+            self.take(url, super::super::flow::form_body(pairs), headers)
         }
         async fn post_json(
             &self,
             url: &str,
-            _: &[(&str, &str)],
+            headers: &[(&str, &str)],
             body: String,
         ) -> Result<HttpReply> {
-            self.take(url, body)
+            self.take(url, body, headers)
         }
-        async fn get(&self, url: &str, _: &[(&str, &str)]) -> Result<HttpReply> {
-            self.take(url, String::new())
+        async fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpReply> {
+            self.take(url, String::new(), headers)
         }
     }
     fn reply(body: &str) -> HttpReply {
@@ -702,9 +774,23 @@ mod tests {
         let requests = fake.requests.lock().unwrap();
         assert!(requests[1].1.contains("free-tier"));
         assert!(!requests[1].1.contains("cloudaicompanionProject"));
+        // Onboarding stays on the host that answered the tier question.
         assert_eq!(
             requests[2].0,
-            "https://cloudcode-pa.googleapis.com/v1internal/operations/op-123"
+            "https://daily-cloudcode-pa.googleapis.com/v1internal/operations/op-123"
+        );
+        drop(requests);
+        // Every Cloud Code call identifies as the IDE. Without this header the backend answers for
+        // the retired Gemini Code Assist client and the free tier is "UNSUPPORTED_CLIENT".
+        let agents = fake.user_agents.lock().unwrap();
+        assert_eq!(agents.len(), 3);
+        assert!(
+            agents.iter().all(|a| a.starts_with("antigravity/ide/")),
+            "every Cloud Code call must carry the IDE fingerprint: {agents:?}"
+        );
+        assert!(
+            agents.iter().all(|a| a.ends_with(" darwin/arm64")),
+            "the platform token is pinned to the desktop fingerprint: {agents:?}"
         );
     }
 
