@@ -93,6 +93,7 @@ strangely with — which is worse than an outright rejection.
 
 | Event | Meaning |
 |---|---|
+| `reasoning-delta` | A fragment of the model's deliberation, bracketed by `reasoning-start`/`reasoning-end`. Carries `text`, like `text-delta`. Forwarded as `reasoning_content`. |
 | `text-delta` | A fragment of assistant text. |
 | `tool-call` | A complete tool call. |
 | `tool-use` / `tool-input-start` | The beginning of a tool call's input. |

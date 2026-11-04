@@ -455,8 +455,18 @@ that knows where an answer ends (`commandcode.rs:3-8`).
 - Errors are not OpenAI-shaped. They are `{"success":false,"error":{…}}`, both as an HTTP body and as
   an `error`-typed stream event, and are rewritten into the client's error shape
   (`commandcode.rs:18-19`).
-- The stream is a private event protocol: `text-delta`, `tool-call`, `tool-use`, `tool-input-start`,
-  `tool-delta`, `tool-input-delta`, `finish` and `error` (`commandcode.rs:461-611`).
+- The stream is a private event protocol: `reasoning-delta`, `text-delta`, `tool-call`,
+  `tool-use`, `tool-input-start`, `tool-delta`, `tool-input-delta`, `finish` and `error`
+  (`commandcode.rs:461-611`).
+- **Reasoning streams as `reasoning-delta`**, bracketed by `reasoning-start`/`reasoning-end` and
+  carrying the fragment in `text` — the same field `text-delta` uses. It is forwarded as the
+  client's `reasoning_content` delta key, never merged into `content`, because a client that reads
+  deliberation as the answer renders the model's scratch work as its reply. These events were
+  previously folded into the catch-all "ignored" arm, so a reasoning model could return
+  `content: ""` with `finish_reason: "length"` while reporting completion tokens it had spent
+  entirely on deliberation the client never saw. The folded (non-streaming) response carries the
+  whole block as `message.reasoning_content`, and omits the field entirely when the model did not
+  deliberate. `reasoning`, `thinking` and `thinking-delta` are accepted as synonyms.
 - Headers are not the translator's business. The relay must add `authorization: Bearer <key>`,
   `accept: text/event-stream`, `x-command-code-version` and `x-cli-environment` itself; the
   constants live next to the translator so the two cannot drift apart

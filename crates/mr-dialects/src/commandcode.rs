@@ -411,6 +411,10 @@ pub(crate) struct StreamState {
     id: String,
     model: String,
     content: String,
+    /// The model's deliberation, kept apart from `content` because it is not the answer. It is
+    /// accumulated for the folded (non-streaming) response, where a client expects the whole
+    /// reasoning block in one message rather than a sequence of deltas.
+    reasoning: String,
     tool_calls: Vec<ToolCall>,
     /// Tool-call id to index in `tool_calls`. The incremental `tool-*` events name an id, and the
     /// client deltas must carry the *index* that id already has — not a fresh one per fragment.
@@ -441,6 +445,7 @@ impl StreamState {
             id: new_completion_id(),
             model: ctx.upstream_model.to_string(),
             content: String::new(),
+            reasoning: String::new(),
             tool_calls: Vec::new(),
             tool_index: HashMap::new(),
             finish_reason: "stop".to_string(),
@@ -461,6 +466,15 @@ impl StreamState {
 enum Step {
     /// A text fragment.
     Text(String),
+    /// A fragment of the model's own deliberation, which is **not** the answer.
+    ///
+    /// The upstream emits `reasoning-delta` events carrying `text`, alongside `text-delta`. Both
+    /// used to be folded into `Ignored`, so a reasoning model's whole budget could be spent on
+    /// deliberation the client never saw: a probe returned `content: ""` with
+    /// `finish_reason: "length"` and 32 completion tokens, all of them reasoning. Reasoning
+    /// therefore rides its own delta key (`reasoning_content`), because mixed into `content` it
+    /// would render the model's scratch work as the answer.
+    Reasoning(String),
     /// A tool call opened, atomically or incrementally. For `tool-call` the arguments are already
     /// complete; for `tool-use` / `tool-input-start` they are empty and arrive as [`Step::ToolArgs`].
     ToolOpen {
@@ -679,9 +693,28 @@ fn classify(state: &mut StreamState, v: &Value) -> Step {
             Step::Ignored
         }
 
-        // `message-start`, `text-start`/`text-end`, `reasoning`, `thinking`, `step-*`, `usage`,
-        // `provider-metadata`, `tool-result` and any Anthropic-shaped event carry nothing this
-        // dialect can forward.
+        // The model's deliberation, which is not the answer. The live endpoint spells this
+        // `reasoning-delta` with a `text` field, exactly like `text-delta`; `reasoning` and
+        // `thinking` are accepted too because older or alternate backends use them and the cost of
+        // tolerating a synonym is one match arm. Dropping these was why a reasoning model could
+        // answer with an empty `content` and `finish_reason: "length"`: every token it spent had
+        // been thrown away.
+        "reasoning-delta" | "reasoning" | "thinking" | "thinking-delta" => {
+            let text = v
+                .get("text")
+                .or_else(|| v.get("delta"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if text.is_empty() {
+                return Step::Ignored;
+            }
+            state.reasoning.push_str(text);
+            Step::Reasoning(text.to_string())
+        }
+
+        // `message-start`, `text-start`/`text-end`, `reasoning-start`/`reasoning-end`, `step-*`,
+        // `usage`, `provider-metadata`, `tool-result` and any Anthropic-shaped event carry nothing
+        // this dialect can forward.
         _ => Step::Ignored,
     }
 }
@@ -858,7 +891,14 @@ pub fn to_pivot_response(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Bytes> {
 /// Build one `chat.completion` object from the accumulated stream.
 fn completion_object(state: &StreamState) -> Value {
     let message = if state.tool_calls.is_empty() {
-        json!({"role": "assistant", "content": state.content})
+        let mut message = json!({"role": "assistant", "content": state.content});
+        // The deliberation the model produced on the way to the answer. Absent when there was
+        // none, rather than an empty string: a client that renders `reasoning_content` should not
+        // be handed a blank thinker.
+        if !state.reasoning.is_empty() {
+            message["reasoning_content"] = json!(state.reasoning);
+        }
+        message
     } else {
         let tool_calls: Vec<Value> = state
             .tool_calls
@@ -1025,6 +1065,13 @@ pub fn translate(
     match &step {
         Step::Text(text) => {
             let delta = with_role(state, json!({"content": text}));
+            chunks.push(chunk(state, delta));
+        }
+
+        // Deliberation rides its own key. A client that understands it renders the model thinking;
+        // one that does not ignores an unknown delta field, which is the correct degradation.
+        Step::Reasoning(text) => {
+            let delta = with_role(state, json!({"reasoning_content": text}));
             chunks.push(chunk(state, delta));
         }
 
@@ -2020,6 +2067,78 @@ mod tests {
         );
     }
 
+    /// The model's deliberation must reach the client on its own key, not vanish.
+    ///
+    /// The shape here is copied from the live endpoint: `reasoning-start`, a run of
+    /// `reasoning-delta` events each carrying `text`, then `reasoning-end`. Before this, every one
+    /// of them fell into the catch-all `Ignored` arm, so a reasoning model spent its whole budget
+    /// on deliberation the client never saw — a probe answered with `content: ""` and
+    /// `finish_reason: "length"` while reporting 32 completion tokens.
+    #[test]
+    fn reasoning_deltas_reach_the_client_as_reasoning_content() {
+        reset_all();
+        assert!(
+            sse_to_pivot(&ctx(), r#"{"type":"reasoning-start","id":"r0"}"#)
+                .unwrap()
+                .is_empty()
+        );
+        for piece in ["17*23 = ", "391"] {
+            let event = format!(r#"{{"type":"reasoning-delta","id":"r0","text":"{piece}"}}"#);
+            let frames = sse_to_pivot(&ctx(), &event).unwrap();
+            assert_eq!(frames.len(), 1, "one delta, one frame");
+            let delta = &data_json(&frames[0])["choices"][0]["delta"];
+            assert_eq!(delta["reasoning_content"], piece);
+            // Deliberation is not the answer: it must never be written to `content`, or the
+            // client renders the model's scratch work as its reply.
+            assert!(
+                delta.get("content").is_none(),
+                "reasoning leaked into content"
+            );
+        }
+        // The answer itself still arrives as `content`.
+        let frames = sse_to_pivot(&ctx(), r#"{"type":"text-delta","text":"391"}"#).unwrap();
+        assert_eq!(
+            data_json(&frames[0])["choices"][0]["delta"]["content"],
+            "391"
+        );
+    }
+
+    /// A folded (non-streaming) answer carries the whole deliberation in its message.
+    #[test]
+    fn a_folded_answer_reports_reasoning_content_beside_the_answer() {
+        reset_all();
+        let body = [
+            r#"{"type":"reasoning-start","id":"r0"}"#,
+            r#"{"type":"reasoning-delta","id":"r0","text":"17*23 = "}"#,
+            r#"{"type":"reasoning-delta","id":"r0","text":"391"}"#,
+            r#"{"type":"reasoning-end","id":"r0"}"#,
+            r#"{"type":"text-delta","text":"391"}"#,
+            r#"{"type":"finish","finishReason":"stop"}"#,
+        ]
+        .join("\n");
+        let out: Value =
+            serde_json::from_slice(&to_pivot_response(&ctx(), body.as_bytes()).unwrap()).unwrap();
+        let message = &out["choices"][0]["message"];
+        assert_eq!(message["content"], "391");
+        assert_eq!(message["reasoning_content"], "17*23 = 391");
+    }
+
+    /// A model that did not deliberate must not be handed a blank thinker field.
+    #[test]
+    fn a_plain_answer_omits_reasoning_content_entirely() {
+        reset_all();
+        let body = [
+            r#"{"type":"text-delta","text":"hello"}"#,
+            r#"{"type":"finish","finishReason":"stop"}"#,
+        ]
+        .join("\n");
+        let out: Value =
+            serde_json::from_slice(&to_pivot_response(&ctx(), body.as_bytes()).unwrap()).unwrap();
+        let message = &out["choices"][0]["message"];
+        assert_eq!(message["content"], "hello");
+        assert!(message.get("reasoning_content").is_none());
+    }
+
     #[test]
     fn an_empty_answer_still_gets_a_role_frame_before_the_terminator() {
         reset_all();
@@ -2038,9 +2157,23 @@ mod tests {
         assert!(sse_to_pivot(&ctx(), "").unwrap().is_empty());
         assert!(sse_to_pivot(&ctx(), "[DONE]").unwrap().is_empty());
         assert!(sse_to_pivot(&ctx(), "not json").unwrap().is_empty());
-        assert!(sse_to_pivot(&ctx(), r#"{"type":"reasoning","text":"x"}"#)
-            .unwrap()
-            .is_empty());
+        // Reasoning is *not* junk: it has its own test below. Every other unrecognised event,
+        // including the bracketing start/end markers, contributes nothing.
+        assert!(
+            sse_to_pivot(&ctx(), r#"{"type":"reasoning-start","id":"r0"}"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            sse_to_pivot(&ctx(), r#"{"type":"reasoning-end","id":"r0"}"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            sse_to_pivot(&ctx(), r#"{"type":"provider-metadata","x":1}"#)
+                .unwrap()
+                .is_empty()
+        );
         assert!(sse_to_pivot(&ctx(), r#"{"type":"text-start"}"#)
             .unwrap()
             .is_empty());
