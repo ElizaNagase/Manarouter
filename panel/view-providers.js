@@ -141,9 +141,11 @@ export function buildRedirectPaste(p, ctx, session) {
   return { block, input, submit, send, show, hide };
 }
 
-// Must list exactly the spellings `Dialect::parse` accepts (mr-core `dialect.rs`). A value here
-// that the backend rejects turns "Add provider" into a save-time error, which is how the
-// pre-rename `command-code` spelling was caught.
+// Must list exactly the spellings the backend *deserialises* (mr-core `dialect.rs`, serde
+// kebab-case) — not the looser aliases `Dialect::parse` accepts. The two differ once: serde wants
+// `open-ai`, `parse` wants `openai`. A value here that the backend rejects turns "Add provider"
+// into a save-time error, which is how the pre-rename `command-code` spelling was caught. The Rust
+// test `the_panel_offers_only_dialects_this_binary_deserialises` pins this list.
 const DIALECTS = ['open-ai', 'anthropic', 'google', 'codex', 'copilot', 'antigravity', 'command-code-go'];
 const KEY_STRATEGIES = ['priority', 'round-robin', 'random', 'least-used'];
 const DELETE_PROVIDER_CONFIRM_KEY = 'manarouter.confirm.deleteProvider';
@@ -166,7 +168,7 @@ const PROVIDER_PRESETS = {
     { name: 'DeepSeek', dialect: 'open-ai', baseUrl: 'https://api.deepseek.com/v1', auth: 'bearer', hint: 'deepseek.com. Add your DeepSeek API key as an account secret after saving.' },
     { name: 'Fireworks AI', dialect: 'open-ai', baseUrl: 'https://api.fireworks.ai/inference/v1', auth: 'bearer', hint: 'fireworks.ai. Add your Fireworks API key as an account secret after saving.' },
     { name: 'Perplexity', dialect: 'open-ai', baseUrl: 'https://api.perplexity.ai', auth: 'bearer', hint: 'perplexity.ai. Add your Perplexity API key as an account secret after saving.' },
-    { name: 'Cohere', dialect: 'open-ai', baseUrl: 'https://api.cohere.ai/v1', auth: 'bearer', hint: 'cohere.ai. Add your Cohere API key as an account secret after saving.' },
+    { name: 'Cohere', dialect: 'open-ai', baseUrl: 'https://api.cohere.com/compatibility/v1', auth: 'bearer', hint: 'cohere.com, OpenAI-compatibility surface. Add your Cohere API key as an account secret after saving.' },
     { name: 'Anthropic', dialect: 'anthropic', baseUrl: 'https://api.anthropic.com/v1', auth: 'bearer', hint: 'api.anthropic.com. Add your Anthropic API key as an account secret after saving.' },
     { name: 'Google Gemini', dialect: 'google', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', auth: 'bearer', hint: 'generativelanguage.googleapis.com. Add your Google API key as an account secret after saving.' },
   ],
@@ -178,6 +180,8 @@ const PROVIDER_PRESETS = {
     { name: 'Copilot', dialect: 'copilot', baseUrl: 'https://api.githubcopilot.com', auth: 'oauth', hint: 'GitHub Copilot — OAuth sign-in from the panel.' },
     { name: 'Antigravity', dialect: 'antigravity', baseUrl: 'https://cloudcode-pa.googleapis.com', auth: 'oauth', hint: 'Google Antigravity / Cloud Code — OAuth sign-in from the panel.' },
     { name: 'Command Code', dialect: 'command-code-go', baseUrl: 'https://api.commandcode.ai', auth: 'bearer', hint: 'Command Code — bearer auth.' },
+    { name: 'OpenCode Zen', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/v1', auth: 'bearer', hint: 'OpenCode Console, pay-as-you-go. The same host serves the free models, which need no key; paid models need an OpenCode API key as an account secret.' },
+    { name: 'OpenCode Go', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/go/v1', auth: 'bearer', hint: 'OpenCode Go subscription tier. Same key as Console, smaller model set. The host also serves /messages and /responses, which one open-ai provider cannot express.' },
   ],
 };
 

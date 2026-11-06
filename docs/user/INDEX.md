@@ -25,6 +25,7 @@ files, and each one is readable at `GET /api/docs/<name>`, where `<name>` is the
 | 10 | [Troubleshooting](10-troubleshooting.md) | The failures you are most likely to hit, and what causes each. |
 | 11 | [Security and credentials](11-security.md) | The vault, the panel's access controls, and what must not be exposed. |
 | 12 | [CLI reference](12-cli-reference.md) | Every `mr` command, with its flags. |
+| 13 | [Using OpenCode with Manarouter](13-opencode.md) | The custom-provider block that points OpenCode at the relay, and the fields that make reasoning and tools work. |
 
 ## The other series
 
