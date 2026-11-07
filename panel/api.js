@@ -45,6 +45,9 @@ export async function request(method, path, { body, contentType = 'application/j
     res = await fetch(path, {
       method,
       credentials: 'same-origin', // the session cookie must ride along; it never leaves this origin
+      // A control-plane read is never worth a cache hit: the health poll looks for a changed
+      // snapshot digest, and a cached body would look like a router that stopped changing.
+      cache: 'no-store',
       headers: body !== undefined ? { 'content-type': contentType } : undefined,
       body: typeof body === 'string' || body === undefined ? body : JSON.stringify(body),
     });

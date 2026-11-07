@@ -132,16 +132,34 @@ async fn panel_assets(State(state): State<AppState>, request: Request) -> Respon
 
     match panel_file(dir, path) {
         Some((file, content_type)) => match std::fs::read(&file) {
-            Ok(bytes) => (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, content_type)],
-                bytes,
-            )
-                .into_response(),
+            Ok(bytes) => revalidatable(
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, content_type)],
+                    bytes,
+                )
+                    .into_response(),
+            ),
             Err(_) => index_or_404(dir, path),
         },
         None => index_or_404(dir, path),
     }
+}
+
+/// Tell the browser to re-read a panel asset instead of reusing its copy.
+///
+/// The panel is served from disk on every request, so an edit — or a git pull — has to reach the
+/// tab on an ordinary reload. Without this header a browser may reuse a heuristically cached copy
+/// for a while, and the operator is left looking at a live-looking page that no longer matches the
+/// files. There are no validators to revalidate against, so no-cache costs one real read; the
+/// files are local and the shell is small.
+fn revalidatable(response: Response) -> Response {
+    let mut response = response;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    response
 }
 
 /// Serve `index.html` for extensionless paths (so a hand-typed deep link lands on the shell and
@@ -149,12 +167,14 @@ async fn panel_assets(State(state): State<AppState>, request: Request) -> Respon
 fn index_or_404(dir: &FsPath, path: &str) -> Response {
     if !path.contains('.') {
         if let Ok(bytes) = std::fs::read(dir.join("index.html")) {
-            return (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                bytes,
-            )
-                .into_response();
+            return revalidatable(
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    bytes,
+                )
+                    .into_response(),
+            );
         }
     }
     (
@@ -224,3 +244,23 @@ to the working directory or the executable. Copy <code>panel/</code> from the re
 release archive) next to this binary, or start the process from the repository root. The API is \
 unaffected: see <code>/api/health</code>.</p>\
 </body></html>";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panel_asset_tells_the_browser_to_re_read_it() {
+        // The panel is served from disk, so an edited script has to reach the tab on an ordinary
+        // reload; a heuristic cache hit would leave the operator looking at stale code.
+        let response = revalidatable((StatusCode::OK, "body").into_response());
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-cache")
+        );
+    }
+}
