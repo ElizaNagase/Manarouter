@@ -258,6 +258,49 @@ export async function renderProviders(mount, ctx) {
   newBtn.addEventListener('click', () => openFormDrawer(null));
   refreshBtn.addEventListener('click', () => reload(true));
 
+  // Out-of-band writes have to reach this table on their own.
+  //
+  // The list used to be read once per page load, so a provider added by `mr provider add`, an
+  // account added from another tab, or an `mr migrate` stayed invisible until the operator pressed
+  // Refresh — the data was in the API the whole time, only the reader was stale. The 5 s health
+  // poll already runs and carries the routing-snapshot digest, which the control plane rebuilds on
+  // every configuration write; watching it costs no extra request and refreshes exactly when
+  // something actually changed.
+  let lastDigest = null;
+  let pendingRefresh = false; // a change is known but the page is not in a state to redraw
+  let digestRefreshInFlight = false;
+  if (typeof ctx.onHealth === 'function') {
+    ctx.onHealth((health) => {
+      const digest = health?.snapshot?.digest ?? null;
+      if (digest === null) return; // control plane unreachable: keep showing the last good list
+      if (lastDigest === null) { lastDigest = digest; return; } // the first reading is the baseline
+      if (digest !== lastDigest) {
+        lastDigest = digest;
+        pendingRefresh = true; // a write happened somewhere: remember it until the redraw is safe
+      }
+      if (!pendingRefresh) return; // nothing was written: no request, no redraw
+      if (digestRefreshInFlight) return; // a write on this page is already reloading
+      // A redraw replaces the table body and rebuilds an open drawer, so it is deferred while any
+      // form is on screen — the next 5 s tick retries, and the change lands by itself once the
+      // operator is done. Losing typed values to a background refresh is not an acceptable trade.
+      if (drawerOpen || operatorIsEditing()) return;
+      pendingRefresh = false;
+      digestRefreshInFlight = true;
+      reload(true).finally(() => { digestRefreshInFlight = false; });
+    });
+  }
+
+  // An automatic refresh replaces the table body and, with a drawer open, the drawer body too. If
+  // the operator's caret is in one of those fields, the change waits for a later tick instead of
+  // eating a half-typed form.
+  function operatorIsEditing() {
+    const el = document.activeElement;
+    if (!el || el.nodeType !== 1) return false;
+    const tag = String(el.tagName).toUpperCase();
+    if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') return false;
+    return typeof mount.contains === 'function' && mount.contains(el);
+  }
+
   function deleteProviderWarningDisabled() {
     try { return localStorage.getItem(DELETE_PROVIDER_CONFIRM_KEY) === 'true'; }
     catch { return false; }
@@ -1765,5 +1808,7 @@ export async function renderProviders(mount, ctx) {
     if (!isEdit) idIn.focus();
   }
 
-  await reload();
+  // Always a fresh read on mount. The shared cache is filled once per page load, and a provider
+  // written after that (the CLI, another tab, a migration) would otherwise never appear here.
+  await reload(true);
 }

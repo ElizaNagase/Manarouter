@@ -65,11 +65,18 @@ function emitHealth() {
 }
 
 async function refreshHealth() {
+  const previous = state.health?.snapshot?.digest ?? null;
   try {
     state.health = await api.get('/api/health');
   } catch {
     state.health = null; // rendered as "control plane unreachable", never as fake data
   }
+  // The control plane rebuilds its routing snapshot on every configuration write, so a new digest
+  // means the provider list cached at page load no longer describes this router. Dropping it here
+  // is what makes a provider added outside the panel (mr provider add, another tab) reach every
+  // later read — the models view, the combo pickers, the quota view — instead of only the next
+  // page load.
+  if ((state.health?.snapshot?.digest ?? null) !== previous) state.providers = null;
   updateHealthPill();
   updateSidebarMeta();
   emitHealth();
