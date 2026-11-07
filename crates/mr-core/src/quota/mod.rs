@@ -40,5 +40,6 @@ pub mod kimi;
 pub mod minimax;
 pub mod moonshot;
 pub mod openai_compat;
+pub mod opencode;
 pub mod openrouter;
 pub mod qwen;

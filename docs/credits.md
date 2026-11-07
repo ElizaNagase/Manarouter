@@ -17,6 +17,7 @@ The provider fetcher source mappings are:
 - `minimax.rs` — `open-sse/services/usage/minimax.ts`
 - `moonshot.rs` — `open-sse/services/usage/moonshotOpenPlatform.ts`
 - `openai_compat.rs` — `open-sse/services/usage/openaiCompatible.ts`
+- `opencode.rs` — no OmniRoute counterpart: written for this project against OpenCode's documented `/zen/go/v1/usage` endpoint
 - `openrouter.rs` — `open-sse/services/usage/openrouter.ts`
 - `qwen.rs` — `open-sse/services/usage/qwen-token-plan.ts`, `open-sse/services/qwenTokenPlanQuotaFetcher.ts`
 

@@ -8,6 +8,24 @@ The panel's **Declared windows** section reads the limits present in provider an
 
 The **Observed usage** section reads cached provider/account quota snapshots from `GET /api/quota`, including source, fetch time, windows, details, and per-account errors. Use the account refresh control or **Refresh all** to ask supported provider integrations to update their snapshot; OAuth accounts currently report refresh as unsupported. A configured provider/account window is only a declaration, not a measured allowance. The API returns `{ "accounts": [...] }` and preserves cached data alongside refresh errors.
 
+### Which providers report a live allowance
+
+A provider appears in **Observed usage** only when a reader exists for it and can prove it has an
+allowance to read. These are the readers in this build:
+
+| Reader | Recognised by |
+|---|---|
+| Antigravity, Claude, Codex, Command Code, Cursor, DeepSeek, GitHub, GLM, Grok, Kimi, MiniMax, Moonshot, OpenRouter, Qwen | the provider id, or the host its base URL points at |
+| OpenCode Go | the provider id `opencode-go` only — `/usage` exists on the Go host and 404s on the others |
+
+Everything else falls to the generic OpenAI-compatible reader, which reports nothing unless the
+account declares a `quotaEndpoint`. An account with no reader and no declaration is left off the
+list rather than shown as empty: a row of zeros would claim a measurement nobody made.
+
+A plan that meters several windows at once (a five-hour, a weekly and a monthly allowance, for
+example) is reported as one row: the window closest to exhaustion is the row's own fraction, and
+every window is listed underneath with its duration in the name.
+
 This provider quota view is separate from request usage accounting. The **client-key** caps are a separate mechanism: the relay enforces the per-key rolling token and request caps on the request path and refuses a request that would exceed them with HTTP 429, before it contacts a provider. What the panel's provider view does *not* show is client spend: the relay writes the settled per-key usage rows into the store, but the panel's quota view reads the *provider* snapshots, not that ledger. Do not treat an empty request-usage history as zero provider usage.
 
 ## The token count of a request

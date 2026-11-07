@@ -180,8 +180,8 @@ const PROVIDER_PRESETS = {
     { name: 'Copilot', dialect: 'copilot', baseUrl: 'https://api.githubcopilot.com', auth: 'oauth', hint: 'GitHub Copilot — OAuth sign-in from the panel.' },
     { name: 'Antigravity', dialect: 'antigravity', baseUrl: 'https://cloudcode-pa.googleapis.com', auth: 'oauth', hint: 'Google Antigravity / Cloud Code — OAuth sign-in from the panel.' },
     { name: 'Command Code', dialect: 'command-code-go', baseUrl: 'https://api.commandcode.ai', auth: 'bearer', hint: 'Command Code — bearer auth.' },
-    { name: 'OpenCode Zen', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/v1', auth: 'bearer', hint: 'OpenCode Console, pay-as-you-go. The same host serves the free models, which need no key; paid models need an OpenCode API key as an account secret.' },
-    { name: 'OpenCode Go', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/go/v1', auth: 'bearer', hint: 'OpenCode Go subscription tier. Same key as Console, smaller model set. The host also serves /messages and /responses, which one open-ai provider cannot express.' },
+    { name: 'OpenCode Zen', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/v1', auth: 'bearer', hint: 'OpenCode Console, pay-as-you-go. Needs a funded key: the free models are refused outside the OpenCode client, so they cannot be routed from here.' },
+    { name: 'OpenCode Go', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/go/v1', auth: 'bearer', hint: 'OpenCode Go subscription tier. Every request needs an x-opencode-session header, which this provider will not add for you — set it as a static header. Only the models your plan lists will answer; sync them from this host.' },
   ],
 };
 
