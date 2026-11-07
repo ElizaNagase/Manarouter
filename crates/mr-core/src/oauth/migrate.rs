@@ -42,15 +42,15 @@ use sha2::{Digest, Sha256};
 
 use crate::catalog::catalog;
 use crate::config::{config_dir, database_path, snapshot_path, Config};
-use crate::dialect::AuthKind;
+use crate::dialect::{AuthKind, Dialect};
 use crate::error::{Error, Result};
 use crate::ids::{AccountId, Millis, OAuthCredentialId};
-use crate::model::{Account, ModelEntry, ModelSource};
+use crate::model::{Account, ModelEntry, ModelSource, Provider};
 use crate::oauth::reference::{
     parse_env_value, ReferenceConnection, ReferenceDb, ReferenceKey, ReferenceModel, ReferencePaths,
 };
 use crate::oauth::{platform as oauth_platform, AccountIdentity, TokenSet};
-use crate::secret::Vault;
+use crate::secret::{account_secret_id, Vault};
 use crate::snapshot::RoutingSnapshot;
 use crate::store::{OAuthCredentialRecord, Store};
 
@@ -117,6 +117,38 @@ impl TransferAction {
     }
 }
 
+/// How one imported account authenticates.
+///
+/// The two are genuinely different jobs. An OAuth grant is *spent*: the reference's refresh token
+/// is exchanged for a token set of this installation's own, so importing it needs a network call
+/// and can fail. An API key is *copied*: it is the credential, unchanged, and the only thing that
+/// can go wrong is a provider this build cannot express or a vault that will not write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credential {
+    /// An OAuth platform this build can refresh, by platform id.
+    OAuth(&'static str),
+    /// A static API key.
+    ApiKey,
+}
+
+impl Credential {
+    /// The platform id for an OAuth grant, or `None` for a key.
+    pub fn platform(self) -> Option<&'static str> {
+        match self {
+            Self::OAuth(platform) => Some(platform),
+            Self::ApiKey => None,
+        }
+    }
+
+    /// One word for the report, so a plan row says what kind of credential it is.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OAuth(_) => "oauth",
+            Self::ApiKey => "api-key",
+        }
+    }
+}
+
 /// One connection the migration intends to carry across.
 #[derive(Debug, Clone)]
 pub struct PlannedTransfer {
@@ -124,10 +156,13 @@ pub struct PlannedTransfer {
     pub reference_id: String,
     /// The reference provider key, as stored.
     pub reference_provider: String,
-    /// The Manarouter OAuth platform id.
-    pub platform: &'static str,
-    /// The Manarouter catalogue provider id to attach the account to.
+    /// How the account authenticates.
+    pub credential: Credential,
+    /// The Manarouter provider id to attach the account to.
     pub provider_id: String,
+    /// For a key connection the reference describes as its own OpenAI-compatible node, the base
+    /// URL that provider must be created with. `None` means the shipped catalogue supplies it.
+    pub base_url: Option<String>,
     /// Display label (the reference email when present).
     pub label: String,
     /// Email or login, when the reference recorded one.
@@ -503,6 +538,90 @@ fn durable_credential<'a>(
     }
 }
 
+/// Where a key-only connection's credential goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyTarget {
+    /// The Manarouter provider id that will own the account.
+    pub provider_id: String,
+    /// The base URL, when the reference describes a custom endpoint rather than a known provider.
+    pub base_url: Option<String>,
+    /// The reference's own name for that endpoint, used as the provider label.
+    pub label: Option<String>,
+}
+
+/// Resolve the provider a key-only connection belongs to.
+///
+/// Most reference providers are known by the same slug they use, and the catalogue supplies the
+/// endpoint. A handful are not providers at all but *user-created OpenAI-compatible nodes*: the
+/// reference ids them `openai-compatible-chat-<uuid>` and carries the real destination in its
+/// provider-specific data. Two connections can therefore share a provider slug and still point at
+/// different hosts, which is why the base URL travels with the plan rather than being looked up
+/// from the slug.
+pub fn key_target(connection: &ReferenceConnection) -> Option<KeyTarget> {
+    let provider = connection.provider.trim().to_ascii_lowercase();
+    let node = provider.starts_with("openai-compatible") || provider.starts_with("custom-");
+    if node {
+        let base_url = connection
+            .provider_data
+            .get("baseUrl")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|url| url.starts_with("http://") || url.starts_with("https://"))?;
+        let name = |key: &str| {
+            connection
+                .provider_data
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        // The reference's own `prefix` is what the operator calls this node, and it is what makes
+        // `mr models list <provider>` recognisable. The node name is the fallback, and a bare
+        // `openai-compatible` is the last resort so the import still lands somewhere sane.
+        let label = name("nodeName").or_else(|| name("prefix"));
+        let provider_id = sanitize_provider_id(
+            &name("prefix")
+                .or_else(|| label.clone())
+                .unwrap_or_else(|| "openai-compatible".to_owned()),
+        )?;
+        return Some(KeyTarget {
+            provider_id,
+            base_url: Some(base_url.to_owned()),
+            label,
+        });
+    }
+    let provider_id = sanitize_provider_id(&provider)?;
+    Some(KeyTarget {
+        provider_id,
+        base_url: None,
+        label: None,
+    })
+}
+
+/// A provider id the configuration will accept: lowercase letters, digits, `-` and `_`.
+///
+/// The reference's node names are free-form, so they are folded rather than rejected — an operator
+/// who named a node "Uno Gateway!" gets `uno-gateway`, not a migration that stops halfway.
+fn sanitize_provider_id(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut dashed = false;
+    for ch in raw.trim().chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() || lower == '_' {
+            out.push(lower);
+            dashed = false;
+        } else if !dashed && !out.is_empty() {
+            out.push('-');
+            dashed = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    (!out.is_empty() && out.len() <= 64).then_some(out)
+}
+
 /// Decide what to do with one reference connection, without touching anything.
 pub fn plan_connection(
     connection: &ReferenceConnection,
@@ -522,12 +641,34 @@ pub fn plan_connection(
     }
 
     if !connection.auth_type.eq_ignore_ascii_case("oauth") {
-        // Reported as what it is. `openrouter` and `deepinfra` are well known to this build; they
-        // are simply API-key providers, and saying "no such platform" would send an operator
-        // looking for a bug that is not there.
-        return PlanDecision::Skip(
-            "API-key connection; API-key import is not implemented yet".to_owned(),
-        );
+        // A key needs no exchange, so the only pre-flight questions are where it goes and whether
+        // it is really there. Both are answerable from the reference row alone.
+        let Some(target) = key_target(connection) else {
+            let reason = format!(
+                "the reference calls this provider {} but records no endpoint for it, so there                  is no host to point a provider at",
+                connection.provider
+            );
+            return PlanDecision::Skip(reason);
+        };
+        if connection
+            .api_key
+            .as_ref()
+            .is_none_or(|key| key.expose().trim().is_empty())
+        {
+            return PlanDecision::Skip(
+                "no API key is stored for this connection (the reference keeps a session cookie or an empty row here)"
+                    .to_owned(),
+            );
+        }
+        // A custom node brings its own base URL, so it can always be created. A known provider
+        // must exist in the catalogue, because inventing an endpoint for it would be a guess.
+        if target.base_url.is_none() && catalog().get(&target.provider_id).is_none() {
+            return PlanDecision::Skip(format!(
+                "this build ships no {} provider, so the key has nowhere to go; add the provider by hand first",
+target.provider_id
+            ));
+        }
+        return PlanDecision::Transfer(TransferAction::Import);
     }
 
     let Some(platform_id) = platform_for(&connection.provider) else {
@@ -655,26 +796,51 @@ pub fn plan_migration(
         }
         match plan_connection(connection, &existing_identities) {
             PlanDecision::Transfer(action) => {
-                let platform_id = platform_for(&connection.provider)
-                    .expect("a Transfer decision implies a resolved platform");
+                let credential = if connection.auth_type.eq_ignore_ascii_case("oauth") {
+                    Credential::OAuth(platform_for(&connection.provider).expect(
+                        "a Transfer decision for an OAuth connection implies a resolved platform",
+                    ))
+                } else {
+                    Credential::ApiKey
+                };
+                let key = key_target(connection).filter(|_| credential == Credential::ApiKey);
+                let provider_id = match (&credential, &key) {
+                    (Credential::OAuth(platform), _) => (*platform).to_owned(),
+                    (Credential::ApiKey, Some(target)) => target.provider_id.clone(),
+                    (Credential::ApiKey, None) => {
+                        unreachable!("a key transfer implies a resolved target")
+                    }
+                };
+                // A custom node's own name is a better label than the reference's provider slug
+                // repeated next to a uuid, and an email is better still when there is one.
+                let label = key
+                    .as_ref()
+                    .and_then(|target| target.label.clone())
+                    .or_else(|| connection.email.clone())
+                    .unwrap_or_else(|| format!("{}/{}", connection.provider, connection.id));
                 transfers.push(PlannedTransfer {
                     reference_id: connection.id.clone(),
                     reference_provider: connection.provider.clone(),
-                    platform: platform_id,
-                    provider_id: platform_id.to_owned(),
-                    label: connection
-                        .email
-                        .clone()
-                        .unwrap_or_else(|| format!("{}/{}", connection.provider, connection.id)),
+                    credential,
+                    provider_id,
+                    base_url: key.and_then(|target| target.base_url),
+                    label,
                     email: connection.email.clone(),
-                    // "Refreshable" means a durable credential exists *for this platform's grant
-                    // shape*, which for Copilot is the GitHub token in the access column — not
-                    // literally a refresh-token column, which Copilot never has.
-                    has_refresh: durable_credential(platform_id, connection).is_some(),
+                    // "Refreshable" means a durable credential exists *for this credential shape*:
+                    // a refresh token, the GitHub token a Copilot session is minted from, or the
+                    // API key itself.
+                    has_refresh: match credential {
+                        Credential::OAuth(platform) => {
+                            durable_credential(platform, connection).is_some()
+                        }
+                        Credential::ApiKey => connection.api_key.is_some(),
+                    },
                     fingerprint: connection.credential_fingerprint(),
                     was_active: connection.is_active,
                     cloudcode_project: cloudcode_project_from(connection),
-                    reason: blocker_reason(platform_id, connection),
+                    reason: credential
+                        .platform()
+                        .and_then(|platform| blocker_reason(platform, connection)),
                     action,
                 });
             }
@@ -871,15 +1037,21 @@ async fn import_one(
     synced_models: &std::collections::HashMap<String, Vec<ReferenceModel>>,
     applied: &mut Vec<AppliedTransfer>,
 ) -> Result<()> {
-    let platform = oauth_platform(transfer.platform).ok_or_else(|| {
+    // An API key is not a grant to spend, so it takes an entirely different path: no exchange, no
+    // token set, no store record. Splitting here rather than threading a flag through keeps the
+    // OAuth path — the one whose write ordering is delicate — exactly as it was.
+    let Credential::OAuth(platform_id) = transfer.credential else {
+        return import_api_key(config, vault, connection, transfer, synced_models, applied);
+    };
+
+    let platform = oauth_platform(platform_id).ok_or_else(|| {
         Error::InvalidState(format!(
-            "the {} platform is not available in this build",
-            transfer.platform
+            "the {platform_id} platform is not available in this build"
         ))
     })?;
 
-    let previous = previous_tokens_for(transfer.platform, connection);
-    let refresh_token = durable_credential(transfer.platform, connection)
+    let previous = previous_tokens_for(platform_id, connection);
+    let refresh_token = durable_credential(platform_id, connection)
         .map(str::to_owned)
         .ok_or_else(|| {
             Error::InvalidState("no refreshable credential is present in the reference row".into())
@@ -900,7 +1072,7 @@ async fn import_one(
     // record the placeholder instead of one. `complete_login` onboards one; when it cannot, the
     // account is refused rather than written, because a project-less Antigravity account fails
     // every request and would look like a Manarouter bug.
-    if transfer.platform == "antigravity"
+    if platform_id == "antigravity"
         && tokens.extra.get("cloudcode_project_id").is_none()
         && transfer.cloudcode_project.is_none()
     {
@@ -913,7 +1085,7 @@ async fn import_one(
     }
     // A project recorded by the reference is trusted over a freshly onboarded one only when
     // onboarding produced nothing — onboarding is authoritative when it runs.
-    if transfer.platform == "antigravity" && tokens.extra.get("cloudcode_project_id").is_none() {
+    if platform_id == "antigravity" && tokens.extra.get("cloudcode_project_id").is_none() {
         if let Some(project) = transfer.cloudcode_project.as_deref() {
             tokens.extra.insert(
                 "cloudcode_project_id".into(),
@@ -921,7 +1093,7 @@ async fn import_one(
             );
         }
     }
-    if transfer.platform == "antigravity" && tokens.extra.get("cloudcode_project_id").is_none() {
+    if platform_id == "antigravity" && tokens.extra.get("cloudcode_project_id").is_none() {
         return Err(Error::InvalidState(
             "no Cloud Code project is available for this Antigravity account; it would fail every \
              request, so nothing was imported"
@@ -942,23 +1114,7 @@ async fn import_one(
         },
     };
 
-    // Create the provider from the shipped catalogue if the operator has not added it yet, so a
-    // migration onto a fresh install works in one step.
-    let mut provider_created = false;
-    if !config
-        .providers
-        .iter()
-        .any(|p| p.id.as_str() == transfer.provider_id)
-    {
-        let template = catalog().get(&transfer.provider_id).ok_or_else(|| {
-            Error::NotFound(format!(
-                "no catalogue entry for {}; add the provider by hand first",
-                transfer.provider_id
-            ))
-        })?;
-        config.providers.push(template.to_provider());
-        provider_created = true;
-    }
+    let provider_created = ensure_provider(config, transfer)?;
 
     let oauth_ref = OAuthCredentialId::generate();
     let vault_ref = format!(
@@ -980,7 +1136,7 @@ async fn import_one(
     // atomic file write per imported account, which is nothing next to a network refresh.
     vault.flush()?;
 
-    let mut record = OAuthCredentialRecord::new(transfer.platform, vault_ref.clone())
+    let mut record = OAuthCredentialRecord::new(platform_id, vault_ref.clone())
         .with_label(identity.label.clone())
         .with_scopes(tokens.scopes.clone());
     record.id = oauth_ref.clone();
@@ -1064,6 +1220,126 @@ async fn import_one(
         provider_id: transfer.provider_id.clone(),
         account_id: account_id.as_str().to_owned(),
         label: identity.label.clone(),
+        provider_created,
+    });
+    Ok(())
+}
+
+/// Make sure the configuration has the provider a transfer belongs to.
+///
+/// For a shipped provider the catalogue supplies the endpoint, so a migration onto a fresh install
+/// works in one step. For a node the reference defined itself
+/// (`openai-compatible-chat-<uuid>`) there is no catalogue entry and there never will be: the
+/// operator's own base URL *is* the provider's definition, so it is carried in the plan.
+///
+/// Returns whether a provider had to be created, which the report shows so an operator can see
+/// that the provider list changed and not only the accounts.
+fn ensure_provider(config: &mut Config, transfer: &PlannedTransfer) -> Result<bool> {
+    if config
+        .providers
+        .iter()
+        .any(|p| p.id.as_str() == transfer.provider_id)
+    {
+        return Ok(false);
+    }
+    let provider = match (
+        transfer.base_url.as_deref(),
+        catalog().get(&transfer.provider_id),
+    ) {
+        // The reference's own endpoint wins. A node the operator created is *defined* by its URL,
+        // so a same-named catalogue entry would be a different service that happens to share a
+        // name, and its base URL is the last thing to trust.
+        (Some(base_url), _) => {
+            let mut provider =
+                Provider::new(transfer.provider_id.clone(), Dialect::OpenAi, base_url);
+            provider.label = Some(transfer.label.clone());
+            provider
+        }
+        (None, Some(template)) => template.to_provider(),
+        (None, None) => {
+            return Err(Error::NotFound(format!(
+                "no catalogue entry for {}; add the provider by hand first",
+                transfer.provider_id
+            )))
+        }
+    };
+    config.providers.push(provider);
+    Ok(true)
+}
+
+/// Install one reference API key as a native account.
+///
+/// A key is not a grant to spend, so there is no exchange to fail: it is read out of the reference,
+/// written to the vault under the account's conventional key, and referenced from the account row.
+/// The vault write comes first and is flushed immediately, for the same reason `mr account add`
+/// does it that way — an account that points at a secret which is not there is a broken account,
+/// while a secret with no account is invisible and harmless.
+///
+/// A re-run replaces the account in place, so a key the operator has since rotated in the reference
+/// is picked up by running the same command again.
+fn import_api_key(
+    config: &mut Config,
+    vault: &mut Vault,
+    connection: &ReferenceConnection,
+    transfer: &PlannedTransfer,
+    synced_models: &std::collections::HashMap<String, Vec<ReferenceModel>>,
+    applied: &mut Vec<AppliedTransfer>,
+) -> Result<()> {
+    let key = connection
+        .api_key
+        .as_ref()
+        .map(|secret| secret.expose())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::InvalidState("no API key is stored for this connection in the reference".into())
+        })?;
+
+    let provider_created = ensure_provider(config, transfer)?;
+
+    // Same order as the OAuth path: models first, because the merge also writes aliases and needs
+    // the provider to exist, and the account row last so it is only written once everything it
+    // depends on is in place.
+    if let Some(ids) = synced_models.get(&format!("{}:{}", connection.provider, connection.id)) {
+        merge_provider_models(config, &transfer.provider_id, ids);
+    }
+
+    let account_id = stable_account_id(&transfer.provider_id, &transfer.reference_id);
+    let secret_id = account_secret_id(&transfer.provider_id, account_id.as_str());
+    vault.put(&secret_id, key)?;
+    vault.flush()?;
+
+    let label = transfer.label.clone();
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|p| p.id.as_str() == transfer.provider_id)
+        .ok_or_else(|| Error::InvalidState("the provider vanished during import".into()))?;
+
+    let mut replaced = false;
+    for account in provider.accounts.iter_mut() {
+        if account.id == account_id {
+            account.secret_ref = Some(secret_id.clone());
+            account.label = Some(label.clone());
+            account.identity = transfer.email.clone();
+            // Respect the reference's own enablement, exactly as the OAuth path does.
+            account.enabled = transfer.was_active;
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        let mut account = Account::new(label.clone());
+        account.id = account_id.clone();
+        account.identity = transfer.email.clone();
+        account.secret_ref = Some(secret_id);
+        account.enabled = transfer.was_active;
+        provider.accounts.push(account);
+    }
+
+    applied.push(AppliedTransfer {
+        provider_id: transfer.provider_id.clone(),
+        account_id: account_id.as_str().to_owned(),
+        label,
         provider_created,
     });
     Ok(())
@@ -1264,6 +1540,224 @@ mod tests {
             input_token_limit: None,
             supported_efforts: efforts.iter().map(|e| (*e).to_owned()).collect(),
         }
+    }
+
+    /// A key-only reference row: the shape the reference writes for ordinary API-key providers.
+    fn key_connection(provider: &str, key: Option<&str>) -> ReferenceConnection {
+        let mut c = connection(provider, None);
+        c.auth_type = "api-key".into();
+        c.access_token = None;
+        c.refresh_token = None;
+        // Fixtures, not credentials: each is a fake value chosen to look like the real shape.
+        c.api_key = key.map(|value| crate::oauth::reference::DecryptedToken::new(value.to_owned()));
+        c
+    }
+
+    /// The plan a key row produces, for the tests that need to hand one to the importer.
+    fn key_transfer(c: &ReferenceConnection) -> PlannedTransfer {
+        let target = key_target(c).expect("a resolvable target");
+        PlannedTransfer {
+            reference_id: c.id.clone(),
+            reference_provider: c.provider.clone(),
+            credential: Credential::ApiKey,
+            provider_id: target.provider_id,
+            base_url: target.base_url,
+            label: target
+                .label
+                .unwrap_or_else(|| format!("{}/{}", c.provider, c.id)),
+            email: c.email.clone(),
+            has_refresh: c.api_key.is_some(),
+            fingerprint: c.credential_fingerprint(),
+            was_active: c.is_active,
+            cloudcode_project: None,
+            reason: None,
+            action: TransferAction::Import,
+        }
+    }
+
+    #[test]
+    fn an_api_key_connection_on_a_shipped_provider_plans_an_import() {
+        let c = key_connection("openrouter", Some("sk-or-fixture")); // secret-scan: allow
+        assert_eq!(
+            plan_connection(&c, &BTreeMap::new()),
+            PlanDecision::Transfer(TransferAction::Import)
+        );
+    }
+
+    #[test]
+    fn a_key_connection_without_a_key_is_skipped_rather_than_imported_empty() {
+        // The reference keeps web sessions and half-written rows in the same table, so an empty
+        // key column is common and must not become an account that fails every request.
+        let c = key_connection("openrouter", None);
+        match plan_connection(&c, &BTreeMap::new()) {
+            PlanDecision::Skip(reason) => assert!(reason.contains("no API key"), "{reason}"),
+            other => panic!("expected a skip, got {other:?}"),
+        }
+        let blank = key_connection("openrouter", Some("   "));
+        assert!(matches!(
+            plan_connection(&blank, &BTreeMap::new()),
+            PlanDecision::Skip(_)
+        ));
+    }
+
+    #[test]
+    fn a_key_for_a_provider_this_build_ships_nothing_for_names_the_slug() {
+        let c = key_connection("firecrawl", Some("fixture-key")); // secret-scan: allow
+        match plan_connection(&c, &BTreeMap::new()) {
+            PlanDecision::Skip(reason) => {
+                assert!(reason.contains("firecrawl"), "{reason}");
+                assert!(reason.contains("add the provider by hand"), "{reason}");
+            }
+            other => panic!("expected a skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_custom_node_arrives_at_its_own_base_url() {
+        // The reference creates these itself for anything OpenAI-compatible, and the whole point
+        // of one is the URL the operator typed: without it the key means nothing.
+        let mut c = key_connection("openai-compatible-chat-1f0c", Some("fixture")); // secret-scan: allow
+        c.provider_data = serde_json::json!({
+            "apiType": "chat",
+            "baseUrl": "https://uno.example.test/v1",
+            "nodeName": "Uno Gateway",
+            "prefix": "uno"
+        });
+        let target = key_target(&c).expect("a target");
+        assert_eq!(target.provider_id, "uno");
+        assert_eq!(
+            target.base_url.as_deref(),
+            Some("https://uno.example.test/v1")
+        );
+        assert_eq!(target.label.as_deref(), Some("Uno Gateway"));
+        assert_eq!(
+            plan_connection(&c, &BTreeMap::new()),
+            PlanDecision::Transfer(TransferAction::Import)
+        );
+    }
+
+    #[test]
+    fn a_custom_node_with_no_endpoint_is_skipped_with_the_reason() {
+        let c = key_connection("openai-compatible-chat-1f0c", Some("fixture")); // secret-scan: allow
+        assert!(key_target(&c).is_none());
+        match plan_connection(&c, &BTreeMap::new()) {
+            PlanDecision::Skip(reason) => {
+                assert!(reason.contains("records no endpoint"), "{reason}")
+            }
+            other => panic!("expected a skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_free_form_node_name_is_folded_into_a_usable_provider_id() {
+        assert_eq!(
+            sanitize_provider_id("Uno Gateway!"),
+            Some("uno-gateway".to_owned())
+        );
+        assert_eq!(
+            sanitize_provider_id("  My_Node.v2  "),
+            Some("my_node-v2".to_owned())
+        );
+        assert_eq!(sanitize_provider_id(""), None);
+        assert_eq!(sanitize_provider_id("---"), None);
+    }
+
+    #[test]
+    fn importing_a_key_creates_the_provider_and_stores_the_secret_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::default();
+        let mut vault = Vault::open(dir.path()).expect("vault");
+        let c = key_connection("openrouter", Some("sk-or-fixture")); // secret-scan: allow
+        let transfer = key_transfer(&c);
+        let models = std::collections::HashMap::new();
+        let mut applied = Vec::new();
+
+        import_api_key(
+            &mut config,
+            &mut vault,
+            &c,
+            &transfer,
+            &models,
+            &mut applied,
+        )
+        .expect("import");
+
+        assert_eq!(applied.len(), 1);
+        assert!(applied[0].provider_created);
+        let provider = config
+            .providers
+            .iter()
+            .find(|p| p.id.as_str() == "openrouter")
+            .expect("the provider exists");
+        assert_eq!(provider.accounts.len(), 1);
+        let account = &provider.accounts[0];
+        assert_eq!(account.oauth_ref, None);
+        let secret_ref = account.secret_ref.clone().expect("a secret reference");
+        assert_eq!(
+            secret_ref,
+            account_secret_id("openrouter", account.id.as_str())
+        );
+        assert_eq!(
+            vault.get(&secret_ref).expect("read back").as_deref(),
+            Some("sk-or-fixture")
+        );
+
+        // A second run updates in place: no duplicate account, and the rotated key wins.
+        let rotated = key_connection("openrouter", Some("sk-or-rotated")); // secret-scan: allow
+        import_api_key(
+            &mut config,
+            &mut vault,
+            &rotated,
+            &transfer,
+            &models,
+            &mut applied,
+        )
+        .expect("re-import");
+        let provider = config
+            .providers
+            .iter()
+            .find(|p| p.id.as_str() == "openrouter")
+            .expect("the provider exists");
+        assert_eq!(provider.accounts.len(), 1);
+        assert_eq!(
+            vault.get(&secret_ref).expect("read back").as_deref(),
+            Some("sk-or-rotated")
+        );
+
+        // And the secret is not in the configuration, which is what gets written to disk.
+        let rendered = serde_json::to_string(&config).expect("serialise");
+        assert!(!rendered.contains("sk-or-rotated"));
+    }
+
+    #[test]
+    fn importing_a_key_into_a_custom_node_keeps_its_own_endpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::default();
+        let mut vault = Vault::open(dir.path()).expect("vault");
+        let mut c = key_connection("openai-compatible-chat-1f0c", Some("fixture")); // secret-scan: allow
+        c.provider_data = serde_json::json!({
+            "baseUrl": "https://uno.example.test/v1",
+            "nodeName": "Uno Gateway",
+            "prefix": "uno"
+        });
+        let transfer = key_transfer(&c);
+        import_api_key(
+            &mut config,
+            &mut vault,
+            &c,
+            &transfer,
+            &std::collections::HashMap::new(),
+            &mut Vec::new(),
+        )
+        .expect("import");
+        let provider = config
+            .providers
+            .iter()
+            .find(|p| p.id.as_str() == "uno")
+            .expect("the node became a provider");
+        assert_eq!(provider.base_url, "https://uno.example.test/v1");
+        assert_eq!(provider.label.as_deref(), Some("Uno Gateway"));
+        assert_eq!(provider.accounts.len(), 1);
     }
 
     #[test]
@@ -1571,12 +2065,20 @@ mod tests {
     }
 
     #[test]
-    fn an_api_key_provider_is_reported_as_such_not_as_a_missing_platform() {
-        let mut c = connection("openrouter", None);
-        c.auth_type = "apikey".into();
-        match plan_connection(&c, &BTreeMap::new()) {
-            PlanDecision::Skip(reason) => assert!(reason.contains("API-key"), "{reason}"),
-            other => panic!("expected an API-key skip, got {other:?}"),
+    fn an_api_key_provider_is_never_reported_as_a_missing_platform() {
+        // The reference spells the auth type variously; all of them mean "not an OAuth grant".
+        // Whichever spelling arrives, the verdict must be about the key, never about the platform,
+        // because openrouter is a provider this build knows perfectly well.
+        for auth_type in ["apikey", "api-key", "api_key", "key"] {
+            let mut c = connection("openrouter", None);
+            c.auth_type = auth_type.into();
+            match plan_connection(&c, &BTreeMap::new()) {
+                PlanDecision::Skip(reason) => {
+                    assert!(reason.contains("no API key"), "{auth_type}: {reason}");
+                    assert!(!reason.contains("this build"), "{auth_type}: {reason}");
+                }
+                other => panic!("{auth_type}: expected a skip, got {other:?}"),
+            }
         }
     }
 

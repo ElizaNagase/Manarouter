@@ -21,14 +21,38 @@ catalogue derived from that install is marked **UNCERTAIN** in
 
 | Item | Imported | Notes |
 |---|---|---|
-| Providers | Yes, when the catalogue has a match | Matched by id. A provider with no catalogue entry is reported, not guessed at. |
-| Credentials | Yes | Written to the vault. Only an id reaches `config.json`. |
-| Combos | Yes | Names **and step order** are preserved exactly. |
+| Providers | Yes, when the catalogue has a match | Matched by id. A provider with no catalogue entry is reported, not guessed at — except a node the reference defined itself, which arrives at its own base URL. |
+| Credentials | Yes | API keys are copied, OAuth grants are re-minted (see below). Written to the vault; only an id reaches `config.json`. |
+| Custom nodes | Yes | An OpenAI-compatible node the reference created itself is recreated at its own base URL. |
+| Combos | Not yet | The reference's routes are not ported. Build the equivalents with mr combo add. |
 | Aliases | Yes | Generated for the alternative model spellings the reference router exposed. |
-| Client keys | Yes | The hash is carried over, so existing client configurations keep working. |
-| Settings | Partially | Ports, timeouts and quota policy map. Anything with no equivalent is reported. |
+| Client keys | Not yet | Apps calling the reference need a key made here: mr key create. |
+| Settings | Not yet | Ports, timeouts and quota policy are not transferred. Set them here. |
 | Usage history | No | Different schema, different meaning. Left behind. |
 | OAuth grants | Yes, for supported platforms | Imported by **one refresh**, never by copying an access token. See below. |
+
+### How API keys are migrated
+
+An API key is not a grant to spend, so there is nothing to exchange and nothing that can be
+consumed: the migration reads the key out of the reference, writes it to this installation's vault
+under the account's conventional key, and references it from the account row — the same shape
+`mr account add` writes, so the relay treats an imported account exactly like one added by hand.
+
+Two details are worth knowing:
+
+- **A provider the catalogue does not have is reported, not guessed at** — unless the reference
+  itself defined the endpoint. OmniRoute creates a node called `openai-compatible-chat-<uuid>` for
+  any OpenAI-compatible service an operator adds by hand, and that node's own base URL *is* its
+  definition. Those become providers here, created at that URL and labelled with the node's name.
+  Everything else with no catalogue entry is listed in the skipped table with the reason, so the
+  operator can add it by hand rather than wonder where it went.
+- **A connection with no key is skipped.** The reference keeps web sessions, OAuth rows and
+  half-written rows in the same table, so an empty key column is normal and must not silently
+  become an account that fails every request.
+
+Re-running `--apply` replaces each imported account in place rather than adding a second one, so a key
+rotated in the reference since the first run is picked up by running the same command again. Unlike
+the OAuth path there is no network call involved, so re-running costs nothing.
 
 ### How OAuth grants are migrated
 
@@ -188,52 +212,31 @@ This writes nothing. It prints:
 ```text
 Reference database  ~/.omniroute/storage.sqlite
                     (copy opened read-only; original untouched)
-Original sha256     9f2c1e...  (will be re-checked when this finishes)
+Original sha256     de0ca0fd…12dc3e4
 
-Providers to import  11
-  openai             api-key   2 accounts   catalogue match
-  anthropic          api-key   1 account    catalogue match
-  google             api-key   1 account    catalogue match
-  openrouter         api-key   1 account    catalogue match
+Credentials to import   44 (43 API keys, 1 OAuth grant)
+  api-key openadapter / openadapter/2d06b696-…  credential …d71ea602158b  key stored
+  api-key openrouter / openrouter/90dc47ac-…    credential …2e5b56ed4f94  key stored
+  api-key uno / unorouter                       credential …874644a5fc2b  key stored
+  api-key wawawa / wawawa                       credential …ecb3bcfea907  key stored
+  oauth   antigravity / operator@example.com    credential …1b32d16e6d9d  refreshable
   ...
 
-Providers refused    6
-  claude-web         web session authentication is never supported
-  deepseek-web       web session authentication is never supported
+Accounts already present   4
+  antigravity / other@example.com   left alone
   ...
 
-Providers skipped    3
-  kiro               no dialect can express an AWS event-stream provider
-  fishaudio          bespoke TTS request and response shape
-  some-local-proxy   no catalogue entry and no matching base URL
-
-Accounts to import   7
-  openai / personal            (credential present, sk-…4f21)
-  openai / work                (credential present, sk-…9ab0)
-  anthropic / main             (credential present, sk-ant-…7712)
+Accounts needing a fresh login   8
+  openai-codex / someone@example.com   the stored grant cannot be refreshed by this build
   ...
 
-OAuth accounts to import   3
-  openai-codex / personal      credential …4f21c8ab  refreshable
-  antigravity / work           credential …9ab03d17  refreshable  project aicode-consumers
-  github-copilot / work        credential …7712ee04  refreshable
-
-OAuth accounts needing a fresh login   1
-  github-copilot / personal    GitHub will not mint a Copilot session from this token (it is a
-                               GitHub App `ghu_` token, and the mint endpoint accepts approved
-                               clients only); log in again through the panel
-
-Combos to import     4
-  coding            priority        3 steps
-    1. openai-codex/gpt-5-codex
-    2. anthropic/claude-sonnet-4-5
-    3. openrouter/qwen/qwen3-coder
+Providers refused    5
+  claude-web         web-session authentication is never supported (project policy)
   ...
 
-Aliases to import    9
-  gpt-6-luna-high -> gpt-6-luna
-  gpt-5-codex     -> openai-codex/gpt-5-codex
-  sonnet          -> anthropic/claude-sonnet-4-5
+Providers skipped    7
+  firecrawl          this build ships no firecrawl provider, so the key has nowhere to go; add the
+                     provider by hand first
   ...
 
 Nothing was written. Re-run with --apply to perform the import.

@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use mr_core::oauth::migrate::{
-    run_migration, MigrationOptions, MigrationReport, PlannedTransfer, TransferAction,
+    run_migration, Credential, MigrationOptions, MigrationReport, PlannedTransfer, TransferAction,
 };
 
 use crate::output::{say, warn, CliError};
@@ -95,8 +95,10 @@ fn transfer_json(t: &PlannedTransfer) -> serde_json::Value {
     serde_json::json!({
         "reference_id": t.reference_id,
         "reference_provider": t.reference_provider,
-        "platform": t.platform,
+        "credential": t.credential.label(),
+        "platform": t.credential.platform(),
         "provider": t.provider_id,
+        "base_url": t.base_url,
         "label": t.label,
         "email": t.email,
         "has_refresh_token": t.has_refresh,
@@ -107,6 +109,15 @@ fn transfer_json(t: &PlannedTransfer) -> serde_json::Value {
         "reason": t.reason,
         "action": t.action.label(),
     })
+}
+
+/// "1" or "12", plus an "s" only when it should have one.
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
 /// Human-readable output, shaped like the report `docs/17-migrating-from-omniroute.md` shows.
@@ -127,9 +138,24 @@ fn print_human(report: &MigrationReport, applied: bool) {
     }
     say(String::new());
 
-    let importable = report.plan.importable().len();
-    say(format!("OAuth accounts to import   {importable}"));
-    for transfer in report.plan.importable() {
+    // Two kinds of credential arrive here and they are not interchangeable: a key is copied as it
+    // stands, a grant is re-minted by a network call. Counting them together under one word would
+    // tell the operator the wrong thing about what the run costs.
+    let importable = report.plan.importable();
+    let keys = importable
+        .iter()
+        .filter(|t| t.credential == Credential::ApiKey)
+        .count();
+    let grants = importable.len() - keys;
+    say(format!(
+        "Credentials to import   {} ({} API key{}, {} OAuth grant{})",
+        importable.len(),
+        keys,
+        plural(keys),
+        grants,
+        plural(grants)
+    ));
+    for transfer in &importable {
         let project = transfer
             .cloudcode_project
             .as_deref()
@@ -142,8 +168,13 @@ fn print_human(report: &MigrationReport, applied: bool) {
         } else {
             ""
         };
+        let state = match transfer.credential {
+            Credential::ApiKey => "key stored",
+            Credential::OAuth(_) => "refreshable",
+        };
         say(format!(
-            "  {} / {:<28} {}  refreshable{}{}",
+            "  {:<7} {} / {:<28} {}  {}{}{}",
+            transfer.credential.label(),
             transfer.provider_id,
             transfer.email.as_deref().unwrap_or(&transfer.label),
             transfer
@@ -151,6 +182,7 @@ fn print_human(report: &MigrationReport, applied: bool) {
                 .as_deref()
                 .map(|f| format!("credential …{f}"))
                 .unwrap_or_else(|| "credential present".to_owned()),
+            state,
             project,
             caveat,
         ));
@@ -164,10 +196,7 @@ fn print_human(report: &MigrationReport, applied: bool) {
         .collect();
     if !untouched.is_empty() {
         say(String::new());
-        say(format!(
-            "OAuth accounts already present   {}",
-            untouched.len()
-        ));
+        say(format!("Accounts already present   {}", untouched.len()));
         for transfer in untouched {
             say(format!(
                 "  {} / {}   left alone",
@@ -186,7 +215,7 @@ fn print_human(report: &MigrationReport, applied: bool) {
     if !relogin.is_empty() {
         say(String::new());
         say(format!(
-            "OAuth accounts needing a fresh login   {}",
+            "Accounts needing a fresh login   {}",
             relogin.len()
         ));
         for transfer in relogin {
@@ -245,7 +274,7 @@ fn print_human(report: &MigrationReport, applied: bool) {
             entry.label,
             entry.account_id,
             if entry.provider_created {
-                "   (provider created from the catalogue)"
+                "   (provider created)"
             } else {
                 ""
             }
