@@ -261,9 +261,11 @@ Antigravity tries, in order:
 2. `https://autopush-cloudcode-pa.sandbox.googleapis.com`
 3. `https://cloudcode-pa.googleapis.com`
 
-The first two are Google-internal sandboxes used by the IDE's own build channels. The router should
-use the production host (`catalog/providers.toml` records `https://cloudcode-pa.googleapis.com`) and
-not treat the sandboxes as a fallback for production traffic — they exist for the IDE's release
+The first two are Google-internal sandboxes used by the IDE's own build channels. This ordering is
+for *discovery* (`loadCodeAssist`, and the quota reader), where production is a legitimate second
+try. Inference is narrower: `catalog/providers.toml` sends generation to
+`https://daily-cloudcode-pa.googleapis.com` and nowhere else, and the sandboxes are not treated as a
+fallback for production traffic — they exist for the IDE's release
 rings, and their availability is not a promise to third parties. This ordering is recorded here so
 that a reader who sees it in another client knows what it is.
 
@@ -272,9 +274,15 @@ that a reader who sees it in another client knows what it is.
 ## 5. Inference: endpoints, headers and the metadata assertion
 
 ```
-POST https://cloudcode-pa.googleapis.com/v1internal:generateContent
-POST https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse
+POST https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent
+POST https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse
 ```
+
+Inference is served by the **daily** host, not the production one. Onboarding mints the Cloud Code
+project there, and production refuses a project it did not mint: `generateContent` against
+`https://cloudcode-pa.googleapis.com` returns `429 RESOURCE_EXHAUSTED` for every account and every
+model family, with no `details` to explain it. That reads exactly like an exhausted quota and is
+not one, so the base URL in `catalog/providers.toml` is the daily host on purpose.
 
 ### Request body
 

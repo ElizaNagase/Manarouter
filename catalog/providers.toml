@@ -99,7 +99,11 @@ copilot_integration_id = "vscode-chat"
 id = "antigravity"
 label = "Google Antigravity / Gemini Code Assist"
 dialect = "antigravity"
-base_url = "https://cloudcode-pa.googleapis.com"
+# Inference lives on the *daily* host. The production host answers onboardUser and
+# loadCodeAssist, but it refuses a project minted on the daily host: generateContent there
+# returns 429 RESOURCE_EXHAUSTED for every account and every model family, which reads as an
+# exhausted quota and is not one. Verified 2026-11-07 against five working accounts.
+base_url = "https://daily-cloudcode-pa.googleapis.com"
 auth = { type = "oauth", platform = "antigravity" }
 oauth_platform = "antigravity"
 capabilities = ["chat", "models", "tool-calling", "reasoning", "vision"]

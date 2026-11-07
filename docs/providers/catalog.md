@@ -29,7 +29,7 @@ many of OmniRoute's credentialed providers could be carried across.
 
 | id | label | dialect | base URL | auth | capabilities |
 |---|---|---|---|---|---|
-| `antigravity` ⚠ | Google Antigravity / Gemini Code Assist | `antigravity` | `https://cloudcode-pa.googleapis.com` | `oauth` (antigravity) | chat, models, tool-calling, reasoning, vision |
+| `antigravity` ⚠ | Google Antigravity / Gemini Code Assist | `antigravity` | `https://daily-cloudcode-pa.googleapis.com` | `oauth` (antigravity) | chat, models, tool-calling, reasoning, vision |
 | `cline` | Cline | `open-ai` | `https://api.cline.bot/api/v1` | `oauth` (cline) | chat, models, tool-calling, reasoning |
 | `codebuddy-cn` ⚠ | CodeBuddy CN | `open-ai` | `https://copilot.tencent.com/v2` | `oauth` (codebuddy-cn) | chat, models, tool-calling |
 | `github-copilot` | GitHub Copilot | `copilot` | `https://api.githubcopilot.com` | `oauth` (github-copilot) | chat, responses, messages, embeddings, models, tool-calling, reasoning, vision |

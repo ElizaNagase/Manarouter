@@ -388,8 +388,10 @@ that `(Anthropic, OpenAi)` uses, not a double pivot (`lib.rs:185-193`).
 ## `antigravity` — Google Cloud Code Assist
 
 **On the wire.** `cloudcode-pa.googleapis.com`, `v1internal:*`, with a project/tier onboarding
-envelope (`dialect.rs:33-35`). The shipped base URL is `https://cloudcode-pa.googleapis.com`, so the
-default path `v1internal:generateContent` lands on the documented URL.
+envelope (`dialect.rs:33-35`). The shipped base URL is the daily host,
+`https://daily-cloudcode-pa.googleapis.com`, because inference there is refused a project that was minted
+on production and vice versa; the default path `v1internal:generateContent` lands on the
+documented URL.
 
 **Who can reach it.** Both client dialects, through the same translator as `google`
 (`lib.rs:202-211`).

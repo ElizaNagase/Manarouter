@@ -26,8 +26,8 @@ at least unambiguous.
 ## The inference shape
 
 ```http
-POST https://cloudcode-pa.googleapis.com/v1internal:generateContent
-POST https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse
+POST https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent
+POST https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse
 ```
 
 with `X-Goog-Api-Client` and a `Client-Metadata` header carrying:
