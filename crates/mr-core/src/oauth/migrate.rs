@@ -580,6 +580,20 @@ pub fn key_target(connection: &ReferenceConnection) -> Option<KeyTarget> {
         // `mr models list <provider>` recognisable. The node name is the fallback, and a bare
         // `openai-compatible` is the last resort so the import still lands somewhere sane.
         let label = name("nodeName").or_else(|| name("prefix"));
+        // A node pointing at an endpoint the catalogue already describes is that provider, not a
+        // second one. Importing it separately would put one service in the config twice, under two
+        // names, with a copy of the same key behind each.
+        if let Some(template) = catalog()
+            .all()
+            .iter()
+            .find(|template| same_endpoint(&template.base_url, base_url))
+        {
+            return Some(KeyTarget {
+                provider_id: template.id.clone(),
+                base_url: None,
+                label,
+            });
+        }
         let provider_id = sanitize_provider_id(
             &name("prefix")
                 .or_else(|| label.clone())
@@ -597,6 +611,14 @@ pub fn key_target(connection: &ReferenceConnection) -> Option<KeyTarget> {
         base_url: None,
         label: None,
     })
+}
+
+/// Whether two endpoints name the same host and path, ignoring a trailing slash and case.
+fn same_endpoint(a: &str, b: &str) -> bool {
+    fn normalise(url: &str) -> String {
+        url.trim().trim_end_matches('/').to_ascii_lowercase()
+    }
+    !a.trim().is_empty() && normalise(a) == normalise(b)
 }
 
 /// A provider id the configuration will accept: lowercase letters, digits, `-` and `_`.
@@ -1634,6 +1656,26 @@ mod tests {
             plan_connection(&c, &BTreeMap::new()),
             PlanDecision::Transfer(TransferAction::Import)
         );
+    }
+
+    #[test]
+    fn a_custom_node_pointing_at_a_catalogue_endpoint_folds_into_that_provider() {
+        // The reference happily holds both a preset for a service and a node an operator pointed
+        // at the same URL. They are one provider with one endpoint, so one of them has to win:
+        // the catalogue entry, which carries the dialect, auth and capability metadata.
+        let mut c = key_connection("openai-compatible-chat-1f0c", Some("fixture")); // secret-scan: allow
+        c.provider_data = serde_json::json!({
+            "apiType": "chat",
+            "baseUrl": "https://api.freeaiapikey.com/v1/",
+            "nodeName": "Free Api Key .com",
+            "prefix": "freeapikey"
+        });
+        let target = key_target(&c).expect("a target");
+        assert_eq!(target.provider_id, "freeaiapikey");
+        // No base URL override: the catalogue already knows where this provider lives, and a
+        // second copy of the address in the plan is a second thing to keep in step.
+        assert_eq!(target.base_url, None);
+        assert_eq!(target.label.as_deref(), Some("Free Api Key .com"));
     }
 
     #[test]
