@@ -980,9 +980,7 @@ async fn dispatch_routed(
             let counter = table.advance_rr(&combo.id);
             let order =
                 select::order_steps(combo, table.snapshot.providers(), &health, counter, now_ms);
-            let sticky_enabled = combo.strategy == mr_core::ComboStrategy::Priority
-                && combo.hedge.enabled
-                && combo.sticky_success_window_secs > 0;
+            let sticky_enabled = sticky_applies(combo);
             if sticky_enabled {
                 sticky_index = app.sticky_success.preferred_index(
                     &combo.id,
@@ -1144,7 +1142,7 @@ async fn dispatch_routed(
             .map(|provider| provider.accounts.len().saturating_sub(1).min(8))
             .unwrap_or(0);
         let mut retries_left = account_retries;
-        let mut attempt = attempt_step(&attempt_ctx, step, is_sticky).await;
+        let mut attempt = attempt_step(&attempt_ctx, step, is_sticky, false).await;
         loop {
             let retry = match &attempt {
                 // A body to hand the client means the upstream answered and refused. That answer is
@@ -1163,7 +1161,7 @@ async fn dispatch_routed(
                 model = %step.model,
                 "retrying the same step on another account"
             );
-            attempt = attempt_step(&attempt_ctx, step, is_sticky).await;
+            attempt = attempt_step(&attempt_ctx, step, is_sticky, false).await;
         }
         match attempt {
             Attempt::Answer(response) => {
@@ -1265,6 +1263,47 @@ async fn dispatch_routed(
                 "the selected route does not support this input modality, and the configured default \"{target}\" cannot be used for it"
             ),
         );
+    }
+
+    // Every step was skipped because its accounts are cooling down. A cooldown is a prediction
+    // about the near future, not a fact about now, and refusing the request without trying
+    // anything is the worst of the available answers: the operator sees a combo that died
+    // instantly while the provider was fine. The step that recovers soonest is tried anyway, and
+    // its answer — or its real error — is what the client gets.
+    if last_failure.is_none() {
+        if let Some(step) = last_resort_step(&app, &table, &steps, &raced, now_ms) {
+            if activity.is_some() {
+                attempted = Some(participant_id(step));
+            }
+            tracing::debug!(
+                provider = %step.provider_id,
+                model = %step.model,
+                "every step is cooling down; trying the one that recovers soonest anyway"
+            );
+            match attempt_step(&attempt_ctx, step, false, true).await {
+                Attempt::Answer(response) => {
+                    let wrapped = crate::recovery::wrap(
+                        response,
+                        Vec::new(),
+                        crate::recovery::RecoveryConfig {
+                            policy: combo.map(|c| c.midstream_policy).unwrap_or_default(),
+                            mode: mr_core::dialect::WinnerFailMode::PickHighestPassed,
+                            client_dialect,
+                            winner_id: participant_id(step),
+                            announceable: false,
+                            rerun_factory: None,
+                            rerun_max_rounds: 0,
+                        },
+                    );
+                    return served_combo(&app, activity, participant_id(step), now_ms, wrapped);
+                }
+                Attempt::Failed {
+                    response: Some(response),
+                    ..
+                } => last_failure = Some(response),
+                _ => {}
+            }
+        }
     }
 
     // Every step was tried. Where a provider gave a specific error, that is more informative than
@@ -1587,7 +1626,12 @@ fn no_credential_message(
 /// The `is_sticky_step` flag says whether this step is the one the combo's sticky preference
 /// points at. A step that turns out to be unusable clears that preference, which is why the
 /// outcome carries a `sticky_cleared` flag rather than the caller deciding it.
-async fn attempt_step(actx: &AttemptContext<'_>, step: &StepPlan, is_sticky_step: bool) -> Attempt {
+async fn attempt_step(
+    actx: &AttemptContext<'_>,
+    step: &StepPlan,
+    is_sticky_step: bool,
+    ignore_cooldowns: bool,
+) -> Attempt {
     let app = actx.app;
     let table = actx.table.clone();
     // The cooldown view is taken per attempt rather than once for the whole request, so that a
@@ -1645,14 +1689,25 @@ async fn attempt_step(actx: &AttemptContext<'_>, step: &StepPlan, is_sticky_step
     }
 
     let account_counter = table.advance_rr(&unique_counter_key(step));
-    let candidates = select::account_candidates(
-        provider,
-        provider.key_strategy,
-        account_counter,
-        &health,
-        now_ms,
-        &step.model,
-    );
+    let candidates = if ignore_cooldowns {
+        select::account_candidates_ignoring_cooldowns(
+            provider,
+            provider.key_strategy,
+            account_counter,
+            &health,
+            now_ms,
+            &step.model,
+        )
+    } else {
+        select::account_candidates(
+            provider,
+            provider.key_strategy,
+            account_counter,
+            &health,
+            now_ms,
+            &step.model,
+        )
+    };
     if candidates.is_empty() {
         if is_sticky_step {
             if let Some(combo) = combo {
@@ -1946,11 +2001,7 @@ async fn attempt_step(actx: &AttemptContext<'_>, step: &StepPlan, is_sticky_step
     match app.relay.upstream().send(request).await {
         Ok(response) if response.status.is_success() => {
             app.health.record_success(account.id.as_str());
-            if let Some(combo) = combo.filter(|c| {
-                c.strategy == mr_core::ComboStrategy::Priority
-                    && c.hedge.enabled
-                    && c.sticky_success_window_secs > 0
-            }) {
+            if let Some(combo) = combo.filter(|c| sticky_applies(c)) {
                 app.sticky_success.record_success(
                     &combo.id,
                     step,
@@ -2002,10 +2053,33 @@ async fn attempt_step(actx: &AttemptContext<'_>, step: &StepPlan, is_sticky_step
                 reason = named;
                 named_wait = wait.or(named_wait);
             }
+            // A refusal used to leave no trace at all, which made the most expensive failure in
+            // a combo — the one that silently sends every request to the next step — invisible.
+            // The excerpt is what names the cause: `prefill_cap_refused` reads as a rate limit in
+            // the status line and is nothing of the sort.
+            let excerpt = response
+                .body
+                .first_frame_bytes()
+                .map(|bytes| String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).into_owned())
+                .unwrap_or_default();
+            tracing::warn!(
+                model = model_name,
+                provider = %step.provider_id,
+                status = response.status.as_u16(),
+                reason = ?reason,
+                named_wait_ms = named_wait,
+                body = %excerpt,
+                "upstream refused the request"
+            );
             let rebuilt = response;
             app.health.cool_down(
                 account.id.as_str(),
-                select::cooldown_until(reason, 0, named_wait, quota),
+                select::cooldown_until(
+                    reason,
+                    app.health.failures(account.id.as_str()),
+                    named_wait,
+                    quota,
+                ),
                 reason,
             );
             Attempt::Failed {
@@ -2048,7 +2122,12 @@ async fn attempt_step(actx: &AttemptContext<'_>, step: &StepPlan, is_sticky_step
             let reason = select::CooldownReason::Backoff;
             app.health.cool_down(
                 account.id.as_str(),
-                select::cooldown_until(reason, 0, None, quota),
+                select::cooldown_until(
+                    reason,
+                    app.health.failures(account.id.as_str()),
+                    None,
+                    quota,
+                ),
                 reason,
             );
             tracing::warn!(
@@ -2267,7 +2346,7 @@ async fn attempt_from_owned(owned: &OwnedAttempt, step: &StepPlan, is_sticky: bo
         lookup_done: owned.lookup_done,
         sticky_index: owned.sticky_index,
     };
-    attempt_step(&ctx, step, is_sticky).await
+    attempt_step(&ctx, step, is_sticky, false).await
 }
 
 /// Run a hedged race over a combo's participants.
@@ -2304,6 +2383,7 @@ async fn run_hedge(
                 actx,
                 step,
                 sticky_step_is(actx.combo, actx.sticky_index, step),
+                false,
             );
             Box::pin(async move { (index, future.await) }) as PendingAttempt<'_>
         })
@@ -2534,6 +2614,57 @@ async fn run_hedge(
     }
 }
 
+/// Whether this combo keeps a sticky-success preference at all.
+///
+/// Stickiness is about cache locality, not about racing. A combo that starts at the same step on
+/// every request keeps the provider's prompt cache warm, and that is worth having whether or not
+/// the combo hedges, so hedging is not a precondition. Round-robin is excluded because spreading
+/// load across steps is its whole purpose, and a window of zero is the operator switching it off.
+fn sticky_applies(combo: &mr_core::snapshot::ComboPlan) -> bool {
+    matches!(
+        combo.strategy,
+        mr_core::ComboStrategy::Priority | mr_core::ComboStrategy::ResetAwarePriority
+    ) && combo.sticky_success_window_secs > 0
+}
+
+/// The step to try when every step of a combo is cooling down.
+///
+/// The one whose accounts recover soonest, because that is the closest thing to a live step the
+/// combo has. Steps that were already raced are excluded: they have been tried in this request.
+fn last_resort_step<'a>(
+    app: &AppState,
+    table: &RouteTable,
+    steps: &[&'a StepPlan],
+    raced: &[&StepPlan],
+    now_ms: u64,
+) -> Option<&'a StepPlan> {
+    let health = app.health.view();
+    steps
+        .iter()
+        .copied()
+        .filter(|step| !raced.iter().any(|tried| std::ptr::eq(*tried, *step)))
+        .filter_map(|step| {
+            let provider = table
+                .snapshot
+                .providers()
+                .get(step.provider_index as usize)?;
+            let soonest = provider
+                .accounts
+                .iter()
+                .filter(|account| select::account_allows_model(account, &step.model))
+                .map(|account| {
+                    health
+                        .get(account.id.as_str())
+                        .map(|cooldown| cooldown.until_ms)
+                        .unwrap_or(now_ms)
+                })
+                .min()?;
+            Some((soonest, step))
+        })
+        .min_by_key(|(soonest, _)| *soonest)
+        .map(|(_, step)| step)
+}
+
 /// Whether a step is the one the combo's sticky preference points at.
 ///
 /// The same comparison the sequential chain uses, in one place, so the race and the chain agree
@@ -2687,7 +2818,45 @@ fn auth_error(outcome: &AuthOutcome, dialect: Dialect) -> Response {
 ///
 /// Returns the reason plus the millisecond wait the body states. The wait is clamped to a day, the
 /// same cap `retry_after_ms` applies, so a bogus value cannot park an account indefinitely.
+/// A refusal that is about *this request* rather than the account's standing.
+///
+/// OpenCode's gateway answers an oversized prefill with a 429 whose body carries a
+/// self-describing marker and its own recovery hint:
+///
+/// `[prefill_cap_refused] the cell is at capacity; retry shortly (after 30 s)`
+///
+/// That is not a rate limit on the credential. The credential is fine; one request was too big
+/// for the cell to admit. Giving it the flat rate-limit cooldown parks a perfectly healthy
+/// account for longer than the upstream asked, and letting it grow with the failure count would
+/// park it for longer still, on every request that happens to be large. The hint is parsed
+/// instead, so the account comes back exactly when the upstream said it would.
+fn capacity_refusal(body: &[u8]) -> Option<u64> {
+    /// The marker OpenCode uses, and the wait to assume if its hint cannot be read.
+    const MARKER: &str = "prefill_cap_refused";
+    const FALLBACK_MS: u64 = 30_000;
+    let text = std::str::from_utf8(body).ok()?;
+    let at = text.find(MARKER)?;
+    // The hint reads `after 30 s`. A body that names the marker but not the delay still gets
+    // the fallback: retrying a refused prefill at full rate is worse than waiting.
+    // The hint reads `(after 30 s)` — the word is parenthesised and the count can be too, so
+    // both are trimmed of punctuation before they are compared or parsed. Splitting on
+    // whitespace alone would miss `(after` and silently fall back on every real body.
+    let mut words = text[at + MARKER.len()..]
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric()));
+    let hinted = words
+        .by_ref()
+        .find(|word| word.eq_ignore_ascii_case("after"))
+        .and_then(|_| words.next())
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .map(|seconds| seconds.min(86_400).saturating_mul(1000));
+    Some(hinted.unwrap_or(FALLBACK_MS))
+}
+
 fn exhausted_by_body(body: &[u8]) -> Option<(select::CooldownReason, Option<u64>)> {
+    if let Some(wait) = capacity_refusal(body) {
+        return Some((select::CooldownReason::RateLimited, Some(wait)));
+    }
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let error = value.get("error").unwrap_or(&value);
     let kind = error.get("type").or_else(|| error.get("code"))?.as_str()?;
@@ -3630,6 +3799,57 @@ mod tests {
             authenticate_request(&relay, true, Some("invalid")),
             AuthOutcome::Rejected
         ));
+    }
+
+    fn combo_plan(
+        strategy: mr_core::dialect::ComboStrategy,
+        window: u32,
+    ) -> mr_core::snapshot::ComboPlan {
+        mr_core::snapshot::ComboPlan {
+            id: mr_core::ids::ComboId::generate(),
+            name: "test".into(),
+            strategy,
+            steps: Vec::new(),
+            hedge: mr_core::snapshot::HedgePlan {
+                enabled: false,
+                participants: Vec::new(),
+                window_ms: 0,
+                winner_metric: Default::default(),
+                on_winner_fail: Default::default(),
+                cancel_losers: true,
+                loser_grace_ms: 0,
+            },
+            midstream_policy: Default::default(),
+            sticky_success_window_secs: window,
+            max_retries: 0,
+            retry_delay_ms: 0,
+            affinity: false,
+            compression: Default::default(),
+            signature: 0,
+        }
+    }
+
+    #[test]
+    fn sticky_success_is_not_gated_on_hedging_or_on_the_plain_priority_strategy() {
+        use mr_core::dialect::ComboStrategy;
+        // The bug this pins: stickiness used to require `hedge.enabled`, so a reset-aware combo
+        // with hedging off could never keep a step, and every failover bounced back to the head of
+        // the list on the next request, losing the provider's prompt cache each time.
+        assert!(sticky_applies(&combo_plan(
+            ComboStrategy::ResetAwarePriority,
+            1800
+        )));
+        assert!(sticky_applies(&combo_plan(ComboStrategy::Priority, 1800)));
+        // Round-robin exists to spread load; pinning it would defeat it.
+        assert!(!sticky_applies(&combo_plan(
+            ComboStrategy::RoundRobin,
+            1800
+        )));
+        // Zero is the operator switching it off.
+        assert!(!sticky_applies(&combo_plan(
+            ComboStrategy::ResetAwarePriority,
+            0
+        )));
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -5143,6 +5363,43 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         // that it stops poisoning requests, short enough that a wrong or stale instant cannot hide a
         // recovered account for a fortnight. Retrying once a day costs one refused request.
         assert_eq!(wait, Some(86_400_000));
+    }
+
+    #[test]
+    fn an_oversized_prefill_is_a_capacity_refusal_and_its_hint_is_used() {
+        // The exact body OpenCode's gateway returns for a prompt past its prefill cap, captured
+        // from a 20 000-word request. It is a 429 with `type: server_error`, so the status line
+        // reads as a throttle and the old code parked a healthy account for the full default
+        // minute. The hint is the upstream saying when it can try again.
+        let body = br#"{"error":{"type":"server_error","message":"Upstream request failed: [prefill_cap_refused] the cell is at capacity; retry shortly (after 30 s)"}}"#;
+        let (reason, wait) = exhausted_by_body(body).expect("a capacity refusal");
+        assert_eq!(reason, select::CooldownReason::RateLimited);
+        assert_eq!(wait, Some(30_000));
+    }
+
+    #[test]
+    fn a_capacity_refusal_without_a_readable_hint_still_waits() {
+        // Naming the marker without naming a delay must not mean "retry immediately": the
+        // request was refused, so a cooldown of some length is always the honest answer.
+        let body = br#"{"error":{"type":"server_error","message":"[prefill_cap_refused]"}}"#;
+        let (_, wait) = exhausted_by_body(body).expect("a capacity refusal");
+        assert_eq!(wait, Some(30_000));
+    }
+
+    #[test]
+    fn a_capacity_hint_is_capped_like_every_other_wait() {
+        let body = br#"[prefill_cap_refused] retry shortly (after 999999 s)"#;
+        let (_, wait) = exhausted_by_body(body).expect("a capacity refusal");
+        assert_eq!(wait, Some(86_400_000));
+    }
+
+    #[test]
+    fn a_body_without_the_marker_is_not_a_capacity_refusal() {
+        assert_eq!(
+            exhausted_by_body(b"[cap_refused] the cell is at capacity; retry shortly (after 30 s)"),
+            None
+        );
+        assert_eq!(exhausted_by_body(b"429 too many requests"), None);
     }
 
     #[test]

@@ -266,7 +266,7 @@ Turn `affinity` off when stickiness actively hurts:
 > stickiness described in this section is **not implemented**. What the relay does implement is a
 > different, narrower mechanism — sticky-success — described in
 > [the hedged race](07-hedged-race.md) §8: a combo-wide preference remembered in-process for a
-> `priority` combo, not a session-keyed pin per conversation.
+> `priority` or `reset-aware-priority` combo, not a session-keyed pin per conversation.
 
 ---
 

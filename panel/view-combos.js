@@ -368,9 +368,9 @@ export async function renderCombos(mount, ctx, selectedId) {
     // --- hedge ---
     const hedgeToggle = toggle('Enable the hedged race for this combo', { checked: Boolean(draft.hedge?.enabled) });
     const hedgeOn = hedgeToggle.input;
-    const stickyWindowInput = h('input', { class: 'input', type: 'number', min: '0', max: '604800', value: draft.sticky_success_window_secs });
+    const stickyWindowInput = h('input', { class: 'input', type: 'number', min: '0', max: '604800', value: draft.sticky_success_window_secs ?? 1800 });
     stickyWindowInput.addEventListener('input', () => markDirty());
-    const stickyWindowBox = field('Sticky success window (seconds)', stickyWindowInput, { hint: 'Priority combos only; enabled with hedge. Default 1800s (30 minutes). Combo-wide across callers; inactivity refreshes after a successful response. Set 0 to disable.' });
+    const stickyWindowBox = field('Sticky success window (seconds)', stickyWindowInput, { hint: 'Priority and reset-aware combos. Default 1800s (30 minutes). Combo-wide across callers; inactivity refreshes after a successful response. Set 0 to disable.' });
     const hedgeCount = h('input', { class: 'input', type: 'number', min: '2', max: '255', 'data-field': 'count', value: draft.hedge?.count ?? 3 });
     hedgeCount.addEventListener('input', () => markDirty());
     const hedgeWindow = h('input', { class: 'input', type: 'number', min: '0', 'data-field': 'window_ms', value: draft.hedge?.window_ms ?? 800 });
@@ -477,7 +477,9 @@ export async function renderCombos(mount, ctx, selectedId) {
       const payload = {
         ...draft,
         name: draft.name.trim(),
-        sticky_success_window_secs: Number(stickyWindowInput.value) || 0,
+        // An empty field means "leave it at the default", not "switch it off". Reading it as 0
+        // silently disabled stickiness on every combo saved through this form.
+        sticky_success_window_secs: stickyWindowInput.value.trim() === '' ? 1800 : (Number(stickyWindowInput.value) || 0),
         steps: draft.steps.map((s) => ({ ...s, note: s.note || undefined })),
         hedge: {
           enabled: hedgeOn.checked,

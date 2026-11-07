@@ -11,6 +11,21 @@ use mr_core::snapshot::StepPlan;
 
 const MAX_ENTRIES: usize = 256;
 
+/// How long a failover may keep winning before the configured order is tried again.
+///
+/// The sliding window alone is not enough: a combo that failed over once would keep serving the
+/// fallback for as long as traffic kept the window alive, so a provider that recovered a minute
+/// later would never be used again. A pin is therefore bounded by *total* age, independent of the
+/// window, so it cannot become permanent.
+///
+/// The bound is deliberately short. Every upstream failure already arms a cooldown on the account,
+/// and `order_steps` demotes a cooling step on its own, so a pin only decides what happens *after*
+/// that cooldown expires. Anything much longer than one cooldown cycle therefore buys no cache
+/// stability that the cooldown was not already giving, and it delays recovery: a step that is well
+/// again is ignored for the rest of the pin's life. Two cooldown defaults is long enough to keep a
+/// burst on the fallback and short enough that a recovered primary is retried promptly.
+const MAX_PIN_AGE: Duration = Duration::from_secs(120);
+
 #[derive(Clone, Debug)]
 struct Pin {
     provider_id: String,
@@ -18,6 +33,7 @@ struct Pin {
     level: u8,
     expires_at: Instant,
     touched_at: Instant,
+    pinned_at: Instant,
 }
 
 /// Process-local sticky-success memory. It never performs provider requests or keepalives.
@@ -31,6 +47,12 @@ impl StickySuccess {
     ///
     /// The sliding inactivity window is extended on each successful request via `record_success`.
     /// `eligible` must reflect current account, cooldown, model, provider, and auth availability.
+    ///
+    /// A pin is a *failover* memory, not a promotion. It is honoured for at most MAX_PIN_AGE from
+    /// the moment the failover happened, so the configured order is retried regularly and a
+    /// provider that recovers is used again. Without that cap a single bad minute would pin a
+    /// combo to its last step for as long as traffic kept the sliding window alive, which is the
+    /// opposite of what the operator asked for when they put a provider first.
     pub fn preferred_index(
         &self,
         combo_id: &ComboId,
@@ -44,7 +66,7 @@ impl StickySuccess {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             let pin = pins.get(combo_id.as_str())?;
-            if pin.expires_at <= now {
+            if pin.expires_at <= now || now.duration_since(pin.pinned_at) >= MAX_PIN_AGE {
                 pins.remove(combo_id.as_str());
                 return None;
             }
@@ -111,6 +133,17 @@ impl StickySuccess {
                 }
             }
         }
+        // A repeat success on the step already pinned extends the sliding window but must not
+        // restart the age cap, or the cap would never be reached under steady traffic.
+        let pinned_at = pins
+            .get(combo_id.as_str())
+            .filter(|pin| {
+                pin.provider_id == step.provider_id.as_str()
+                    && pin.model == step.model
+                    && pin.level == step.level
+            })
+            .map(|pin| pin.pinned_at)
+            .unwrap_or(now);
         pins.insert(
             combo_id.as_str().to_owned(),
             Pin {
@@ -119,6 +152,7 @@ impl StickySuccess {
                 level: step.level,
                 expires_at: now + window,
                 touched_at: now,
+                pinned_at,
             },
         );
     }
@@ -202,13 +236,43 @@ mod tests {
             cache.preferred_index(&combo, &steps, |s| s.provider_id.as_str() == "b", now),
             None
         );
+        // The fallback becomes the pin, and it is honoured while the step ahead of it is down.
         cache.record_success(&combo, &steps[1], Duration::from_secs(30), now);
         assert_eq!(
-            cache.preferred_index(&combo, &steps, |_| true, now),
+            cache.preferred_index(&combo, &steps, |s| s.provider_id.as_str() == "b", now),
             Some(1)
         );
         cache.clear(&combo);
         assert_eq!(cache.preferred_index(&combo, &steps, |_| true, now), None);
+    }
+
+    #[test]
+    fn a_failover_pin_expires_even_while_traffic_keeps_refreshing_it() {
+        let cache = StickySuccess::default();
+        let combo = ComboId::from_raw("combo");
+        let steps = vec![step("a", "m"), step("b", "m"), step("c", "m")];
+        let start = Instant::now();
+        // The combo failed over to its last step while the first two were unusable.
+        cache.record_success(&combo, &steps[2], Duration::from_secs(1800), start);
+        // Steady traffic keeps the sliding window alive, but not the age cap.
+        let mut now = start;
+        while now.duration_since(start) < MAX_PIN_AGE - Duration::from_secs(10) {
+            now += Duration::from_secs(10);
+            cache.record_success(&combo, &steps[2], Duration::from_secs(1800), now);
+            assert_eq!(
+                cache.preferred_index(&combo, &steps, |_| true, now),
+                Some(2)
+            );
+        }
+        // Once the cap is reached the configured order is tried again.
+        let after = start + MAX_PIN_AGE;
+        assert_eq!(cache.preferred_index(&combo, &steps, |_| true, after), None);
+        // A fresh failover starts a fresh cap.
+        cache.record_success(&combo, &steps[2], Duration::from_secs(1800), after);
+        assert_eq!(
+            cache.preferred_index(&combo, &steps, |_| true, after + Duration::from_secs(1)),
+            Some(2)
+        );
     }
 
     #[test]

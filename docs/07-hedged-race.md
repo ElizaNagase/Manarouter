@@ -436,9 +436,11 @@ Two different ideas are easily confused here, and only one of them runs today.
 relay's step loop. After a step answers successfully, the next request for that combo starts at that
 same step instead of at the head of the ordered list. What it actually does is narrow:
 
-- It is opt-in and only active for a `priority` combo with `hedge.enabled` true and
-  `sticky_success_window_secs` greater than zero. The default window is **1800 s**, and each success
-  resets it (a sliding window).
+- It is opt-in through `sticky_success_window_secs` greater than zero, and it applies to a
+  `priority` or `reset-aware-priority` combo. Hedging is **not** a precondition: stickiness is about
+  keeping a provider's prompt cache warm, which is worth having whether or not the combo races.
+  `round-robin` is excluded because spreading load is its whole purpose. The default window is
+  **1800 s**, and each success resets it (a sliding window).
 - It is **combo-wide**, not per conversation: the cache is keyed by combo id, so every caller of that
   combo is offered the same preferred step. There is no `x-manarouter-session` key and no
   conversation hash.
@@ -448,6 +450,16 @@ same step instead of at the head of the ordered list. What it actually does is n
   have gone unavailable is skipped and the pin dropped. It is lost when the process restarts or the
   window expires.
 - It reorders where the **sequential** loop begins; it does not run anything concurrently.
+- A pin is dropped the moment the pinned step fails, so a failover is not undone by the next request
+  returning to a step that just broke.
+- A pin also has a **total age cap of 120 s**, independent of the sliding window. The window alone
+  would let one bad minute pin a combo to its fallback for as long as traffic kept refreshing it,
+  so a provider that recovered would never be used again. The cap is deliberately short because
+  every upstream failure already arms a cooldown and `order_steps` demotes a cooling step by
+  itself: a pin only decides what happens *after* that cooldown expires, so a long cap buys no
+  cache stability the cooldown was not already giving and only delays recovery. With the cap the
+  configured order is retried at most once every two minutes, and a fresh failover starts a fresh
+  cap.
 
 **Session affinity is not wired.** The intended feature — pinning a whole conversation to a step via
 the client-supplied `x-manarouter-session` header or a hash of the conversation's first system message

@@ -150,6 +150,19 @@ impl Health {
         self.record_success(account_id);
     }
 
+    /// How many consecutive failures this account has recorded.
+    ///
+    /// The count carries forward across cooldowns and resets only on a success, so it is the
+    /// honest input to `cooldown_until`'s growth. Callers used to pass a hard-coded zero, which
+    /// silently disabled the growth: an account that failed fifteen times in a row was parked
+    /// for the same minute as one that failed once, and the combo re-walked it on every request.
+    pub fn failures(&self, account_id: &str) -> u32 {
+        self.map
+            .load()
+            .get(account_id)
+            .map_or(0, |cooldown| cooldown.failures)
+    }
+
     /// The number of accounts currently cooling down.
     pub fn cooling_count(&self) -> usize {
         self.map.load().len()
@@ -351,12 +364,43 @@ pub fn account_candidates<'a>(
     now_ms: u64,
     model: &str,
 ) -> Vec<&'a AccountPlan> {
+    account_candidates_with(provider, strategy, counter, health, now_ms, model, true)
+}
+
+/// The same ordered list, but with the cooldown filter left out.
+///
+/// A cooldown is a prediction about the near future, not a fact about now: an account that was
+/// throttled a minute ago may answer perfectly well. When every step of a combo is cooling down,
+/// refusing the request without trying anything is the worst of the available answers, so the
+/// caller uses this to make one last attempt on the step that recovers soonest. The model filter
+/// still applies — an account that is not allowed to serve this model will not start being allowed
+/// because the request was desperate.
+pub fn account_candidates_ignoring_cooldowns<'a>(
+    provider: &'a ProviderPlan,
+    strategy: KeyStrategy,
+    counter: u64,
+    health: &HashMap<String, Cooldown>,
+    now_ms: u64,
+    model: &str,
+) -> Vec<&'a AccountPlan> {
+    account_candidates_with(provider, strategy, counter, health, now_ms, model, false)
+}
+
+fn account_candidates_with<'a>(
+    provider: &'a ProviderPlan,
+    strategy: KeyStrategy,
+    counter: u64,
+    health: &HashMap<String, Cooldown>,
+    now_ms: u64,
+    model: &str,
+    respect_cooldowns: bool,
+) -> Vec<&'a AccountPlan> {
     // Candidates in the operator's order. `priority` is expressed by the order of the account list
     // in the configuration, so nothing here needs to sort for that strategy.
     let mut candidates: Vec<&AccountPlan> = provider
         .accounts
         .iter()
-        .filter(|a| account_available(a.id.as_str(), health, now_ms))
+        .filter(|a| !respect_cooldowns || account_available(a.id.as_str(), health, now_ms))
         .filter(|a| account_allows_model(a, model))
         .collect();
 
@@ -891,6 +935,22 @@ mod tests {
         assert_eq!(h.view().get("a").unwrap().failures, 2);
         h.cool_down("a", 3_000, CooldownReason::RateLimited);
         assert_eq!(h.view().get("a").unwrap().failures, 3);
+    }
+
+    #[test]
+    fn the_failure_count_is_readable_so_the_cooldown_can_grow_with_it() {
+        // The relay used to pass a hard-coded zero to `cooldown_until`, which disabled the
+        // growth entirely: a permanently dead account was parked for the same minute as one
+        // that had failed once, and every request re-walked it. The count has to be readable
+        // for the growth to be reachable at all.
+        let h = Health::new();
+        assert_eq!(h.failures("a"), 0, "an account never seen has no failures");
+        h.cool_down("a", 1_000, CooldownReason::RateLimited);
+        assert_eq!(h.failures("a"), 1);
+        h.cool_down("a", 2_000, CooldownReason::RateLimited);
+        assert_eq!(h.failures("a"), 2);
+        h.record_success("a");
+        assert_eq!(h.failures("a"), 0);
     }
 
     #[test]
