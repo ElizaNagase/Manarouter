@@ -651,7 +651,15 @@ mod tests {
     /// an operator into a login that cannot exist.
     // Catalog targets intentionally withheld pending vendor flow validation; see
     // docs/omniroute-reference.md for the broader OmniRoute inventory.
-    const NOT_IMPLEMENTED: &[&str] = &["cline"];
+    const NOT_IMPLEMENTED: &[&str] = &[
+        "cline",
+        "codebuddy-cn",
+        "grok-cli",
+        "kilocode",
+        "openference",
+        "qoder",
+        "trae",
+    ];
     const NON_INTERACTIVE: &[&str] = &["xai"];
 
     fn oauth_platform_ids() -> Vec<String> {

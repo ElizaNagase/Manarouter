@@ -637,6 +637,1238 @@ capabilities = ["chat", "responses", "models", "tool-calling", "reasoning"]
 note = "Go-plan tier; the host also serves /messages and /responses, which a single-dialect provider cannot express."
 
 # ---------------------------------------------------------------------------------------------
+# Imported from the reference router registry (OmniRoute)
+# ---------------------------------------------------------------------------------------------
+# Every entry below exists in that install and speaks a dialect this build has. Each one is
+# marked UNCERTAIN in docs/providers/catalog.md: the base URL and auth shape come from that
+# registry, not from the vendor, and the capabilities are the conservative set the dialect can
+# serve rather than a per-provider claim the research did not record.
+
+[[providers]]
+id = "agentrouter"
+label = "AgentRouter"
+dialect = "anthropic"
+base_url = "https://agentrouter.org/v1"
+auth = { type = "api-key-header", header = "x-api-key" }
+capabilities = ["messages", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "agnes-cn"
+label = "Agnes AI (China)"
+dialect = "open-ai"
+base_url = "https://api.agnes-ai.cn/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "ai21"
+label = "AI21 Labs"
+dialect = "open-ai"
+base_url = "https://api.ai21.com/studio/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "aimlapi"
+label = "AI/ML API"
+dialect = "open-ai"
+base_url = "https://api.aimlapi.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "ainative"
+label = "AINative Studio"
+dialect = "open-ai"
+base_url = "https://api.ainative.studio/api/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "alibaba"
+label = "Alibaba Cloud Model Studio"
+dialect = "open-ai"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "alibaba-cn"
+label = "Alibaba (China)"
+dialect = "open-ai"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "ant-ling"
+label = "Ant Ling / Ring (inclusionAI)"
+dialect = "open-ai"
+base_url = "https://api.ant-ling.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "anyapi"
+label = "AnyAPI AI"
+dialect = "open-ai"
+base_url = "https://api.anyapi.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "arcee-ai"
+label = "Arcee AI"
+dialect = "open-ai"
+base_url = "https://api.arcee.ai/api/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "auriko"
+label = "Auriko"
+dialect = "open-ai"
+base_url = "https://api.auriko.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "bai"
+label = "b.ai"
+dialect = "open-ai"
+base_url = "https://api.b.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "baichuan"
+label = "Baichuan"
+dialect = "open-ai"
+base_url = "https://api.baichuan-ai.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "baidu"
+label = "Baidu (ERNIE)"
+dialect = "open-ai"
+base_url = "https://qianfan.baidubce.com/v2"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "bailian-coding-plan"
+label = "Alibaba Token Plan"
+dialect = "anthropic"
+base_url = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic/v1"
+auth = { type = "api-key-header", header = "x-api-key" }
+capabilities = ["messages", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "baseten"
+label = "Baseten"
+dialect = "open-ai"
+base_url = "https://inference.baseten.co/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "bazaarlink"
+label = "BazaarLink"
+dialect = "open-ai"
+base_url = "https://bazaarlink.ai/api/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "blackbox"
+label = "Blackbox AI"
+dialect = "open-ai"
+base_url = "https://api.blackbox.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "bluesminds"
+label = "BluesMinds"
+dialect = "open-ai"
+base_url = "https://api.bluesminds.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "byteplus"
+label = "BytePlus ModelArk"
+dialect = "open-ai"
+base_url = "https://ark.ap-southeast.bytepluses.com/api/v3"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "charm-hyper"
+label = "Charm Hyper"
+dialect = "open-ai"
+base_url = "https://hyper.charm.land/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "chat-oripe"
+label = "Chat Oripe"
+dialect = "open-ai"
+base_url = "https://api.oriper.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "chatanywhere"
+label = "ChatAnywhere"
+dialect = "open-ai"
+base_url = "https://api.chatanywhere.org/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "chenzk"
+label = "Chenzk API"
+dialect = "open-ai"
+base_url = "https://chenzk.top/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "chutes"
+label = "Chutes.ai"
+dialect = "open-ai"
+base_url = "https://llm.chutes.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "cloudcode-one"
+label = "CloudCode.ONE"
+dialect = "open-ai"
+base_url = "https://api.cloudcode.one/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "codebuddy-cn"
+label = "CodeBuddy CN"
+dialect = "open-ai"
+base_url = "https://copilot.tencent.com/v2"
+auth = { type = "oauth", platform = "codebuddy-cn" }
+oauth_platform = "codebuddy-cn"
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support. The codebuddy-cn OAuth platform is not implemented in this build, so the entry records the migration target rather than offering a working login."
+[[providers]]
+id = "codestral"
+label = "Codestral"
+dialect = "open-ai"
+base_url = "https://codestral.mistral.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "coze"
+label = "Coze"
+dialect = "open-ai"
+base_url = "https://api.coze.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "crof"
+label = "CrofAI"
+dialect = "open-ai"
+base_url = "https://crof.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "dahl"
+label = "Dahl"
+dialect = "open-ai"
+base_url = "https://inference.dahl.global/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "dgrid"
+label = "DGrid"
+dialect = "open-ai"
+base_url = "https://api.dgrid.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "digitalocean"
+label = "DigitalOcean"
+dialect = "open-ai"
+base_url = "https://inference.do-ai.run/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "dit"
+label = "DIT.ai"
+dialect = "open-ai"
+base_url = "https://api.dit.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "doubao"
+label = "Doubao"
+dialect = "open-ai"
+base_url = "https://ark.cn-beijing.volces.com/api/v3"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "dxnt"
+label = "DXNT / DX Token"
+dialect = "open-ai"
+base_url = "https://www.dxnt.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "electronhub"
+label = "Electron Hub"
+dialect = "open-ai"
+base_url = "https://api.electronhub.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "eurouter"
+label = "EURouter"
+dialect = "open-ai"
+base_url = "https://api.eurouter.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "factory"
+label = "Factory"
+dialect = "open-ai"
+base_url = "https://api.factory.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "fastrouter"
+label = "FastRouter"
+dialect = "open-ai"
+base_url = "https://api.fastrouter.ai/api/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "featherless-ai"
+label = "Featherless AI"
+dialect = "open-ai"
+base_url = "https://api.featherless.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "freebuff"
+label = "Freebuff"
+dialect = "open-ai"
+base_url = "https://www.codebuff.com/api/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "freeinference"
+label = "FreeInference"
+dialect = "open-ai"
+base_url = "https://freeinference.org/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "freetheai"
+label = "FreeTheAi"
+dialect = "open-ai"
+base_url = "https://api.freetheai.xyz/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "friendliai"
+label = "FriendliAI"
+dialect = "open-ai"
+base_url = "https://api.friendli.ai/serverless/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "g4f-gemini"
+label = "g4f.space — Gemini"
+dialect = "open-ai"
+base_url = "https://g4f.space/api/gemini/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "g4f-groq"
+label = "g4f.space — Groq"
+dialect = "open-ai"
+base_url = "https://g4f.space/api/groq/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "g4f-nvidia"
+label = "g4f.space — NVIDIA"
+dialect = "open-ai"
+base_url = "https://g4f.space/api/nvidia/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "g4f-ollama"
+label = "g4f.space — Ollama"
+dialect = "open-ai"
+base_url = "https://g4f.space/api/ollama/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "g4f-pollinations"
+label = "g4f.space — Pollinations"
+dialect = "open-ai"
+base_url = "https://g4f.space/api/pollinations/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "galadriel"
+label = "Galadriel"
+dialect = "open-ai"
+base_url = "https://api.galadriel.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "gigachat"
+label = "GigaChat (Sber)"
+dialect = "open-ai"
+base_url = "https://gigachat.devices.sberbank.ru/api/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "glm-cn"
+label = "GLM Coding (China)"
+dialect = "open-ai"
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "greenpt"
+label = "GreenPT"
+dialect = "open-ai"
+base_url = "https://api.greenpt.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "grok-cli"
+label = "Grok Build"
+dialect = "open-ai"
+base_url = "https://cli-chat-proxy.grok.com/v1"
+auth = { type = "oauth", platform = "grok-cli" }
+oauth_platform = "grok-cli"
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support. The grok-cli OAuth platform is not implemented in this build, so the entry records the migration target rather than offering a working login."
+[[providers]]
+id = "hcnsec"
+label = "Huancheng Public API"
+dialect = "open-ai"
+base_url = "https://api.hcnsec.cn/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "helixmind"
+label = "HelixMind"
+dialect = "open-ai"
+base_url = "https://helixmind.online/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "helyxai"
+label = "Helyx AI"
+dialect = "open-ai"
+base_url = "https://helyxai.space/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "heroku"
+label = "Heroku AI"
+dialect = "open-ai"
+base_url = "https://us.inference.heroku.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "iflytek"
+label = "iFlytek Spark"
+dialect = "open-ai"
+base_url = "https://spark-api-open.xf-yun.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "inference-net"
+label = "Inference.net"
+dialect = "open-ai"
+base_url = "https://api.inference.net/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "internlm"
+label = "InternLM (Intern-S1)"
+dialect = "open-ai"
+base_url = "https://chat.intern-ai.org.cn/api/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "kenari"
+label = "Kenari"
+dialect = "open-ai"
+base_url = "https://kenari.id/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "kilo-gateway"
+label = "Kilo Gateway"
+dialect = "open-ai"
+base_url = "https://api.kilo.ai/api/gateway"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+
+[providers.route_overrides]
+chat-completions = "chat/completions"
+[[providers]]
+id = "kilocode"
+label = "Kilo Code"
+dialect = "open-ai"
+base_url = "https://api.kilo.ai/api/openrouter"
+auth = { type = "oauth", platform = "kilocode" }
+oauth_platform = "kilocode"
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support. The kilocode OAuth platform is not implemented in this build, so the entry records the migration target rather than offering a working login."
+
+[providers.route_overrides]
+chat-completions = "chat/completions"
+[[providers]]
+id = "lambda-ai"
+label = "Lambda AI"
+dialect = "open-ai"
+base_url = "https://api.lambda.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "liquid"
+label = "Liquid AI"
+dialect = "open-ai"
+base_url = "https://inference.liquid.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "literouter"
+label = "LiteRouter"
+dialect = "open-ai"
+base_url = "https://api.literouter.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "llamagate"
+label = "LlamaGate"
+dialect = "open-ai"
+base_url = "https://llamagate.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "llm7"
+label = "LLM7.io"
+dialect = "open-ai"
+base_url = "https://api.llm7.io/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "llmgateway"
+label = "LLM Gateway"
+dialect = "open-ai"
+base_url = "https://api.llmgateway.io/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "logfare"
+label = "Logfare"
+dialect = "open-ai"
+base_url = "https://logfare.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "longcat"
+label = "LongCat AI"
+dialect = "open-ai"
+base_url = "https://api.longcat.chat/openai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "lyceum"
+label = "Lyceum"
+dialect = "open-ai"
+base_url = "https://api.lyceum.technology/openai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "meganova-ai"
+label = "MegaNova AI"
+dialect = "open-ai"
+base_url = "https://api.meganova.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "meta-llama"
+label = "Meta Llama API"
+dialect = "open-ai"
+base_url = "https://api.llama.com/compat/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "minimax-cn"
+label = "Minimax (China)"
+dialect = "open-ai"
+base_url = "https://api.minimaxi.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "mixlayer"
+label = "Mixlayer"
+dialect = "open-ai"
+base_url = "https://models.mixlayer.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "mnn-ai"
+label = "MNN AI"
+dialect = "open-ai"
+base_url = "https://api.mnnai.ru/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "modal"
+label = "Modal"
+dialect = "open-ai"
+base_url = "https://api.modal.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "modelscope"
+label = "ModelScope"
+dialect = "open-ai"
+base_url = "https://api-inference.modelscope.cn/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "monsterapi"
+label = "MonsterAPI"
+dialect = "open-ai"
+base_url = "https://api.monsterapi.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "morph"
+label = "Morph"
+dialect = "open-ai"
+base_url = "https://api.morphllm.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "naga-ac"
+label = "Naga.ac"
+dialect = "open-ai"
+base_url = "https://api.naga.ac/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "naga-ai"
+label = "Naga AI"
+dialect = "open-ai"
+base_url = "https://api.naga.ac/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "nanogpt"
+label = "NanoGPT"
+dialect = "open-ai"
+base_url = "https://nano-gpt.com/api/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "nara"
+label = "NaraRouter"
+dialect = "open-ai"
+base_url = "https://router.bynara.id/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "navy"
+label = "NavyAI"
+dialect = "open-ai"
+base_url = "https://api.navy/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "nous-research"
+label = "Nous Research"
+dialect = "open-ai"
+base_url = "https://inference-api.nousresearch.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "nscale"
+label = "nScale"
+dialect = "open-ai"
+base_url = "https://inference.api.nscale.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "nube"
+label = "Nube.sh"
+dialect = "open-ai"
+base_url = "https://ai.nube.sh/api/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "ofoxai"
+label = "OfoxAI"
+dialect = "open-ai"
+base_url = "https://api.ofox.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "openference"
+label = "Openference"
+dialect = "open-ai"
+base_url = "https://api.openference.com/v1"
+auth = { type = "oauth", platform = "openference" }
+oauth_platform = "openference"
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support. The openference OAuth platform is not implemented in this build, so the entry records the migration target rather than offering a working login."
+[[providers]]
+id = "openference-api"
+label = "Openference API"
+dialect = "open-ai"
+base_url = "https://api.openference.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "openvecta"
+label = "OpenVecta"
+dialect = "open-ai"
+base_url = "https://api.openvecta.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "opper"
+label = "Opper"
+dialect = "open-ai"
+base_url = "https://api.opper.ai/v3/compat"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+
+[providers.route_overrides]
+chat-completions = "chat/completions"
+[[providers]]
+id = "orcarouter"
+label = "OrcaRouter"
+dialect = "open-ai"
+base_url = "https://api.orcarouter.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "ovhcloud"
+label = "OVHcloud AI"
+dialect = "open-ai"
+base_url = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "perplexity-agent"
+label = "Perplexity Agent"
+dialect = "open-ai"
+base_url = "https://api.perplexity.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "responses", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "pioneer"
+label = "Pioneer AI"
+dialect = "open-ai"
+base_url = "https://api.pioneer.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "plamo"
+label = "PLaMo"
+dialect = "open-ai"
+base_url = "https://api.platform.preferredai.jp/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "poe"
+label = "Poe"
+dialect = "open-ai"
+base_url = "https://api.poe.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "poixe-ai"
+label = "Poixe AI"
+dialect = "open-ai"
+base_url = "https://api.poixe.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "poolside"
+label = "Poolside"
+dialect = "open-ai"
+base_url = "https://inference.poolside.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "predibase"
+label = "Predibase"
+dialect = "open-ai"
+base_url = "https://serving.app.predibase.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "publicai"
+label = "PublicAI"
+dialect = "open-ai"
+base_url = "https://api.publicai.co/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "qianfan"
+label = "Baidu Qianfan"
+dialect = "open-ai"
+base_url = "https://qianfan.baidubce.com/v2"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "qiniu"
+label = "Qiniu"
+dialect = "open-ai"
+base_url = "https://api.qnaigc.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "qoder"
+label = "Qoder"
+dialect = "open-ai"
+base_url = "https://api.qoder.com/v1"
+auth = { type = "oauth", platform = "qoder" }
+oauth_platform = "qoder"
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support. The qoder OAuth platform is not implemented in this build, so the entry records the migration target rather than offering a working login."
+[[providers]]
+id = "qwen-cloud"
+label = "Qwen Cloud"
+dialect = "open-ai"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "qwen-cloud-token-plan"
+label = "Qwen Cloud Token Plan"
+dialect = "open-ai"
+base_url = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "regolo"
+label = "Regolo AI"
+dialect = "open-ai"
+base_url = "https://api.regolo.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "reka"
+label = "Reka"
+dialect = "open-ai"
+base_url = "https://api.reka.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "sarvam"
+label = "Sarvam AI"
+dialect = "open-ai"
+base_url = "https://api.sarvam.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "scaleway"
+label = "Scaleway AI"
+dialect = "open-ai"
+base_url = "https://api.scaleway.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "seekai"
+label = "SeekAi"
+dialect = "open-ai"
+base_url = "https://seekai.cc/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "sensenova"
+label = "SenseNova"
+dialect = "open-ai"
+base_url = "https://token.sensenova.cn/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "siliconflow"
+label = "SiliconFlow"
+dialect = "open-ai"
+base_url = "https://api.siliconflow.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "snowflake"
+label = "Snowflake Cortex"
+dialect = "open-ai"
+base_url = "https://{account}.snowflakecomputing.com/api/v2"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "sparkdesk"
+label = "SparkDesk"
+dialect = "open-ai"
+base_url = "https://spark-api-open.xf-yun.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "speka"
+label = "Speka AI"
+dialect = "open-ai"
+base_url = "https://speka.me/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "stepfun"
+label = "StepFun"
+dialect = "open-ai"
+base_url = "https://api.stepfun.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "sumopod"
+label = "SumoPod"
+dialect = "open-ai"
+base_url = "https://ai.sumopod.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "synthetic"
+label = "Synthetic"
+dialect = "open-ai"
+base_url = "https://api.synthetic.new/openai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "tabitoken"
+label = "TabiToken"
+dialect = "anthropic"
+base_url = "https://tabitoken.com/v1"
+auth = { type = "api-key-header", header = "x-api-key" }
+capabilities = ["messages", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "tencent"
+label = "Tencent Hunyuan"
+dialect = "open-ai"
+base_url = "https://api.hunyuan.cloud.tencent.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "token-kiosk"
+label = "Token Kiosk"
+dialect = "open-ai"
+base_url = "https://agent-router.gaib.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "tokenreply"
+label = "TokenReply"
+dialect = "open-ai"
+base_url = "https://api.tokenreply.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "tokenrouter"
+label = "TokenRouter"
+dialect = "open-ai"
+base_url = "https://api.tokenrouter.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "trae"
+label = "Trae"
+dialect = "open-ai"
+base_url = "https://core-normal.trae.ai/api/remote/v1"
+auth = { type = "oauth", platform = "trae" }
+oauth_platform = "trae"
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support. The trae OAuth platform is not implemented in this build, so the entry records the migration target rather than offering a working login."
+[[providers]]
+id = "typhoon"
+label = "Typhoon"
+dialect = "open-ai"
+base_url = "https://api.opentyphoon.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "uc-direct"
+label = "UC Direct (uncensored.com)"
+dialect = "open-ai"
+base_url = "https://api.uncensored.com/api/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "unorouter"
+label = "UnoRouter"
+dialect = "open-ai"
+base_url = "https://api.unorouter.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "upstage"
+label = "Upstage"
+dialect = "open-ai"
+base_url = "https://api.upstage.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "venice"
+label = "Venice.ai"
+dialect = "open-ai"
+base_url = "https://api.venice.ai/api/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "void-ai"
+label = "Void AI"
+dialect = "open-ai"
+base_url = "https://api.voidai.app/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "volcengine"
+label = "Volcengine"
+dialect = "open-ai"
+base_url = "https://ark.cn-beijing.volces.com/api/v3"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "volcengine-agent-plan"
+label = "Volcengine Ark Agent Plan"
+dialect = "open-ai"
+base_url = "https://ark.cn-beijing.volces.com/api/plan/v3"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "volcengine-coding-plan"
+label = "Volcengine Ark Coding Plan"
+dialect = "open-ai"
+base_url = "https://ark.cn-beijing.volces.com/api/coding/v3"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "wafer"
+label = "Wafer AI"
+dialect = "anthropic"
+base_url = "https://pass.wafer.ai/v1"
+auth = { type = "api-key-header", header = "x-api-key" }
+capabilities = ["messages", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "wandb"
+label = "Weights & Biases Inference"
+dialect = "open-ai"
+base_url = "https://api.inference.wandb.ai/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "writer"
+label = "Writer"
+dialect = "open-ai"
+base_url = "https://api.writer.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "x5lab"
+label = "X5Lab"
+dialect = "open-ai"
+base_url = "https://api.x5lab.dev/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "xiaomi-mimo-token-plan"
+label = "Xiaomi MiMo Token Plan"
+dialect = "open-ai"
+base_url = "https://token-plan-sgp.xiaomimimo.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "xkiro"
+label = "xKiro"
+dialect = "open-ai"
+base_url = "https://api.xkiro.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "yi"
+label = "Yi (01.AI)"
+dialect = "open-ai"
+base_url = "https://api.lingyiwanwu.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "yolo-auto"
+label = "Yolo-Auto"
+dialect = "open-ai"
+base_url = "https://yolo-auto.com/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "zai"
+label = "Z.AI"
+dialect = "anthropic"
+base_url = "https://api.z.ai/api/anthropic/v1"
+auth = { type = "api-key-header", header = "x-api-key" }
+capabilities = ["messages", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "zenmux"
+label = "ZenMux"
+dialect = "open-ai"
+base_url = "https://zenmux.ai/api/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "zerolimitai"
+label = "ZeroLimitAI"
+dialect = "open-ai"
+base_url = "https://www.zerolimitai.com/api/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+[[providers]]
+id = "zylo-api"
+label = "Zylo API"
+dialect = "open-ai"
+base_url = "https://api.zyloai.net/v1"
+auth = { type = "bearer" }
+capabilities = ["chat", "models", "tool-calling"]
+note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
+
+# ---------------------------------------------------------------------------------------------
 # Not shipped, deliberately
 # ---------------------------------------------------------------------------------------------
 # kiro               — AWS CodeWhisperer event-stream protocol; no Dialect can express it.
