@@ -302,9 +302,13 @@ fn print_human(report: &MigrationReport, applied: bool) {
             "routing snapshot written to {}",
             report.snapshot_path.display()
         ));
+        // A copied key is not a proven key: nothing here calls the upstream, so a key the reference
+        // stored but never used is only going to fail on first use. Saying "live" would be a claim
+        // the tool cannot make.
         say(
-            "The imported grants were refreshed, so these accounts are live; the relay picks them \
-             up on its next snapshot reload.",
+            "Keys were copied into the vault and grants were refreshed. No upstream was called to \
+             prove them, so a key the reference stored but never used will fail on first use. The \
+             relay picks the new accounts up on its next snapshot reload.",
         );
     }
 }
