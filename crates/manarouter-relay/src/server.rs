@@ -979,7 +979,7 @@ async fn dispatch_routed(
     let steps: Vec<&StepPlan> = match (combo, direct) {
         (_, Some(step)) => vec![step],
         (Some(combo), None) => {
-            let counter = table.advance_rr(&combo.id);
+            let counter = table.advance_combo_rr(&combo.id);
             let order =
                 select::order_steps(combo, table.snapshot.providers(), &health, counter, now_ms);
             let sticky_enabled = sticky_applies(combo);
@@ -1690,7 +1690,7 @@ async fn attempt_step(
         return Attempt::Answer(crate::count_tokens::estimate_response(bytes));
     }
 
-    let account_counter = table.advance_rr(&unique_counter_key(step));
+    let account_counter = table.advance_account_rr(step);
     let candidates = if ignore_cooldowns {
         select::account_candidates_ignoring_cooldowns(
             provider,
@@ -2692,9 +2692,6 @@ fn sticky_step_is(
                 .is_some_and(|candidate| std::ptr::eq(candidate, step))
         })
     })
-}
-fn unique_counter_key(step: &StepPlan) -> mr_core::ids::ComboId {
-    mr_core::ids::ComboId::from_raw(format!("{}#{}", step.provider_id, step.model))
 }
 
 /// The client's request body with its `model` field replaced.
@@ -5658,16 +5655,6 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
     }
 
     #[test]
-    fn a_combo_move_counter_key_differs_between_steps_on_one_provider() {
-        // Otherwise adding a second step would silently change which key the first one uses.
-        let a = unique_counter_key(&step(Dialect::OpenAi, "https://a"));
-        let mut b_step = step(Dialect::OpenAi, "https://a");
-        b_step.model = "other".into();
-        let b = unique_counter_key(&b_step);
-        assert_ne!(a, b);
-    }
-
-    #[test]
     fn a_streaming_request_asks_the_upstream_for_events() {
         let head = scan_request_head(br#"{"model":"m","stream":true}"#);
         assert!(head.wants_stream());
@@ -8016,8 +8003,24 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         Arc<std::sync::Mutex<Vec<String>>>,
         tempfile::TempDir,
     ) {
+        two_account_state_with(stored, mr_core::dialect::KeyStrategy::Priority).await
+    }
+
+    /// The same, with the account strategy the test is about.
+    ///
+    /// The strategy is all these tests vary, so it is a parameter rather than a second fixture that
+    /// could drift from this one in the vault setup.
+    async fn two_account_state_with(
+        stored: &[&str],
+        strategy: mr_core::dialect::KeyStrategy,
+    ) -> (
+        AppState,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tempfile::TempDir,
+    ) {
         let (url, seen) = upstream_recording_auth().await;
         let mut provider = provider_serving("p", &url, "m", &[InputModality::Text]);
+        provider.key_strategy = strategy;
 
         // The configuration order is the priority order, so the account the operator listed first
         // is the one the bug stopped at.
@@ -8128,6 +8131,47 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert_eq!(response.status(), StatusCode::OK);
         let called = seen.lock().unwrap().clone();
         assert_eq!(called, vec!["Bearer sk-first".to_owned()]);
+    }
+
+    /// Round-robin must take turns: a second request may not land on the first account again.
+    ///
+    /// Both accounts hold a credential and the operator declared `round-robin`, so nothing but the
+    /// rotation counter decides. The regression this guards is that the counter was keyed by a
+    /// synthetic `provider#model` id the routing table never allocated: the lookup missed, the
+    /// counter read `0` on every request, and rotating by zero is the identity. The account choice
+    /// was therefore byte-for-byte `priority` — every account after the first was dead weight no
+    /// matter how healthy or how recently used — and the only visible symptom was a request served
+    /// successfully by the wrong account.
+    #[tokio::test]
+    async fn round_robin_accounts_take_turns_across_requests() {
+        let (state, seen, _dir) = two_account_state_with(
+            &["first", "second"],
+            mr_core::dialect::KeyStrategy::RoundRobin,
+        )
+        .await;
+
+        for _ in 0..3 {
+            let response = dispatch(
+                state.clone(),
+                Dialect::OpenAi,
+                Method::POST,
+                Uri::from_static("/v1/chat/completions"),
+                headers(&[]),
+                two_account_body(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![
+                "Bearer sk-first".to_owned(),
+                "Bearer sk-second".to_owned(),
+                "Bearer sk-first".to_owned(),
+            ],
+            "three requests must cycle the two accounts, not pin the first"
+        );
     }
 
     /// A credential stored while the relay is running must be usable without a restart.

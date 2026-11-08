@@ -2,8 +2,9 @@
 //!
 //! # What is here, and what is deliberately not
 //!
-//! Mutable request-path state is limited to relaxed atomics: a `AtomicU64` per combo for the
-//! `round-robin` strategy, plus a global counter and per-proxy in-flight counts for proxy choice.
+//! Mutable request-path state is limited to relaxed atomics: an `AtomicU64` per rotating pool — a
+//! combo's steps, a step's accounts — plus a global counter and per-proxy in-flight counts for
+//! proxy choice.
 //! Everything else — the routing table, the providers, the accounts — is loaded once, behind an
 //! `ArcSwap`, and read without a lock.
 //!
@@ -18,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use mr_core::config::Config;
 use mr_core::ids::ComboId;
-use mr_core::snapshot::RoutingSnapshot;
+use mr_core::snapshot::{RoutingSnapshot, StepPlan};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -132,43 +133,77 @@ impl Drop for ProxyLease {
 pub struct RouteTable {
     /// The compiled snapshot. Immutable for the life of this table.
     pub snapshot: RoutingSnapshot,
-    /// One relaxed counter per combo, indexed by position in `snapshot.combos`.
+    /// One relaxed counter per rotating pool, indexed by position in `counter_pos`.
     ///
     /// Relaxed ordering is correct here and not a shortcut. The counter orders *nothing*: no thread
     /// synchronises with another through it, and a lost update means one request goes to the next
     /// step instead of this one. Paying for `SeqCst` to order a decision that nothing observes would
     /// be buying a fence with no buyer.
     rr: Vec<AtomicU64>,
-    /// Combo id to its position in `snapshot.combos`, for the counter lookup.
-    combo_pos: HashMap<ComboId, usize>,
+    /// Every key a counter is held under, to its position in `rr`.
+    ///
+    /// Two kinds of pool share the vector, because both are the same thing: a rotation that has to
+    /// remember where it got to. A combo takes its steps in turn, and a step takes its accounts in
+    /// turn. Both are allocated in [`new`](Self::new), from the snapshot itself.
+    counter_pos: HashMap<ComboId, usize>,
 }
 
 impl RouteTable {
-    /// Build a table around a snapshot, allocating one counter per combo.
+    /// Build a table around a snapshot, allocating one counter per rotating pool.
     pub fn new(snapshot: RoutingSnapshot) -> Self {
-        let rr = (0..snapshot.combos().len())
-            .map(|_| AtomicU64::new(0))
-            .collect();
-        let combo_pos = snapshot
-            .combos()
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.id.clone(), i))
-            .collect();
+        // Every pool a request can advance, in a fixed order so that two tables built from one
+        // snapshot hand out the same slots: each combo's step rotation first, then each step's
+        // account rotation.
+        //
+        // The step keys are the half that matters. A step's accounts are taken in turn however the
+        // step was reached — a direct `provider/model` request never sees a combo — so every
+        // compiled step is allocated here. Leaving one out does not fail loudly: a lookup that misses
+        // answers `0`, which is a perfectly good counter, so the rotation would never advance and
+        // the provider would serve from its first account for as long as the process lived.
+        let mut keys: Vec<ComboId> = snapshot.combos().iter().map(|c| c.id.clone()).collect();
+        for provider in snapshot.providers() {
+            keys.extend(provider.steps.iter().map(step_counter_key));
+        }
+        for combo in snapshot.combos() {
+            keys.extend(combo.steps.iter().map(step_counter_key));
+        }
+        let mut counter_pos = HashMap::with_capacity(keys.len());
+        for key in keys {
+            // The length is the next free slot while the keys arrive in order. A step named twice —
+            // by two combos, or by a combo and its provider's own model list — is one pool, so it
+            // keeps the slot it already has and both callers advance the same counter.
+            let next = counter_pos.len();
+            counter_pos.entry(key).or_insert(next);
+        }
+        let rr = (0..counter_pos.len()).map(|_| AtomicU64::new(0)).collect();
         Self {
             snapshot,
             rr,
-            combo_pos,
+            counter_pos,
         }
     }
 
-    /// Advance and read the round-robin counter for a combo.
+    /// Advance and read the round-robin counter that orders a combo's steps.
+    pub fn advance_combo_rr(&self, combo: &ComboId) -> u64 {
+        self.advance(combo)
+    }
+
+    /// Advance and read the round-robin counter that rotates one step's accounts.
     ///
-    /// Returns `0` for a combo with no counter, which can only happen if the caller's combo came
-    /// from a different table generation — impossible while a request holds one guard, but a `0`
-    /// makes that harmless rather than a panic.
-    pub fn advance_rr(&self, combo: &ComboId) -> u64 {
-        match self.combo_pos.get(combo) {
+    /// Keyed by the step rather than by the combo that names it: two combos sharing a step are
+    /// choosing from the same account pool, and so is a direct `provider/model` request, so all
+    /// three must advance one counter between them.
+    pub fn advance_account_rr(&self, step: &StepPlan) -> u64 {
+        self.advance(&step_counter_key(step))
+    }
+
+    /// Advance one counter, or answer `0` for a key this table never allocated.
+    ///
+    /// Unreachable by construction — the two callers above only build keys [`new`](Self::new)
+    /// allocated — and it answers `0` rather than panicking, because one request must not take the
+    /// process down.
+    fn advance(&self, key: &ComboId) -> u64 {
+        match self.counter_pos.get(key) {
             Some(&i) => match self.rr.get(i) {
                 Some(counter) => counter.fetch_add(1, Ordering::Relaxed),
                 None => 0,
@@ -181,6 +216,16 @@ impl RouteTable {
     pub fn combo_count(&self) -> usize {
         self.snapshot.combos().len()
     }
+}
+
+/// The counter key for one step's account rotation.
+///
+/// Provider and model rather than the combo: the accounts a step draws from are a property of the
+/// step, not of the route that named it. `#` is punctuation no provider id is likely to contain; a
+/// model string that did contain it could collide with another step's key, and the cost of a
+/// collision is two steps sharing one rotation counter — faster rotation, never a wrong route.
+fn step_counter_key(step: &StepPlan) -> ComboId {
+    ComboId::from_raw(format!("{}#{}", step.provider_id, step.model))
 }
 
 /// A client key, reduced to what authentication actually needs.
@@ -738,6 +783,67 @@ mod tests {
         let key = client_key("k-good", "good", &hex, true);
         let entry = KeyEntry::from_config(&key).expect("a well-formed hash parses");
         assert!(entry.matches(&hash));
+    }
+
+    /// A compiled snapshot with one provider, two models and two accounts.
+    ///
+    /// Authored as JSON because that is the shape an operator's file arrives in, and because it
+    /// keeps the fixture to the fields these tests are about: a hand-built `ModelEntry` is twenty
+    /// fields of noise around the one the counter key reads.
+    fn two_model_snapshot() -> RoutingSnapshot {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "providers": [{
+                    "id": "p",
+                    "dialect": "open-ai",
+                    "base_url": "https://example.test/v1",
+                    "key_strategy": "round-robin",
+                    "accounts": [{"id": "first"}, {"id": "second"}],
+                    "models": [{"id": "m"}, {"id": "n"}]
+                }]
+            }"#,
+        )
+        .expect("the fixture is a valid configuration");
+        RoutingSnapshot::compile(&config).expect("the fixture compiles")
+    }
+
+    /// A compiled step owns its account rotation counter, and advancing it advances the counter.
+    ///
+    /// This is the regression: the request path built its own `provider#model` key, the table
+    /// allocated counters for combos only, and an unknown key answered `0`. Every request therefore
+    /// rotated by zero — the identity — so `round-robin` selected like `priority` for every provider
+    /// and every model, silently, because a served request is a served request.
+    #[test]
+    fn a_compiled_step_has_an_account_counter_that_advances() {
+        let table = RouteTable::new(two_model_snapshot());
+        let step = &table.snapshot.providers()[0].steps[0];
+
+        assert_eq!(table.advance_account_rr(step), 0);
+        assert_eq!(
+            table.advance_account_rr(step),
+            1,
+            "the second request on a step must read a counter selection can rotate by"
+        );
+    }
+
+    /// Two models on one provider rotate their accounts independently.
+    ///
+    /// Keying by provider alone would couple them, so traffic to one model would decide which account
+    /// the other used — an operator-visible surprise, and the reason the key carries both halves of
+    /// the step.
+    #[test]
+    fn each_model_on_a_provider_advances_its_own_account_counter() {
+        let table = RouteTable::new(two_model_snapshot());
+        let provider = &table.snapshot.providers()[0];
+        let (first, second) = (&provider.steps[0], &provider.steps[1]);
+
+        assert_eq!(table.advance_account_rr(first), 0);
+        assert_eq!(
+            table.advance_account_rr(second),
+            0,
+            "another model's first request is still a first request"
+        );
+        assert_eq!(table.advance_account_rr(first), 1);
     }
 
     #[test]
