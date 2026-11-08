@@ -164,6 +164,7 @@ operating system's default. Neither field is wrong to set, and neither does anyt
   "auth": { "kind": "bearer" },        // see §9
   "capabilities": ["chat", "responses", "embeddings", "models"],
   "key_strategy": "priority",          // priority | round-robin | random | least-used
+  "cooldown_scope": "account",         // account | model | provider — what a refusal parks
   "enabled": true,
 
   "accounts": [ /* one per credential */ ],
@@ -207,8 +208,34 @@ How an account is chosen from those that are available. See `docs/05-key-selecti
 | `random` | Uniform choice among available accounts. |
 | `least-used` | The account with the fewest recorded requests in the current window. |
 
-All four **skip unusable accounts** — rate-limited, backed off, auth-failed or disabled. Account
-health is never conflated with provider health; see §11.
+All four **skip unusable accounts** — rate-limited, backed off, auth-failed or disabled — and each
+one skips only the accounts that are unusable *for the model being requested*, which is what
+`cooldown_scope` below decides. Account health is never conflated with provider health; see §11.
+
+### `cooldown_scope`
+
+What a refusal takes out of rotation. It changes only *which keys* a failure is recorded under — the
+routing order, the backoff curve and the reset-aware demotion are the same whatever it says.
+
+| Value | A refusal parks |
+|---|---|
+| `account` | The credential, for every model it can serve. Default, and the behaviour before the field existed. |
+| `model` | That credential for **only the model** that was refused; its sibling models stay in rotation. |
+| `provider` | That model for **every credential of the provider**, for a quota the whole provider shares. |
+
+Reach for `model` or `provider` only when the upstream meters things that way. OpenAdapter's free
+plan counts Pro models apart from Lite ones and Antigravity publishes a quota per model, so with the
+default `account` a spent Pro allowance also removes that credential's Lite capacity — capacity the
+request never touched. The opposite mistake is the one `provider` fixes: when one bucket is shared by
+every key, parking a single account just hands the next request to a credential that will be refused
+the same way.
+
+Two facts stay account-shaped whatever the scope says, because they describe the credential rather
+than a limit: an authentication failure is always recorded against the account, and a malformed
+request records nothing at all — a client error is not the upstream's verdict on your quota.
+
+Changing the scope does not migrate live entries; one recorded under the old shape expires on its own
+within a single cooldown window. See `docs/08-quota-tracking.md`.
 
 ### `route_overrides`
 
@@ -483,6 +510,7 @@ a secret that window is the difference between a defence and a gesture.
 - `docs/02-quickstart.md` — a working configuration in five minutes
 - `docs/04-routing-snapshot.md` — how the configuration becomes the compiled table
 - `docs/05-key-selection.md` — `key_strategy` in detail
+- `docs/08-quota-tracking.md` — cooldowns, backoff and `cooldown_scope`
 - `docs/06-combos.md` — combos, strategies and worked examples
 - `docs/21-security.md` — the vault, the panel and the threat model
 - `docs/22-sync-design.md` — why unknown keys are preserved

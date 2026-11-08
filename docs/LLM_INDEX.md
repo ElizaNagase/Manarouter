@@ -237,7 +237,14 @@ table — the `serde` kebab spelling is used instead (`chat-completions`, `count
 ### `KeyStrategy` — how an account is chosen within a provider
 `priority` · `round-robin` · `random` · `least-used`
 
-All four skip unusable accounts. Account health is never conflated with provider health.
+All four skip unusable accounts, where "unusable" is decided per account **and** — under a provider's
+`cooldown_scope` — per model. Account health is never conflated with provider health.
+
+### `CooldownScope` — how far a refusal spreads
+`account` (default) · `model` · `provider`
+
+Which key the relay parks after a `429`/`401`: the credential alone, that credential and one model on
+it, or one model across every credential of the provider. `AuthFailed` is always account-wide.
 
 ### `ComboStrategy` — how a step is chosen when not hedging
 `priority` · `round-robin` · `reset-aware-priority`
@@ -374,7 +381,8 @@ wrong, say so explicitly rather than quietly working around it.
 ## 10. Glossary
 
 - **Account** — one credential for a provider. A provider with three API keys has three accounts, and
-  health, quotas and rotation are tracked **per account**.
+  health, quotas and rotation are tracked **per account** — or, when a provider's `cooldown_scope` says
+  the upstream meters them that way, per account-and-model or per provider-and-model.
 - **Combo** — a named model that resolves to an ordered list of provider/model steps. Clients call it
   exactly like a model name. A combo name may carry a `-<level>` suffix (`coding-high`), which pins
   every step to that tier; a combo named with no suffix runs each step at that step's own default.
@@ -411,11 +419,11 @@ trigger.
     { "path": "docs/01-architecture.md", "purpose": "Why there are two processes, what the compiled snapshot is, and the full request path", "read_when": "changing anything structural" },
     { "path": "docs/02-quickstart.md", "purpose": "A working configuration in five minutes", "read_when": "installing or writing a test harness" },
     { "path": "docs/03-configuration.md", "purpose": "The complete config.json schema, plus why unknown keys are preserved", "read_when": "changing any config field" },
-    { "path": "docs/04-routing-snapshot.md", "purpose": "The compiled binary table: layout (format version 6), level-aware compilation, index precedence, versioning, hot swap", "read_when": "changing the snapshot format or the relay's lookup" },
+    { "path": "docs/04-routing-snapshot.md", "purpose": "The compiled binary table: layout (format version 7), level-aware compilation, index precedence, versioning, hot swap", "read_when": "changing the snapshot format or the relay's lookup" },
     { "path": "docs/05-key-selection.md", "purpose": "priority, round-robin, random and least-used, and how dead accounts are skipped", "read_when": "touching account selection" },
     { "path": "docs/06-combos.md", "purpose": "The combo reference and worked examples", "read_when": "changing combo semantics" },
     { "path": "docs/07-hedged-race.md", "purpose": "The eligibility gate, the four on-failure modes, midstream policy, session affinity", "read_when": "touching the race — read it all" },
-    { "path": "docs/08-quota-tracking.md", "purpose": "How consumption is observed, recorded and surfaced", "read_when": "touching accounting" },
+    { "path": "docs/08-quota-tracking.md", "purpose": "How consumption is observed, recorded and surfaced, and the cooldown_scope that decides how far a refusal spreads", "read_when": "touching accounting or cooldowns" },
     { "path": "docs/09-reset-aware-priority.md", "purpose": "How cooldowns demote rather than remove a step, and how resets restore it", "read_when": "touching reset-aware behaviour" },
     { "path": "docs/10-oauth-overview.md", "purpose": "The shared OAuth machinery: PKCE, loopback, device flow, refresh, single-flight", "read_when": "touching any login flow" },
     { "path": "docs/11-oauth-codex.md", "purpose": "The OpenAI Codex login and inference fingerprint", "read_when": "working on Codex" },

@@ -1336,6 +1336,9 @@ impl Config {
             p.id.as_str().hash(&mut hasher);
             p.enabled.hash(&mut hasher);
             p.key_strategy.hash(&mut hasher);
+            // The scope decides which keys a refusal is recorded under, so it changes routing as
+            // much as the strategy does: a change must invalidate the digest and recompile.
+            p.cooldown_scope.hash(&mut hasher);
             p.proxy.hash(&mut hasher);
             for (account_index, a) in p.accounts.iter().enumerate() {
                 account_index.hash(&mut hasher);

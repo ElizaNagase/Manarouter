@@ -94,7 +94,7 @@ magic[8] | version u32 | digest u64 | payload_len u32 | checksum u64 | payload[.
 | Field | Offset | Type | Protects against |
 |---|---|---|---|
 | `magic` | 0 | 8 bytes | Being handed an unrelated file. The constant is `SNAPSHOT_MAGIC = *b"MROUTES1"` in `mr-core/src/lib.rs`. A mismatch is reported as *"this is not a compiled routing snapshot"*, before any structure is built. |
-| `version` | 8 | `u32` LE | Loading a layout this binary cannot interpret. `SNAPSHOT_VERSION = 6`. A mismatch is refused, not guessed at. |
+| `version` | 8 | `u32` LE | Loading a layout this binary cannot interpret. `SNAPSHOT_VERSION = 7`. A mismatch is refused, not guessed at. |
 | `digest` | 12 | `u64` LE | Being unable to tell "the file changed" from "the bytes changed" without comparing whole snapshots. Copied from `Config::routing_digest()`. |
 | `payload_len` | 20 | `u32` LE | A truncated or padded file. Checked against the actual byte count in both directions: fewer bytes is a precise "truncated" error, more bytes is a "trailing bytes" error. |
 | `checksum` | 24 | `u64` LE | A single flipped byte anywhere meaningful. |
@@ -412,7 +412,7 @@ yet, not a routing decision — a `Default` snapshot resolves everything to `Not
 
 ## 10. Version and compatibility
 
-`SNAPSHOT_MAGIC` is `*b"MROUTES1"` and `SNAPSHOT_VERSION` is `6`, both in
+`SNAPSHOT_MAGIC` is `*b"MROUTES1"` and `SNAPSHOT_VERSION` is `7`, both in
 `crates/mr-core/src/lib.rs`.
 
 The version history is worth recording, because it has moved repeatedly. Version 3 added the
@@ -421,8 +421,10 @@ per-step reasoning-level fields (`levels`, `default_level`, `reasoning_json`), `
 writing them, so a version-3 frame would decode with empty level tables. Version 4 completed the
 feature: a step's level metadata is now actually encoded, and every lookup entry carries the level it
 resolves to (`level` plus the `requested` it is compared against). Version 5 added compiled
-client-key limits and proxy assignments/settings, and version 6 added modality fallback defaults. A
-version-2 through version-5 snapshot is therefore refused rather than read as though it carried
+client-key limits and proxy assignments/settings, version 6 added modality fallback defaults, and
+version 7 added the provider's cooldown scope byte — the scope governs which key the relay records a
+refusal under, so a frame that omits it would silently reintroduce account-wide cooldowns. A
+version-2 through version-6 snapshot is therefore refused rather than read as though it carried
 fields it does not.
 
 The rule is absolute: **a change to the compiled layout requires a `SNAPSHOT_VERSION` bump.** The
@@ -490,7 +492,7 @@ everything the compiler reads, and deliberately nothing else:
 | Included | Why it is routing-relevant |
 |---|---|
 | Provider **array position** | It is the provider's priority order, so a drag-reorder in the panel must recompile. |
-| Provider `id`, `enabled`, `key_strategy` | They change what exists and how an account is picked. |
+| Provider `id`, `enabled`, `key_strategy`, `cooldown_scope` | They change what exists and how an account is picked, and whether a refusal is recorded against the account, the model, or the provider's model bucket. |
 | Account **array position**, `id`, `priority`, `weight`, `enabled` | They change the selection order the relay reads directly. |
 | Account `models_allow`, `models_deny` | They change which account may serve a model. |
 | Model `id`, `hidden` | The id is the lookup key, and a hidden model is dropped from the direct-lookup index. **The model's level metadata is not hashed** — see the note below. |
@@ -575,10 +577,10 @@ strings         ["openai", "https://api.openai.com/v1", "a1", "gpt-5.5",
                  "claude-sonnet-4-5", "Good", "gpt-5", ...]
                  (the reference variant of ids::fnv1a64, plus each id's secret-ref path)
 
-providers[0]    id=openai dialect=openai key_strategy=priority
+providers[0]    id=openai dialect=openai key_strategy=priority cooldown_scope=account
                 accounts = [ a1(priority 0) ]          ← a2 dropped: disabled
                 steps    = [ gpt-5.5 ]                 ← gpt-5.5-mini dropped: hidden
-providers[1]    id=anthropic dialect=anthropic key_strategy=round-robin
+providers[1]    id=anthropic dialect=anthropic key_strategy=round-robin cooldown_scope=account
                 accounts = [ b1(priority 0) ]
                 steps    = [ claude-sonnet-4-5 ]
 

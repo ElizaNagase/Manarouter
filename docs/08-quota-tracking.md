@@ -118,17 +118,51 @@ ProviderHealth::from_counts(total, usable)
 yet, or whose accounts they have all disabled on purpose, is not broken — and the panel must not paint
 it red, or operators learn to ignore red.
 
+## What a refusal is recorded against: `cooldown_scope`
+
+The *usage* is per credential, but the *limit* that refused a request is not always the credential's.
+OpenAdapter's free plan counts Pro models apart from Lite ones and Antigravity publishes a quota per
+model, so a 429 that means "this account has spent its Pro allowance" says nothing about that account's
+Lite capacity. Recording it against the bare account throws the sibling models away with it.
+
+Each provider therefore carries a `cooldown_scope`, and the key a refusal lands under follows it:
+
+| `cooldown_scope` | Recorded against | Consulted for a request |
+|---|---|---|
+| `account` (default) | the account | the account |
+| `model` | the account **and the model** | the account, then that model on the account |
+| `provider` | **the provider and the model** | the account, then the model on every account of the provider |
+
+A lookup consults the account-shaped key plus the one wider shape the scope adds, never a narrower
+one, so a refusal recorded for one model cannot spread to its siblings. Two consequences of that rule
+are worth stating outright:
+
+- the reset instant for a route is the **latest** of the keys parking it — a route is free only when
+  every fact that refused it has expired;
+- `step_earliest_reset` and the last-resort pick take the **earliest** across accounts — the demoted
+  step comes back as soon as *anything* can serve it.
+
+Two facts are fixed rather than configurable, because they describe the credential instead of a limit:
+`AuthFailed` is always recorded against the bare account (the credential is broken for every model),
+and a malformed request records nothing at all.
+
+The default is `account`, so an existing configuration behaves exactly as before. Changing the scope
+does not migrate live entries — they keep the shape they were recorded under and expire on their own
+within one cooldown window. `model` also multiplies the live entries by the number of refused models;
+see [the entry count caveat](#the-entry-count-caveat).
+
 ## The cooldown lifecycle
 
 ```text
   request  ->  429 with retry-after: 47
                   |
                   v
-       account.state = RateLimited
-       account.reset_at = now + 47s        (from the header: knowledge)
+       key = cooldown_key(cooldown_scope, ...)   (the account, account+model, or provider+model)
+       key.state = RateLimited
+       key.reset_at = now + 47s    (from the header: knowledge)
                   |
                   v
-       every KeyStrategy skips this account
+       every KeyStrategy skips the routes that key parks
        (priority moves on, round-robin skips it, least-used ignores it)
                   |
                   v
@@ -136,9 +170,13 @@ it red, or operators learn to ignore red.
        compares now against reset_at (`is_over(now)`)
                   |
                   v
-       once now >= reset_at the account is eligible again
+       once now >= reset_at the key parks nothing
        a reset-aware combo promotes the step back to its authored position
 ```
+
+Under the default `cooldown_scope` the key *is* the account, which is what the rest of this document
+calls a cooldown. Read "the account" below as "the key that was refused" wherever a scoped key
+applies.
 
 There is no timer thread in either process: a cooldown is in-memory state in the relay, and "expired"
 is computed lazily the next time a selection looks at the account. Nothing polls, and nothing wakes
@@ -153,6 +191,20 @@ What a client sees during a cooldown: nothing different, provided another step i
 succeeds against a lower-priority step. If every step for every account is cooling down, the relay
 returns a 429 **of its own** — distinguishable from a forwarded one, which
 [the API reference](18-api-reference.md) describes.
+
+## The entry count caveat
+
+A cooldown entry disappears when its key next **succeeds**, or when a selection notices it has expired;
+there is no pruning timer. That was invisible under the account-only default — one entry per refused
+credential, a few dozen at most. A scoped key makes the count a function of the catalogue instead: one
+entry per refused model under `model`, and under `provider` a single entry shared by every account
+that serves it.
+
+The entries are small — a key, an instant, a reason, a failure count — and a refused model is not
+retried until its window passes, so the practical ceiling is "models actually refused in the last
+window", not "models configured". That is still enough for a provider with hundreds of models and a
+per-model quota to be worth a glance: `/control/activity` lists every parked shape, and a `model` key
+shows up in composed form rather than as a bare account id.
 
 ## Why a 401 and a 429 are treated oppositely
 

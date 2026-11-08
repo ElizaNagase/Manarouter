@@ -50,8 +50,8 @@ pub use ids::{
     ProviderId, Revision,
 };
 pub use model::{
-    Account, Alias, ClientKey, Combo, ComboStep, CompressionMode, CompressionSpec, HedgeSpec,
-    Http2Preference, ModelEntry, ModelSource, Provider, QuotaWindow,
+    Account, Alias, ClientKey, Combo, ComboStep, CompressionMode, CompressionSpec, CooldownScope,
+    HedgeSpec, Http2Preference, ModelEntry, ModelSource, Provider, QuotaWindow,
 };
 
 /// Default host for the data plane (the relay).
@@ -101,7 +101,11 @@ pub const SNAPSHOT_MAGIC: [u8; 8] = *b"MROUTES1";
 ///
 /// Version 6 adds modality fallback defaults to the compiled routing plan. A v5 frame has no such
 /// defaults, so it must be rejected and rebuilt from authored config.
-pub const SNAPSHOT_VERSION: u32 = 6;
+///
+/// Version 7 adds each provider's **cooldown scope** to the compiled plan. A v6 frame has no such
+/// field, and its provider records are one byte shorter, so reading one would shift every following
+/// byte of the record — it must be rejected rather than reinterpreted.
+pub const SNAPSHOT_VERSION: u32 = 7;
 
 /// Current on-disk database schema version.
 ///

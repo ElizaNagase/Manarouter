@@ -148,6 +148,10 @@ export function buildRedirectPaste(p, ctx, session) {
 // test `the_panel_offers_only_dialects_this_binary_deserialises` pins this list.
 const DIALECTS = ['open-ai', 'anthropic', 'google', 'codex', 'copilot', 'antigravity', 'command-code-go'];
 const KEY_STRATEGIES = ['priority', 'round-robin', 'random', 'least-used'];
+// What a refusal parks: the credential (every model), that model on the credential, or that model
+// on every credential of the provider. Widening past `account` is only right when the upstream
+// meters models separately (a per-model quota) or shares one bucket across all of its keys.
+const COOLDOWN_SCOPES = ['account', 'model', 'provider'];
 const DELETE_PROVIDER_CONFIRM_KEY = 'manarouter.confirm.deleteProvider';
 // Sourced from catalog/providers.toml and the OAuth dialect docs. These are documented production
 // endpoints, but remain suggestions: account-specific gateways or a deliberate proxy can differ.
@@ -626,6 +630,7 @@ export async function renderProviders(mount, ctx) {
       ['base URL', h('span', { class: 'mono' }, p.base_url ?? '—')],
       ['auth', authLabel(p.auth)],
       ['key strategy', h('span', { class: 'mono' }, p.key_strategy ?? 'priority')],
+      ['cooldown scope', h('span', { class: 'mono' }, p.cooldown_scope ?? 'account')],
       ['note', p.note ?? '—'],
     ])));
 
@@ -1696,6 +1701,8 @@ export async function renderProviders(mount, ctx) {
 
     const keyStrat = h('select', { class: 'input', 'data-field': 'key_strategy' },
       ...KEY_STRATEGIES.map((k) => h('option', { value: k, selected: (p?.key_strategy ?? 'priority') === k }, k)));
+    const cooldownScope = h('select', { class: 'input', 'data-field': 'cooldown_scope' },
+      ...COOLDOWN_SCOPES.map((s) => h('option', { value: s, selected: (p?.cooldown_scope ?? 'account') === s }, s)));
     const prewarmToggle = toggle('Prewarm connections at startup', {
       checked: p?.prewarm ?? false,
       hint: 'Per-provider override; global latency.prewarm still applies server-side.',
@@ -1734,6 +1741,9 @@ export async function renderProviders(mount, ctx) {
         h('div', { class: 'field' }, h('label', {}, 'Key strategy'),
           h('div', { style: 'display:flex;gap:8px;align-items:center;' },
             keyStrat, h('span', { class: 'hint' }, 'Selects the account key rotation mode.')))),
+      h('div', { class: 'grid-fields' }, field('Cooldown scope', cooldownScope, {
+        hint: 'What a refusal takes out of rotation: the account for every model, that model on that account, or that model on all of the provider’s accounts. Use model when the upstream meters each model separately (per-model quotas); use account when a spent quota means the credential itself is spent.',
+      })),
       field('Base URL', baseUrl),
       baseUrlSuggestion,
       h('fieldset', { class: 'plain' }, h('legend', {}, 'Auth'), authSel, authBox),
@@ -1757,6 +1767,7 @@ export async function renderProviders(mount, ctx) {
       payload.base_url = baseUrl.value.trim();
       payload.note = note.value || null;
       payload.key_strategy = keyStrat.value;
+      payload.cooldown_scope = cooldownScope.value;
       payload.prewarm = prewarmToggle.input.checked;
       payload.enabled = enabledToggle.input.checked;
       const t = authSel.value;

@@ -38,6 +38,7 @@ So the catalogue is curated data, reviewed like code.
 | `auth` | An `AuthKind`: `bearer`, `api-key-header`, `header`, `query-param`, `oauth`. The relay sends `bearer`, `api-key-header` and `header`; it never sends `query-param`, because a credential does not go in a URL. |
 | `capabilities` | Which behaviours are claimed. Drives what the router will even attempt. |
 | `key_strategy` | Default account selection: `priority`, `round-robin`, `random`, `least-used`. |
+| `cooldown_scope` | What a refusal parks: the `account` (default), the `model` on that account, or the `model` on `provider`-wide. |
 | `note` | Free text, displayed in the panel. **Where uncertainty is recorded.** |
 | `docs_url` | For the panel's link. |
 | `headers` | Fingerprint headers sent on every request. |

@@ -2002,7 +2002,12 @@ async fn attempt_step(
 
     match app.relay.upstream().send(request).await {
         Ok(response) if response.status.is_success() => {
-            app.health.record_success(account.id.as_str());
+            app.health.record_success(
+                provider.cooldown_scope,
+                step.provider_id.as_str(),
+                account.id.as_str(),
+                &step.model,
+            );
             if let Some(combo) = combo.filter(|c| sticky_applies(c)) {
                 app.sticky_success.record_success(
                     &combo.id,
@@ -2083,10 +2088,21 @@ async fn attempt_step(
                 };
             }
             app.health.cool_down(
-                account.id.as_str(),
+                &select::cooldown_key(
+                    provider.cooldown_scope,
+                    step.provider_id.as_str(),
+                    account.id.as_str(),
+                    &step.model,
+                    reason,
+                ),
                 select::cooldown_until(
                     reason,
-                    app.health.failures(account.id.as_str()),
+                    app.health.failures(
+                        provider.cooldown_scope,
+                        step.provider_id.as_str(),
+                        account.id.as_str(),
+                        &step.model,
+                    ),
                     named_wait,
                     quota,
                 ),
@@ -2131,10 +2147,21 @@ async fn attempt_step(
             }
             let reason = select::CooldownReason::Backoff;
             app.health.cool_down(
-                account.id.as_str(),
+                &select::cooldown_key(
+                    provider.cooldown_scope,
+                    step.provider_id.as_str(),
+                    account.id.as_str(),
+                    &step.model,
+                    reason,
+                ),
                 select::cooldown_until(
                     reason,
-                    app.health.failures(account.id.as_str()),
+                    app.health.failures(
+                        provider.cooldown_scope,
+                        step.provider_id.as_str(),
+                        account.id.as_str(),
+                        &step.model,
+                    ),
                     None,
                     quota,
                 ),
@@ -2663,10 +2690,14 @@ fn last_resort_step<'a>(
                 .iter()
                 .filter(|account| select::account_allows_model(account, &step.model))
                 .map(|account| {
-                    health
-                        .get(account.id.as_str())
-                        .map(|cooldown| cooldown.until_ms)
-                        .unwrap_or(now_ms)
+                    select::route_reset_instant(
+                        provider.cooldown_scope,
+                        provider.id.as_str(),
+                        account.id.as_str(),
+                        &step.model,
+                        &health,
+                    )
+                    .unwrap_or(now_ms)
                 })
                 .min()?;
             Some((soonest, step))
@@ -3911,6 +3942,7 @@ mod tests {
             base_url: "https://example.com".into(),
             auth: AuthKind::Bearer,
             key_strategy: Default::default(),
+            cooldown_scope: Default::default(),
             proxy: None,
             accounts: Vec::new(),
             capabilities: Vec::new(),

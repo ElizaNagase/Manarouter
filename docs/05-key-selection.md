@@ -16,8 +16,9 @@ it reads is the order the compiler already resolved.
 
 ## 1. What the relay has to work with
 
-The snapshot's `ProviderPlan` carries `key_strategy` and an `accounts: Vec<AccountPlan>` that is
-already ordered by ascending `priority`, with ties keeping authored order. Each plan has `id`,
+The snapshot's `ProviderPlan` carries `key_strategy`, the `cooldown_scope` that decides how far a
+refusal spreads (§6), and an `accounts: Vec<AccountPlan>` that is already ordered by ascending
+`priority`, with ties keeping authored order. Each plan has `id`,
 `priority`, `weight`, `max_concurrent`, `models_allow`, `models_deny`, and credential *references* —
 never a value.
 
@@ -288,6 +289,14 @@ the rollup is `Degraded`, not `Dead`, and selection routes around the bad accoun
 reason health is tracked per account: a router that pools its provider's accounts into one health flag
 takes an entire provider offline because one key was rotated on a Tuesday.
 
+**A refusal can be narrower than the account.** The tracked unit is the credential, but a `429`
+that means "this account has spent its Pro allowance" is not a fact about the credential — it is a
+fact about the model. A provider's `cooldown_scope` (`account`, the default; `model`; or `provider`)
+decides how far a refusal spreads, and every `KeyStrategy` above skips exactly the accounts and models
+it parks. Under `model`, an account refused for one model keeps serving its siblings; under
+`provider`, one refused model is skipped on every account, because an untried key would be refused
+the same way. See [quota tracking](08-quota-tracking.md#what-a-refusal-is-recorded-against-cooldown_scope).
+
 **A provider whose every account is deliberately disabled is `Unconfigured`, not `Dead`.** This
 follows from `total` counting only *enabled* accounts: disable all three accounts and `total` becomes
 zero, which is the `Unconfigured` row. It is not an accident of the arithmetic — it is the intended
@@ -382,7 +391,7 @@ Account state is **observed, not authored**, and it is stored accordingly:
 | Data | Location | Written by |
 |---|---|---|
 | `enabled`, `priority`, `weight`, `models_allow`, `models_deny` | `config.json`, per account | the operator, the panel, or `mr` |
-| Live account health (cooldown, reset time, failure count) | the relay process's memory (`manarouter-relay/src/select.rs`), keyed by account id | the relay, from the `429`/`401` it observes |
+| Live account health (cooldown, reset time, failure count) | the relay process's memory (`manarouter-relay/src/select.rs`), keyed by account id — or by account-and-model, or provider-and-model, when `cooldown_scope` widens the key | the relay, from the `429`/`401` it observes |
 | Round-robin cursor | the relay's in-memory selection state, not the snapshot | the relay, per request |
 
 The schema has four tables — `account_health`, `usage`, `oauth_credential` and `oplog` — and the

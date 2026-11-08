@@ -480,6 +480,9 @@ pub struct Provider {
     /// How to choose among [`Provider::accounts`].
     #[serde(default)]
     pub key_strategy: KeyStrategy,
+    /// What a refusal takes out of rotation. See [`CooldownScope`].
+    #[serde(default)]
+    pub cooldown_scope: CooldownScope,
     /// Models discovered from `/models`, plus hand-entered ones.
     #[serde(default)]
     pub models: Vec<ModelEntry>,
@@ -545,6 +548,60 @@ pub struct Provider {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+/// What a refusal takes out of rotation: one credential, one model on it, or one model everywhere.
+///
+/// A provider's limits are not always a property of the credential. Some meter **one model** apart
+/// from the rest of the catalogue — OpenAdapter's free plan counts Pro models separately from Lite
+/// ones, and Antigravity publishes a quota per model — and some meter **every credential of the
+/// provider** in one bucket. Recording every refusal against the account, which is the historical
+/// behaviour and still the default, makes a spent Pro allowance look like a dead credential: the
+/// combo's Lite step on that same account is skipped for a reason that never applied to it.
+///
+/// The scope decides the key a refusal is recorded under. A lookup consults every shape that applies
+/// to the request, so a narrow refusal is never widened by the routing code. Two things are fixed
+/// whatever the scope says, because they describe the credential rather than its limits: an
+/// authentication failure is always recorded against the account, and a malformed request records
+/// nothing at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
+pub enum CooldownScope {
+    /// The credential, for every model it can serve. The default, and the behaviour before scopes
+    /// existed.
+    #[default]
+    Account = 0,
+    /// The credential, for the one model that was refused. Right when the upstream meters each model
+    /// separately, so its sibling models are still worth trying.
+    Model = 1,
+    /// Every credential of the provider, for the one model that was refused. Right when the quota is
+    /// shared by the whole provider, so an untried account would be refused for the same reason.
+    Provider = 2,
+}
+
+impl CooldownScope {
+    /// Every scope, from the narrowest to the widest, for command-line spellings and listings.
+    pub const ALL: [Self; 3] = [Self::Account, Self::Model, Self::Provider];
+
+    /// The stable identifier used in config and the panel.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Account => "account",
+            Self::Model => "model",
+            Self::Provider => "provider",
+        }
+    }
+
+    /// Parse the config identifier, tolerating underscores and spacing.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "account" => Some(Self::Account),
+            "model" => Some(Self::Model),
+            "provider" => Some(Self::Provider),
+            _ => None,
+        }
+    }
+}
+
 fn default_capabilities() -> Vec<Capability> {
     vec![Capability::Chat, Capability::Models]
 }
@@ -587,6 +644,7 @@ impl Provider {
             capabilities: default_capabilities(),
             accounts: Vec::new(),
             key_strategy: KeyStrategy::default(),
+            cooldown_scope: CooldownScope::default(),
             models: Vec::new(),
             models_synced_at: None,
             quota: Vec::new(),
@@ -1959,6 +2017,53 @@ mod tests {
                 "round trip invented the key `{absent}`: {model}"
             );
         }
+    }
+
+    #[test]
+    fn a_provider_defaults_to_account_scoped_cooldowns_and_parses_every_scope() {
+        // The default is the behaviour before scopes existed: an untouched config keeps the
+        // historical cooldown keys, and nothing changes shape on upgrade.
+        let p: Provider = serde_json::from_value(serde_json::json!({
+            "id": "openadapter",
+            "dialect": "open-ai",
+            "base_url": "https://example.test/v1"
+        }))
+        .unwrap();
+        assert_eq!(p.cooldown_scope, CooldownScope::Account);
+        assert_eq!(CooldownScope::default(), CooldownScope::Account);
+
+        // A provider created in code carries the same default.
+        assert_eq!(
+            Provider::new("fresh", Dialect::OpenAi, "https://example.test/v1").cooldown_scope,
+            CooldownScope::Account
+        );
+
+        // Every variant has one stable written form, and the parser accepts that form plus the
+        // tolerant spellings an operator might type on a command line.
+        let scopes = [
+            (CooldownScope::Account, "account"),
+            (CooldownScope::Model, "model"),
+            (CooldownScope::Provider, "provider"),
+        ];
+        for (scope, text) in scopes {
+            assert_eq!(scope.as_str(), text);
+            assert_eq!(CooldownScope::parse(text), Some(scope));
+            assert_eq!(
+                serde_json::to_value(scope).unwrap(),
+                serde_json::json!(text)
+            );
+            assert_eq!(
+                serde_json::from_value::<CooldownScope>(serde_json::json!(text)).unwrap(),
+                scope
+            );
+            assert_eq!(CooldownScope::parse(&format!(" {text} ")), Some(scope));
+            assert_eq!(
+                CooldownScope::parse(&text.to_ascii_uppercase()),
+                Some(scope)
+            );
+        }
+        assert_eq!(CooldownScope::parse("model_scope"), None);
+        assert_eq!(CooldownScope::parse(""), None);
     }
 
     #[test]

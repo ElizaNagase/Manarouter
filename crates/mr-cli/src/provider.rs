@@ -14,7 +14,7 @@ use http::Method;
 use mr_core::catalog::{catalog, load_error};
 use mr_core::dialect::{AuthKind, Capability, Dialect, KeyStrategy};
 use mr_core::ids::ProviderId;
-use mr_core::model::Provider;
+use mr_core::model::{CooldownScope, Provider};
 use mr_core::secret::provider_secret_id;
 
 use crate::output::{
@@ -101,6 +101,9 @@ pub struct AddArgs {
     /// Account selection strategy for this provider.
     #[arg(long = "key-strategy", value_name = "STRATEGY")]
     pub key_strategy: Option<String>,
+    /// What a refusal takes out of rotation: `account` (default), `model`, or `provider`.
+    #[arg(long = "cooldown-scope", value_name = "SCOPE")]
+    pub cooldown_scope: Option<String>,
     /// TCP connect timeout in milliseconds.
     #[arg(long = "connect-timeout-ms", value_name = "MS")]
     pub connect_timeout_ms: Option<u64>,
@@ -344,6 +347,14 @@ pub(crate) fn resolve_add(a: &AddArgs) -> Result<Provider, CliError> {
             KeyStrategy::parse,
         )?;
     }
+    if let Some(scope) = &a.cooldown_scope {
+        p.cooldown_scope = parse_choice(
+            "--cooldown-scope",
+            scope,
+            &all_labels(&CooldownScope::ALL),
+            CooldownScope::parse,
+        )?;
+    }
     if let Some(ms) = a.connect_timeout_ms {
         p.connect_timeout_ms = ms;
     }
@@ -492,6 +503,10 @@ fn show(ctx: &Ctx, id: &str) -> Result<(), CliError> {
     t.row(vec![
         "key_strategy".to_owned(),
         serde_label(&p.key_strategy),
+    ]);
+    t.row(vec![
+        "cooldown_scope".to_owned(),
+        serde_label(&p.cooldown_scope),
     ]);
     t.row(vec!["status".to_owned(), status_cell(color, p)]);
     t.row(vec![
@@ -1081,6 +1096,7 @@ mod tests {
             capability: Vec::new(),
             header: Vec::new(),
             key_strategy: None,
+            cooldown_scope: None,
             connect_timeout_ms: None,
             ttfb_timeout_ms: None,
             idle_timeout_ms: None,
@@ -1174,6 +1190,37 @@ mod tests {
             Some("platform")
         );
         assert_eq!(p.key_strategy, KeyStrategy::RoundRobin);
+    }
+
+    #[test]
+    fn the_cooldown_scope_flag_reaches_the_provider_and_rejects_nonsense() {
+        let mut a = args("myproxy");
+        a.base_url = Some("http://127.0.0.1:1/v1".into());
+        assert_eq!(
+            resolve_add(&a).unwrap().cooldown_scope,
+            CooldownScope::Account
+        );
+
+        a.cooldown_scope = Some("model".into());
+        assert_eq!(
+            resolve_add(&a).unwrap().cooldown_scope,
+            CooldownScope::Model
+        );
+
+        // The config spelling and a typed underscore both work; anything else names the choices.
+        a.cooldown_scope = Some(" Provider ".into());
+        assert_eq!(
+            resolve_add(&a).unwrap().cooldown_scope,
+            CooldownScope::Provider
+        );
+        a.cooldown_scope = Some("per-model".into());
+        let err = resolve_add(&a).unwrap_err();
+        assert_eq!(err.exit, crate::output::Exit::Usage);
+        assert!(
+            err.message.contains("account, model, provider"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

@@ -74,6 +74,13 @@ Each account cooling down carries an `until_ms` instant. It comes from, in order
 A step's earliest reset is the **minimum** over its accounts, because any one account becoming usable
 makes the step usable again.
 
+That minimum is taken over the *effective* reset of each account, and the effective reset follows the
+provider's `cooldown_scope`: a route is parked only while **every** applicable fact about it still
+holds, so a model-scoped refusal is the latest of that account's account-wide and model-wide instants,
+and a provider-scoped one also waits for the provider's model bucket. The demotion itself does not
+care which shape decided it — only when the route becomes usable again does. See
+[quota tracking](08-quota-tracking.md#what-a-refusal-is-recorded-against-cooldown_scope).
+
 When nothing is known, the step sorts by the guess. It stays in the unavailable group either way, so
 an unknown reset degrades the ordering but never the correctness of the partition.
 

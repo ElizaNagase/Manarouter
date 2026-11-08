@@ -77,8 +77,8 @@ use crate::dialect::{
 use crate::error::{Error, Result};
 use crate::ids::{fnv1a64, AccountId, ClientKeyId, ComboId, Millis, ProviderId};
 use crate::model::{
-    Account, ClientKey, CompressionMode, CompressionSpec, Http2Preference, KeyLimit, KeyLimits,
-    ModelEntry, PricingPlan, PricingSource,
+    Account, ClientKey, CompressionMode, CompressionSpec, CooldownScope, Http2Preference, KeyLimit,
+    KeyLimits, ModelEntry, PricingPlan, PricingSource,
 };
 use crate::secret::account_secret_id;
 use crate::{SNAPSHOT_MAGIC, SNAPSHOT_VERSION};
@@ -424,6 +424,9 @@ pub struct ProviderPlan {
     pub auth: AuthKind,
     /// How to choose among `accounts`.
     pub key_strategy: KeyStrategy,
+    /// What a refusal takes out of rotation: this credential, this model on it, or this model across
+    /// every credential of the provider. See [`CooldownScope`].
+    pub cooldown_scope: CooldownScope,
     /// Enabled accounts, ordered by ascending priority (ties keep their authored order).
     ///
     /// The relay reads this order directly; it must not re-sort, because the authored array order
@@ -731,6 +734,7 @@ impl RoutingSnapshot {
                 base_url: provider.base_url.clone(),
                 auth: provider.auth.clone(),
                 key_strategy: provider.key_strategy,
+                cooldown_scope: provider.cooldown_scope,
                 accounts,
                 proxy: provider.proxy.as_deref().map(str::to_owned),
                 capabilities: provider.capabilities.clone(),
@@ -2037,6 +2041,7 @@ fn encode_provider(encoder: &mut Encoder, provider: &ProviderPlan) {
     encoder.put_str(&provider.base_url);
     encode_auth(encoder, &provider.auth);
     encoder.put_u8(provider.key_strategy as u8);
+    encoder.put_u8(provider.cooldown_scope as u8);
     let proxy = encoder.opt_str_id(provider.proxy.as_deref());
     encoder.put_u32(proxy);
     encoder.put_u32(provider.capabilities.len() as u32);
@@ -2439,6 +2444,7 @@ fn decode_providers(reader: &mut Reader, strings: &[String]) -> Result<Vec<Provi
         let base_url = reader.string(strings)?;
         let auth = decode_auth(reader, strings)?;
         let key_strategy = key_strategy_from_tag(reader.u8()?)?;
+        let cooldown_scope = cooldown_scope_from_tag(reader.u8()?)?;
         let proxy = reader.opt_string(strings)?;
         let capability_count = reader.u32()? as usize;
         let mut capabilities = Vec::with_capacity(capability_count.min(64));
@@ -2466,6 +2472,7 @@ fn decode_providers(reader: &mut Reader, strings: &[String]) -> Result<Vec<Provi
             base_url,
             auth,
             key_strategy,
+            cooldown_scope,
             accounts,
             proxy,
             capabilities,
@@ -2850,6 +2857,20 @@ fn capability_from_tag(tag: u8) -> Result<Capability> {
         _ => {
             return Err(Error::Snapshot(format!(
                 "snapshot contains unknown capability tag {tag}"
+            )))
+        }
+    })
+}
+
+/// Decode a cooldown scope tag.
+fn cooldown_scope_from_tag(tag: u8) -> Result<CooldownScope> {
+    Ok(match tag {
+        0 => CooldownScope::Account,
+        1 => CooldownScope::Model,
+        2 => CooldownScope::Provider,
+        _ => {
+            return Err(Error::Snapshot(format!(
+                "snapshot contains unknown cooldown scope tag {tag}"
             )))
         }
     })
@@ -3364,6 +3385,43 @@ mod tests {
         let decoded = RoutingSnapshot::decode(&bytes).unwrap();
         assert_eq!(decoded, original);
         assert_eq!(decoded.digest(), config.routing_digest());
+    }
+
+    #[test]
+    fn the_cooldown_scope_is_compiled_and_survives_the_encode_decode_round_trip() {
+        let mut config = rich_config();
+        config.providers[0].cooldown_scope = CooldownScope::Provider;
+        config.providers[1].cooldown_scope = CooldownScope::Model;
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+        assert_eq!(
+            snapshot.providers()[0].cooldown_scope,
+            CooldownScope::Provider
+        );
+        assert_eq!(snapshot.providers()[1].cooldown_scope, CooldownScope::Model);
+
+        let bytes = snapshot.encode().unwrap();
+        let decoded = RoutingSnapshot::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.providers()[0].cooldown_scope,
+            CooldownScope::Provider
+        );
+        assert_eq!(decoded.providers()[1].cooldown_scope, CooldownScope::Model);
+
+        // The scope decides which keys a refusal lands under, so changing it is routing-relevant:
+        // the digest has to move or the conductor would skip the recompile that applies it.
+        let before = config.routing_digest();
+        config.providers[0].cooldown_scope = CooldownScope::Account;
+        assert_ne!(config.routing_digest(), before);
+    }
+
+    #[test]
+    fn an_unknown_cooldown_scope_tag_is_a_decode_error() {
+        // A tag this build does not know cannot be guessed at: silently mapping it to the default
+        // would route with a scope the operator never chose.
+        assert!(cooldown_scope_from_tag(3).is_err());
+        assert_eq!(cooldown_scope_from_tag(0).unwrap(), CooldownScope::Account);
+        assert_eq!(cooldown_scope_from_tag(1).unwrap(), CooldownScope::Model);
+        assert_eq!(cooldown_scope_from_tag(2).unwrap(), CooldownScope::Provider);
     }
 
     #[test]

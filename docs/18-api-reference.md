@@ -68,6 +68,11 @@ scope of a fact about in-flight work:
       "until_ms": 1793707688231,
       "reason": "rate_limited",
       "failures": 1
+    },
+    "01a1bbd3-8335-7624-9eed-d8d9623086f3": {
+      "until_ms": 1793707700000,
+      "reason": "quota_exhausted",
+      "failures": 2
     }
   }
 }
@@ -80,9 +85,11 @@ gave up. Only a request whose model name resolved to a **combo** is recorded: a 
 `provider/model` request is not a combo decision.
 
 `cooldowns` is the relay's own account-health map, expired-but-not-yet-cleared entries included, so
-this view cannot disagree with the selection it is meant to explain. `reason` is one of
-`rate_limited`, `quota_exhausted`, `auth_failed`, `backoff`. No label, account secret, request id or
-body appears anywhere in the document.
+this view cannot disagree with the selection it is meant to explain. A key is the account id when the
+provider's `cooldown_scope` is `account` (the default); a narrower or wider scope appears as a composed
+key naming the model as well, and a provider-scoped key is shared by every account of that provider.
+`reason` is one of `rate_limited`, `quota_exhausted`, `auth_failed`, `backoff`. No label, account
+secret, request id or body appears anywhere in the document.
 
 ### Model addressing
 

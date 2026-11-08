@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use mr_core::dialect::{ComboStrategy, KeyStrategy};
 use mr_core::ids::now_millis;
+use mr_core::model::CooldownScope;
 use mr_core::snapshot::{AccountPlan, ComboPlan, ProviderPlan, StepPlan};
 
 /// Why an account is temporarily unusable.
@@ -138,35 +139,83 @@ impl Health {
         });
     }
 
-    /// Record a success, clearing any cooldown and the failure count.
-    pub fn record_success(&self, account_id: &str) {
+    /// Record a success on one route, clearing the cooldown and failure count for every shape that
+    /// could have parked it.
+    ///
+    /// Every shape, not only the configured one: the request proves the credential answers **and**
+    /// that this model answers on it, so leaving a wider entry in place would keep skipping a route
+    /// that has just demonstrated it works.
+    pub fn record_success(
+        &self,
+        scope: CooldownScope,
+        provider_id: &str,
+        account_id: &str,
+        model: &str,
+    ) {
+        let mut keys = Vec::with_capacity(2);
+        keys.push(account_id.to_owned());
+        if let Some(wider) = wider_key(scope, provider_id, account_id, model) {
+            keys.push(wider);
+        }
         self.map.rcu(|current| {
-            if !current.contains_key(account_id) {
+            if keys.iter().all(|key| !current.contains_key(key)) {
                 return current.clone();
             }
             let mut next = HashMap::with_capacity(current.len());
             next.extend(current.iter().map(|(k, v)| (k.clone(), *v)));
-            next.remove(account_id);
+            for key in &keys {
+                next.remove(key);
+            }
             std::sync::Arc::new(next)
         });
     }
 
-    /// Clear one account's cooldown, for the operator's "try it now" action.
+    /// Clear everything recorded against one account, for the operator's "try it now" action.
+    ///
+    /// The prefix covers the model-shaped keys as well: "try this account now" means every route on
+    /// it. A provider-shaped key is deliberately left alone — it belongs to the provider's quota
+    /// rather than to this credential, and clearing it would be claiming a recovery that this
+    /// account cannot demonstrate.
     pub fn clear(&self, account_id: &str) {
-        self.record_success(account_id);
+        let prefix = format!("{account_id}{SCOPE_SEPARATOR}");
+        self.map.rcu(|current| {
+            let keep = current.len();
+            let mut next = HashMap::with_capacity(keep);
+            next.extend(
+                current
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != account_id && !key.starts_with(&prefix))
+                    .map(|(k, v)| (k.clone(), *v)),
+            );
+            if next.len() == keep {
+                return current.clone();
+            }
+            std::sync::Arc::new(next)
+        });
     }
 
-    /// How many consecutive failures this account has recorded.
+    /// How many consecutive failures this route has recorded: the worst of the shapes that can park
+    /// it, so a model-scoped failure keeps growing rather than restarting at one each time.
     ///
     /// The count carries forward across cooldowns and resets only on a success, so it is the
     /// honest input to `cooldown_until`'s growth. Callers used to pass a hard-coded zero, which
     /// silently disabled the growth: an account that failed fifteen times in a row was parked
     /// for the same minute as one that failed once, and the combo re-walked it on every request.
-    pub fn failures(&self, account_id: &str) -> u32 {
-        self.map
-            .load()
-            .get(account_id)
-            .map_or(0, |cooldown| cooldown.failures)
+    pub fn failures(
+        &self,
+        scope: CooldownScope,
+        provider_id: &str,
+        account_id: &str,
+        model: &str,
+    ) -> u32 {
+        let map = self.map.load();
+        let own = map.get(account_id).map_or(0, |c| c.failures);
+        match wider_key(scope, provider_id, account_id, model)
+            .and_then(|key| map.get(&key).map(|c| c.failures))
+        {
+            Some(wider) => own.max(wider),
+            None => own,
+        }
     }
 
     /// The number of accounts currently cooling down.
@@ -192,7 +241,74 @@ impl Health {
     }
 }
 
-/// Whether an account is usable right now.
+/// The separator between the parts of a scoped cooldown key.
+///
+/// `\u{1f}` (unit separator): neither an account id (a UUID, or a `mig-…` migration marker) nor a
+/// model id contains a control character, so splitting on it is unambiguous — and an account-scoped
+/// key stays the bare account id it has always been, which keeps existing entries, log lines and the
+/// panel's `cooldowns` object readable across the change.
+const SCOPE_SEPARATOR: char = '\u{1f}';
+
+/// The prefix that marks a cooldown recorded against a whole provider rather than one credential.
+const PROVIDER_PREFIX: char = '\u{1e}';
+
+/// The model-shaped key: this credential, for this one model.
+fn model_key(account_id: &str, model: &str) -> String {
+    format!("{account_id}{SCOPE_SEPARATOR}{model}")
+}
+
+/// The provider-shaped key: every credential of this provider, for this one model.
+fn provider_key(provider_id: &str, model: &str) -> String {
+    format!("{PROVIDER_PREFIX}{provider_id}{SCOPE_SEPARATOR}{model}")
+}
+
+/// Whether the cooldown recorded under `key` has elapsed, or there is none.
+fn cooldown_over(health: &HashMap<String, Cooldown>, key: &str, now_ms: u64) -> bool {
+    match health.get(key) {
+        None => true,
+        Some(c) => c.is_over(now_ms),
+    }
+}
+
+/// The extra key `scope` adds on top of the bare account id, if it adds one.
+///
+/// The account shape needs no entry here: it is the shape an authentication failure is recorded under
+/// whatever the scope says, because a rejected credential is a fact about the account and not about
+/// one model. Returning `None` for `account` is what keeps the default scope's lookups to one
+/// borrowed `&str` and no allocation on the request path.
+fn wider_key(
+    scope: CooldownScope,
+    provider_id: &str,
+    account_id: &str,
+    model: &str,
+) -> Option<String> {
+    match scope {
+        CooldownScope::Account => None,
+        CooldownScope::Model => Some(model_key(account_id, model)),
+        CooldownScope::Provider => Some(provider_key(provider_id, model)),
+    }
+}
+
+/// The key a refusal on one route is recorded under.
+///
+/// Two cases ignore the scope, because they describe the credential rather than its limits: an
+/// authentication failure is recorded against the account — parking one model would leave the same
+/// rejection waiting on every other one — and a malformed request is not recorded at all, which the
+/// caller enforces by returning before it reaches here.
+pub fn cooldown_key(
+    scope: CooldownScope,
+    provider_id: &str,
+    account_id: &str,
+    model: &str,
+    reason: CooldownReason,
+) -> String {
+    match wider_key(scope, provider_id, account_id, model) {
+        Some(key) if reason != CooldownReason::AuthFailed => key,
+        _ => account_id.to_owned(),
+    }
+}
+
+/// Whether an account is usable right now, considering only the account-shaped key.
 ///
 /// Takes the map by reference rather than loading it itself, so one request resolves every account
 /// against a single consistent view.
@@ -201,17 +317,61 @@ pub fn account_available(
     health: &HashMap<String, Cooldown>,
     now_ms: u64,
 ) -> bool {
-    match health.get(account_id) {
+    cooldown_over(health, account_id, now_ms)
+}
+
+/// Whether an account can serve one model right now, under the provider's cooldown scope.
+///
+/// Every shape that can park this route is consulted, so a narrow refusal is never widened by the
+/// routing code: under `model` a spent allowance for one model leaves the account's other models
+/// alone, under `provider` it parks that model across every credential of the provider (an untried
+/// account would be refused for the same reason), and under `account` the credential is parked for
+/// everything, which is the behaviour that predates scopes.
+pub fn account_available_for(
+    scope: CooldownScope,
+    provider_id: &str,
+    account_id: &str,
+    model: &str,
+    health: &HashMap<String, Cooldown>,
+    now_ms: u64,
+) -> bool {
+    if !cooldown_over(health, account_id, now_ms) {
+        return false;
+    }
+    match wider_key(scope, provider_id, account_id, model) {
+        Some(wider) => cooldown_over(health, &wider, now_ms),
         None => true,
-        Some(c) => c.is_over(now_ms),
     }
 }
 
-/// Whether a step has at least one usable account.
+/// The instant at which a route's own cooldowns have all elapsed, or `None` when it has none.
+///
+/// The latest of the shapes that apply, not the earliest: a route is usable only when nothing about
+/// it is still cooling, and reporting the soonest expiry of two would promise a service that the
+/// other one still refuses.
+pub fn route_reset_instant(
+    scope: CooldownScope,
+    provider_id: &str,
+    account_id: &str,
+    model: &str,
+    health: &HashMap<String, Cooldown>,
+) -> Option<u64> {
+    let own = health.get(account_id).map(|c| c.until_ms);
+    let wider = wider_key(scope, provider_id, account_id, model)
+        .and_then(|key| health.get(&key).map(|c| c.until_ms));
+    match (own, wider) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(instant), None) | (None, Some(instant)) => Some(instant),
+        (None, None) => None,
+    }
+}
+
+/// Whether a step has at least one usable account for `model`.
 pub fn step_available(
     provider: &ProviderPlan,
     health: &HashMap<String, Cooldown>,
     now_ms: u64,
+    model: &str,
 ) -> bool {
     // A step whose provider exists but has no accounts at all is unavailable. That case is real: an
     // operator adds a provider, adds a combo step for it, and has not yet attached a credential.
@@ -220,10 +380,16 @@ pub fn step_available(
     if provider.accounts.is_empty() {
         return false;
     }
-    provider
-        .accounts
-        .iter()
-        .any(|a| account_available(a.id.as_str(), health, now_ms))
+    provider.accounts.iter().any(|a| {
+        account_available_for(
+            provider.cooldown_scope,
+            provider.id.as_str(),
+            a.id.as_str(),
+            model,
+            health,
+            now_ms,
+        )
+    })
 }
 
 /// Whether a step has at least one usable account that allows the requested model.
@@ -233,10 +399,17 @@ pub fn step_has_usable_account(
     now_ms: u64,
     model: &str,
 ) -> bool {
-    provider
-        .accounts
-        .iter()
-        .any(|a| account_available(a.id.as_str(), health, now_ms) && account_allows_model(a, model))
+    provider.accounts.iter().any(|a| {
+        account_allows_model(a, model)
+            && account_available_for(
+                provider.cooldown_scope,
+                provider.id.as_str(),
+                a.id.as_str(),
+                model,
+                health,
+                now_ms,
+            )
+    })
 }
 
 /// The order in which a combo's steps should be tried, as indices into `combo.steps`.
@@ -265,7 +438,7 @@ pub fn order_steps(
     let available: Vec<bool> = (0..n)
         .map(
             |i| match providers.get(combo.steps[i].provider_index as usize) {
-                Some(p) => step_available(p, health, now_ms),
+                Some(p) => step_available(p, health, now_ms, &combo.steps[i].model),
                 None => false,
             },
         )
@@ -308,10 +481,21 @@ fn step_earliest_reset(
     let Some(provider) = providers.get(step.provider_index as usize) else {
         return u64::MAX;
     };
+    // Accounts that forbid this model are not candidates for it, so their cooldowns say nothing
+    // about when the step can serve it.
     provider
         .accounts
         .iter()
-        .filter_map(|a| health.get(a.id.as_str()).map(|c| c.until_ms))
+        .filter(|a| account_allows_model(a, &step.model))
+        .filter_map(|a| {
+            route_reset_instant(
+                provider.cooldown_scope,
+                provider.id.as_str(),
+                a.id.as_str(),
+                &step.model,
+                health,
+            )
+        })
         .min()
         .unwrap_or(u64::MAX)
 }
@@ -406,7 +590,17 @@ fn account_candidates_with<'a>(
     let mut candidates: Vec<&AccountPlan> = provider
         .accounts
         .iter()
-        .filter(|a| !respect_cooldowns || account_available(a.id.as_str(), health, now_ms))
+        .filter(|a| {
+            !respect_cooldowns
+                || account_available_for(
+                    provider.cooldown_scope,
+                    provider.id.as_str(),
+                    a.id.as_str(),
+                    model,
+                    health,
+                    now_ms,
+                )
+        })
         .filter(|a| account_allows_model(a, model))
         .collect();
 
@@ -680,6 +874,7 @@ mod tests {
             base_url: "https://example.com".into(),
             auth: mr_core::dialect::AuthKind::Bearer,
             key_strategy: KeyStrategy::Priority,
+            cooldown_scope: CooldownScope::Account,
             accounts,
             proxy: None,
             capabilities: Vec::new(),
@@ -951,20 +1146,24 @@ mod tests {
         // that had failed once, and every request re-walked it. The count has to be readable
         // for the growth to be reachable at all.
         let h = Health::new();
-        assert_eq!(h.failures("a"), 0, "an account never seen has no failures");
+        assert_eq!(
+            h.failures(CooldownScope::Account, "p", "a", "m"),
+            0,
+            "an account never seen has no failures"
+        );
         h.cool_down("a", 1_000, CooldownReason::RateLimited);
-        assert_eq!(h.failures("a"), 1);
+        assert_eq!(h.failures(CooldownScope::Account, "p", "a", "m"), 1);
         h.cool_down("a", 2_000, CooldownReason::RateLimited);
-        assert_eq!(h.failures("a"), 2);
-        h.record_success("a");
-        assert_eq!(h.failures("a"), 0);
+        assert_eq!(h.failures(CooldownScope::Account, "p", "a", "m"), 2);
+        h.record_success(CooldownScope::Account, "p", "a", "m");
+        assert_eq!(h.failures(CooldownScope::Account, "p", "a", "m"), 0);
     }
 
     #[test]
     fn a_success_clears_the_failure_count() {
         let h = Health::new();
         h.cool_down("a", 1_000, CooldownReason::RateLimited);
-        h.record_success("a");
+        h.record_success(CooldownScope::Account, "p", "a", "m");
         assert_eq!(h.cooling_count(), 0);
         h.cool_down("a", 2_000, CooldownReason::RateLimited);
         assert_eq!(
@@ -1407,5 +1606,224 @@ mod tests {
         // An account the relay has never seen a failure for is usable. Defaulting the other way
         // would make a fresh install route nothing.
         assert!(account_available("never-seen", &healthy(), 0));
+    }
+
+    /// A cooldown entry for the fake-clock tests: parked until `until_ms`, first strike.
+    fn parked(until_ms: u64, reason: CooldownReason) -> Cooldown {
+        Cooldown {
+            until_ms,
+            reason,
+            failures: 1,
+        }
+    }
+
+    #[test]
+    fn the_default_scope_parks_the_whole_account() {
+        // An operator who never sets a scope gets the historical behaviour exactly: one refusal
+        // takes the credential out for every model, under the bare account id as the key.
+        let p = provider("p", vec![account("a0")]);
+        assert_eq!(p.cooldown_scope, CooldownScope::Account);
+        let key = cooldown_key(
+            p.cooldown_scope,
+            "p",
+            "a0",
+            "pro",
+            CooldownReason::RateLimited,
+        );
+        assert_eq!(key, "a0");
+        let mut h = HashMap::new();
+        h.insert(key, parked(9_000, CooldownReason::RateLimited));
+        assert!(!step_available(&p, &h, 0, "pro"));
+        assert!(!step_available(&p, &h, 0, "lite"));
+    }
+
+    #[test]
+    fn a_model_scope_parks_only_the_refused_model_on_that_credential() {
+        // The OpenAdapter shape: a spent Pro allowance says nothing about Lite on the same
+        // credential, so the combo's Lite step must still be allowed to use it.
+        let mut solo = provider("p", vec![account("a0")]);
+        solo.cooldown_scope = CooldownScope::Model;
+        let key = cooldown_key(
+            CooldownScope::Model,
+            "p",
+            "a0",
+            "pro",
+            CooldownReason::QuotaExhausted,
+        );
+        assert_ne!(key, "a0", "the model scope records under a composed key");
+        let mut h = HashMap::new();
+        h.insert(key, parked(9_000, CooldownReason::QuotaExhausted));
+
+        assert!(!account_available_for(
+            CooldownScope::Model,
+            "p",
+            "a0",
+            "pro",
+            &h,
+            0
+        ));
+        assert!(account_available_for(
+            CooldownScope::Model,
+            "p",
+            "a0",
+            "lite",
+            &h,
+            0
+        ));
+        assert!(!step_available(&solo, &h, 0, "pro"));
+        assert!(step_available(&solo, &h, 0, "lite"));
+
+        // And it is scoped to the credential, not to the provider: an untouched account can still
+        // serve the parked model.
+        let mut pair = provider("p", vec![account("a0"), account("a1")]);
+        pair.cooldown_scope = CooldownScope::Model;
+        assert!(account_available_for(
+            CooldownScope::Model,
+            "p",
+            "a1",
+            "pro",
+            &h,
+            0
+        ));
+        assert!(step_available(&pair, &h, 0, "pro"));
+    }
+
+    #[test]
+    fn a_provider_scope_parks_the_model_for_every_credential() {
+        // The opposite reading of the same refusal: the bucket belongs to the provider, so a
+        // credential that has not been tried yet would be refused for the same reason.
+        let mut p = provider("p", vec![account("a0"), account("a1")]);
+        p.cooldown_scope = CooldownScope::Provider;
+        let mut h = HashMap::new();
+        h.insert(
+            cooldown_key(
+                CooldownScope::Provider,
+                "p",
+                "a0",
+                "pro",
+                CooldownReason::RateLimited,
+            ),
+            parked(9_000, CooldownReason::RateLimited),
+        );
+        assert!(!account_available_for(
+            CooldownScope::Provider,
+            "p",
+            "a1",
+            "pro",
+            &h,
+            0
+        ));
+        assert!(account_available_for(
+            CooldownScope::Provider,
+            "p",
+            "a1",
+            "lite",
+            &h,
+            0
+        ));
+        assert!(!step_available(&p, &h, 0, "pro"));
+        assert!(step_available(&p, &h, 0, "lite"));
+    }
+
+    #[test]
+    fn an_auth_failure_is_account_wide_under_every_scope() {
+        // A rejected credential is a fact about the credential. Widening it would silence accounts
+        // whose keys were never sent, so the scope must not apply to it.
+        for scope in [
+            CooldownScope::Account,
+            CooldownScope::Model,
+            CooldownScope::Provider,
+        ] {
+            assert_eq!(
+                cooldown_key(scope, "p", "a0", "pro", CooldownReason::AuthFailed),
+                "a0"
+            );
+            let mut h = HashMap::new();
+            h.insert("a0".to_owned(), parked(9_000, CooldownReason::AuthFailed));
+            assert!(!account_available_for(scope, "p", "a0", "any-model", &h, 0));
+        }
+    }
+
+    #[test]
+    fn a_route_resets_when_the_last_shape_parking_it_expires() {
+        // The maximum, not the minimum: the account entry expiring does not make the route usable
+        // while the model-shaped entry still holds it. Reading the minimum here would let a step
+        // back in as soon as either half lifted.
+        let h = Health::new();
+        h.cool_down("a0", 1_000, CooldownReason::AuthFailed);
+        h.cool_down(
+            &model_key("a0", "pro"),
+            5_000,
+            CooldownReason::QuotaExhausted,
+        );
+        assert_eq!(
+            route_reset_instant(CooldownScope::Model, "p", "a0", "pro", &h.view()),
+            Some(5_000)
+        );
+        assert_eq!(
+            route_reset_instant(CooldownScope::Model, "p", "a0", "lite", &h.view()),
+            Some(1_000)
+        );
+    }
+
+    #[test]
+    fn a_success_clears_every_shape_that_could_have_parked_the_route() {
+        // A request that worked proves both halves: the credential answers and this model answers
+        // on it. Leaving the wider entry behind would keep skipping a route just shown to work.
+        let h = Health::new();
+        h.cool_down("a0", 1_000, CooldownReason::RateLimited);
+        h.cool_down(
+            &model_key("a0", "pro"),
+            2_000,
+            CooldownReason::QuotaExhausted,
+        );
+        h.record_success(CooldownScope::Model, "p", "a0", "pro");
+        assert_eq!(h.cooling_count(), 0);
+        assert_eq!(h.failures(CooldownScope::Model, "p", "a0", "pro"), 0);
+    }
+
+    #[test]
+    fn clearing_an_account_takes_its_model_keys_but_leaves_a_provider_bucket() {
+        // "Try this account now" means every route on this credential. A provider-scoped entry is
+        // not this account's to clear: it belongs to the provider's quota.
+        let h = Health::new();
+        h.cool_down("a0", 1_000, CooldownReason::RateLimited);
+        h.cool_down(
+            &model_key("a0", "pro"),
+            2_000,
+            CooldownReason::QuotaExhausted,
+        );
+        h.cool_down(
+            &provider_key("p", "pro"),
+            3_000,
+            CooldownReason::QuotaExhausted,
+        );
+        h.clear("a0");
+        assert_eq!(h.cooling_count(), 1);
+        assert!(h.view().contains_key(&provider_key("p", "pro")));
+    }
+
+    #[test]
+    fn order_steps_demotes_a_parked_model_and_keeps_its_sibling_step() {
+        // The combo-level regression for the live failure this scope exists for: step 1's model is
+        // out of quota, step 2 is a different model on the same credential and must stay first.
+        let mut p = provider("p0", vec![account("a0")]);
+        p.cooldown_scope = CooldownScope::Model;
+        let c = combo(
+            ComboStrategy::Priority,
+            vec![step(0, "pro"), step(0, "lite")],
+        );
+        let mut h = HashMap::new();
+        h.insert(
+            cooldown_key(
+                CooldownScope::Model,
+                "p0",
+                "a0",
+                "pro",
+                CooldownReason::QuotaExhausted,
+            ),
+            parked(9_000, CooldownReason::QuotaExhausted),
+        );
+        assert_eq!(order_steps(&c, &[p], &h, 0, 0), vec![1, 0]);
     }
 }
