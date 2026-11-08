@@ -34,11 +34,14 @@ request path, failing closed), per-key quota *enforcement* (D2, admitted before 
 the `responses.rs` reachability tests, the `tools/bench` latency harness and the provider-dialects
 document. Automatic modality fallback (D3) was already implemented — a bounded, complete reroute.
 
-**Still not implemented, and still described as such:** the **mid-stream splice and the four
-`WinnerFailMode`s** that depend on it — a winner that dies while its body is streaming is not
-replaced. The **hedged race runner itself is implemented**: a combo with `hedge.enabled` dispatches
-every participant at once and commits the highest-priority participant that answers inside the
-eligibility window. See §4.
+**Still not implemented:** `winner_metric` does not yet distinguish `first_response_byte` from
+`first_complete_token` — both resolve at the response arrival (`docs/23-implementation-status.md`
+§3). The hedged race runner itself is implemented: a combo with `hedge.enabled` dispatches every
+participant at once and commits the highest-priority participant that answers inside the
+eligibility window. Winner recovery is also implemented: `crates/manarouter-relay/src/recovery.rs`
+wraps the committed winner's body so a mid-stream death is replaced by the highest-priority
+participant that passed the race, under all four `WinnerFailMode`s (`pick-highest-passed`,
+`pick-highest-passed-different-provider`, `rerun-excluding`, `stable-fallback`). See §4.
 
 ---
 

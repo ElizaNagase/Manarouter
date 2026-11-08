@@ -39,12 +39,17 @@ pub enum CooldownReason {
     AuthFailed,
     /// Repeated transient failures. The cooldown grows with each one.
     Backoff,
+    /// The client's request is malformed (400, 404, 422…). No cooldown — the account is fine.
+    InvalidRequest,
 }
 
 impl CooldownReason {
     /// Whether waiting can fix this.
     pub fn self_healing(self) -> bool {
-        !matches!(self, CooldownReason::AuthFailed)
+        !matches!(
+            self,
+            CooldownReason::AuthFailed | CooldownReason::InvalidRequest
+        )
     }
 
     /// The stable identifier, for logs and the panel.
@@ -54,6 +59,7 @@ impl CooldownReason {
             Self::QuotaExhausted => "quota-exhausted",
             Self::AuthFailed => "auth-failed",
             Self::Backoff => "backoff",
+            Self::InvalidRequest => "invalid-request",
         }
     }
 }
@@ -626,6 +632,7 @@ pub fn cooldown_until(
     let now = now_millis().max(0) as u64;
     let base = match reason {
         CooldownReason::AuthFailed => config.auth_failure_cooldown_secs.saturating_mul(1000),
+        CooldownReason::InvalidRequest => 0,
         CooldownReason::RateLimited | CooldownReason::QuotaExhausted | CooldownReason::Backoff => {
             config.default_cooldown_secs.saturating_mul(1000)
         }

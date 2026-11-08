@@ -292,6 +292,12 @@ pub struct RelayState {
     /// unfair, and an in-flight count that restarted would make `least-used` send a burst of
     /// requests through one proxy.
     proxy_selection: ProxySelectionState,
+    /// Quota cooldown configuration, from config.json.
+    ///
+    /// `default_cooldown_secs`, `auth_failure_cooldown_secs` and `live_signals_win` are read here
+    /// so that an operator's configured values actually take effect on the request path, instead
+    /// of the hard-coded defaults.
+    pub quota_config: mr_core::config::QuotaConfig,
 }
 
 impl RelayState {
@@ -305,6 +311,7 @@ impl RelayState {
             keys_declared: std::sync::atomic::AtomicBool::new(!config.client_keys.is_empty()),
             config_dir: mr_core::config::config_dir(),
             proxy_selection: ProxySelectionState::new(&config.proxies),
+            quota_config: config.quota.clone(),
         }
     }
 
@@ -596,6 +603,7 @@ mod tests {
             keys_declared: std::sync::atomic::AtomicBool::new(false),
             config_dir: std::path::PathBuf::from("/tmp"),
             proxy_selection: ProxySelectionState::empty(),
+            quota_config: mr_core::config::QuotaConfig::default(),
         }
     }
 

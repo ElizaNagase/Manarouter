@@ -230,13 +230,15 @@ async fn control_probe(
     let Ok(uri) = "/v1/chat/completions".parse::<Uri>() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
     dispatch_routed(
         DispatchRequest {
             app,
             client_dialect: Dialect::OpenAi,
             method: Method::POST,
             uri,
-            headers: HeaderMap::new(),
+            headers,
             body: AxumBody::from(bytes),
             pre_authorized: true,
         },
@@ -1026,7 +1028,7 @@ async fn dispatch_routed(
 
     // --- Try each step in order, until one answers successfully. ---
     let mut last_failure: Option<Response> = None;
-    let quota = mr_core::config::QuotaConfig::default();
+    let quota = app.relay.quota_config.clone();
     // The model the request should be retried against when no step can carry its modality.
     let mut fallback_target: Option<String> = None;
 
@@ -2072,6 +2074,14 @@ async fn attempt_step(
                 "upstream refused the request"
             );
             let rebuilt = response;
+            // A 4xx client error (400, 404, 422…) is the client's fault, never the account's.
+            // Do not cool down the account — the credential is fine — and do not retry on
+            // another account — the same request would fail the same way there.
+            if matches!(reason, select::CooldownReason::InvalidRequest) {
+                return Attempt::Fatal {
+                    response: build_response(rebuilt, None),
+                };
+            }
             app.health.cool_down(
                 account.id.as_str(),
                 select::cooldown_until(
@@ -2897,6 +2907,9 @@ fn classify_status(status: StatusCode) -> select::CooldownReason {
         401 | 403 => select::CooldownReason::AuthFailed,
         402 => select::CooldownReason::QuotaExhausted,
         429 => select::CooldownReason::RateLimited,
+        // A client error (400, 404, 422…) is the client’s fault. Do not cool down the account
+        // and do not retry: another account would reject the same malformed request.
+        400 | 404 | 405 | 413 | 415 | 422 => select::CooldownReason::InvalidRequest,
         _ => select::CooldownReason::Backoff,
     }
 }
