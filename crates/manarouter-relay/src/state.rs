@@ -297,7 +297,11 @@ pub struct RelayState {
     /// `default_cooldown_secs`, `auth_failure_cooldown_secs` and `live_signals_win` are read here
     /// so that an operator's configured values actually take effect on the request path, instead
     /// of the hard-coded defaults.
-    pub quota_config: mr_core::config::QuotaConfig,
+    ///
+    /// Swapped whole on reload. A plain field would be captured once at startup, so an operator
+    /// who hand-edits `quota` in config.json and sees "routing table reloaded" would reasonably
+    /// expect the new cooldown to apply — and would silently keep the old one until a restart.
+    quota_config: ArcSwap<mr_core::config::QuotaConfig>,
 }
 
 impl RelayState {
@@ -311,8 +315,16 @@ impl RelayState {
             keys_declared: std::sync::atomic::AtomicBool::new(!config.client_keys.is_empty()),
             config_dir: mr_core::config::config_dir(),
             proxy_selection: ProxySelectionState::new(&config.proxies),
-            quota_config: config.quota.clone(),
+            quota_config: ArcSwap::from_pointee(config.quota.clone()),
         }
+    }
+
+    /// The configured quota cooldown settings.
+    ///
+    /// Read once per request, so a reload that lands mid-request cannot make one step cool an
+    /// account down for a different length than another.
+    pub fn quota_config(&self) -> std::sync::Arc<mr_core::config::QuotaConfig> {
+        self.quota_config.load_full()
     }
 
     /// Load the snapshot and configuration from disk.
@@ -418,15 +430,29 @@ impl RelayState {
         if let Err(e) = snapshot.write_to(&mr_core::config::snapshot_path()) {
             tracing::warn!(error = %e, "could not persist the recompiled snapshot");
         }
-        // Client keys live in the same file the routing table is compiled from. A reload that
-        // refreshed only the table would leave a revoked or disabled key working until restart.
-        self.keys.store(Arc::new(key_ring(&config)));
+        self.install_reloaded(&config, snapshot);
+        Ok(digest)
+    }
+
+    /// Install everything a successfully loaded configuration resolved to.
+    ///
+    /// Split out of [`reload`](Self::reload) only so a test can drive it with a configuration it
+    /// built itself: `reload` reads the real config directory, which a unit test must not write.
+    ///
+    /// Every section here is one an operator expects a reload to pick up. Client keys live in the
+    /// same file as the routing table, so refreshing only the table would leave a revoked key
+    /// working until restart. Cooldown lengths are policy rather than routing state and so are not
+    /// part of the snapshot — but leaving them behind would make `quota` the one section of
+    /// config.json that silently needs a restart.
+    fn install_reloaded(&self, config: &Config, snapshot: RoutingSnapshot) {
+        self.keys.store(Arc::new(key_ring(config)));
         self.keys_declared.store(
             !config.client_keys.is_empty(),
             std::sync::atomic::Ordering::Relaxed,
         );
+        self.quota_config
+            .store(std::sync::Arc::new(config.quota.clone()));
         self.install(snapshot);
-        Ok(digest)
     }
 
     /// The shared upstream client.
@@ -603,8 +629,32 @@ mod tests {
             keys_declared: std::sync::atomic::AtomicBool::new(false),
             config_dir: std::path::PathBuf::from("/tmp"),
             proxy_selection: ProxySelectionState::empty(),
-            quota_config: mr_core::config::QuotaConfig::default(),
+            quota_config: ArcSwap::from_pointee(mr_core::config::QuotaConfig::default()),
         }
+    }
+
+    /// A reload must replace the cooldown policy, not just the routing table.
+    ///
+    /// The regression this guards is silent by construction: the relay logs "routing table
+    /// reloaded" and then keeps cooling accounts down for the old lengths, so an operator sees a
+    /// successful reload and a policy that did not take effect.
+    #[test]
+    fn a_reload_replaces_the_quota_cooldown_policy() {
+        let s = state_with(Vec::new());
+        assert_eq!(
+            s.quota_config().default_cooldown_secs,
+            mr_core::config::QuotaConfig::default().default_cooldown_secs,
+            "the fixture should start from the default policy"
+        );
+
+        let mut config = Config::default();
+        config.quota.default_cooldown_secs = 7;
+        config.quota.auth_failure_cooldown_secs = 11;
+        s.install_reloaded(&config, RoutingSnapshot::default());
+
+        let after = s.quota_config();
+        assert_eq!(after.default_cooldown_secs, 7);
+        assert_eq!(after.auth_failure_cooldown_secs, 11);
     }
 
     #[test]

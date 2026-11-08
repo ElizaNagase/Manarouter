@@ -1028,7 +1028,7 @@ async fn dispatch_routed(
 
     // --- Try each step in order, until one answers successfully. ---
     let mut last_failure: Option<Response> = None;
-    let quota = app.relay.quota_config.clone();
+    let quota = app.relay.quota_config();
     // The model the request should be retried against when no step can carry its modality.
     let mut fallback_target: Option<String> = None;
 
