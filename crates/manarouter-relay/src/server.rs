@@ -188,6 +188,24 @@ struct ProbeRequest {
     prompt: Option<String>,
 }
 
+/// The one completion a probe asks for.
+///
+/// **No output cap on purpose.** The probe used to send `max_tokens: 32`, which is only safe for a
+/// model that answers with its first token: a model that thinks by default spends the whole
+/// allowance in its head, finishes `MAX_TOKENS`, and returns nothing a client could read.
+/// Antigravity's `gemini-3.8-flash-tiered` did exactly that — 27 of the 32 tokens were thoughts, and
+/// one run in four came back with no `parts` at all — so the panel reported a successful test with a
+/// blank answer and called a working route broken. The prompt is one short phrase, so an uncapped
+/// probe still costs a handful of tokens, and the route now gets the same budget a real client would
+/// rather than a ceiling the probe invented.
+fn probe_payload(model: &str, prompt: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": false,
+    })
+}
+
 /// `POST /control/probe` — run one real request for the control plane.
 ///
 /// The panel's "test model" and the combo health check used to speak the OpenAI shape themselves,
@@ -218,12 +236,7 @@ async fn control_probe(
         .prompt
         .filter(|prompt| !prompt.trim().is_empty())
         .unwrap_or_else(|| "Reply with the single word OK.".to_owned());
-    let payload = serde_json::json!({
-        "model": body.model,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 32,
-        "stream": false,
-    });
+    let payload = probe_payload(&body.model, &prompt);
     let Ok(bytes) = serde_json::to_vec(&payload) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
@@ -1667,6 +1680,25 @@ fn no_credential_message(
 /// The `is_sticky_step` flag says whether this step is the one the combo's sticky preference
 /// points at. A step that turns out to be unusable clears that preference, which is why the
 /// outcome carries a `sticky_cleared` flag rather than the caller deciding it.
+/// The client's own conversation marker, when it sent one as a header.
+///
+/// Codex keys its prompt cache on `prompt_cache_key`, and the official CLI sends its conversation
+/// id as `session-id` on every request; a generic client tends to use `x-session-id`. Passing the
+/// client's own marker through is the whole of the affinity the upstream needs — inventing one here
+/// would either fold two unrelated conversations into one cache bucket or hand the provider a
+/// session the client cannot keep stable across its own turns.
+fn client_session_hint(headers: &HeaderMap) -> Option<&str> {
+    /// The headers a client is known to use for this. Order is preference, not priority.
+    const NAMES: [&str; 2] = ["session-id", "x-session-id"];
+    /// Past this a header is not an id a provider can key anything on, and forwarding it would
+    /// only put an arbitrary-length string in front of the upstream's validation.
+    const MAX_LEN: usize = 128;
+    NAMES.iter().find_map(|name| {
+        let value = headers.get(*name)?.to_str().ok()?.trim();
+        (!value.is_empty() && value.len() <= MAX_LEN).then_some(value)
+    })
+}
+
 async fn attempt_step(
     actx: &AttemptContext<'_>,
     step: &StepPlan,
@@ -1842,7 +1874,7 @@ async fn attempt_step(
         upstream_dialect: provider.dialect,
         upstream_model: step.model.as_str(),
         client_streaming: head.wants_stream(),
-        session_id: None,
+        session_id: client_session_hint(headers),
     };
     let translated = match translate_request(&ctx, bytes) {
         Ok(t) => t,
@@ -3437,6 +3469,14 @@ async fn build_client_response(
         // state instead, which is the same corruption seen from the other side. Its state is
         // `commandcode` below, owned per stream and dropped with the body.
         let mut commandcode = mr_dialects::commandcode::Translator::new();
+        // Codex is the other dialect whose stream state is per answer, and for the same reason: a
+        // thread-local cannot tell two answers in flight on one worker apart.
+        let mut responses = mr_dialects::responses::Translator::new();
+        // A `None` marker closes the stream: it is how the last partial line in `pending` and any
+        // closing frame the translator still owes the client get written before the body ends.
+        let frames = frames
+            .map(Some)
+            .chain(futures_util::stream::once(async { None }));
         let stream = frames.scan(
             (Vec::<u8>::new(), false),
             move |(pending, started), frame| {
@@ -3453,10 +3493,22 @@ async fn build_client_response(
                     session_id: None,
                 };
                 let out = match frame {
-                    Ok(frame) => frame.into_data().ok().map(|chunk| {
-                        translate_stream_chunk(&ctx, &mut commandcode, pending, &chunk)
+                    Some(Ok(frame)) => frame.into_data().ok().map(|chunk| {
+                        translate_stream_chunk(
+                            &ctx,
+                            &mut commandcode,
+                            &mut responses,
+                            pending,
+                            &chunk,
+                        )
                     }),
-                    Err(e) => Some(vec![Err(e)]),
+                    Some(Err(e)) => Some(vec![Err(e)]),
+                    None => Some(flush_stream_chunk(
+                        &ctx,
+                        &mut commandcode,
+                        &mut responses,
+                        pending,
+                    )),
                 };
                 async move { Some(out) }
             },
@@ -3528,6 +3580,7 @@ async fn build_client_response(
 fn translate_stream_chunk(
     ctx: &TranslateCtx<'_>,
     commandcode: &mut mr_dialects::commandcode::Translator,
+    responses: &mut mr_dialects::responses::Translator,
     pending: &mut Vec<u8>,
     chunk: &Bytes,
 ) -> Vec<Result<Bytes, hyper::Error>> {
@@ -3569,6 +3622,8 @@ fn translate_stream_chunk(
         match data {
             Some(data) => match if ctx.upstream_dialect == Dialect::CommandCodeGo {
                 mr_dialects::commandcode::translate(commandcode, ctx, data)
+            } else if ctx.upstream_dialect == Dialect::Codex && !ctx.is_passthrough() {
+                responses.translate(ctx, data)
             } else {
                 mr_dialects::translate_sse_data(ctx, data)
             } {
@@ -3594,6 +3649,41 @@ fn translate_stream_chunk(
             // chunk or — with no `data:` to join — hand a strict client an event whose data is empty
             // and unparseable, which surfaces as malformed server-sent event JSON.
             None => {}
+        }
+    }
+    out
+}
+
+/// Write out whatever the end of the upstream body still owes the client.
+///
+/// Two things are still held when the upstream stops sending: the bytes of a line that never got its
+/// newline, and the closing frame of a translated dialect. Both are part of the answer. A final
+/// `data: [DONE]` very often arrives without a trailing newline, and a Codex stream whose terminal
+/// event was cut off still has to be closed honestly — see
+/// [`mr_dialects::responses::Translator::finish`].
+fn flush_stream_chunk(
+    ctx: &TranslateCtx<'_>,
+    commandcode: &mut mr_dialects::commandcode::Translator,
+    responses: &mut mr_dialects::responses::Translator,
+    pending: &mut Vec<u8>,
+) -> Vec<Result<Bytes, hyper::Error>> {
+    let mut out = Vec::new();
+    if !pending.is_empty() {
+        let mut tail = std::mem::take(pending);
+        tail.push(b'\n');
+        out.extend(translate_stream_chunk(
+            ctx,
+            commandcode,
+            responses,
+            pending,
+            &Bytes::from(tail),
+        ));
+    }
+    if ctx.upstream_dialect == Dialect::Codex && !ctx.is_passthrough() {
+        for line in responses.finish(ctx) {
+            if !line.is_empty() {
+                out.push(Ok(translated_frame(&line)));
+            }
         }
     }
     out
@@ -4480,11 +4570,20 @@ mod tests {
             session_id: None,
         };
         let mut commandcode = mr_dialects::commandcode::Translator::new();
+        let mut responses = mr_dialects::responses::Translator::new();
         let mut pending = Vec::new();
         let metadata = Bytes::from_static(b"{\"type\":\"start\"}\n");
-        assert!(translate_stream_chunk(&ctx, &mut commandcode, &mut pending, &metadata).is_empty());
+        assert!(translate_stream_chunk(
+            &ctx,
+            &mut commandcode,
+            &mut responses,
+            &mut pending,
+            &metadata
+        )
+        .is_empty());
         let token = Bytes::from_static(b"{\"type\":\"text-delta\",\"text\":\"OK\"}\n");
-        let output = translate_stream_chunk(&ctx, &mut commandcode, &mut pending, &token);
+        let output =
+            translate_stream_chunk(&ctx, &mut commandcode, &mut responses, &mut pending, &token);
         let output = output.into_iter().map(Result::unwrap).collect::<Vec<_>>();
         assert_eq!(output.len(), 1);
         let text = std::str::from_utf8(&output[0]).unwrap();
@@ -4494,7 +4593,13 @@ mod tests {
         let finish = Bytes::from_static(
             b"{\"type\":\"finish\",\"finishReason\":\"stop\",\"totalUsage\":{\"inputTokens\":2,\"outputTokens\":1}}\n",
         );
-        let output = translate_stream_chunk(&ctx, &mut commandcode, &mut pending, &finish);
+        let output = translate_stream_chunk(
+            &ctx,
+            &mut commandcode,
+            &mut responses,
+            &mut pending,
+            &finish,
+        );
         let text = output
             .into_iter()
             .map(Result::unwrap)
@@ -4525,12 +4630,14 @@ mod tests {
         };
         mr_dialects::reset_stream_state();
         let mut translator = mr_dialects::commandcode::Translator::new();
+        let mut responses = mr_dialects::responses::Translator::new();
         let mut pending = Vec::new();
         let chunk = Bytes::from_static(
             b"event: response.created\n\nevent: response.in_progress\n\nevent: \
 response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Hi\"}\n\n",
         );
-        let out = translate_stream_chunk(&ctx, &mut translator, &mut pending, &chunk);
+        let out =
+            translate_stream_chunk(&ctx, &mut translator, &mut responses, &mut pending, &chunk);
         let text = out
             .into_iter()
             .map(Result::unwrap)
@@ -4565,11 +4672,13 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             session_id: None,
         };
         let mut translator = mr_dialects::commandcode::Translator::new();
+        let mut responses = mr_dialects::responses::Translator::new();
         let mut pending = Vec::new();
         let chunk = Bytes::from_static(
             b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
         );
-        let out = translate_stream_chunk(&ctx, &mut translator, &mut pending, &chunk);
+        let out =
+            translate_stream_chunk(&ctx, &mut translator, &mut responses, &mut pending, &chunk);
         let text = out
             .into_iter()
             .map(Result::unwrap)
@@ -4598,10 +4707,12 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             session_id: None,
         };
         let mut translator = mr_dialects::commandcode::Translator::new();
+        let mut responses = mr_dialects::responses::Translator::new();
         let mut pending = Vec::new();
         let out = translate_stream_chunk(
             &ctx,
             &mut translator,
+            &mut responses,
             &mut pending,
             &Bytes::from_static(b"data: {\"id\":\"x\",\"choices\":[]}\n\n"),
         );
@@ -4625,10 +4736,12 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             session_id: None,
         };
         let mut translator = mr_dialects::commandcode::Translator::new();
+        let mut responses = mr_dialects::responses::Translator::new();
         let mut pending = Vec::new();
         let out = translate_stream_chunk(
             &ctx,
             &mut translator,
+            &mut responses,
             &mut pending,
             &Bytes::from_static(b": keep-alive\n"),
         );
@@ -4638,6 +4751,240 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             .map(|b| String::from_utf8(b.to_vec()).unwrap())
             .collect::<String>();
         assert_eq!(text, ": keep-alive\n");
+    }
+
+    /// Two Codex answers in flight on the gateway at once must not share translation state.
+    ///
+    /// This is the relay's own entry point with two translators, interleaving chunks exactly as a busy
+    /// runtime does. While the state lived in a `thread_local` the two streams wrote into one cell: the
+    /// second answer's text arrived attributed to the first answer's id, and one of the two clients was
+    /// left with a stream that never carried a `finish_reason`.
+    #[test]
+    fn two_codex_answers_in_flight_do_not_share_state() {
+        let ctx = TranslateCtx {
+            route: RouteKind::ChatCompletions,
+            client_dialect: Dialect::OpenAi,
+            upstream_dialect: Dialect::Codex,
+            upstream_model: "gpt-6-luna",
+            client_streaming: true,
+            session_id: None,
+        };
+        let (mut open_a, mut open_b) = (
+            mr_dialects::responses::Translator::new(),
+            mr_dialects::responses::Translator::new(),
+        );
+        let (mut cc_a, mut cc_b) = (
+            mr_dialects::commandcode::Translator::new(),
+            mr_dialects::commandcode::Translator::new(),
+        );
+        let (mut pending_a, mut pending_b) = (Vec::new(), Vec::new());
+        let feed = |open: &mut mr_dialects::responses::Translator,
+                    cc: &mut mr_dialects::commandcode::Translator,
+                    pending: &mut Vec<u8>,
+                    frame: &'static [u8]| {
+            translate_stream_chunk(&ctx, cc, open, pending, &Bytes::from_static(frame))
+                .into_iter()
+                .map(Result::unwrap)
+                .map(|b| String::from_utf8(b.to_vec()).unwrap())
+                .collect::<String>()
+        };
+
+        let mut text_a = String::new();
+        let mut text_b = String::new();
+        text_a.push_str(&feed(
+            &mut open_a,
+            &mut cc_a,
+            &mut pending_a,
+            br#"data: {"type":"response.created","response":{"id":"resp_a","status":"in_progress","model":"gpt-6-luna"}}
+
+"#,
+        ));
+        text_b.push_str(&feed(
+            &mut open_b,
+            &mut cc_b,
+            &mut pending_b,
+            br#"data: {"type":"response.created","response":{"id":"resp_b","status":"in_progress","model":"gpt-6-luna"}}
+
+"#,
+        ));
+        // The two answers now interleave, one delta each.
+        text_a.push_str(&feed(
+            &mut open_a,
+            &mut cc_a,
+            &mut pending_a,
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"A1\"}\n\n",
+        ));
+        text_b.push_str(&feed(
+            &mut open_b,
+            &mut cc_b,
+            &mut pending_b,
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"B1\"}\n\n",
+        ));
+        text_a.push_str(&feed(
+            &mut open_a,
+            &mut cc_a,
+            &mut pending_a,
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"A2\"}\n\n",
+        ));
+        text_b.push_str(&feed(
+            &mut open_b,
+            &mut cc_b,
+            &mut pending_b,
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_b\",\"status\":\"completed\",\"model\":\"gpt-6-luna\"}}\n\n",
+        ));
+        text_a.push_str(&feed(
+            &mut open_a,
+            &mut cc_a,
+            &mut pending_a,
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_a\",\"status\":\"completed\",\"model\":\"gpt-6-luna\"}}\n\n",
+        ));
+
+        assert!(
+            text_a.contains("\"A1\"") && text_a.contains("\"A2\""),
+            "{text_a:?}"
+        );
+        assert!(text_b.contains("\"B1\""), "{text_b:?}");
+        assert!(
+            !text_a.contains("B1"),
+            "A must not carry B's text: {text_a:?}"
+        );
+        assert!(
+            !text_b.contains("A1"),
+            "B must not carry A's text: {text_b:?}"
+        );
+        assert!(
+            text_a.contains("resp_a") && !text_a.contains("resp_b"),
+            "{text_a:?}"
+        );
+        assert!(
+            text_b.contains("resp_b") && !text_b.contains("resp_a"),
+            "{text_b:?}"
+        );
+        assert_eq!(
+            text_a.matches("finish_reason\":\"stop").count(),
+            1,
+            "each stream closes exactly once: {text_a:?}"
+        );
+        assert!(
+            text_b.contains("finish_reason\":\"stop"),
+            "B is not left open: {text_b:?}"
+        );
+        assert!(
+            text_a.trim_end().ends_with("[DONE]"),
+            "the client is told the stream is over: {text_a:?}"
+        );
+    }
+
+    /// The probe must not cap the answer, because a cap is a ceiling on thinking *and* text together.
+    ///
+    /// The panel's "test this model" reports what the probe returns, so a cap small enough to starve a
+    /// reasoning model showed up as a successful test with an empty answer. What the probe asks for is
+    /// therefore pinned here: a plain non-streaming completion with no `max_tokens`, so the route gets
+    /// the same budget a real client would.
+    #[test]
+    fn the_probe_asks_for_an_answer_without_dictating_its_length() {
+        let payload = probe_payload("antigravity/gemini-3.8-flash-tiered", "reply with \"yes\"");
+        assert_eq!(payload["model"], "antigravity/gemini-3.8-flash-tiered");
+        assert_eq!(payload["stream"], false);
+        assert_eq!(payload["messages"][0]["content"], "reply with \"yes\"");
+        for cap in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+            assert!(
+                payload.get(cap).is_none(),
+                "the probe must not send {cap}: {payload}"
+            );
+        }
+    }
+    /// The upstream keys its prompt cache on `prompt_cache_key`, and the only honest source of one
+    /// is the client's own session marker. Reading it off a header keeps the fast path free: no body
+    /// is parsed just to find a cache key.
+    #[test]
+    fn a_client_session_header_becomes_the_prompt_cache_key() {
+        let mut headers = HeaderMap::new();
+        assert!(
+            client_session_hint(&headers).is_none(),
+            "a client that declares no session asks for no affinity"
+        );
+
+        headers.insert("x-session-id", HeaderValue::from_static("  conv-1  "));
+        assert_eq!(
+            client_session_hint(&headers),
+            Some("conv-1"),
+            "the generic spelling is read, and whitespace trimmed"
+        );
+
+        // The official CLI's own spelling outranks the generic one when a client sends both.
+        headers.insert("session-id", HeaderValue::from_static("official"));
+        assert_eq!(client_session_hint(&headers), Some("official"));
+
+        let mut blank = HeaderMap::new();
+        blank.insert("session-id", HeaderValue::from_static("   "));
+        assert!(
+            client_session_hint(&blank).is_none(),
+            "a blank id would put every conversation in one cache bucket"
+        );
+
+        let mut oversized = HeaderMap::new();
+        oversized.insert(
+            "session-id",
+            HeaderValue::from_str(&"x".repeat(129)).expect("a long header is still a header"),
+        );
+        assert!(
+            client_session_hint(&oversized).is_none(),
+            "an arbitrary-length string is not a cache key"
+        );
+    }
+
+    /// A Codex stream that stops before its terminal event is closed honestly at end of body.
+    ///
+    /// The upstream dying mid-answer is the ordinary case this has to survive: the client must learn
+    /// that the answer was cut short, and the last partial line in the buffer — a `data:` payload
+    /// whose newline never arrived — must not be thrown away.
+    #[test]
+    fn a_codex_stream_that_stops_early_is_closed_at_the_end_of_the_body() {
+        let ctx = TranslateCtx {
+            route: RouteKind::ChatCompletions,
+            client_dialect: Dialect::OpenAi,
+            upstream_dialect: Dialect::Codex,
+            upstream_model: "gpt-6-luna",
+            client_streaming: true,
+            session_id: None,
+        };
+        let mut cc = mr_dialects::commandcode::Translator::new();
+        let mut open = mr_dialects::responses::Translator::new();
+        let mut pending = Vec::new();
+        // The tail of the body has no trailing newline, which is how a cut connection ends.
+        translate_stream_chunk(
+            &ctx,
+            &mut cc,
+            &mut open,
+            &mut pending,
+            &Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}",
+            ),
+        );
+        let out = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending);
+        let text = out
+            .into_iter()
+            .map(Result::unwrap)
+            .map(|b| String::from_utf8(b.to_vec()).unwrap())
+            .collect::<String>();
+
+        assert!(
+            text.contains("Hel"),
+            "the partial tail is not lost: {text:?}"
+        );
+        assert!(text.contains("stream_truncated"), "{text:?}");
+        assert!(
+            !text.contains("finish_reason"),
+            "a truncated answer must not claim it finished: {text:?}"
+        );
+        assert!(
+            text.trim_end().ends_with("[DONE]"),
+            "the client is told the stream is over: {text:?}"
+        );
+        assert!(pending.is_empty(), "the buffer is drained");
+        // A second flush, as the body ending twice would do, says nothing again.
+        assert!(flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending).is_empty());
     }
 
     /// Two Command Code answers in flight on the gateway at once must not share translation state.
@@ -4667,8 +5014,14 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                    pending: &mut Vec<u8>,
                    frame: &'static str|
          -> String {
-            let out =
-                translate_stream_chunk(&ctx, t, pending, &Bytes::from_static(frame.as_bytes()));
+            let mut responses = mr_dialects::responses::Translator::new();
+            let out = translate_stream_chunk(
+                &ctx,
+                t,
+                &mut responses,
+                pending,
+                &Bytes::from_static(frame.as_bytes()),
+            );
             out.into_iter()
                 .map(Result::unwrap)
                 .map(|b| String::from_utf8(b.to_vec()).unwrap())
@@ -4769,6 +5122,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             session_id: None,
         };
         let mut t = mr_dialects::commandcode::Translator::new();
+        let mut responses = mr_dialects::responses::Translator::new();
         let mut pending = Vec::new();
         for frame in [
             "{\"type\":\"tool-input-start\",\"id\":\"c1\",\"toolName\":\"f\"}\n",
@@ -4777,6 +5131,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             let _ = translate_stream_chunk(
                 &ctx,
                 &mut t,
+                &mut responses,
                 &mut pending,
                 &Bytes::from_static(frame.as_bytes()),
             );

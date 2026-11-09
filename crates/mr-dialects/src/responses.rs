@@ -51,6 +51,9 @@ fn malformed_request(detail: impl Into<String>) -> TranslateError {
 ///
 /// Either way the upstream is Codex, so `stream` is forced on and `store` is forced off; the relay
 /// reads the SSE answer back even for a client that asked for one JSON document.
+/// The include key that makes the backend return its encrypted reasoning.
+const REASONING_INCLUDE: &str = "reasoning.encrypted_content";
+
 pub fn from_pivot_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<TranslatedRequest> {
     let v: Value = serde_json::from_slice(body).map_err(|e| malformed_request(e.to_string()))?;
     let obj = v
@@ -73,6 +76,23 @@ pub fn from_pivot_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Transla
     if let Some(map) = out.as_object_mut() {
         map.insert("stream".into(), json!(true));
         map.insert("store".into(), json!(false));
+        // Nothing is stored upstream, so the reasoning the model encrypted while answering is gone
+        // unless it is asked to hand it back. Without it every turn of a tool loop arrives with the
+        // thinking that justified the previous tool calls missing, and the model re-plans what it
+        // already decided — which looks like the model misbehaving, not like a lost field. The
+        // official client asks for this on every request.
+        let mut include = map
+            .get("include")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !include
+            .iter()
+            .any(|value| value.as_str() == Some(REASONING_INCLUDE))
+        {
+            include.push(json!(REASONING_INCLUDE));
+        }
+        map.insert("include".into(), Value::Array(include));
     }
     rewrite_model(&mut out, ctx.upstream_model);
     // A Responses client that sent `input: []` would otherwise be answered with a rejection: the
@@ -113,8 +133,13 @@ fn pivot_messages_to_responses(
 ) -> Value {
     let mut instructions = String::new();
     let mut input: Vec<Value> = Vec::new();
+    // Instructions stand ahead of the conversation, so only the instruction turns that precede
+    // every other turn are hoisted. One that arrives mid-conversation keeps its place: pulling it to
+    // the front would put a correction before the turns it corrects, which is a different prompt.
+    let mut conversation_began = false;
     for message in messages {
-        message_into_items(message, &mut instructions, &mut input);
+        message_into_items(message, &mut instructions, &mut input, !conversation_began);
+        conversation_began |= !is_instruction_role(message);
     }
 
     let mut out = Map::new();
@@ -135,14 +160,11 @@ fn pivot_messages_to_responses(
     copy_field(obj, "temperature", &mut out);
     copy_field(obj, "top_p", &mut out);
     copy_field(obj, "parallel_tool_calls", &mut out);
-    // Both spellings of the output cap mean the same thing upstream.
-    if let Some(cap) = obj
-        .get("max_completion_tokens")
-        .or_else(|| obj.get("max_tokens"))
-        .filter(|v| !v.is_null())
-    {
-        out.insert("max_output_tokens".into(), cap.clone());
-    }
+    // The output cap is deliberately not forwarded. On this face it is not a ceiling on the answer
+    // but a ceiling shared with the reasoning budget, and the reasoning budget is set by the effort
+    // level in thousands of tokens: a client asking for a 4k answer while thinking at `high` gets
+    // its whole budget spent before the first visible token, and back comes an empty message.
+    // The official client never sends this field, and the model's own ceiling applies without it.
     // Chat Completions carries a bare `reasoning_effort`; Responses nests it under `reasoning`.
     if let Some(effort) = obj.get("reasoning_effort").and_then(Value::as_str) {
         out.insert("reasoning".into(), json!({"effort": effort}));
@@ -150,15 +172,35 @@ fn pivot_messages_to_responses(
     if let Some(text) = obj.get("response_format").and_then(text_format) {
         out.insert("text".into(), text);
     }
-    // Prompt-cache affinity is per client session; Responses spells it `prompt_cache_key`.
-    if let Some(session) = ctx.session_id {
+    // Prompt-cache affinity is per client session; Responses spells it `prompt_cache_key`. The
+    // relay hands down the session the client itself declared; a client that already spells the
+    // field the upstream way keeps its own value rather than losing it in the rewrite.
+    if let Some(session) = ctx.session_id.map(str::to_owned).or_else(|| {
+        obj.get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }) {
         out.insert("prompt_cache_key".into(), json!(session));
     }
     Value::Object(out)
 }
 
 /// Append one pivot message to the Responses transcript, folding system turns into `instructions`.
-fn message_into_items(message: &Value, instructions: &mut String, out: &mut Vec<Value>) {
+/// Whether a message is an instruction turn rather than part of the conversation.
+fn is_instruction_role(message: &Value) -> bool {
+    matches!(
+        message.get("role").and_then(Value::as_str),
+        Some("system") | Some("developer")
+    )
+}
+
+fn message_into_items(
+    message: &Value,
+    instructions: &mut String,
+    out: &mut Vec<Value>,
+    leading: bool,
+) {
     let role = message
         .get("role")
         .and_then(Value::as_str)
@@ -166,15 +208,25 @@ fn message_into_items(message: &Value, instructions: &mut String, out: &mut Vec<
     let null = Value::Null;
     let content = message.get("content").unwrap_or(&null);
     match role {
-        // Responses has no `system` role item in the input array: both spellings become the
-        // top-level `instructions` string, joined in the order they appeared.
+        // A leading `system`/`developer` turn is the top-level `instructions` string, joined in the
+        // order the turns appeared. A later one has no such home — hoisting it would reorder the
+        // conversation — so it becomes a `developer` item in `input`, where it stands in order.
         "system" | "developer" => {
             let text = flatten_text(content);
-            if !text.is_empty() {
+            if text.is_empty() {
+                return;
+            }
+            if leading {
                 if !instructions.is_empty() {
                     instructions.push_str("\n\n");
                 }
                 instructions.push_str(&text);
+            } else {
+                out.push(json!({
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": text}],
+                }));
             }
         }
         "tool" => {
@@ -189,6 +241,20 @@ fn message_into_items(message: &Value, instructions: &mut String, out: &mut Vec<
             }));
         }
         "assistant" => {
+            // Reasoning the model produced last turn is part of the transcript, not prose: with
+            // `store: false` the only copy of it is what the client round-trips, so dropping it here
+            // means every turn of a tool loop arrives without the thinking that justified the tool
+            // calls it made.
+            if let Some(text) = message
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                out.push(json!({
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": text}],
+                }));
+            }
             if let Some(parts) = content_parts("assistant", content) {
                 if !parts.is_empty() {
                     out.push(json!({
@@ -745,20 +811,89 @@ impl ResponseStreamState {
     }
 }
 
-thread_local! {
-    /// Stream state for whichever Responses stream is in flight on this thread.
+/// One Responses stream's state, owned by whoever is reading the upstream.
+///
+/// Translation is called frame by frame, so the accumulation has to live somewhere. A thread-local
+/// is not a per-stream place: two answers in flight on one worker thread share it, and each one's
+/// deltas splice into the other. That is not hypothetical — the Command Code dialect has the same
+/// shape and was observed corrupting exactly like this with a parent and a sub-agent streaming
+/// concurrently, which is why it owns a translator of this kind. The relay builds one of these per
+/// upstream stream and drops it with the body, so the lifetime is the stream's and no thread needs
+/// to agree with itself about which answer is in flight.
+///
+/// [`sse_to_pivot`] still exists for callers with nowhere to put a handle, and documents why that is
+/// the weaker arrangement.
+pub struct Translator {
+    state: Option<ResponseStreamState>,
+    /// The answer has been closed by [`Translator::finish`], so nothing more is owed to the client.
+    closed: bool,
+}
+
+impl Translator {
+    /// A translator for a stream that has not delivered anything yet.
+    pub fn new() -> Self {
+        Self {
+            state: None,
+            closed: false,
+        }
+    }
+
+    /// Whether a terminal frame has already gone out, so the answer is complete.
+    pub fn is_finished(&self) -> bool {
+        self.closed || self.state.as_ref().map(|state| state.done).unwrap_or(false)
+    }
+
+    /// Translate one upstream event into client frames.
+    pub fn translate(&mut self, ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<String>> {
+        translate_event(&mut self.state, ctx, data)
+    }
+
+    /// Close an answer whose upstream ended without a terminal frame.
     ///
-    /// Translation is called frame by frame with no per-stream handle, so the accumulation has to
-    /// live somewhere. A thread-local keeps concurrent conversations from sharing it; the state
-    /// also resets itself once a terminal frame has gone out. The Anthropic adapter keeps its own
-    /// thread-local, which `crate::openai::reset_stream_state` clears.
+    /// An event stream that stops mid-answer is the normal way an upstream dies, and the client has
+    /// no way to tell a truncated answer from a complete one unless this says so: without a closing
+    /// frame the last `chat.completion.chunk` simply never carries a `finish_reason`, and a
+    /// non-streaming client waits for a document that never arrives. Reporting it is the honest
+    /// choice, and the alternative — synthesizing a `finish_reason: "stop"` — would claim the
+    /// answer finished when it did not.
+    pub fn finish(&mut self, ctx: &TranslateCtx<'_>) -> Vec<String> {
+        // A pass-through stream was never translated, so its framing belongs to the upstream and
+        // nothing here can know whether it ended well. Nothing is said about it.
+        if self.is_finished() || ctx.is_passthrough() {
+            return Vec::new();
+        }
+        self.closed = true;
+        self.state = None;
+        error_frames(
+            ctx,
+            &json!({
+                "message": "the upstream stream ended before the answer finished",
+                "type": "upstream_error",
+                "code": "stream_truncated",
+            }),
+        )
+    }
+}
+
+impl Default for Translator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+thread_local! {
+    /// The weaker arrangement, for callers that cannot own a [`Translator`].
+    ///
+    /// Only [`sse_to_pivot`] reads this. Two streams translated on one thread through it still
+    /// corrupt each other, so anything that can pass a [`Translator`] must do that instead; the relay
+    /// does.
     static RESPONSE_STREAM_STATE: RefCell<Option<ResponseStreamState>> = const { RefCell::new(None) };
 }
 
-/// Forget the in-flight stream state.
+/// Forget the thread-local stream state.
 ///
-/// Call between streams on a reused worker thread. The state self-heals after a terminal frame, but
-/// a stream that dies without one leaves partial state behind.
+/// Call between streams on a reused worker thread when using [`sse_to_pivot`]. The relay does not
+/// depend on this: its state is a [`Translator`] owned by the stream.
 pub fn reset_stream_state() {
     RESPONSE_STREAM_STATE.with(|cell| *cell.borrow_mut() = None);
 }
@@ -1058,6 +1193,21 @@ fn error_to_client(error: &Value) -> Value {
     })
 }
 
+/// An upstream error in the frames the client's dialect closes a failed stream with.
+///
+/// The OpenAI surface has no error event, so the error rides as a data frame ahead of `[DONE]`;
+/// Anthropic has a named event for exactly this.
+fn error_frames(ctx: &TranslateCtx<'_>, error: &Value) -> Vec<String> {
+    let body = error_to_client(error);
+    match ctx.client_dialect {
+        Dialect::Anthropic => vec![sse::named_frame("error", &body.to_string())],
+        _ => vec![
+            sse::data_frame(&body.to_string()),
+            sse::data_frame(SSE_DONE),
+        ],
+    }
+}
+
 /// Frame already-built pivot chunks, and close the client's stream the way its dialect requires.
 fn frames_for(ctx: &TranslateCtx<'_>, chunks: Vec<Value>, terminate: bool) -> Result<Vec<String>> {
     let mut out = Vec::new();
@@ -1091,6 +1241,18 @@ fn frames_for(ctx: &TranslateCtx<'_>, chunks: Vec<Value>, terminate: bool) -> Re
 /// * an **Anthropic client** gets the same chunks through the Anthropic adapter, which turns the
 ///   `[DONE]` sentinel into `message_delta` + `message_stop` instead of forwarding it.
 pub fn sse_to_pivot(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<String>> {
+    RESPONSE_STREAM_STATE.with(|cell| translate_event(&mut cell.borrow_mut(), ctx, data))
+}
+
+/// Translate one upstream event against a caller-owned stream state.
+///
+/// This is the whole stream machine: [`Translator::translate`] hands in the state it owns and
+/// [`sse_to_pivot`] hands in the thread-local one.
+fn translate_event(
+    slot: &mut Option<ResponseStreamState>,
+    ctx: &TranslateCtx<'_>,
+    data: &str,
+) -> Result<Vec<String>> {
     let trimmed = data.trim();
     // The relay strips the `data:` prefix before calling this, but a raw NDJSON line would not
     // have one, and tolerating both costs nothing.
@@ -1105,8 +1267,7 @@ pub fn sse_to_pivot(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<String>> {
         return Ok(vec![candidate.to_owned()]);
     }
 
-    RESPONSE_STREAM_STATE.with(|cell| {
-        let mut slot = cell.borrow_mut();
+    {
         if candidate == SSE_DONE {
             // The upstream is not expected to send a sentinel of its own; if it does, close the
             // answer rather than dropping it, so the client still gets its finish reason.
@@ -1190,19 +1351,12 @@ pub fn sse_to_pivot(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<String>> {
             }
             Step::Error(error) => {
                 state.done = true;
-                let body = error_to_client(&error);
-                return Ok(match ctx.client_dialect {
-                    Dialect::Anthropic => vec![sse::named_frame("error", &body.to_string())],
-                    _ => vec![
-                        sse::data_frame(&body.to_string()),
-                        sse::data_frame(SSE_DONE),
-                    ],
-                });
+                return Ok(error_frames(ctx, &error));
             }
             Step::Ignored => {}
         }
         frames_for(ctx, chunks, terminate)
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1247,6 +1401,41 @@ mod tests {
     // that chain so the arm cannot rot unnoticed.
 
     #[test]
+    fn a_prompt_cache_key_follows_the_client_session_that_asked_for_it() {
+        // The relay hands down the session the client declared as a header; that is the id the
+        // upstream keys its prompt cache on.
+        let ctx = TranslateCtx {
+            session_id: Some("session-from-a-header"),
+            ..TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Codex, "gpt-5-codex")
+        };
+        let body = br#"{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}"#;
+        let translated = translate_request(&ctx, body)
+            .expect("the pairing is supported")
+            .expect("a Codex upstream is not a passthrough");
+        let upstream: Value = serde_json::from_slice(&translated.body).expect("JSON");
+        assert_eq!(upstream["prompt_cache_key"], json!("session-from-a-header"));
+
+        // A client that already spells the field the upstream way keeps its own value, because
+        // losing it would throw away cache affinity the client was careful to ask for.
+        let ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Codex, "gpt-5-codex");
+        let body = br#"{"model":"gpt-5","prompt_cache_key":"client-chose-this","messages":[{"role":"user","content":"hi"}]}"#;
+        let translated = translate_request(&ctx, body)
+            .expect("the pairing is supported")
+            .expect("a Codex upstream is not a passthrough");
+        let upstream: Value = serde_json::from_slice(&translated.body).expect("JSON");
+        assert_eq!(upstream["prompt_cache_key"], json!("client-chose-this"));
+
+        // With neither, the field is absent rather than an empty string, which the upstream would
+        // otherwise key a single shared bucket on.
+        let body = br#"{"model":"gpt-5","prompt_cache_key":"","messages":[{"role":"user","content":"hi"}]}"#;
+        let translated = translate_request(&ctx, body)
+            .expect("the pairing is supported")
+            .expect("a Codex upstream is not a passthrough");
+        let upstream: Value = serde_json::from_slice(&translated.body).expect("JSON");
+        assert!(upstream.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
     fn a_chat_request_becomes_a_responses_request() {
         let ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Codex, "gpt-5-codex");
         let body = br#"{
@@ -1289,10 +1478,13 @@ mod tests {
         // `instructions` slot instead of being smuggled through as a message.
         assert_eq!(upstream["instructions"], json!("Be brief."));
 
-        // The token cap is renamed rather than dropped, but the fields Responses has no
-        // equivalent for are dropped rather than smuggled through — Codex rejects what it does
-        // not understand.
-        assert_eq!(upstream["max_output_tokens"], json!(100));
+        // The client's output cap is dropped rather than forwarded: on this face the cap is shared
+        // with the reasoning budget, so a 100-token answer at a thinking effort of thousands comes
+        // back empty. The official client never sends it.
+        assert!(upstream.get("max_output_tokens").is_none());
+        // The encrypted reasoning is asked for on every request, because nothing is stored
+        // upstream and an unreturned reasoning item cannot be replayed on the next turn.
+        assert_eq!(upstream["include"], json!(["reasoning.encrypted_content"]));
         assert!(upstream.get("max_tokens").is_none());
         assert!(upstream.get("stop").is_none());
         assert!(upstream.get("n").is_none());
@@ -1450,5 +1642,147 @@ mod tests {
         assert_eq!(frames[1].trim(), format!("data: {SSE_DONE}"));
 
         reset_stream_state();
+    }
+
+    /// A system turn said mid-conversation must not be moved to the front.
+    ///
+    /// Hoisting it into `instructions` reorders the conversation: a correction the operator gave
+    /// after the model went wrong then sits ahead of the turns it corrects, which is a different
+    /// prompt and a different answer.
+    #[test]
+    fn a_system_turn_after_the_conversation_began_keeps_its_place() {
+        let ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Codex, "gpt-5-codex");
+        let body = serde_json::json!({
+            "model": "gpt-5-codex",
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "Hello"},
+                {"role": "system", "content": "Never mention prices."},
+                {"role": "user", "content": "What does it cost?"}
+            ]
+        });
+        let translated = translate_request(&ctx, serde_json::to_vec(&body).unwrap().as_slice())
+            .expect("the pairing is supported")
+            .expect("a Codex upstream is not a passthrough");
+        let upstream: Value = serde_json::from_slice(&translated.body).unwrap();
+
+        assert_eq!(
+            upstream["instructions"],
+            json!("Be brief."),
+            "only the leading instruction turn belongs in `instructions`"
+        );
+        let input = upstream["input"].as_array().expect("the transcript");
+        assert_eq!(
+            input.len(),
+            3,
+            "the two user turns and the later system turn: {input:?}"
+        );
+        assert_eq!(input[0]["role"], json!("user"));
+        assert_eq!(input[1]["role"], json!("developer"));
+        assert_eq!(
+            input[1]["content"],
+            json!([{"type": "input_text", "text": "Never mention prices."}])
+        );
+        assert_eq!(input[2]["role"], json!("user"));
+    }
+
+    /// Reasoning the model produced comes back as a reasoning input item.
+    ///
+    /// `store: false` keeps nothing upstream, so the only copy of the model's thinking is what the
+    /// client round-trips. Dropping it makes every turn of a tool loop arrive without the reasoning
+    /// that justified the tool calls, and the model re-plans what it already decided.
+    #[test]
+    fn the_reasoning_a_model_produced_comes_back_as_an_input_item() {
+        let ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Codex, "gpt-5-codex");
+        let body = serde_json::json!({
+            "model": "gpt-5-codex",
+            "messages": [
+                {"role": "user", "content": "List the files."},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "I should call the listing tool.",
+                    "tool_calls": [
+                        {"id": "call_1", "type": "function", "function": {"name": "ls", "arguments": "{}"}}
+                    ]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "a.txt"}
+            ]
+        });
+        let translated = translate_request(&ctx, serde_json::to_vec(&body).unwrap().as_slice())
+            .expect("the pairing is supported")
+            .expect("a Codex upstream is not a passthrough");
+        let upstream: Value = serde_json::from_slice(&translated.body).unwrap();
+        let input = upstream["input"].as_array().expect("the transcript");
+
+        let reasoning = input
+            .iter()
+            .find(|item| item["type"] == json!("reasoning"))
+            .expect("the reasoning is part of the transcript");
+        assert_eq!(
+            reasoning["content"],
+            json!([{"type": "reasoning_text", "text": "I should call the listing tool."}])
+        );
+        // It stands before the call it justified, so the model reads its own plan first.
+        let reasoning_at = input
+            .iter()
+            .position(|i| i["type"] == json!("reasoning"))
+            .unwrap();
+        let call_at = input
+            .iter()
+            .position(|i| i["type"] == json!("function_call"))
+            .unwrap();
+        assert!(
+            reasoning_at < call_at,
+            "the reasoning precedes the call: {input:?}"
+        );
+    }
+
+    /// A stream that stops early is closed with an error, not left open.
+    ///
+    /// Without a closing frame the last chunk simply never carries a `finish_reason`, and a client
+    /// has no way to tell a truncated answer from a complete one. Synthesizing `finish_reason:
+    /// "stop"` would be worse — it claims the answer finished.
+    #[test]
+    fn a_stream_that_stops_early_is_closed_with_an_error() {
+        let ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Codex, "gpt-5-codex");
+        let mut translator = Translator::new();
+        let opened = translator
+            .translate(
+                &ctx,
+                r#"{"type":"response.output_text.delta","delta":"Hel"}"#,
+            )
+            .expect("the delta translates");
+        assert_eq!(opened.len(), 1);
+        assert!(!translator.is_finished(), "the answer is still open");
+
+        let closing = translator.finish(&ctx);
+        assert_eq!(
+            closing.len(),
+            2,
+            "the error frame and the sentinel: {closing:?}"
+        );
+        let error = frame_payload(&closing[0]);
+        assert_eq!(error["error"]["code"], json!("stream_truncated"));
+        assert_eq!(closing[1].trim(), format!("data: {SSE_DONE}"));
+        assert!(
+            translator.is_finished(),
+            "nothing more is owed to the client"
+        );
+    }
+
+    /// A completed stream owes the client nothing more when the body ends.
+    #[test]
+    fn a_completed_stream_needs_no_closing_frame() {
+        let ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Codex, "gpt-5-codex");
+        let mut translator = Translator::new();
+        translator
+            .translate(
+                &ctx,
+                r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-5-codex"}}"#,
+            )
+            .expect("the terminal event translates");
+        assert!(translator.is_finished());
+        assert!(translator.finish(&ctx).is_empty());
     }
 }

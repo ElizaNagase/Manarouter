@@ -314,8 +314,24 @@ The shipped template's base URL is `https://chatgpt.com/backend-api/codex`, so t
 The body is a Responses object: a typed `input` item array rather than free-form `messages`, with
 `instructions` as the top-level system slot (`crates/mr-dialects/src/responses.rs:7-9`). The
 translator writes `instructions`, `input`, `tools`, `tool_choice`, `temperature`, `top_p`,
-`parallel_tool_calls`, `max_output_tokens`, `reasoning`, `text` (from `response_format`) and
-`prompt_cache_key` (`responses.rs:109-160`).
+`parallel_tool_calls`, `reasoning`, `text` (from `response_format`), `include` and
+`prompt_cache_key` (`responses.rs:57-160`).
+
+Two details of that body carry weight beyond their size:
+
+- **`include: ["reasoning.encrypted_content"]`** is asked for on every request. With `store: false`
+  the provider keeps nothing, so an encrypted reasoning item is the only way the client can hand the
+  model's own thinking back on the next turn (`responses.rs:55`, `:88-95`). A transcript whose
+  reasoning was dropped makes a tool loop re-plan what it already decided.
+- **`max_output_tokens` is not forwarded.** On this face the cap is shared with the reasoning budget,
+  so a small client cap plus a thinking effort of thousands returns an empty message — the official
+  client never sends the field (`responses.rs:139-146`).
+- **`prompt_cache_key` is the client's own session marker**, never an invented one. The official CLI
+  sends its conversation id as `session-id`; a generic client uses `x-session-id`. The relay reads
+  either off the request headers (`client_session_hint` in `crates/manarouter-relay/src/server.rs`),
+  trimming it and refusing a blank or over-long value, and the translator reuses a
+  `prompt_cache_key` a Chat Completions client already sent. With none of those the field is absent
+  rather than empty, which would fold every conversation into one cache bucket (`responses.rs:173-184`).
 
 **Who can reach it.** Both client dialects (`lib.rs:217-220`).
 
@@ -335,7 +351,15 @@ streams an answer regardless and rejects `store: true` (`responses.rs:71-76`).
 - The endpoint is SSE-first and the stream is a typed event protocol (`response.created`,
   `output_text.delta`, `response.completed`, …) rather than bare `chat.completion.chunk` payloads,
   so a response translation has to track cross-frame state: one role chunk, stable tool indices, one
-  terminator (`responses.rs:10-14`).
+  terminator (`responses.rs:10-14`). That state belongs to the *answer*, not to the thread: the relay
+  gives every stream its own `mr_dialects::responses::Translator` and drops it with the body, so two
+  answers in flight on one worker cannot splice their ids, text or terminating chunks
+  (`crates/manarouter-relay/src/server.rs:3442-3446`).
+- A stream whose upstream stops before its terminal event is closed by
+  `Translator::finish` with an `error` frame (`code: stream_truncated`) and the `[DONE]` sentinel —
+  never with a synthesized `finish_reason: "stop"`, which would claim the answer finished. The last
+  line in the buffer is flushed first, because a cut body ends without a trailing newline
+  (`responses.rs:852-864`, and `flush_stream_chunk` in `crates/manarouter-relay/src/server.rs`).
 - The terminator is where the two client shapes diverge: a Chat Completions client needs a final
   `finish_reason` chunk and `data: [DONE]`, while a Responses client terminates on
   `response.completed` and treats `[DONE]` as protocol noise — so `[DONE]` is suppressed for
@@ -343,6 +367,11 @@ streams an answer regardless and rejects `store: true` (`responses.rs:71-76`).
 - Fields with no Responses equivalent (`n`, `stop`, `stream_options`) are dropped rather than
   smuggled through, because the upstream rejects what it does not understand
   (`responses.rs:105-108`).
+- No client identity is fabricated: the relay sends no invented `codex_cli_rs` `User-Agent` and no
+  invented `session-id`. Those are facts about the first-party client, and claiming them would both
+  misrepresent this process to the upstream and merge unrelated conversations into one cache bucket.
+  A real identity belongs in a provider entry's editable `headers`, not in the dialect
+  ([Codex](providers/codex.md#fingerprint-headers)).
 - Codex is the one dialect `Dialect::always_reasons` treats as reasoning-only: a model listed
   under Codex with no declared metadata is still seeded with the dialect's level names
   (`crates/mr-core/src/dialect.rs`, and the [API reference](18-api-reference.md#model-addressing)).

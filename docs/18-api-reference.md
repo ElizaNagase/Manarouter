@@ -45,8 +45,15 @@ check is the whole authorisation for them.
 
 | Method | Path | Answers |
 |---|---|---|
-| `POST` | `/control/probe` | Runs one small completion for a model or combo through the ordinary dispatch path — routing table, dialect translation, account selection, cooldowns, fallbacks — and returns the ordinary OpenAI response. This is what "test this model" and the combo health check use, which is why they work for every dialect rather than only the OpenAI shape. |
+| `POST` | `/control/probe` | Runs one small completion for a model or combo through the ordinary dispatch path — routing table, dialect translation, account selection, cooldowns, fallbacks — and returns the ordinary OpenAI response. This is what "test this model" and the combo health check use, which is why they work for every dialect rather than only the OpenAI shape. It sends **no output cap**, so the model answers inside the budget a real client would get; the earlier fixed 32-token cap let a reasoning model spend its whole allowance on thoughts and return an empty answer. |
 | `GET` | `/control/activity` | The combo decisions this process has made, newest first, and the account cooldowns it currently holds. It is answered from memory, by the process that made the decisions, because only that process knows which step a combo committed to. |
+
+The panel's "test" button goes through the conductor (`POST /api/models/test`), which asks this probe
+and then insists on a non-empty answer: a response with no text is reported as a failure naming the
+upstream `finish_reason`, never as a pass. The conductor allows the probe two minutes — a reasoning
+model can legitimately think for over a minute — and a failure to reach the relay is reported as a
+timeout or a transport error, not as "the relay is not running" unless the connection was actually
+refused.
 
 `GET /control/activity` returns at most 24 entries and forgets them on restart, which is the honest
 scope of a fact about in-flight work:

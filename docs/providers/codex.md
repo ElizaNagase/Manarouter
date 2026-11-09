@@ -84,6 +84,18 @@ a real subscription settles which form the endpoint accepts.
 | `User-Agent` | `codex_cli_rs/<version>` | Sent by the first-party client. |
 | `OpenAI-Beta` | `responses=experimental` | **UNCERTAIN.** Needed by older servers; sent for compatibility. A server that rejects an unknown beta header would refuse the request. |
 
+### What the relay does not make up
+
+It sends no `codex_cli_rs` `User-Agent` of its own invention, and no `session-id` it invented. Both
+headers are real facts about the first-party client, and this process is not that client: a fabricated
+`User-Agent` would be an untrue claim to the upstream, and an invented `session-id` would file
+unrelated conversations into one prompt-cache bucket, which is worse than sending none. The relay
+uses a client's own session marker when the client sent one and omits the field otherwise.
+
+If a future upstream ever requires the first-party `User-Agent` to serve subscription traffic, the
+value belongs in that provider entry's `headers` — a seed an operator can see and edit — not baked
+into the dialect, where nobody could inspect or change it.
+
 ## The account model
 
 One OAuth credential per ChatGPT account. Several accounts can be attached to one provider entry, and

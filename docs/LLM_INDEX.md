@@ -117,7 +117,13 @@ Router/
     │       ├── lib.rs              ★ the dispatch + TranslateCtx contract
     │       ├── openai.rs           the Chat Completions pivot + Anthropic→pivot response direction
     │       ├── anthropic.rs        pivot → Anthropic Messages request direction
-    │       ├── responses.rs        OpenAI Responses API (Codex)
+    │       ├── responses.rs        OpenAI Responses API (Codex). Stream state is **owned per
+    │       │                       stream** (`responses::Translator`), for the same reason as
+    │       │                       Command Code; `Translator::finish` closes a truncated answer
+    │       │                       with an error frame rather than a fake `finish_reason`. The
+    │       │                       transcript replays reasoning as an input item and asks for
+    │       │                       `include: ["reasoning.encrypted_content"]`, because `store` is
+    │       │                       false and nothing else survives the turn.
     │       ├── google.rs           Gemini generateContent
     │       ├── commandcode.rs      Command Code alpha/generate. Its stream state is **owned per
     │       │                       stream** (`commandcode::Translator`), not a thread-local: two

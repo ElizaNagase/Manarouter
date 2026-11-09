@@ -23,6 +23,36 @@ use crate::state::AppState;
 /// exhaust conductor memory by answering with an enormous (or endless) body.
 const MAX_TEST_RESPONSE_BYTES: usize = 1 << 20;
 
+/// How long a test may take before the conductor gives up on the relay.
+///
+/// It has to cover a reasoning model, not just a round trip: a thinking model can spend ninety
+/// seconds before its first token, and that is a *correct* answer, not a broken relay. The old
+/// thirty-second budget turned such a model into a red "the relay is not answering" — the route
+/// worked the whole time. Two minutes leaves headroom for one slow think without letting a wedged
+/// socket hang the page forever.
+const MODEL_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The sentence for a test that ran out of time. It must not blame the relay's liveness: time is
+/// what ran out, and a slow model is the likelier reason.
+fn timeout_message(timeout: std::time::Duration) -> String {
+    format!(
+        "the model test got no answer within {} s; a reasoning model can be this slow, so retry, \
+         or check the relay log for the provider's own error",
+        timeout.as_secs()
+    )
+}
+
+/// The sentence for a transport failure. A refusal at connect time is the only failure that
+/// means the relay is not running; anything else (a reset mid-request, a malformed URL) is named
+/// as itself, because the old text blamed the process for every error and hid the cause.
+fn transport_message(url: &str, refused: bool, error: &str) -> String {
+    if refused {
+        format!("the relay is not answering on {url}; start it and try again")
+    } else {
+        format!("the model test could not reach the relay: {error}")
+    }
+}
+
 /// The routes this module contributes, merged into the authenticated API surface.
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -88,21 +118,15 @@ async fn test_model(
         "prompt": request.prompt,
     }))
     .map_err(|e| ApiError::internal(format!("the test request could not be encoded: {e}")))?;
+    // The failure text comes from `send_json`, which knows *why* the call failed. Replacing it
+    // here is what used to turn every timeout into a claim that the relay was down.
     let (status, response_body) = send_json(
         &relay,
         &[("content-type".to_owned(), "application/json".to_owned())],
         &payload,
+        MODEL_TEST_TIMEOUT,
     )
-    .await
-    .map_err(|_| {
-        ApiError::upstream(
-            axum::http::StatusCode::BAD_GATEWAY,
-            format!(
-                "the relay is not answering on 127.0.0.1:{}; start it and try again",
-                config.relay.port
-            ),
-        )
-    })?;
+    .await?;
     let parsed: Value = serde_json::from_slice(&response_body)
         .map_err(|_| ApiError::bad_gateway("the model test returned invalid JSON"))?;
     if !status.is_success() {
@@ -113,9 +137,59 @@ async fn test_model(
             .unwrap_or("the relay refused the test");
         return Err(probe_failure(status, message));
     }
+    let answer = tested_answer(&parsed)?;
     Ok(Json(
-        json!({"provider": request.provider, "model": request.model, "ok": true, "response": parsed.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message")).and_then(|m| m.get("content")).cloned().unwrap_or(Value::Null)}),
+        json!({"provider": request.provider, "model": request.model, "ok": true, "response": answer}),
     ))
+}
+
+/// The answer a successful probe actually delivered, or a failure that says why there is none.
+///
+/// A `200` from the relay only means the route was reached: a model can finish with an empty
+/// answer, and reporting `ok: true` with a blank string is the worst of both worlds — the operator
+/// sees a green result and no text, and nothing says whether the route is broken or the model simply
+/// had nothing to say. The finish reason is carried into the message because it is the diagnosis:
+/// `length` means the allowance ran out (a reasoning model can spend all of it thinking), `stop`
+/// means the model genuinely answered with nothing.
+fn tested_answer(parsed: &Value) -> ApiResult<Value> {
+    let choice = parsed.get("choices").and_then(|c| c.get(0));
+    let message = choice.and_then(|c| c.get("message"));
+    // A tool call is a real answer that carries no prose, so an empty `content` next to one is not
+    // a failure.
+    let called_a_tool = message
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty());
+    let content = message
+        .map(|m| &m["content"])
+        .cloned()
+        .unwrap_or(Value::Null);
+    if !called_a_tool && !has_text(&content) {
+        let reason = choice
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        return Err(ApiError::bad_gateway(format!(
+            "the model answered with no text (finish reason: {reason})"
+        )));
+    }
+    Ok(content)
+}
+
+/// Whether a Chat Completions `content` carries any text.
+///
+/// The field is a plain string in the ordinary case and a list of typed parts when an image or a
+/// refusal rides along, so both shapes are read; anything else counts as no text.
+fn has_text(content: &Value) -> bool {
+    match content {
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(parts) => parts.iter().any(|part| {
+            part.get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty())
+        }),
+        _ => false,
+    }
 }
 
 /// The failure to hand back when the probe's route refused.
@@ -142,6 +216,7 @@ async fn send_json(
     url: &str,
     headers: &[(String, String)],
     body: &[u8],
+    timeout: std::time::Duration,
 ) -> ApiResult<(StatusCode, Bytes)> {
     let client = sync_client().map_err(ApiError::internal)?;
     let mut builder = Request::builder()
@@ -157,20 +232,19 @@ async fn send_json(
     let request = builder
         .body(Full::new(Bytes::copy_from_slice(body)))
         .map_err(|e| ApiError::internal(format!("could not build model request: {e}")))?;
-    let response =
-        tokio::time::timeout(std::time::Duration::from_secs(30), client.request(request))
-            .await
-            .map_err(|_| ApiError::bad_gateway("model-test upstream timed out"))?
-            .map_err(|e| {
-                ApiError::bad_gateway(format!("model test could not reach upstream: {e}"))
-            })?;
+    let response = tokio::time::timeout(timeout, client.request(request))
+        .await
+        .map_err(|_| ApiError::bad_gateway(timeout_message(timeout)))?
+        .map_err(|e| {
+            ApiError::bad_gateway(transport_message(url, e.is_connect(), &e.to_string()))
+        })?;
     let status = response.status();
     let body = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        timeout,
         Limited::new(response.into_body(), MAX_TEST_RESPONSE_BYTES).collect(),
     )
     .await
-    .map_err(|_| ApiError::bad_gateway("model-test response timed out"))?
+    .map_err(|_| ApiError::bad_gateway(timeout_message(timeout)))?
     .map_err(|e| ApiError::bad_gateway(format!("could not read model-test response: {e}")))?
     .to_bytes();
     Ok((status, body))
@@ -269,5 +343,74 @@ mod tests {
             let response = probe_failure(upstream, "x").into_response();
             assert_eq!(response.status(), expected, "{upstream}");
         }
+    }
+
+    /// A green test with no text is worse than a red one: it says "the route works" and shows nothing.
+    ///
+    /// Antigravity's `gemini-3.8-flash-tiered` thinks by default, and the probe used to cap the answer
+    /// at 32 tokens, so the thoughts consumed the allowance and the route finished `length` with an
+    /// empty `content`. The panel showed a successful test with a blank answer, which reads as a broken
+    /// model rather than a starved one. The empty answer is now a failure whose message carries the
+    /// finish reason — `length` for that case — while a tool call, which is a real answer with no prose,
+    /// still counts as an answer.
+    #[tokio::test]
+    async fn an_empty_answer_is_a_failed_test_that_names_the_finish_reason() {
+        let starved = json!({"choices": [{"message": {"content": ""}, "finish_reason": "length"}]});
+        let refusal = tested_answer(&starved)
+            .expect_err("an empty answer is refused")
+            .into_response();
+        assert_eq!(refusal.status(), StatusCode::BAD_GATEWAY);
+        let body = refusal.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("finish reason: length"), "{body}");
+
+        // A null content is the same failure under another spelling.
+        let absent =
+            json!({"choices": [{"message": {"content": Value::Null}, "finish_reason": "stop"}]});
+        assert!(tested_answer(&absent).is_err());
+
+        // Whitespace is not text, in either shape the field takes.
+        assert!(tested_answer(&json!({"choices": [{"message": {"content": "  "}}]})).is_err());
+        assert!(tested_answer(
+            &json!({"choices": [{"message": {"content": [{"type": "text", "text": ""}]}}]})
+        )
+        .is_err());
+
+        // A real answer passes through untouched, as does a tool call with no prose.
+        let answered =
+            json!({"choices": [{"message": {"content": "yes"}, "finish_reason": "stop"}]});
+        assert_eq!(
+            tested_answer(&answered).ok().expect("an answer passes"),
+            json!("yes")
+        );
+        let parts =
+            json!({"choices": [{"message": {"content": [{"type": "text", "text": "yes"}]}}]});
+        assert!(tested_answer(&parts).is_ok());
+        let tool = json!({"choices": [{"message": {"content": "", "tool_calls": [{"id": "call_0"}]}, "finish_reason": "tool_calls"}]});
+        assert!(tested_answer(&tool).is_ok());
+    }
+
+    #[test]
+    fn a_timeout_names_time_running_out_not_a_dead_relay() {
+        // The old text claimed the relay was down after thirty seconds, which sent an operator
+        // to restart a process that was working fine. A timeout must say what actually expired.
+        let message = timeout_message(std::time::Duration::from_secs(120));
+        assert!(message.contains("120 s"), "{message}");
+        assert!(message.contains("reasoning model"), "{message}");
+        assert!(!message.contains("not answering"), "{message}");
+    }
+
+    #[test]
+    fn only_a_refused_connection_claims_the_relay_is_down() {
+        let url = "http://127.0.0.1:20900/control/probe";
+        let refused = transport_message(url, true, "connect error: Connection refused");
+        assert!(refused.contains("is not answering"), "{refused}");
+        assert!(refused.contains(url), "{refused}");
+
+        // Anything else is reported as itself: a reset mid-request means the relay accepted the
+        // connection and then failed, which is a different problem with a different fix.
+        let reset = transport_message(url, false, "connection reset by peer");
+        assert!(reset.contains("connection reset by peer"), "{reset}");
+        assert!(!reset.contains("not answering"), "{reset}");
     }
 }

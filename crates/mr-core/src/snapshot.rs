@@ -1833,6 +1833,8 @@ fn reasoning_fragments(dialect: Dialect, model: &ModelEntry, levels: u32) -> [Op
         if let Some(value) = fragment.as_mut() {
             if !fit_thinking_budget(value, model.max_output_tokens) {
                 fragment = None;
+            } else {
+                state_thinking_output_cap(dialect, value, model);
             }
         }
         out[level.rank() as usize] = fragment.and_then(|value| serde_json::to_string(&value).ok());
@@ -1840,6 +1842,49 @@ fn reasoning_fragments(dialect: Dialect, model: &ModelEntry, levels: u32) -> [Op
     out
 }
 
+/// State the output allowance a thinking budget has to fit inside.
+///
+/// A budget is not a free-standing number: it is carved out of the same allowance the answer comes
+/// from, and an upstream that reads both from one body compares them before it does any work.
+/// Cloud Code answers Anthropic's `max_tokens` must be greater than `thinking.budget_tokens` when a
+/// budget arrives, as antigravity bodies do, without the `maxOutputTokens` it is measured against —
+/// the model then reasons under a ceiling it was never told about.
+///
+/// So the ceiling travels with the budget, and only for the two dialects that carry thinking inside
+/// `generationConfig`: Anthropic is handed `max_tokens` by its own translator, and the
+/// `reasoning_effort` dialects have no budget to pair. The relay still lets a client's stated cap
+/// win, because it refits the budget to that cap before merging and never overwrites a field the
+/// request already set.
+fn state_thinking_output_cap(
+    dialect: Dialect,
+    fragment: &mut serde_json::Value,
+    model: &ModelEntry,
+) {
+    if !matches!(dialect, Dialect::Google | Dialect::Antigravity) {
+        return;
+    }
+    let Some(ceiling) = model.max_output_tokens else {
+        // Nothing declared is nothing to state: inventing a ceiling would be inventing a limit
+        // the model may not have.
+        return;
+    };
+    if !mentions_thinking_budget(fragment) {
+        return;
+    }
+    // The fragment is shaped exactly as deep as the field it has to reach: `generationConfig` is
+    // at the top level for Gemini, and under the envelope's `request` for Antigravity.
+    let generation = match fragment.get_mut("generationConfig") {
+        Some(generation) => Some(generation),
+        None => fragment
+            .get_mut("request")
+            .and_then(|envelope| envelope.get_mut("generationConfig")),
+    };
+    if let Some(serde_json::Value::Object(generation)) = generation {
+        if !generation.contains_key("maxOutputTokens") {
+            generation.insert("maxOutputTokens".into(), serde_json::Value::from(ceiling));
+        }
+    }
+}
 /// The level→fragment table for one dialect.
 ///
 /// These are the documented defaults from `plan.md` §4.5. The relay merges the selected fragment
@@ -4752,6 +4797,9 @@ mod tests {
 
         // Anthropic refuses `budget_tokens` at or above `max_tokens`, so a budget at the model's
         // own ceiling makes every request a 400. The answer needs room too, hence the headroom.
+        // Unlike the two Gemini-shaped dialects below, the fragment states no ceiling of its own:
+        // the Anthropic translator always writes `max_tokens`, so a second opinion here would be a
+        // number with nothing to override.
         assert_eq!(
             fragment_for(Dialect::Anthropic, Some(64_000)),
             Some(serde_json::json!({
@@ -4765,6 +4813,7 @@ mod tests {
             fragment_for(Dialect::Google, Some(65_536)),
             Some(serde_json::json!({
                 "generationConfig": {
+                    "maxOutputTokens": 65_536,
                     "thinkingConfig": { "thinkingLevel": "high", "thinkingBudget": 61_440 }
                 }
             }))
@@ -4774,6 +4823,7 @@ mod tests {
             Some(serde_json::json!({
                 "request": {
                     "generationConfig": {
+                        "maxOutputTokens": 64_000,
                         "thinkingConfig": { "thinkingLevel": "high", "thinkingBudget": 59_904 }
                     }
                 }
