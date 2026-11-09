@@ -77,8 +77,8 @@ use crate::dialect::{
 use crate::error::{Error, Result};
 use crate::ids::{fnv1a64, AccountId, ClientKeyId, ComboId, Millis, ProviderId};
 use crate::model::{
-    Account, ClientKey, CompressionMode, CompressionSpec, CooldownScope, Http2Preference, KeyLimit,
-    KeyLimits, ModelEntry, PricingPlan, PricingSource,
+    Account, ClientKey, ComboStep, CompressionMode, CompressionSpec, CooldownScope,
+    Http2Preference, KeyLimit, KeyLimits, ModelEntry, PricingPlan, PricingSource, Provider,
 };
 use crate::secret::account_secret_id;
 use crate::{SNAPSHOT_MAGIC, SNAPSHOT_VERSION};
@@ -789,44 +789,33 @@ impl RoutingSnapshot {
             // stable-fallback references can be rewritten onto the surviving steps.
             let mut remap: Vec<Option<u16>> = vec![None; combo.steps.len()];
             let mut steps: Vec<StepPlan> = Vec::with_capacity(combo.steps.len());
-            let mut unknown: Vec<&str> = Vec::new();
+            let mut unknown: Vec<String> = Vec::new();
+            let mut expander = ComboExpander {
+                config,
+                entries: &entries,
+                providers: &providers,
+                provider_index: &provider_index,
+                disabled_providers: &disabled_providers,
+                default_level: config.routing.default_reasoning_level,
+                chain: vec![combo.name.clone()],
+            };
 
             for (authored_index, step) in combo.steps.iter().enumerate() {
-                if !step.enabled {
-                    continue;
+                let before = steps.len();
+                expander.add_authored(step, &mut steps, &mut unknown)?;
+                if steps.len() > before {
+                    // A nested combo can expand to several steps; a hedge participant or stable
+                    // fallback that named this authored step follows its first expanded step.
+                    remap[authored_index] = Some(before as u16);
                 }
-                match provider_index.get(step.provider.as_str()) {
-                    Some(&provider) => {
-                        let plan = &providers[provider as usize];
-                        // The entry comes from the authored configuration rather than from the
-                        // compiled plan, so a combo step is built from exactly the same metadata a
-                        // direct `provider/model` request is, with no second derivation to drift.
-                        let entry = entries
-                            .get(step.provider.as_str())
-                            .and_then(|source| {
-                                source
-                                    .models
-                                    .iter()
-                                    .find(|m| m.id.eq_ignore_ascii_case(&step.model))
-                            })
-                            .unwrap_or(&UNKNOWN_MODEL);
-                        // A step may pin its own tier; otherwise the routing default applies.
-                        // `plan_step` clamps a level the model does not offer to the model's
-                        // highest one, so an over-asked level degrades instead of failing.
-                        steps.push(plan_step(
-                            provider,
-                            plan,
-                            entry,
-                            step.level.unwrap_or(config.routing.default_reasoning_level),
-                        ));
-                        remap[authored_index] = Some((steps.len() - 1) as u16);
-                    }
-                    None => {
-                        if !disabled_providers.contains(step.provider.as_str()) {
-                            unknown.push(step.provider.as_str());
-                        }
-                    }
-                }
+            }
+            if steps.len() > u16::MAX as usize {
+                return Err(Error::Snapshot(format!(
+                    "combo {:?} expands to {} steps, more than the {} a compiled plan can index",
+                    combo.name,
+                    steps.len(),
+                    u16::MAX
+                )));
             }
 
             if steps.is_empty() {
@@ -1700,6 +1689,108 @@ fn key_plan(key: &ClientKey) -> KeyPlan {
         allow_routes: key.allow_routes.clone(),
         limit_requests: key.limit_requests,
         limits: key.limits,
+    }
+}
+
+/// Expands one combo's authored steps into the flat step list the relay executes.
+///
+/// A step may name a provider/model pair or another combo. A combo target is spliced in place: the
+/// nested combo contributes its enabled steps, in its own order, and the outer combo keeps its
+/// strategy, hedge, retries and compression. Expansion is recursive, so a combo can be assembled
+/// from smaller routes; [`Self::chain`] makes a loop an error naming the chain instead of a
+/// request that never terminates.
+struct ComboExpander<'a> {
+    config: &'a Config,
+    entries: &'a HashMap<&'a str, &'a Provider>,
+    providers: &'a [ProviderPlan],
+    provider_index: &'a HashMap<&'a str, u32>,
+    disabled_providers: &'a HashSet<&'a str>,
+    default_level: ReasoningLevel,
+    /// Names of the combos currently being expanded, outermost first.
+    chain: Vec<String>,
+}
+
+impl ComboExpander<'_> {
+    /// Append the steps `step` contributes, returning whether it contributed any.
+    fn add_authored(
+        &mut self,
+        step: &ComboStep,
+        out: &mut Vec<StepPlan>,
+        unknown: &mut Vec<String>,
+    ) -> Result<bool> {
+        if !step.enabled {
+            return Ok(false);
+        }
+        if let Some(target) = &step.combo {
+            return self.add_combo_target(target, out, unknown);
+        }
+        match self.provider_index.get(step.provider.as_str()) {
+            Some(&provider) => {
+                let plan = &self.providers[provider as usize];
+                // The entry comes from the authored configuration rather than from the compiled
+                // plan, so a combo step is built from exactly the same metadata a direct
+                // `provider/model` request is, with no second derivation to drift.
+                let entry = self
+                    .entries
+                    .get(step.provider.as_str())
+                    .and_then(|source| {
+                        source
+                            .models
+                            .iter()
+                            .find(|m| m.id.eq_ignore_ascii_case(&step.model))
+                    })
+                    .unwrap_or(&UNKNOWN_MODEL);
+                // A step may pin its own tier; otherwise the routing default applies.
+                // `plan_step` clamps a level the model does not offer to the model's highest one,
+                // so an over-asked level degrades instead of failing.
+                out.push(plan_step(
+                    provider,
+                    plan,
+                    entry,
+                    step.level.unwrap_or(self.default_level),
+                ));
+                Ok(true)
+            }
+            None => {
+                if !self.disabled_providers.contains(step.provider.as_str()) {
+                    unknown.push(step.provider.as_str().to_string());
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    fn add_combo_target(
+        &mut self,
+        target: &str,
+        out: &mut Vec<StepPlan>,
+        unknown: &mut Vec<String>,
+    ) -> Result<bool> {
+        let Some(nested) = self.config.combo(target) else {
+            return Err(Error::Snapshot(format!(
+                "combo step routes to unknown combo {target:?}"
+            )));
+        };
+        // A disabled combo is not routable at all, so it contributes nothing; the outer combo
+        // either keeps its other steps or is omitted by the caller as unroutable.
+        if !nested.enabled {
+            return Ok(false);
+        }
+        if self.chain.iter().any(|name| name == &nested.name) {
+            let mut chain = self.chain.clone();
+            chain.push(nested.name.clone());
+            return Err(Error::Snapshot(format!(
+                "combo routing loop: {}",
+                chain.join(" -> ")
+            )));
+        }
+        self.chain.push(nested.name.clone());
+        let before = out.len();
+        for step in &nested.steps {
+            self.add_authored(step, out, unknown)?;
+        }
+        self.chain.pop();
+        Ok(out.len() > before)
     }
 }
 
@@ -4460,6 +4551,100 @@ mod tests {
         assert_eq!(
             plan.steps[1].reasoning_fragment(),
             Some(r#"{"reasoning_effort":"high"}"#)
+        );
+    }
+
+    #[test]
+    fn a_combo_step_routing_to_another_combo_is_spliced_in_place() {
+        let mut inner = combo("c-inner", "inner", &[("p1", "m1"), ("p1", "m2")]);
+        // A disabled nested step is not routable, so it contributes nothing.
+        inner.steps[1].enabled = false;
+        inner.strategy = ComboStrategy::RoundRobin;
+
+        let mut outer = combo("c-outer", "outer", &[("p1", "m0")]);
+        outer.strategy = ComboStrategy::Priority;
+        outer.steps = vec![ComboStep::new("p1", "m0"), ComboStep::from_combo("inner")];
+
+        let snapshot = compile_one(
+            vec![model("m0"), model("m1"), model("m2")],
+            vec![inner, outer],
+        );
+        let plan = snapshot
+            .combos()
+            .iter()
+            .find(|c| c.id.as_str() == "c-outer")
+            .expect("the outer combo compiles");
+        let models: Vec<&str> = plan.steps.iter().map(|s| s.model.as_str()).collect();
+        assert_eq!(models, ["m0", "m1"]);
+        assert_eq!(
+            plan.strategy,
+            ComboStrategy::Priority,
+            "the caller keeps its own strategy; only the target's steps are spliced in"
+        );
+    }
+
+    #[test]
+    fn a_hedge_participant_that_names_a_combo_step_follows_its_first_expanded_step() {
+        // Authored step 0 expands to two steps, so the direct step authored at index 1 lands at
+        // compiled index 2 and the participant list has to say so.
+        let inner = combo("c-inner", "inner", &[("p1", "m1"), ("p1", "m2")]);
+        let mut outer = combo("c-outer", "outer", &[("p1", "m0")]);
+        outer.steps = vec![ComboStep::from_combo("inner"), ComboStep::new("p1", "m0")];
+        outer.hedge.enabled = true;
+        outer.hedge.participants = vec![1];
+
+        let snapshot = compile_one(
+            vec![model("m0"), model("m1"), model("m2")],
+            vec![inner, outer],
+        );
+        let plan = snapshot
+            .combos()
+            .iter()
+            .find(|c| c.id.as_str() == "c-outer")
+            .expect("the outer combo compiles");
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.hedge.participants, vec![2]);
+    }
+
+    #[test]
+    fn a_routing_loop_is_refused_at_compile_time_with_the_chain() {
+        // `Config::validate` reports this too, but the compiler must fail closed on its own: it is
+        // reachable with a config that was never validated.
+        let mut a = combo("c-a", "a", &[("p1", "m1")]);
+        a.steps = vec![ComboStep::from_combo("b")];
+        let mut b = combo("c-b", "b", &[("p1", "m1")]);
+        b.steps = vec![ComboStep::from_combo("a")];
+
+        let mut config = Config {
+            providers: vec![level_provider("p1", vec![model("m1")])],
+            ..Config::default()
+        };
+        config.combos = vec![a, b];
+
+        let err = RoutingSnapshot::compile(&config).expect_err("a loop must not compile");
+        let message = err.to_string();
+        assert!(
+            message.contains("combo routing loop: a -> b -> a"),
+            "got {message}"
+        );
+    }
+
+    #[test]
+    fn a_combo_routing_to_an_unknown_combo_fails_to_compile() {
+        let mut outer = combo("c-outer", "outer", &[("p1", "m1")]);
+        outer.steps = vec![ComboStep::from_combo("missing")];
+
+        let mut config = Config {
+            providers: vec![level_provider("p1", vec![model("m1")])],
+            ..Config::default()
+        };
+        config.combos = vec![outer];
+
+        let err =
+            RoutingSnapshot::compile(&config).expect_err("a dangling target must not compile");
+        assert!(
+            err.to_string().contains("unknown combo \"missing\""),
+            "got {err}"
         );
     }
 

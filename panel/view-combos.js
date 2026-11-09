@@ -19,8 +19,9 @@ import {
 import {
   extractList, stepLabel, moveStep, remapParticipants, remapIndex,
   parseWinnerFail, buildWinnerFail, toggleParticipant,
-  comboLevels, stepModel, stepProvider, modelLevels, providerLevels, endsInLevelName,
+  stepModel, stepProvider, modelLevels, providerLevels, probeTarget,
 } from './format.js';
+import { createSearchSelect } from './search-select.js';
 
 // A check's result outlives the selection that produced it: an operator who checks three combos and
 // then scrolls back should still see what came back. Keyed by combo id, then step index. Module
@@ -96,13 +97,11 @@ export async function renderCombos(mount, ctx, selectedId) {
   function renderList() {
     listEl.replaceChildren();
     for (const c of combos) {
-      const offeredNames = comboLevels(c.steps ?? [], providers).map((level) => `${c.name || c.id}-${level}`);
       const btn = h('button', { type: 'button', 'aria-current': c.id === selectedId ? 'true' : null },
         h('div', { class: 'cname' }, c.name || c.id),
         h('div', { class: 'cmeta' },
           `${(c.steps ?? []).length} step${(c.steps ?? []).length === 1 ? '' : 's'}`,
           chip(c.strategy ?? 'priority'),
-          ...offeredNames.map((name) => chip(name, 'chip-neutral', 'Level-qualified combo name')),
           c.hedge?.enabled ? chip('hedged', 'chip-pink', 'hedged race enabled') : null,
           c.enabled === false ? chip('off') : null));
       btn.addEventListener('click', () => ctx.navigate(`#/combos/${encodeURIComponent(c.id)}`));
@@ -138,7 +137,6 @@ export async function renderCombos(mount, ctx, selectedId) {
   }
 
   function renderSummary(target, combo) {
-    const levels = comboLevels(combo.steps ?? [], providers);
     const healthSection = h('section', {});
     const editBtn = h('button', { class: 'btn btn-primary', type: 'button' }, 'Edit combo');
     editBtn.addEventListener('click', () => openEditorDrawer(combo));
@@ -151,22 +149,19 @@ export async function renderCombos(mount, ctx, selectedId) {
         combo.hedge?.enabled ? chip('hedged', 'chip-pink', 'hedged race enabled') : null,
         combo.enabled === false ? chip('off') : chip('enabled', 'chip-green')),
       h('section', {},
-        h('h3', {}, 'Level-qualified names'),
-        levels.length
-          ? h('div', { class: 'cmeta' }, ...levels.map((level) => chip(`${combo.name || combo.id}-${level}`, 'chip-neutral', `Available level suffix: ${level}`)))
-          : h('p', { class: 'hint' }, 'These models expose no reasoning levels: nothing is declared on their entries and their provider dialects contribute none.')),
-      h('section', {},
         h('h3', {}, 'Steps — priority order'),
         h('ol', { class: 'steps' }, ...(combo.steps ?? []).map((step, i) => {
-          const model = stepModel(step, providers);
-          const levelsForStep = modelLevels(model, stepProvider(step, providers));
+          // A combo target has no model of its own to pin a level on: the nested combo supplies
+          // its steps' levels. Showing a ladder here would offer a control with no routing effect.
+          const comboStep = Boolean(step.combo);
+          const model = comboStep ? null : stepModel(step, providers);
+          const levelsForStep = comboStep ? [] : modelLevels(model, stepProvider(step, providers));
           const defaultLevel = model?.default_reasoning_level;
           const offersLevel = defaultLevel && levelsForStep.includes(defaultLevel);
-          const canNameComboTier = !endsInLevelName(combo.name || combo.id);
           return h('li', { class: 'step-row' },
             h('span', { class: 'step-pos' }, String(i + 1)),
             h('span', { class: 'step-ref mono' }, stepLabel(step)),
-            step.level ? chip(`at ${step.level}`, 'chip-neutral', 'reasoning level this step runs at') : null,
+            !comboStep && step.level ? chip(`at ${step.level}`, 'chip-neutral', 'reasoning level this step runs at') : null,
             ...levelsForStep.map((level) => chip(String(level), 'chip-neutral', 'Reasoning level offered by this model')),
             defaultLevel && !offersLevel ? chip(`default ${defaultLevel}`, 'chip-pink', 'Model-specific default reasoning level') : null,
             step.enabled === false ? chip('off') : null);
@@ -189,36 +184,46 @@ export async function renderCombos(mount, ctx, selectedId) {
     return chip(`failed · ${status.code ?? status.status}`, 'chip-pink', status.message ?? 'the model did not answer');
   }
 
-  // A check is one tiny completion per step, in priority order, and it is always the operator's
-  // click: nothing here runs on page load or on a timer.
+  // A check is one tiny completion per model step, in priority order, and it is always the
+  // operator's click: nothing here runs on page load or on a timer. A step that routes to another
+  // combo has no provider/model pair of its own, so it is listed but not probed; the nested combo
+  // carries the model steps that can answer.
   function renderHealth(section, combo) {
     const steps = (combo.steps ?? []).map((step, index) => ({ step, index }));
+    const checkable = steps.flatMap(({ step, index }) => {
+      const target = step.enabled === false ? null : probeTarget(step);
+      return target ? [{ step, index, target }] : [];
+    });
     const run = h('button', { class: 'btn btn-small', type: 'button' }, 'Check steps');
     const out = h('div', {});
 
     const paint = () => {
       const results = checked.get(combo.id) ?? new Map();
-      const answered = steps.filter(({ index }) => results.get(index)?.state === 'ok');
-      const failed = steps.filter(({ index }) => results.get(index)?.state === 'failed');
+      const answered = checkable.filter(({ index }) => results.get(index)?.state === 'ok');
+      const failed = checkable.filter(({ index }) => results.get(index)?.state === 'failed');
       out.replaceChildren(
         h('ol', { class: 'steps' }, ...steps.map(({ step, index }) => {
           const status = results.get(index);
           return h('li', { class: 'step-row' },
             h('span', { class: 'step-pos' }, String(index + 1)),
             h('span', { class: 'step-ref mono' }, stepLabel(step)),
-            step.level ? chip(`at ${step.level}`, 'chip-neutral', 'pinned reasoning level') : null,
-            statusChip(status),
+            !step.combo && step.level ? chip(`at ${step.level}`, 'chip-neutral', 'pinned reasoning level') : null,
+            step.combo
+              ? chip('nested combo', 'chip-neutral', 'this step runs another combo\u2019s steps; open that combo to check them')
+              : statusChip(status),
             status?.message && status.state === 'failed'
               ? h('span', { class: 'hint' }, status.message)
               : null);
         })),
-        steps.length && results.size
+        checkable.length && results.size
           ? h('p', { class: 'hint' },
             answered.length
-              ? `${answered.length} of ${steps.length} answering${failed.length ? `, ${failed.length} failing` : ''}.`
+              ? `${answered.length} of ${checkable.length} answering${failed.length ? `, ${failed.length} failing` : ''}.`
               : `Nothing answered${failed.length ? `: ${failed.map(({ index }) => `step ${index + 1}`).join(', ')}` : ''}.`)
           : h('p', { class: 'hint' },
-            'Each check sends one trivial completion per enabled step, in priority order.'));
+            checkable.length
+              ? 'Each check sends one trivial completion per enabled model step, in priority order; a step that routes to another combo is not probed here.'
+              : 'No enabled model steps to check; a step that routes to another combo is checked in that combo.'));
     };
 
     run.addEventListener('click', async () => {
@@ -227,8 +232,7 @@ export async function renderCombos(mount, ctx, selectedId) {
       const results = new Map();
       checked.set(combo.id, results);
       try {
-        for (const { step, index } of steps) {
-          if (step.enabled === false) continue;
+        for (const { index, target } of checkable) {
           results.set(index, { state: 'checking' });
           paint();
           const started = performance.now();
@@ -236,8 +240,8 @@ export async function renderCombos(mount, ctx, selectedId) {
             // A step's own 401 is a provider refusal, not a dead panel session: report it in this
             // row instead of signing the operator out mid-check.
             const answer = await api.post('/api/models/test', {
-              provider: step.provider,
-              model: step.model,
+              provider: target.provider,
+              model: target.model,
               prompt: 'Reply with the single word OK.',
             }, { skipAuthRedirect: true });
             results.set(index, {
@@ -331,38 +335,102 @@ export async function renderCombos(mount, ctx, selectedId) {
       'and in a hedged race the winner is the highest-priority participant that replied within the window. ',
       'Reorder by dragging a row (or the arrow buttons) — the number on the left is the rank.');
 
-    const addProv = h('select', { class: 'input', 'aria-label': 'Provider for new step' });
-    const addModel = h('input', { class: 'input mono', type: 'text', 'aria-label': 'Model for new step', placeholder: 'model id' });
-    const addDatalist = h('datalist', { id: 'combo-model-datalist' });
-    addModel.setAttribute('list', 'combo-model-datalist');
+    // Three pickers, one row. A step is either provider/model or a route to another combo; the
+    // small selector swaps which ones are visible so the common case keeps two fields.
+    const addKind = h('select', { class: 'input add-kind', 'aria-label': 'What this step routes to' },
+      h('option', { value: 'model' }, 'model'),
+      h('option', { value: 'combo' }, 'combo'));
+    const addProv = createSearchSelect({
+      ariaLabel: 'Provider for new step',
+      placeholder: 'provider…',
+      emptyText: 'no provider matches',
+      onChoose: () => syncAddModels(),
+    });
+    const addModel = createSearchSelect({
+      ariaLabel: 'Model for new step',
+      placeholder: 'model id',
+      emptyText: 'no model matches',
+    });
+    const addCombo = createSearchSelect({
+      ariaLabel: 'Combo this step routes to',
+      placeholder: 'combo name…',
+      emptyText: 'no combo matches',
+    });
+    addCombo.el.hidden = true;
     const addNote = h('input', { class: 'input', type: 'text', 'aria-label': 'Note for new step (optional)', placeholder: 'note (optional)' });
     const addBtn = h('button', { class: 'btn', type: 'button' }, 'Add step');
-    const addRow = h('div', { style: 'display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:8px;' },
-      addProv, addModel, addNote, addBtn, addDatalist);
+    const addRow = h('div', { class: 'add-step-row' },
+      addKind, addProv.el, addModel.el, addCombo.el, addNote, addBtn);
 
-    ctx.loadProviders().then((providers) => {
-      addProv.replaceChildren(...(providers ?? []).map((p) => h('option', { value: p.id }, p.id)));
-      addProv.prepend(h('option', { value: '', selected: true }, 'provider…'));
-    }).catch(() => {
-      addProv.replaceChildren(h('option', { value: '' }, 'providers unavailable'));
-    });
-    addProv.addEventListener('change', () => fillDatalist());
-    function fillDatalist() {
-      const p = (ctx.state.providers ?? []).find((x) => x.id === addProv.value);
-      addDatalist.replaceChildren(...(p?.models ?? []).map((m) => h('option', { value: m.id })));
+    function providerChoices() {
+      return (providers ?? []).map((p) => ({
+        value: p.id,
+        label: p.id,
+        hint: p.label && p.label !== p.id ? p.label : undefined,
+      }));
     }
+    function modelChoices(providerId) {
+      const provider = (providers ?? []).find((p) => p.id === providerId);
+      return (provider?.models ?? []).map((m) => ({
+        value: m.id,
+        label: m.id,
+        hint: m.label && m.label !== m.id ? m.label : undefined,
+      }));
+    }
+    function comboChoices() {
+      return combos
+        .filter((c) => c.id !== draft.id && c.name !== draft.name)
+        .map((c) => ({
+          value: c.name || c.id,
+          label: c.name || c.id,
+          hint: c.name && c.name !== c.id ? c.id : undefined,
+        }));
+    }
+    function syncAddModels() {
+      addModel.setOptions(modelChoices(addProv.value()));
+    }
+    function syncAddKind() {
+      const toCombo = addKind.value === 'combo';
+      addProv.el.hidden = toCombo;
+      addModel.el.hidden = toCombo;
+      addCombo.el.hidden = !toCombo;
+    }
+    addKind.addEventListener('change', syncAddKind);
+
+    addProv.setOptions(providerChoices());
+    addCombo.setOptions(comboChoices());
+    ctx.loadProviders().then((next) => {
+      providers = next ?? providers;
+      addProv.setOptions(providerChoices());
+      addCombo.setOptions(comboChoices());
+      syncAddModels();
+    }).catch(() => { /* the editor still works with what was loaded */ });
+    syncAddModels();
 
     addBtn.addEventListener('click', () => {
-      const provider = addProv.value;
-      const model = addModel.value.trim();
-      const problems = [];
-      if (!provider) problems.push('pick a provider for the step');
-      if (!model) problems.push('enter a model id for the step');
-      if (problems.length) { ctx.toast.warning(problems.join(' — ')); return; }
-      // Appends at the END: a new step starts at the lowest priority. It is never inserted
-      // "where it fits" — only the operator decides placement.
-      draft.steps.push({ provider, model, enabled: true, note: addNote.value.trim() || undefined });
-      addModel.value = ''; addNote.value = '';
+      const note = addNote.value.trim() || undefined;
+      if (addKind.value === 'combo') {
+        const combo = addCombo.value();
+        if (!combo) { ctx.toast.warning('pick a combo for the step'); return; }
+        if (combo === draft.name || combo === draft.id) {
+          ctx.toast.warning('a combo cannot route to itself');
+          return;
+        }
+        // Appends at the END: a new step starts at the lowest priority. It is never inserted
+        // "where it fits" — only the operator decides placement.
+        draft.steps.push({ combo, enabled: true, note });
+        addCombo.setValue(''); addNote.value = '';
+      } else {
+        const provider = addProv.value();
+        const model = addModel.value();
+        const problems = [];
+        if (!provider) problems.push('pick a provider for the step');
+        else if (!(providers ?? []).some((p) => p.id === provider)) problems.push('pick a provider from the list');
+        if (!model) problems.push('enter a model id for the step');
+        if (problems.length) { ctx.toast.warning(problems.join(' — ')); return; }
+        draft.steps.push({ provider, model, enabled: true, note });
+        addModel.setValue(''); addNote.value = '';
+      }
       renderSteps(); renderStableSelect(); renderParticipantSummary();
       markDirty();
     });
@@ -467,7 +535,10 @@ export async function renderCombos(mount, ctx, selectedId) {
       const problems = [];
       if (!draft.name?.trim()) problems.push({ field: 'name', message: 'the callable name is required — clients will pass it as the model' });
       if (!draft.steps.length) problems.push({ field: 'steps', message: 'a combo needs at least one step' });
-      if (draft.steps.some((s) => !s.provider || !String(s.model ?? '').trim())) problems.push({ field: 'steps', message: 'every step needs a provider and a model id' });
+      // A combo target is a complete step without provider or model; a model step still needs both.
+      if (draft.steps.some((s) => (s.combo ? !String(s.combo).trim() : (!s.provider || !String(s.model ?? '').trim())))) {
+        problems.push({ field: 'steps', message: 'every step needs a provider and a model id, or a combo' });
+      }
       if (draft.wf.mode === 'stable-fallback' && !(draft.wf.step >= 0 && draft.wf.step < draft.steps.length)) {
         problems.push({ field: 'step', message: 'the stable step must point at one of this combo\u2019s steps' });
       }
@@ -482,7 +553,17 @@ export async function renderCombos(mount, ctx, selectedId) {
         // An empty field means "leave it at the default", not "switch it off". Reading it as 0
         // silently disabled stickiness on every combo saved through this form.
         sticky_success_window_secs: stickyWindowInput.value.trim() === '' ? 1800 : (Number(stickyWindowInput.value) || 0),
-        steps: draft.steps.map((s) => ({ ...s, note: s.note || undefined })),
+        steps: draft.steps.map((s) => {
+          const step = { ...s, note: s.note || undefined };
+          // A combo target ignores provider, model and pinned level at compile time. Strip them
+          // rather than write fields that look meaningful but are never read.
+          if (step.combo) {
+            delete step.provider;
+            delete step.model;
+            delete step.level;
+          }
+          return step;
+        }),
         hedge: {
           enabled: hedgeOn.checked,
           participants: draft.hedge.participants ?? [],
@@ -608,43 +689,48 @@ export async function renderCombos(mount, ctx, selectedId) {
         up.addEventListener('click', () => doMove(i, i - 1));
         down.addEventListener('click', () => doMove(i, i + 1));
 
-        // A step may run at its own tier. The list is the model's effective levels — declared on
-        // the entry, otherwise derived from the provider dialect and capped by what that dialect can
-        // send. Offering a level the model does not offer is how a request becomes a silent
-        // substitution; a level already configured but no longer offered is kept and labelled with
-        // the ceiling it will actually run at, so the value is never silently rewritten.
-        const stepMeta = stepModel(step, providers);
-        const stepProviderEntry = stepProvider(step, providers);
-        const offered = modelLevels(stepMeta, stepProviderEntry);
-        const ceiling = offered[offered.length - 1];
-        // Every level the provider's dialect can put on the wire is selectable, so a level can be
-        // pinned by hand even when the model entry advertises none (a model synced without declared
-        // levels used to leave "model default" as the only choice). A level the model does not
-        // offer is still honest: the label says what it will actually run at, which is the ceiling
-        // the relay substitutes.
-        const sendable = providerLevels(stepProviderEntry, stepMeta);
-        const levelOptions = [h('option', { value: '' }, 'model default')];
-        for (const level of sendable) {
-          levelOptions.push(h('option', {
-            value: level,
-            selected: step.level === level,
-          }, offered.includes(level) ? level : `${level} → ${ceiling ?? 'no reasoning'}`));
+        // A model step may run at its own tier. A combo target has no model to pin a level on:
+        // the nested combo supplies its own steps' levels, so there is no selector to offer.
+        let levelSelect = null;
+        if (!step.combo) {
+          // The list is the model's effective levels — declared on the entry, otherwise derived
+          // from the provider dialect and capped by what that dialect can send. Offering a level
+          // the model does not offer is how a request becomes a silent substitution; a level
+          // already configured but no longer offered is kept and labelled with the ceiling it will
+          // actually run at, so the value is never silently rewritten.
+          const stepMeta = stepModel(step, providers);
+          const stepProviderEntry = stepProvider(step, providers);
+          const offered = modelLevels(stepMeta, stepProviderEntry);
+          const ceiling = offered[offered.length - 1];
+          // Every level the provider's dialect can put on the wire is selectable, so a level can
+          // be pinned by hand even when the model entry advertises none (a model synced without
+          // declared levels used to leave "model default" as the only choice). A level the model
+          // does not offer is still honest: the label says what it will actually run at, which is
+          // the ceiling the relay substitutes.
+          const sendable = providerLevels(stepProviderEntry, stepMeta);
+          const levelOptions = [h('option', { value: '' }, 'model default')];
+          for (const level of sendable) {
+            levelOptions.push(h('option', {
+              value: level,
+              selected: step.level === level,
+            }, offered.includes(level) ? level : `${level} → ${ceiling ?? 'no reasoning'}`));
+          }
+          if (step.level && !sendable.includes(step.level)) {
+            levelOptions.push(h('option', {
+              value: step.level, selected: true,
+            }, `${step.level} → unsendable on this provider`));
+          }
+          levelSelect = h('select', {
+            class: 'input step-level',
+            'aria-label': `Reasoning level for step ${i + 1}`,
+            title: 'Reasoning level this step runs at',
+          }, ...levelOptions);
+          levelSelect.addEventListener('change', () => {
+            if (levelSelect.value) draft.steps[i].level = levelSelect.value;
+            else delete draft.steps[i].level;
+            markDirty();
+          });
         }
-        if (step.level && !sendable.includes(step.level)) {
-          levelOptions.push(h('option', {
-            value: step.level, selected: true,
-          }, `${step.level} → unsendable on this provider`));
-        }
-        const levelSelect = h('select', {
-          class: 'input step-level',
-          'aria-label': `Reasoning level for step ${i + 1}`,
-          title: 'Reasoning level this step runs at',
-        }, ...levelOptions);
-        levelSelect.addEventListener('change', () => {
-          if (levelSelect.value) draft.steps[i].level = levelSelect.value;
-          else delete draft.steps[i].level;
-          markDirty();
-        });
 
         const edit = h('button', { class: 'icon-btn', type: 'button', 'aria-label': `Edit step ${i + 1}` }, icon('pencil'));
         edit.addEventListener('click', () => renderStepEdit(i));
@@ -694,21 +780,98 @@ export async function renderCombos(mount, ctx, selectedId) {
       const li = stepsOl.querySelector(`li[data-idx="${i}"]`);
       if (!li) return;
       const step = draft.steps[i];
-      const provSel = h('select', { class: 'input', 'aria-label': `Provider for step ${i + 1}` });
-      ctx.loadProviders().then((providers) => {
-        provSel.replaceChildren(...(providers ?? []).map((p) => h('option', { value: p.id, selected: p.id === step.provider }, p.id)));
-      }).catch(() => {});
-      const modelIn = h('input', { class: 'input mono', type: 'text', value: step.model, 'aria-label': `Model for step ${i + 1}` });
+      const kindSel = h('select', { class: 'input', 'aria-label': `What step ${i + 1} routes to` },
+        h('option', { value: 'model', selected: !step.combo }, 'model'),
+        h('option', { value: 'combo', selected: Boolean(step.combo) }, 'combo'));
+      const provSel = createSearchSelect({
+        ariaLabel: `Provider for step ${i + 1}`,
+        placeholder: 'provider…',
+        value: step.provider ?? '',
+        emptyText: 'no provider matches',
+        onChoose: () => fillModels(),
+      });
+      const modelSel = createSearchSelect({
+        ariaLabel: `Model for step ${i + 1}`,
+        placeholder: 'model id',
+        value: step.model ?? '',
+        emptyText: 'no model matches',
+      });
+      const comboPick = createSearchSelect({
+        ariaLabel: `Combo for step ${i + 1}`,
+        placeholder: 'combo name…',
+        value: step.combo ?? '',
+        emptyText: 'no combo matches',
+      });
       const noteIn = h('input', { class: 'input', type: 'text', value: step.note ?? '', placeholder: 'note (optional)', 'aria-label': `Note for step ${i + 1}` });
       const done = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, 'Done');
+
+      function localProviders(next) {
+        return next !== undefined ? next : (ctx.state.providers ?? providers ?? []);
+      }
+      function fillModels() {
+        const provider = localProviders().find((p) => p.id === provSel.value());
+        modelSel.setOptions((provider?.models ?? []).map((m) => ({
+          value: m.id,
+          label: m.id,
+          hint: m.label && m.label !== m.id ? m.label : undefined,
+        })));
+      }
+      function applyKind() {
+        const toCombo = kindSel.value === 'combo';
+        provSel.el.hidden = toCombo;
+        modelSel.el.hidden = toCombo;
+        comboPick.el.hidden = !toCombo;
+      }
+      function fillProviderChoices(next) {
+        provSel.setOptions(localProviders(next).map((p) => ({
+          value: p.id,
+          label: p.id,
+          hint: p.label && p.label !== p.id ? p.label : undefined,
+        })));
+      }
+      kindSel.addEventListener('change', applyKind);
+      provSel.setOptions(localProviders().map((p) => ({
+        value: p.id,
+        label: p.id,
+        hint: p.label && p.label !== p.id ? p.label : undefined,
+      })));
+      comboPick.setOptions(combos
+        .filter((c) => c.id !== draft.id && c.name !== draft.name)
+        .map((c) => ({ value: c.name || c.id, label: c.name || c.id, hint: c.name && c.name !== c.id ? c.id : undefined })));
+      fillModels();
+      applyKind();
+
+      ctx.loadProviders().then((next) => {
+        providers = next ?? providers;
+        fillProviderChoices(next);
+        fillModels();
+      }).catch(() => {});
+
       done.addEventListener('click', () => {
-        draft.steps[i] = { ...step, provider: provSel.value || step.provider, model: modelIn.value.trim() || step.model, note: noteIn.value.trim() || undefined };
+        const note = noteIn.value.trim() || undefined;
+        if (kindSel.value === 'combo') {
+          const combo = comboPick.value();
+          if (!combo) { ctx.toast.warning('pick a combo for the step'); return; }
+          if (combo === draft.name || combo === draft.id) {
+            ctx.toast.warning('a combo cannot route to itself');
+            return;
+          }
+          draft.steps[i] = { combo, enabled: step.enabled !== false, note };
+        } else {
+          const provider = provSel.value();
+          const model = modelSel.value();
+          if (!provider) { ctx.toast.warning('pick a provider for the step'); return; }
+          if (!model) { ctx.toast.warning('enter a model id for the step'); return; }
+          const next = { ...step, provider, model, note };
+          delete next.combo;
+          draft.steps[i] = next;
+        }
         renderSteps(); renderStableSelect();
         markDirty();
       });
       li.replaceChildren(h('div', { class: 'step-edit' },
-        h('span', { class: 'step-pos' }, String(i + 1)), provSel, modelIn, noteIn, done));
-      modelIn.focus();
+        h('span', { class: 'step-pos' }, String(i + 1)), kindSel, provSel.el, modelSel.el, comboPick.el, noteIn, done));
+      (kindSel.value === 'combo' ? comboPick : modelSel).input.focus();
     }
 
     // The ONLY way order changes. After the re-render the moved row is focused so keyboard

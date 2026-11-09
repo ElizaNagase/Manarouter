@@ -139,6 +139,9 @@ function renderedIds(mount) {
   const tbody = table && findOne(table, 'TBODY');
   if (!tbody) return [];
   return tbody.children.map((tr) => {
+    // Rows carry their provider id because the first cell is now the pin control, not the name.
+    const id = tr.getAttribute?.('data-provider-id');
+    if (id) return id;
     const firstCell = tr.children[0];
     const idText = firstCell?.children?.[0];
     return idText ? String(idText.textContent) : '';

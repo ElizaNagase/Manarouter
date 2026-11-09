@@ -4,10 +4,10 @@
 // REMAINING, and every bar, chip and card border consumes that tone. These checks pin the
 // boundaries, because an off-by-one here silently paints a nearly-exhausted window green.
 //
-// Not covered here: the rendered DOM (chip strip, bars, countdowns) or the account-row filter,
-// which lives in view-quota.js. That needs a browser — open the Quota page and confirm the chips
-// jump to their card, the bars fill from the left, the countdown sits at the right of each row,
-// and the colour matches the percentage written beside the bar.
+// Not covered here: the rendered DOM (chip strip, bars, countdowns) or the page's live account
+// list. Those need a browser — open the Quota page and confirm the chips jump to their card, the
+// bars fill from the left, the countdown sits at the right of each row, and the colour matches the
+// percentage written beside the bar. The pure visibility and merge policies are covered below.
 //
 // Run: node --test panel/test/quota-display.test.mjs
 
@@ -19,6 +19,8 @@ import {
   QUOTA_STATUS_HEALTHY_ABOVE,
   chunkFill,
   formatQuotaUsage,
+  mergeQuotaRecord,
+  quotaAccountVisible,
   formatResetIn,
   formatResetInLabel,
   quotaFamilyLabel,
@@ -115,4 +117,42 @@ test('chunk mode still paints a nearly empty window, so it never reads as exhaus
   assert.deepEqual(chunkFill(0.01, 20), { full: 0, half: true });
   assert.deepEqual(chunkFill(0, 20), { full: 0, half: false });
   assert.equal(chunkFill(null, 20), null);
+});
+
+test('an error never creates a quota card; it sits on a card that has a window', () => {
+  const quantified = { family: '1w', fraction_reported: true, remaining_percentage: 78, total: 100 };
+  assert.equal(quotaAccountVisible({ windows: [quantified] }), true);
+  assert.equal(quotaAccountVisible({ windows: [{ unlimited: true, fraction_reported: true }] }), true);
+
+  // The 401 an account earns before it has ever produced a snapshot has no allowance to describe.
+  assert.equal(quotaAccountVisible({ windows: [], error: 'rejected the API key (HTTP 401)', fetched_at: null }), false);
+  assert.equal(quotaAccountVisible({ windows: [], error: 'rejected the API key (HTTP 401)' }), false);
+  // Even a timestamp does not make an error-only record a card.
+  assert.equal(quotaAccountVisible({ windows: [], error: 'refresh failed', fetched_at: 1 }), false);
+  // Silence is still not a card: no window, no error.
+  assert.equal(quotaAccountVisible({ windows: [], error: null, fetched_at: 1 }), false);
+  // A window the provider never quantified is not a window (openrouter's unlimited-but-unreported
+  // window must stay invisible even if a refresh later fails).
+  assert.equal(quotaAccountVisible({ windows: [{ family: '1w', unlimited: true, fraction_reported: false }], error: 'failed', fetched_at: 1 }), false);
+});
+
+test('a failed refresh keeps the last-good window and its fetch time', () => {
+  const previous = {
+    provider: 'p', account: 'a', fetched_at: 100,
+    windows: [{ family: '1w', fraction_reported: true, remaining_percentage: 60, total: 100 }],
+  };
+  const failed = { provider: 'p', account: 'a', fetched_at: null, windows: [], error: 'HTTP 401' };
+  const merged = mergeQuotaRecord(previous, failed);
+  assert.equal(merged.windows, previous.windows);
+  assert.equal(merged.fetched_at, 100);
+  assert.equal(merged.error, 'HTTP 401');
+  assert.equal(quotaAccountVisible(merged), true);
+
+  // A successful empty answer is news: the window is gone, so stale numbers must not survive it.
+  const empty = { provider: 'p', account: 'a', fetched_at: 200, windows: [], error: null };
+  assert.deepEqual(mergeQuotaRecord(previous, empty), empty);
+
+  // A failed refresh that did return a window replaces the snapshot and its timestamp.
+  const partial = { provider: 'p', account: 'a', fetched_at: 300, windows: [previous.windows[0]], error: 'partial' };
+  assert.deepEqual(mergeQuotaRecord(previous, partial), partial);
 });

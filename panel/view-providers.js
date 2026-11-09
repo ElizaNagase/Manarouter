@@ -1,7 +1,8 @@
-// view-providers.js — dense provider table + per-provider detail drawer.
+// view-providers.js — dense provider table with the selected provider's detail inline under its
+// own row (no detached drawer).
 //
-// Table: id, label, dialect, accounts (state chips), models count, health.
-// Drawer: accounts (add/enable/disable/delete), models (add manual / hide / delete),
+// Table: pin/manual-move column, id, label, dialect, accounts (state chips), models count, health.
+// Inline detail: accounts (add/enable/disable/delete), models (add manual / hide / delete / edit),
 // timeouts, headers, route overrides, and the per-provider "sync models" action.
 //
 // NOTE ON SERVER STRINGS: provider ids, labels, model ids and error text come from the server
@@ -153,6 +154,39 @@ const KEY_STRATEGIES = ['priority', 'round-robin', 'random', 'least-used'];
 // meters models separately (a per-model quota) or shares one bucket across all of its keys.
 const COOLDOWN_SCOPES = ['account', 'model', 'provider'];
 const DELETE_PROVIDER_CONFIRM_KEY = 'manarouter.confirm.deleteProvider';
+// Provider list preferences live in this browser: pins and a manual order are a per-operator
+// view choice, not router configuration, so they must not create a config write (or a digest
+// change that refreshes every other panel tab). Sort modes: name (default), added (the order the
+// config file lists them in, our only proxy for creation date), keys (most accounts first) and
+// manual.
+const PROVIDER_SORT_KEY = 'manarouter.providers.sort';
+const PROVIDER_PINS_KEY = 'manarouter.providers.pins';
+const PROVIDER_ORDER_KEY = 'manarouter.providers.order';
+const PROVIDER_SORT_MODES = [
+  ['name', 'Name (A–Z)'],
+  ['added', 'Date added'],
+  ['keys', 'Number of keys'],
+  ['manual', 'Manual order'],
+];
+const PROVIDER_SORT_IDS = new Set(PROVIDER_SORT_MODES.map(([id]) => id));
+
+function storedIdList(key) {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(key) ?? '[]');
+    return Array.isArray(parsed) ? parsed.filter((id) => typeof id === 'string' && id) : [];
+  } catch {
+    return [];
+  }
+}
+
+function storeIdList(key, ids) {
+  try {
+    localStorage.setItem(key, JSON.stringify(ids));
+    return true;
+  } catch {
+    return false;
+  }
+}
 // Sourced from catalog/providers.toml and the OAuth dialect docs. These are documented production
 // endpoints, but remain suggestions: account-specific gateways or a deliberate proxy can differ.
 // Provider presets, split into two clearly separated categories so that NVIDIA NIM, Codex,
@@ -209,8 +243,26 @@ export async function renderProviders(mount, ctx) {
   let drawerOpen = false;
   // Keep in-progress inline number edits across any redraw caused by a refresh or another action.
   const inlineDrafts = new Map();
+  // Pins, manual order and the selected sort are browser preferences, never router config.
+  let sortMode = (() => {
+    try {
+      const stored = localStorage.getItem(PROVIDER_SORT_KEY);
+      return PROVIDER_SORT_IDS.has(stored) ? stored : 'name';
+    } catch {
+      return 'name';
+    }
+  })();
+  let pinned = new Set(storedIdList(PROVIDER_PINS_KEY));
+  let manualOrder = storedIdList(PROVIDER_ORDER_KEY);
+  let draggedId = null;
+  let dragSuppressed = false;
 
   const tableWrap = h('div', { class: 'table-scroll' });
+  // The provider detail used to be a fixed right-hand overlay. It is now a panel in the page,
+  // expanded directly under the provider's own row, so opening a provider never scrolls past
+  // the rest of a long list to find it.
+  const workWrap = h('div', { class: 'provider-work' });
+  let detailRow = null;
   const count = h('span', { class: 'count' });
   const newBtn = h('button', { class: 'btn btn-primary', type: 'button' }, 'New provider');
   // Per-account quota cache: key = "providerId|accountId" -> { remaining, total, windows, error, fetched_at }
@@ -239,6 +291,12 @@ export async function renderProviders(mount, ctx) {
     return quotaCache;
   }
   const refreshBtn = h('button', { class: 'btn', type: 'button' }, 'Refresh');
+  const sortSel = h('select', { class: 'input', 'aria-label': 'Sort providers' },
+    ...PROVIDER_SORT_MODES.map(([id, text]) => h('option', { value: id }, text)));
+  sortSel.value = sortMode;
+  const sortHint = h('span', { class: 'hint' }, 'Pinned providers stay on top.');
+  const sortControl = h('label', { class: 'provider-sort' },
+    h('span', { class: 'provider-sort-label' }, 'Sort'), sortSel, sortHint);
   // The preference is an explicit opt-out from warnings, never an automatic delete action. Keeping
   // the checkbox in the list toolbar also makes reversing it discoverable without opening a drawer.
   const deleteWarning = toggle('Do not warn me again', {
@@ -255,10 +313,102 @@ export async function renderProviders(mount, ctx) {
   });
 
   mount.replaceChildren(
-    h('div', { class: 'toolbar' }, newBtn, refreshBtn, deleteWarning.row, h('span', { class: 'spacer' }), count),
+    h('div', { class: 'toolbar' }, sortControl, newBtn, refreshBtn, deleteWarning.row, h('span', { class: 'spacer' }), count),
     tableWrap,
   );
 
+  function saveSort(mode) {
+    sortMode = mode;
+    sortSel.value = mode;
+    try {
+      localStorage.setItem(PROVIDER_SORT_KEY, mode);
+    } catch {
+      ctx.toast.warning('This browser could not save the provider sort preference.');
+    }
+  }
+
+  function savePins() {
+    if (!storeIdList(PROVIDER_PINS_KEY, [...pinned])) {
+      ctx.toast.warning('This browser could not save pinned providers.');
+    }
+  }
+
+  function saveManualOrder(ids) {
+    manualOrder = ids;
+    if (!storeIdList(PROVIDER_ORDER_KEY, ids)) {
+      ctx.toast.warning('This browser could not save the provider order.');
+    }
+  }
+
+  /// The list in display order: pinned first, then the chosen sort inside each group.
+  ///
+  /// "Date added" is the order /api/providers returns, which is the config file's order — the
+  /// provider record has no created_at, and inventing a timestamp from the newest sync would
+  /// reorder a provider every time it refreshed.
+  function orderedProviders() {
+    const source = providers.slice();
+    const configIndex = new Map(source.map((p, index) => [p.id, index]));
+    const manualIndex = new Map(manualOrder.map((id, index) => [id, index]));
+    if (sortMode === 'name') {
+      source.sort((a, b) => String(a.id).localeCompare(String(b.id), undefined, { sensitivity: 'base', numeric: true }));
+    } else if (sortMode === 'keys') {
+      source.sort((a, b) => (b.accounts?.length ?? 0) - (a.accounts?.length ?? 0)
+        || String(a.id).localeCompare(String(b.id), undefined, { sensitivity: 'base', numeric: true }));
+    } else if (sortMode === 'manual') {
+      source.sort((a, b) => (manualIndex.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (manualIndex.get(b.id) ?? Number.MAX_SAFE_INTEGER)
+        || (configIndex.get(a.id) ?? 0) - (configIndex.get(b.id) ?? 0));
+    }
+    // A stable partition: the chosen sort never lifts an unpinned provider above a pinned one.
+    return [...source.filter((p) => pinned.has(p.id)), ...source.filter((p) => !pinned.has(p.id))];
+  }
+
+  function togglePin(id) {
+    if (pinned.has(id)) pinned.delete(id); else pinned.add(id);
+    savePins();
+    renderTable();
+  }
+
+  function switchSort(mode) {
+    if (mode === 'manual') {
+      // Freeze what the operator is looking at before manual becomes the source of truth.
+      saveManualOrder(orderedProviders().map((p) => p.id));
+    }
+    saveSort(mode);
+    renderTable();
+  }
+
+  /// Move one provider by a small delta for keyboard users. A row never crosses the pin boundary:
+  /// pinned and unpinned are separate groups in every sort mode, so a cross-group move would look
+  /// like a no-op and then be undone by the next render.
+  function moveProvider(id, delta) {
+    const list = orderedProviders();
+    const from = list.findIndex((p) => p.id === id);
+    const to = from + delta;
+    if (from < 0 || to < 0 || to >= list.length) return;
+    if (pinned.has(list[from].id) !== pinned.has(list[to].id)) return;
+    [list[from], list[to]] = [list[to], list[from]];
+    saveManualOrder(list.map((p) => p.id));
+    saveSort('manual');
+    renderTable();
+    const row = tableWrap.querySelector('tr[data-provider-id="' + CSS.escape(id) + '"]');
+    row?.querySelector('.provider-move')?.focus();
+  }
+
+  function reorderProvider(sourceId, targetId) {
+    if (sourceId === targetId) return;
+    if (pinned.has(sourceId) !== pinned.has(targetId)) return;
+    const list = orderedProviders();
+    const from = list.findIndex((p) => p.id === sourceId);
+    if (from < 0) return;
+    const [moved] = list.splice(from, 1);
+    const insertAt = list.findIndex((p) => p.id === targetId);
+    list.splice(insertAt < 0 ? list.length : insertAt, 0, moved);
+    saveManualOrder(list.map((p) => p.id));
+    saveSort('manual');
+    renderTable();
+  }
+
+  sortSel.addEventListener('change', () => switchSort(sortSel.value));
   newBtn.addEventListener('click', () => openFormDrawer(null));
   refreshBtn.addEventListener('click', () => reload(true));
 
@@ -312,13 +462,15 @@ export async function renderProviders(mount, ctx) {
 
   function refreshInlineDrawer(providerId) {
     const p = providers.find((provider) => provider.id === providerId);
-    const body = mount.querySelector('.drawer .drawer-body');
+    const body = workWrap.querySelector('.drawer-body');
     if (p && drawerId === providerId && body) { renderDetail(body, p); }
   }
 
   async function reload(force = false) {
     try {
-      providers = (await ctx.loadProviders(force)).slice().sort((a, b) => String(a.id).localeCompare(String(b.id)));
+      // Keep the server's config order: it is what "Date added" sorts by, and re-sorting here
+      // would silently destroy that order before the operator ever chose a sort mode.
+      providers = (await ctx.loadProviders(force)).slice();
     } catch (err) {
       tableWrap.replaceChildren(errorBlock(err));
       return;
@@ -332,6 +484,7 @@ export async function renderProviders(mount, ctx) {
   }
 
   function renderTable() {
+    const ordered = orderedProviders();
     count.textContent = `${providers.length} provider${providers.length === 1 ? '' : 's'}`;
     if (!providers.length) {
       tableWrap.replaceChildren(emptyState('No providers configured yet.',
@@ -339,11 +492,12 @@ export async function renderProviders(mount, ctx) {
       return;
     }
     const tbody = h('tbody');
-    for (const p of providers) {
+    ordered.forEach((p, index) => {
       const health = deriveProviderHealth(p);
       const accounts = Array.isArray(p.accounts) ? p.accounts : [];
       const enabledCount = accounts.filter((a) => a && a.enabled !== false).length;
       const models = Array.isArray(p.models) ? p.models : [];
+      const isPinned = pinned.has(p.id);
 
       const openBtn = h('button', { class: 'btn btn-sm', type: 'button' }, 'Open');
       openBtn.addEventListener('click', (e) => { e.stopPropagation(); openDetailDrawer(p); });
@@ -353,13 +507,46 @@ export async function renderProviders(mount, ctx) {
       // open the drawer, scroll to Accounts, find Add account / Connect.
       const needsAccount = accounts.length === 0;
 
-      const tr = h('tr', { class: 'row-click', tabindex: '0' },
+      const pinBtn = h('button', {
+        class: 'pin-btn' + (isPinned ? ' pinned' : ''),
+        type: 'button',
+        'aria-pressed': isPinned ? 'true' : 'false',
+        'aria-label': (isPinned ? 'Unpin ' : 'Pin to top ') + p.id,
+        title: isPinned ? 'Unpin' : 'Pin to top',
+      }, isPinned ? '★' : '☆');
+      pinBtn.addEventListener('click', (e) => { e.stopPropagation(); togglePin(p.id); });
+
+      const pinCell = h('td', { class: 'pin-col' }, pinBtn);
+      if (sortMode === 'manual') {
+        const up = h('button', {
+          class: 'icon-btn provider-move', type: 'button',
+          disabled: index === 0
+            || (pinned.has(ordered[index - 1]?.id) !== isPinned),
+          'aria-label': 'Move ' + p.id + ' up', title: 'Move up',
+        }, icon('up'));
+        const down = h('button', {
+          class: 'icon-btn provider-move', type: 'button',
+          disabled: index === ordered.length - 1
+            || (pinned.has(ordered[index + 1]?.id) !== isPinned),
+          'aria-label': 'Move ' + p.id + ' down', title: 'Move down',
+        }, icon('down'));
+        up.addEventListener('click', (e) => { e.stopPropagation(); moveProvider(p.id, -1); });
+        down.addEventListener('click', (e) => { e.stopPropagation(); moveProvider(p.id, 1); });
+        pinCell.append(up, down);
+      }
+
+      const tr = h('tr', {
+        class: 'row-click' + (isPinned ? ' pinned-row' : '') + (sortMode === 'manual' ? ' row-draggable' : ''),
+        tabindex: '0',
+        'data-provider-id': p.id,
+      },
+        pinCell,
         h('td', { class: 'mono' }, p.id, ' ', copyButton(p.id, { className: 'btn btn-sm icon-btn', title: 'Copy provider ID' })),
         h('td', {}, p.label ?? ''),
         h('td', {}, chip(p.dialect ?? '—')),
         h('td', {}, accountSummary(accounts, enabledCount)),
         h('td', { class: 'num' }, String(models.length)),
-        h('td', {}, chip(health.label, health.cls, `health: ${health.key}`)),
+        h('td', {}, chip(health.label, health.cls, 'health: ' + health.key)),
         h('td', { class: 'actions' },
           ...(needsAccount
             ? [(() => {
@@ -371,15 +558,51 @@ export async function renderProviders(mount, ctx) {
             : []),
           openBtn),
       );
-      const activate = () => openDetailDrawer(p);
+
+      const activate = () => { if (!dragSuppressed) openDetailDrawer(p); };
       tr.addEventListener('click', activate);
       // Enter opens only when the row itself is focused; Enter on the inner Open button must
       // not double-trigger through bubbling.
       tr.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target === tr) activate(); });
+
+      if (sortMode === 'manual') {
+        tr.draggable = true;
+        tr.addEventListener('dragstart', (e) => {
+          if (e.target.closest('button, a, input, select, textarea')) { e.preventDefault(); return; }
+          draggedId = p.id;
+          dragSuppressed = true;
+          if (e.dataTransfer) {
+            e.dataTransfer.effectAllowed = 'move';
+            try { e.dataTransfer.setData('text/plain', p.id); } catch { /* Firefox needs this only for external drags. */ }
+          }
+          tr.classList.add('dragging');
+        });
+        tr.addEventListener('dragend', () => {
+          draggedId = null;
+          tr.classList.remove('dragging');
+          tableWrap.querySelectorAll('.drag-over').forEach((row) => row.classList.remove('drag-over'));
+          setTimeout(() => { dragSuppressed = false; }, 0);
+        });
+        tr.addEventListener('dragover', (e) => {
+          if (!draggedId || draggedId === p.id || pinned.has(draggedId) !== isPinned) return;
+          e.preventDefault();
+          if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+          tr.classList.add('drag-over');
+        });
+        tr.addEventListener('dragleave', () => tr.classList.remove('drag-over'));
+        tr.addEventListener('drop', (e) => {
+          e.preventDefault();
+          tr.classList.remove('drag-over');
+          const source = draggedId;
+          draggedId = null;
+          if (source) reorderProvider(source, p.id);
+        });
+      }
       tbody.append(tr);
-    }
-    tableWrap.replaceChildren(h('table', { class: 'tbl' },
+    });
+    tableWrap.replaceChildren(h('table', { class: 'tbl provider-table' },
       h('thead', {}, h('tr', {},
+        h('th', { scope: 'col', class: 'pin-col' }, h('span', { class: 'sr-only' }, 'Pin and reorder')),
         h('th', { scope: 'col' }, 'ID'),
         h('th', { scope: 'col' }, 'Provider Name'),
         h('th', { scope: 'col' }, 'Dialect'),
@@ -388,6 +611,7 @@ export async function renderProviders(mount, ctx) {
         h('th', { scope: 'col' }, 'Health'),
         h('th', { scope: 'col' }, ''))),
       tbody));
+    if (drawerOpen) placeDetailRow();
   }
 
   function accountSummary(accounts, enabledCount) {
@@ -406,10 +630,27 @@ export async function renderProviders(mount, ctx) {
 
   // ------------------------------------------------------------------ drawer
 
+  /// Move the inline panel under the row it belongs to, replacing any previous detail row.
+  function placeDetailRow() {
+    if (detailRow) {
+      detailRow.remove();
+      detailRow = null;
+    }
+    if (!drawerId) return;
+    const anchor = tableWrap.querySelector('tr[data-provider-id="' + CSS.escape(drawerId) + '"]');
+    if (!anchor) return;
+    detailRow = h('tr', { class: 'provider-detail-row' }, h('td', { colspan: '8' }, workWrap));
+    anchor.after(detailRow);
+  }
+
   function closeDrawer() {
     drawerId = null;
     drawerOpen = false;
-    mount.querySelector('.drawer')?.remove();
+    if (detailRow) {
+      detailRow.remove();
+      detailRow = null;
+    }
+    workWrap.replaceChildren();
   }
 
   function drawerShell(title, ariaLabel) {
@@ -417,20 +658,24 @@ export async function renderProviders(mount, ctx) {
       h('h2', {}, title),
       h('span', { class: 'spacer' }));
     const body = h('div', { class: 'drawer-body' });
-    const drawer = h('div', { class: 'drawer', role: 'region', 'aria-label': ariaLabel ?? title }, head, body);
+    const drawer = h('div', { class: 'work-panel', role: 'region', 'aria-label': ariaLabel ?? title }, head, body);
     drawer.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
-    mount.append(drawer);
+    workWrap.replaceChildren(drawer);
     drawerOpen = true;
+    placeDetailRow();
     return { drawer, head, body };
   }
 
-  async function openDetailDrawer(provider) {
+  async function openDetailDrawer(provider, { silent = false } = {}) {
     closeDrawer();
     drawerId = provider.id;
-    const { head, body } = drawerShell(provider.label ? `${provider.label} (${provider.id})` : String(provider.id));
+    const title = provider.label ? provider.label + ' (' + provider.id + ')' : String(provider.id);
+    const { drawer, head, body } = drawerShell(title);
     head.append(copyButton(provider.id, { className: "btn btn-sm", title: "Copy provider ID" }));
     head.append(closeButton());
     await renderDetail(body, provider);
+    // Keep the panel in view without yanking a background digest refresh around.
+    if (!silent) requestAnimationFrame(() => { if (drawer.isConnected) drawer.scrollIntoView({ block: 'nearest' }); });
   }
 
   function closeButton() {
@@ -588,35 +833,44 @@ export async function renderProviders(mount, ctx) {
           'aria-label': `Test model ${m.id}`, title: 'Send one tiny completion through the router',
         }, icon('play'), h('span', {}, 'Test'));
         test.addEventListener('click', () => testModel(p, m, test));
-        const metadata = [];
-        if (Array.isArray(m.reasoning_levels) && m.reasoning_levels.length) {
-          metadata.push(...m.reasoning_levels.map((level) => chip(String(level), 'chip-neutral', 'reasoning level')));
-        }
-        if (Array.isArray(m.input_modalities) && m.input_modalities.length) {
-          metadata.push(...m.input_modalities.map((modality) => chip(String(modality), 'chip-neutral', 'input modality')));
-        }
-        const pricing = modelPricing(m);
-        if (pricing) metadata.push(chip(pricing, 'chip-neutral', 'pricing per million tokens'));
-        const idCell = h('td', {},
-          h('span', { class: 'mono', style: 'overflow-wrap:anywhere;' }, m.id, ' ', copyButton(m.id, { className: 'btn btn-sm icon-btn', title: 'Copy model ID' })),
-          metadata.length ? h('div', { style: 'display:flex;gap:4px;flex-wrap:wrap;margin-top:4px;' }, metadata) : null);
+
+        const editorRow = buildModelEditor(p, m);
+        editorRow.hidden = true;
+        const edit = h('button', {
+          class: 'btn btn-sm', type: 'button',
+          'aria-label': `Edit model ${m.id}`, 'aria-expanded': 'false', 'data-model-edit': m.id,
+        }, 'Edit');
+        edit.addEventListener('click', () => {
+          const opening = editorRow.hidden;
+          for (const row of tb.querySelectorAll('.model-editor-row')) row.hidden = true;
+          for (const btn of tb.querySelectorAll('[data-model-edit]')) btn.setAttribute('aria-expanded', 'false');
+          editorRow.hidden = !opening;
+          edit.setAttribute('aria-expanded', opening ? 'true' : 'false');
+          if (opening) editorRow.querySelector('input')?.focus();
+        });
+
+        // One row per model, with the id and the few facts an operator scans for. The full
+        // editor opens underneath it: an eight-column table of always-live inputs made every
+        // row a form and every form a horizontal scroll.
         tb.append(h('tr', {},
-          idCell,
+          h('td', {},
+            h('span', { class: 'mono model-id' }, m.id, ' ', copyButton(m.id, { className: 'btn btn-sm icon-btn', title: 'Copy model ID' })),
+            m.label ? h('div', { class: 'hint' }, m.label) : null,
+            m.hidden ? h('div', {}, chip('hidden')) : null),
           h('td', {}, chip(m.source ?? 'synced', 'chip-neutral', 'source')),
-          m.hidden ? h('td', {}, chip('hidden')) : h('td', {}),
-          buildInlineModelNumber(p, m, 'context_length', 'context length'),
-          buildInlineModelLevels(p, m),
-          buildInlineModelReasoning(p, m),
-          buildInlineModelModalities(p, m),
-          h('td', { class: 'actions' }, test, toggle, del)));
+          h('td', { class: 'num' }, m.context_length != null ? formatCompact(Number(m.context_length)) : '—'),
+          h('td', { class: 'num model-price' }, modelPriceShort(m)),
+          h('td', {}, h('span', { class: 'mono' }, m.default_reasoning_level ?? 'inherit')),
+          h('td', { class: 'actions' }, test, edit, toggle, del)));
+        tb.append(editorRow);
       }
-      modelSection.append(h('div', { class: 'table-scroll', style: 'max-height: min(48vh, 460px); overflow:auto;' },
-        h('table', { class: 'tbl' },
+      modelSection.append(h('div', { class: 'table-scroll model-table-scroll' },
+        h('table', { class: 'tbl model-table' },
           h('thead', {}, h('tr', {},
             h('th', { scope: 'col' }, 'Model'), h('th', { scope: 'col' }, 'Source'),
-            h('th', { scope: 'col' }, ''), h('th', { scope: 'col' }, 'Ctx'),
-            h('th', { scope: 'col' }, 'Levels'), h('th', { scope: 'col' }, 'Default level'),
-            h('th', { scope: 'col' }, 'Input modalities'),
+            h('th', { scope: 'col', class: 'num' }, 'Ctx'),
+            h('th', { scope: 'col', class: 'num' }, 'Price / Mtok'),
+            h('th', { scope: 'col' }, 'Default level'),
             h('th', { scope: 'col' }, ''))),
           tb)));
     } else {
@@ -660,6 +914,191 @@ export async function renderProviders(mount, ctx) {
     if (input == null && output == null) return null;
     const rate = (value) => value == null ? '—' : formatCompact(Number(value));
     return `$${rate(input)} / $${rate(output)} / 1M in/out`;
+  }
+
+  function modelPriceShort(model) {
+    const pricing = model.pricing ?? {};
+    const input = pricing.input_per_mtok ?? model.input_price_per_mtok;
+    const output = pricing.output_per_mtok ?? model.output_price_per_mtok;
+    if (input == null && output == null) return h('span', { class: 'hint' }, '—');
+    const rate = (value) => value == null ? '—' : '$' + formatCompact(Number(value));
+    return h('span', { title: modelPricing(model) ?? '' }, rate(input) + ' / ' + rate(output));
+  }
+
+  /// Full-width editor for one model, opened under its row.
+  ///
+  /// It saves once through the same endpoint the form uses, with a full copy of the model plus
+  /// the edited fields. The previous design wrote every keystroke-sized change through its own
+  /// little request, which made a typo a config write and made the table eight columns of live
+  /// inputs. Unknown fields on the model are carried through untouched.
+  function buildModelEditor(p, m) {
+    const tr = h('tr', { class: 'model-editor-row' });
+    const td = h('td', { colspan: '6' });
+    tr.append(td);
+
+    const labelInput = h('input', { class: 'input', value: m.label ?? '', placeholder: m.id });
+    const contextInput = h('input', {
+      class: 'input', type: 'number', min: '0', step: '1',
+      value: m.context_length ?? '', placeholder: 'inherit / unknown',
+    });
+    const outputInput = h('input', {
+      class: 'input', type: 'number', min: '0', step: '1',
+      value: m.max_output_tokens ?? '', placeholder: 'provider default',
+    });
+    const oldInputPrice = m.pricing?.input_per_mtok ?? m.input_price_per_mtok ?? null;
+    const oldOutputPrice = m.pricing?.output_per_mtok ?? m.output_price_per_mtok ?? null;
+    const inputPrice = h('input', {
+      class: 'input', type: 'number', min: '0', step: 'any',
+      value: oldInputPrice ?? '', placeholder: 'unknown',
+    });
+    const outputPrice = h('input', {
+      class: 'input', type: 'number', min: '0', step: 'any',
+      value: oldOutputPrice ?? '', placeholder: 'unknown',
+    });
+
+    const levels = providerLevels(p, m);
+    const chosenLevels = new Set(declaredLevels(m));
+    const levelRow = h('div', { class: 'model-chip-row' });
+    for (const level of levels) {
+      const btn = h('button', {
+        class: 'chip model-editor-chip' + (chosenLevels.has(level) ? ' active' : ''),
+        type: 'button', 'aria-pressed': chosenLevels.has(level) ? 'true' : 'false',
+      }, String(level));
+      btn.addEventListener('click', () => {
+        if (chosenLevels.has(level)) chosenLevels.delete(level); else chosenLevels.add(level);
+        const on = chosenLevels.has(level);
+        btn.classList.toggle('active', on);
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
+      levelRow.append(btn);
+    }
+
+    const defaultSel = h('select', { class: 'input' }, h('option', { value: '' }, 'Inherit global'));
+    for (const level of levels) defaultSel.append(h('option', { value: String(level) }, String(level)));
+    const currentDefault = m.default_reasoning_level == null ? '' : String(m.default_reasoning_level);
+    if (currentDefault && !levels.some((level) => String(level) === currentDefault)) {
+      defaultSel.append(h('option', { value: currentDefault }, currentDefault + ' (current)'));
+    }
+    defaultSel.value = currentDefault;
+
+    const chosenModalities = new Set(Array.isArray(m.input_modalities) ? m.input_modalities.map(String) : []);
+    const modalityRow = h('div', { class: 'model-chip-row' });
+    for (const modality of INPUT_MODALITIES) {
+      const btn = h('button', {
+        class: 'chip model-editor-chip' + (chosenModalities.has(modality) ? ' active' : ''),
+        type: 'button', 'aria-pressed': chosenModalities.has(modality) ? 'true' : 'false',
+      }, modality);
+      btn.addEventListener('click', () => {
+        if (chosenModalities.has(modality)) chosenModalities.delete(modality); else chosenModalities.add(modality);
+        const on = chosenModalities.has(modality);
+        btn.classList.toggle('active', on);
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
+      modalityRow.append(btn);
+    }
+
+    const save = h('button', { class: 'btn btn-primary', type: 'button' }, 'Save model');
+    const cancel = h('button', { class: 'btn', type: 'button' }, 'Cancel');
+    const closeEditor = () => {
+      tr.hidden = true;
+      tr.previousElementSibling?.querySelector('[data-model-edit]')?.setAttribute('aria-expanded', 'false');
+    };
+    cancel.addEventListener('click', closeEditor);
+
+    function readNumber(input, label, { integer = false, max = null } = {}) {
+      const raw = input.value.trim();
+      if (!raw) return { ok: true, value: null };
+      const value = Number(raw);
+      const invalid = !Number.isFinite(value) || value < 0 || (integer && !Number.isInteger(value))
+        || (max != null && value > max);
+      if (invalid) {
+        ctx.toast.warning(label + ' must be ' + (integer ? 'a whole number' : 'a number') + ' of 0 or more.');
+        input.focus();
+        return { ok: false, value: null };
+      }
+      return { ok: true, value };
+    }
+
+    function put(target, key, value) {
+      if (value === null || value === undefined) delete target[key];
+      else target[key] = value;
+    }
+
+    save.addEventListener('click', async () => {
+      if (save.disabled) return;
+      const context = readNumber(contextInput, 'Context length', { integer: true, max: 4294967295 });
+      if (!context.ok) return;
+      const maxOutput = readNumber(outputInput, 'Maximum output tokens', { integer: true, max: 4294967295 });
+      if (!maxOutput.ok) return;
+      const inPrice = readNumber(inputPrice, 'Input price');
+      if (!inPrice.ok) return;
+      const outPrice = readNumber(outputPrice, 'Output price');
+      if (!outPrice.ok) return;
+
+      const next = { ...m };
+      const label = labelInput.value.trim();
+      if (label) next.label = label; else delete next.label;
+      put(next, 'context_length', context.value);
+      put(next, 'max_output_tokens', maxOutput.value);
+      put(next, 'default_reasoning_level', defaultSel.value || null);
+
+      const orderedLevels = levels.filter((level) => chosenLevels.has(level));
+      if (orderedLevels.length) next.reasoning_levels = orderedLevels; else delete next.reasoning_levels;
+      const orderedModalities = INPUT_MODALITIES.filter((modality) => chosenModalities.has(modality));
+      if (orderedModalities.length) next.input_modalities = orderedModalities; else delete next.input_modalities;
+
+      const samePrice = (input, old) => {
+        const typed = input.value.trim() === '' ? null : Number(input.value);
+        const previous = old == null ? null : Number(old);
+        return typed === previous;
+      };
+      if (!samePrice(inputPrice, oldInputPrice) || !samePrice(outputPrice, oldOutputPrice)) {
+        put(next, 'input_price_per_mtok', inPrice.value);
+        put(next, 'output_price_per_mtok', outPrice.value);
+        next.pricing = {
+          ...(m.pricing ?? {}),
+          input_per_mtok: inPrice.value,
+          output_per_mtok: outPrice.value,
+          source: 'manual',
+        };
+        if (inPrice.value === null && outPrice.value === null && !m.pricing) delete next.pricing;
+      }
+
+      save.disabled = true;
+      const before = save.textContent;
+      save.textContent = 'Saving…';
+      try {
+        await api.post('/api/providers/' + encodeURIComponent(p.id) + '/models', next);
+        ctx.toast.success('Saved ' + m.id + '.');
+        await reload(true);
+      } catch (err) {
+        ctx.toast.error(err?.message ?? String(err));
+        save.disabled = false;
+        save.textContent = before;
+      }
+    });
+
+    td.append(h('div', { class: 'model-editor' },
+      h('div', { class: 'model-editor-title' },
+        h('strong', {}, 'Edit model'),
+        h('span', { class: 'mono' }, m.id)),
+      h('div', { class: 'model-field-grid' },
+        field('Display label', labelInput, { hint: 'Falls back to the model id.' }),
+        field('Default reasoning level', defaultSel, { hint: 'Requests without a level suffix use this.' }),
+        field('Context length', contextInput, { hint: 'Tokens. Blank inherits discovery metadata.' }),
+        field('Maximum output tokens', outputInput, { hint: 'Blank means the provider default.' }),
+        field('Input price / Mtok', inputPrice, { hint: 'USD per million input tokens.' }),
+        field('Output price / Mtok', outputPrice, { hint: 'USD per million output tokens.' })),
+      h('div', { class: 'model-editor-group' },
+        h('span', { class: 'model-editor-label' }, 'Reasoning levels'),
+        levelRow,
+        h('p', { class: 'hint' }, 'None selected means automatic: derive from the model catalogue and dialect.')),
+      h('div', { class: 'model-editor-group' },
+        h('span', { class: 'model-editor-label' }, 'Input modalities'),
+        modalityRow,
+        h('p', { class: 'hint' }, 'None selected means automatic. Empty is normal.')),
+      h('div', { class: 'model-editor-actions' }, cancel, save)));
+    return tr;
   }
 
   /// Send one small request to this model and report what came back.

@@ -5,8 +5,10 @@
 // is looking at — the exact waste the poll scheduler exists to avoid. It runs once on open and
 // on demand via the "Probe again" button.
 
+import { api } from './api.js';
 import { h, chip, spinner } from './dom.js';
 import { formatUptime, formatAge, truncateMiddle, relayProbeUrl } from './format.js';
+import { recentCombos } from './combo-live.js';
 
 export async function renderOverview(mount, ctx) {
   const alive = { on: true };
@@ -15,7 +17,15 @@ export async function renderOverview(mount, ctx) {
 
   const statGrid = h('div', { class: 'stat-grid' });
   const relayBox = h('div');
-  root.append(statGrid, relayBox);
+  // Below the relay boxes on purpose: reachability is the urgent fact, recent combo use is
+  // context. The row is fed by the same health tick, never by a second poller of its own.
+  const comboSection = h('section', { class: 'recent-combos', 'aria-label': 'Combos used in the last 5 minutes' });
+  const comboHead = h('div', { class: 'recent-combos-head' },
+    h('h2', {}, 'Combos'),
+    h('span', { class: 'hint', 'data-combo-hint': '' }, 'last 5 minutes'));
+  const comboRow = h('div', { class: 'combo-row', tabindex: '0' });
+  comboSection.append(comboHead, comboRow);
+  root.append(statGrid, relayBox, comboSection);
 
   function stat(k, valueEl, sub = null) {
     const v = h('div', { class: 'v' }, valueEl);
@@ -51,6 +61,74 @@ export async function renderOverview(mount, ctx) {
         health.password_set ? chip('set', 'chip-green') : chip('not set', 'chip-amber'),
         health.password_set ? 'sessions require the password' : 'control plane has no password yet'),
     );
+  }
+
+  // --- combos used recently ------------------------------------------------
+
+  let comboBusy = false;
+  // Shared with restoreComboFocus: the box focused before this repaint, by combo name.
+  let focusedCombo = null;
+
+  function paintCombos(list, unreachable = false) {
+    // The row is rebuilt on every health tick (5 s). Remember which box had focus so a keyboard
+    // operator does not lose their place — and the :focus-within expansion — every five seconds.
+    const doc = comboRow.ownerDocument;
+    const active = doc?.activeElement ?? null;
+    focusedCombo = active && active !== comboRow && comboRow.contains(active)
+      ? active.dataset?.combo ?? null
+      : null;
+    comboRow.replaceChildren();
+    if (unreachable) {
+      comboRow.append(h('span', { class: 'combo-row-empty' },
+        'Combo activity is unavailable right now; the relay status above is the place to look.'));
+      comboHead.lastChild.textContent = 'last 5 minutes';
+      restoreComboFocus();
+      return;
+    }
+    if (!list || list.length === 0) {
+      comboRow.append(h('span', { class: 'combo-row-empty' }, 'No combo has been used in the last 5 minutes.'));
+      comboHead.lastChild.textContent = 'last 5 minutes';
+      restoreComboFocus();
+      return;
+    }
+    comboHead.lastChild.textContent = `last 5 minutes · ${list.length} combo${list.length === 1 ? '' : 's'}`;
+    for (const item of list) {
+      const when = item.live ? 'is live now' : `last used ${formatAge(item.lastStartedAt)}`;
+      const box = h('button', {
+        class: 'stat combo-stat',
+        type: 'button',
+        dataset: { combo: item.combo },
+        title: `${item.combo} ${when}, ${item.count} call${item.count === 1 ? '' : 's'} in the last 5 minutes. Open combos.`,
+      },
+      h('div', { class: 'k' },
+        `combo · ${item.live ? 'live' : formatAge(item.lastStartedAt)} · ${item.count} call${item.count === 1 ? '' : 's'}`),
+      h('div', { class: 'v' }, item.combo));
+      box.addEventListener('click', () => ctx.navigate('#/combos'));
+      comboRow.append(box);
+    }
+    restoreComboFocus();
+  }
+
+  /** Put focus back on the same combo after a repaint, or on the row if it left the window. */
+  function restoreComboFocus() {
+    if (focusedCombo == null) return;
+    const again = [...comboRow.querySelectorAll('.combo-stat')]
+      .find((box) => box.dataset?.combo === focusedCombo);
+    // `preventScroll` keeps a tick from yanking the page to a row the operator is already on.
+    (again ?? comboRow).focus({ preventScroll: true });
+  }
+
+  async function refreshCombos() {
+    if (!alive.on || !mount.isConnected || comboBusy) return;
+    comboBusy = true;
+    try {
+      const payload = await api.get('/api/activity');
+      if (alive.on) paintCombos(recentCombos(payload, { now: Date.now() }));
+    } catch {
+      if (alive.on) paintCombos(null, true);
+    } finally {
+      comboBusy = false;
+    }
   }
 
   // --- relay reachability -------------------------------------------------
@@ -106,9 +184,11 @@ export async function renderOverview(mount, ctx) {
   ctx.onHealth((health) => {
     if (!alive.on) return;
     renderStats(health);
+    refreshCombos();
   });
 
   await Promise.all([ctx.loadProviders().catch(() => null), ctx.refreshPorts()]);
   renderStats(ctx.state.health);
+  refreshCombos();
   await probeRelay();
 }

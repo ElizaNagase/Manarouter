@@ -995,12 +995,20 @@ impl Config {
             })
             .collect();
         let mut combo_ids = BTreeMap::new();
+        let mut combo_names = BTreeMap::new();
         for c in &self.combos {
             if combo_ids
                 .insert(c.id.as_str().to_string(), "combo")
                 .is_some()
             {
                 problems.push(format!("duplicate combo id {}", c.id));
+            }
+            // The name is the callable model id and is also how a combo target is spelled, so two
+            // combos sharing one would make every reference to it a coin toss.
+            if c.name.trim().is_empty() {
+                problems.push(format!("combo {} has an empty name", c.id));
+            } else if combo_names.insert(c.name.as_str(), c.id.as_str()).is_some() {
+                problems.push(format!("duplicate combo name {:?}", c.name));
             }
             // `Combo::validate` is handed the provider list so it can report a step that names a
             // provider nobody declared. Discovering that at request time is the worst moment.
@@ -1010,6 +1018,19 @@ impl Config {
                     .map(|m| format!("combo {}: {m}", c.id)),
             );
             for (index, step) in c.steps.iter().enumerate() {
+                // A step that names a combo is expanded into that combo's steps rather than
+                // dispatched to a provider, so provider and model checks do not apply to it.
+                if let Some(target) = &step.combo {
+                    if !target.trim().is_empty() && self.combo(target).is_none() {
+                        problems.push(format!(
+                            "combo {}: step {} routes to unknown combo {:?}",
+                            c.id,
+                            index + 1,
+                            target
+                        ));
+                    }
+                    continue;
+                }
                 let Some(provider) = providers_by_id.get(step.provider.as_str()) else {
                     continue; // an unknown provider is already reported above
                 };
@@ -1037,6 +1058,22 @@ impl Config {
                     step.model,
                     step.provider,
                     models.iter().copied().collect::<Vec<_>>().join(", "),
+                ));
+            }
+        }
+
+        // A combo may route to another combo, which is useful and also a way to write a loop no
+        // request could ever finish. Every target is resolved above; here the reference graph is
+        // walked once so a cycle is reported with the chain that closes it rather than as a
+        // mysterious failure at request time.
+        let mut settled: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for combo in &self.combos {
+            let mut chain = Vec::new();
+            if let Some(cycle) = combo_cycle(self, combo, &mut chain, &mut settled) {
+                problems.push(format!(
+                    "combo {}: routing loop {}",
+                    combo.id,
+                    cycle.join(" -> ")
                 ));
             }
         }
@@ -1306,6 +1343,12 @@ impl Config {
         let mut out: Vec<String> = Vec::new();
         for c in &self.combos {
             for s in &c.steps {
+                // A step that routes to another combo names no model. Check the target itself,
+                // not the empty model field: a hand-edited file can carry both a target and a
+                // stale model id, and that model is not routed by this step.
+                if s.combo.is_some() {
+                    continue;
+                }
                 if !out.contains(&s.model) {
                     out.push(s.model.clone());
                 }
@@ -1414,6 +1457,42 @@ impl Config {
         self.routing.defaults.file.hash(&mut hasher);
         hasher.finish()
     }
+}
+
+/// Walk combo targets and return the chain that closes a routing loop, if one exists.
+///
+/// `chain` is the path from the combo validation started at; `settled` holds combos already proven
+/// acyclic, so a diamond of references is walked once rather than once per path. A target that does
+/// not resolve is reported by the caller and is skipped here.
+fn combo_cycle<'a>(
+    config: &'a Config,
+    combo: &'a crate::model::Combo,
+    chain: &mut Vec<String>,
+    settled: &mut std::collections::BTreeSet<&'a str>,
+) -> Option<Vec<String>> {
+    if chain.iter().any(|seen| seen == &combo.name) {
+        let mut loop_chain = chain.clone();
+        loop_chain.push(combo.name.clone());
+        return Some(loop_chain);
+    }
+    if settled.contains(combo.id.as_str()) {
+        return None;
+    }
+    chain.push(combo.name.clone());
+    for step in &combo.steps {
+        let Some(target) = step.combo.as_deref() else {
+            continue;
+        };
+        let Some(next) = config.combo(target) else {
+            continue;
+        };
+        if let Some(loop_chain) = combo_cycle(config, next, chain, settled) {
+            return Some(loop_chain);
+        }
+    }
+    chain.pop();
+    settled.insert(combo.id.as_str());
+    None
 }
 
 /// Hash a rolling-window cap without collapsing absence into an explicit zero cap.
@@ -1719,6 +1798,92 @@ mod tests {
     }
 
     #[test]
+    fn a_combo_may_route_to_another_combo_by_name_and_by_id() {
+        let mut cfg = Config::default();
+        cfg.providers.push(servable_provider("p1"));
+        cfg.combos.push(combo_with_id("c-inner", "inner", "p1"));
+
+        let mut by_name = combo("by-name", "p1");
+        by_name.steps = vec![crate::model::ComboStep::from_combo("inner")];
+        cfg.combos.push(by_name);
+
+        let mut by_id = combo("by-id", "p1");
+        by_id.steps = vec![crate::model::ComboStep::from_combo("c-inner")];
+        cfg.combos.push(by_id);
+
+        let problems = cfg.validate();
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn a_combo_routing_to_an_unknown_combo_is_reported() {
+        let mut cfg = Config::default();
+        let mut c = combo("outer", "p1");
+        c.steps = vec![crate::model::ComboStep::from_combo("missing")];
+        cfg.combos.push(c);
+
+        let problems = cfg.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|m| m.contains("step 1 routes to unknown combo \"missing\"")),
+            "got {problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_routing_loop_between_combos_is_reported_with_the_chain() {
+        // Without this check a loop compiles into a route no request can finish, and the operator
+        // would only find out when a client hangs.
+        let mut cfg = Config::default();
+        let mut a = combo("a", "p1");
+        a.steps = vec![crate::model::ComboStep::from_combo("b")];
+        let mut b = combo("b", "p1");
+        b.steps = vec![crate::model::ComboStep::from_combo("a")];
+        cfg.combos.push(a);
+        cfg.combos.push(b);
+
+        let problems = cfg.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|m| m.contains("routing loop") && m.contains("a -> b -> a")),
+            "got {problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_combo_routing_to_itself_is_a_loop() {
+        let mut cfg = Config::default();
+        let mut c = combo("selfish", "p1");
+        c.steps = vec![crate::model::ComboStep::from_combo("selfish")];
+        cfg.combos.push(c);
+
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|m| m.contains("routing loop selfish -> selfish")),
+            "{:?}",
+            cfg.validate()
+        );
+    }
+
+    #[test]
+    fn duplicate_combo_names_are_reported() {
+        // The name is what a combo target is spelled with, so an ambiguous name would make every
+        // reference to it depend on declaration order.
+        let mut cfg = Config::default();
+        cfg.providers.push(servable_provider("p1"));
+        cfg.combos.push(combo_with_id("c-one", "same", "p1"));
+        cfg.combos.push(combo_with_id("c-two", "same", "p1"));
+
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|m| m.contains("duplicate combo name")));
+    }
+
+    #[test]
     fn an_alias_pointing_nowhere_is_reported() {
         let mut cfg = Config::default();
         cfg.aliases.push(Alias {
@@ -2003,6 +2168,20 @@ mod tests {
         assert!(models.contains(&"p1/direct".to_string()));
         assert!(models.contains(&"p1/m".to_string()));
         assert!(cfg.reachable_model_ids().contains(&"direct".to_string()));
+    }
+
+    #[test]
+    fn a_combo_target_does_not_expose_a_stale_model_id() {
+        let mut cfg = Config::default();
+        cfg.providers.push(provider("p1"));
+        cfg.combos.push(combo("inner", "p1"));
+        let mut outer = Combo::new("outer", ComboStep::from_combo("inner"));
+        // A hand-edited file can leave a model id beside the combo target. The step routes to the
+        // nested combo, so that id is not reachable and must not be offered as if it were.
+        outer.steps[0].model = "ghost".to_string();
+        cfg.combos.push(outer);
+        assert!(!cfg.reachable_model_ids().contains(&"ghost".to_string()));
+        assert!(cfg.reachable_model_ids().contains(&"m".to_string()));
     }
 
     #[test]

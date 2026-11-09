@@ -9,7 +9,8 @@ import { h, emptyState, errorBlock, toggle } from './dom.js';
 import {
   QUOTA_STATUS_CRITICAL_AT_OR_BELOW, QUOTA_STATUS_HEALTHY_ABOVE,
   formatQuotaAge, formatQuotaUsage, formatPercent, formatResetInLabel,
-  quotaFamilyLabel, quotaStatusLevel, quotaWindows, worstQuotaStatus,
+  mergeQuotaRecord, quotaAccountVisible, quotaFamilyLabel, quotaStatusLevel, quotaWindows,
+  worstQuotaStatus,
 } from './format.js';
 
 // Bars by default: a share of a window is a share, and twenty cells made an operator count them.
@@ -116,7 +117,11 @@ export async function renderQuota(mount, ctx) {
         'Add an account, or check a provider whose upstream exposes its remaining allowance.'));
     } else {
       children.push(renderGlance());
-      for (const [index, row] of accountRows.entries()) children.push(renderAccount(row, index));
+      // Cards share a responsive grid: at desktop width a long single column wastes most of the
+      // page and pushes the request ledger far below the allowances it explains.
+      const cards = h('div', { class: 'quota-cards' });
+      for (const [index, row] of accountRows.entries()) cards.append(renderAccount(row, index));
+      children.push(cards);
     }
     children.push(renderUsage());
     mount.replaceChildren(...children);
@@ -358,13 +363,8 @@ export async function renderQuota(mount, ctx) {
   function mergeRecords(incoming, onlyKey = null) {
     for (const [key, next] of incoming) {
       if (onlyKey && key !== onlyKey) continue;
-      const previous = records.get(key);
       // A per-account error must not erase its last good cached snapshot.
-      if (next.error && !Array.isArray(next.windows) && previous) {
-        records.set(key, { ...previous, ...next, windows: previous.windows });
-      } else {
-        records.set(key, next);
-      }
+      records.set(key, mergeQuotaRecord(records.get(key), next));
       if (next.error) localErrors.set(key, errorMessage(next.error));
       else localErrors.delete(key);
     }
@@ -442,13 +442,14 @@ function buildAccountRows(providers, records) {
   // provider reports no allowance at all. Rendering every configured account here would put those
   // back on the page with invented `0/0` windows, so the rows come from the quota response.
   //
-  // Even inside that response, an account is only a row when it has a quantified window. A cached
-  // failure stays: 'the provider would not answer' is a fact, and it is the one case an operator
-  // must see. A snapshot with neither a window nor an error is silence, and silence gets no card.
+  // Even inside that response, an account is only a row when it has a quantified window to draw.
+  // An error alone is not a quota card: without a window the card would say "Never fetched" and
+  // repeat the log. After a failed refresh, mergeRecords keeps the last-good window, so the error
+  // is still displayed on the card it belongs to.
   const rows = [];
   const byProvider = new Map(providers.map((provider) => [provider.id, provider]));
   for (const [key, record] of records) {
-    if (!quotaWindows(record?.windows).length && record?.error == null) continue;
+    if (!quotaAccountVisible(record)) continue;
     const provider = byProvider.get(record.provider) ?? { id: record.provider || '(unknown provider)' };
     const account = (provider.accounts ?? []).find((candidate) => candidate.id === record.account)
       ?? { id: record.account, label: record.label || record.account };

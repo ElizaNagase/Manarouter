@@ -9,7 +9,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { comboActivityView, comboAgeLabel, startComboLive } from '../combo-live.js';
+import { comboActivityView, comboAgeLabel, recentCombos, startComboLive } from '../combo-live.js';
 
 const T0 = 1_793_641_349_000;
 
@@ -38,7 +38,7 @@ test('a request in flight shows the combo and the step the relay chose, labelled
   assert.equal(view.state, 'live');
   assert.equal(view.combo, 'expensivesmart');
   assert.equal(view.step, 'openai-codex/gpt-6-luna');
-  assert.equal(view.route, 'expensivesmart → openai-codex/gpt-6-luna');
+  assert.equal(view.route, 'openai-codex/gpt-6-luna');
   assert.equal(view.status, 'live');
 });
 
@@ -56,7 +56,7 @@ test('an in-flight request wins over a newer finished one', () => {
 test('nothing running shows the most recent decision and its age', () => {
   const view = comboActivityView({ entries: [finished()] }, { now: T0 + 12_000 });
   assert.equal(view.state, 'recent');
-  assert.equal(view.route, 'expensivesmart → openai-codex/gpt-6-luna');
+  assert.equal(view.route, 'openai-codex/gpt-6-luna');
   assert.equal(view.status, '12s ago');
 });
 
@@ -92,6 +92,55 @@ test('a malformed entry is not rendered as half a route', () => {
     { now: T0 },
   );
   assert.equal(view.state, 'empty');
+});
+
+test('the overview gets one box per combo used in the last five minutes', () => {
+  const entries = [
+    finished({ combo: 'cheap', started_at: T0 + 30_000, step: 'a/one' }),
+    finished({ combo: 'cheap', started_at: T0 + 10_000, step: 'a/zero' }),
+    finished({ combo: 'deepseek', started_at: T0 + 20_000, step: 'b/two' }),
+  ];
+  const list = recentCombos({ entries }, { now: T0 + 60_000 });
+  assert.deepEqual(list.map((item) => item.combo), ['cheap', 'deepseek']);
+  assert.equal(list[0].count, 2);
+  assert.equal(list[0].step, 'a/one', 'the newest step for that combo is the one remembered');
+  assert.equal(list[1].count, 1);
+});
+
+test('a combo is dropped from the overview once its last request leaves the window', () => {
+  const entries = [
+    finished({ combo: 'edge', started_at: T0 }),
+    finished({ combo: 'old', started_at: T0 - 300_001 }),
+    finished({ combo: 'future', started_at: T0 + 120_000 }),
+  ];
+  const list = recentCombos({ entries }, { now: T0 });
+  assert.deepEqual(list.map((item) => item.combo), ['edge']);
+});
+
+test('a combo with a request in flight leads the overview row even if it started earlier', () => {
+  const entries = [
+    finished({ combo: 'recent', started_at: T0 + 10_000 }),
+    inFlight({ combo: 'running', started_at: T0 + 1_000 }),
+  ];
+  const list = recentCombos({ entries }, { now: T0 + 20_000 });
+  assert.deepEqual(list.map((item) => item.combo), ['running', 'recent']);
+  assert.equal(list[0].live, true);
+});
+
+test('a request that is still in flight stays visible past the five-minute window', () => {
+  const entries = [
+    finished({ combo: 'recent', started_at: T0 + 10_000 }),
+    inFlight({ combo: 'running', started_at: T0 - 600_000 }),
+  ];
+  const list = recentCombos({ entries }, { now: T0 + 20_000 });
+  assert.deepEqual(list.map((item) => item.combo), ['running', 'recent']);
+  assert.equal(list[0].live, true);
+});
+
+test('an activity payload that cannot be read yields no overview boxes rather than guesses', () => {
+  for (const payload of [null, {}, { entries: [null, 'nonsense', { combo: 'x' }] }]) {
+    assert.deepEqual(recentCombos(payload, { now: T0 }), []);
+  }
 });
 
 test('relative ages are stated in one unit that fits the sidebar', () => {
@@ -178,8 +227,8 @@ test('the live state is painted as text, with the route and the word live', asyn
   assert.equal(head.children[0].textContent, 'expensivesmart');
   assert.equal(head.children[0].className, 'combo-live-combo');
   assert.equal(head.children[1].textContent, 'live');
-  assert.equal(route.textContent, 'expensivesmart → openai-codex/gpt-6-luna');
-  assert.equal(route.title, route.textContent);
+  assert.equal(route.textContent, 'openai-codex/gpt-6-luna');
+  assert.equal(route.title, 'expensivesmart: openai-codex/gpt-6-luna');
 });
 
 test('a failed poll replaces the shown state with one short line', async () => {
@@ -230,7 +279,7 @@ test('a change of state is announced once, not on every poll', async () => {
   }
 
   const first = doc.announce.textContent;
-  assert.equal(first, 'last combo decision expensivesmart → openai-codex/gpt-6-luna');
+  assert.equal(first, 'last combo decision expensivesmart: openai-codex/gpt-6-luna');
   // A second identical poll must not rewrite the announcement.
   ctl.paint(comboActivityView({ entries: [finished()] }, { now: T0 + 40_000 }));
   assert.equal(doc.announce.textContent, first);

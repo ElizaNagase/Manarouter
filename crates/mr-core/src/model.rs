@@ -1034,9 +1034,30 @@ impl HedgeSpec {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ComboStep {
     /// The provider that serves this step.
+    ///
+    /// Empty when this step routes to another combo instead; see [`Self::combo`].
+    #[serde(
+        default = "empty_provider_id",
+        skip_serializing_if = "provider_is_empty"
+    )]
     pub provider: ProviderId,
     /// The model id as the upstream expects it.
+    ///
+    /// Empty when this step routes to another combo instead.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
+    /// Route this step to another combo by id or name.
+    ///
+    /// A combo target is expanded where it stands: the nested combo's enabled steps are spliced
+    /// into this combo's step list at compile time, in its own order. That makes a combo callable
+    /// from another without copying its steps, while the caller keeps its own strategy, retries,
+    /// hedge and compression. The nested combo's strategy is deliberately ignored — it contributes
+    /// steps, not a second router.
+    ///
+    /// Cycles are rejected when the configuration is validated and again at compile time, because
+    /// a loop here would be an unbounded request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combo: Option<String>,
     /// Whether the operator has this step enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -1065,12 +1086,39 @@ impl ComboStep {
         Self {
             provider: ProviderId::from(provider.into()),
             model: model.into(),
+            combo: None,
             enabled: true,
             weight: 0,
             level: None,
             note: None,
         }
     }
+
+    /// A step that routes to another combo.
+    pub fn from_combo(combo: impl Into<String>) -> Self {
+        Self {
+            provider: ProviderId::from(String::new()),
+            model: String::new(),
+            combo: Some(combo.into()),
+            enabled: true,
+            weight: 0,
+            level: None,
+            note: None,
+        }
+    }
+
+    /// Whether this step names another combo rather than a provider/model pair.
+    pub fn is_combo_target(&self) -> bool {
+        self.combo.is_some()
+    }
+}
+
+fn empty_provider_id() -> ProviderId {
+    ProviderId::from(String::new())
+}
+
+fn provider_is_empty(id: &ProviderId) -> bool {
+    id.as_str().is_empty()
 }
 
 /// A named route: a custom model name that resolves to an ordered list of steps.
@@ -1216,6 +1264,15 @@ impl Combo {
             problems.push("combo has no enabled steps".to_string());
         }
         for (i, s) in self.steps.iter().enumerate() {
+            if let Some(target) = &s.combo {
+                // Whether the target exists, and whether following it closes a loop, is a
+                // cross-combo question: Config::validate owns it. Here only the step's own
+                // shape is checked.
+                if target.trim().is_empty() {
+                    problems.push(format!("step {i} has an empty combo target"));
+                }
+                continue;
+            }
             if !known_providers.contains(&s.provider) {
                 problems.push(format!(
                     "step {i} references unknown provider {:?}",
@@ -1302,6 +1359,14 @@ impl Combo {
             h ^= fnv1a64(s.provider.as_str().as_bytes());
             h ^= fnv1a64(s.model.as_bytes());
             h ^= fnv1a64(&(s.enabled as u8).to_le_bytes());
+            // A step's pinned tier and its combo target both change which upstream is called, so a
+            // signature that ignored them would leave the relay running the previous plan.
+            if let Some(level) = s.level {
+                h ^= fnv1a64(&[level.rank()]);
+            }
+            if let Some(target) = &s.combo {
+                h ^= fnv1a64(target.as_bytes());
+            }
         }
         for p in &self.hedge.participants {
             h ^= fnv1a64(&p.to_le_bytes());
@@ -1829,6 +1894,40 @@ mod tests {
     }
 
     #[test]
+    fn a_combo_step_can_route_to_another_combo_without_naming_a_provider() {
+        let mut c = Combo::new("outer", ComboStep::from_combo("inner"));
+        c.steps.push(ComboStep::new("p", "m"));
+        // The target is resolved against the other combos by `Config::validate`, so the step must
+        // not be reported as referencing an unknown provider here.
+        assert!(
+            c.validate(&[ProviderId::from("p")]).is_empty(),
+            "{:?}",
+            c.validate(&[ProviderId::from("p")])
+        );
+        assert!(c.steps[0].is_combo_target());
+        assert!(!c.steps[1].is_combo_target());
+
+        let blank = Combo::new("bad", ComboStep::from_combo("  "));
+        assert!(blank
+            .validate(&[])
+            .iter()
+            .any(|p| p.contains("empty combo target")));
+    }
+
+    #[test]
+    fn a_combo_step_that_routes_to_a_combo_serializes_without_provider_or_model() {
+        // The authored JSON stays readable: a combo target is one key, not two empty strings.
+        let step: ComboStep =
+            serde_json::from_value(serde_json::json!({ "combo": "inner" })).unwrap();
+        assert_eq!(step.provider.as_str(), "");
+        assert!(step.model.is_empty());
+        assert_eq!(
+            serde_json::to_value(&step).unwrap(),
+            serde_json::json!({ "combo": "inner", "enabled": true, "weight": 0 })
+        );
+    }
+
+    #[test]
     fn combo_signature_changes_when_routing_changes_but_not_on_unrelated_edits() {
         let c = Combo::new("a", ComboStep::new("p", "m"));
         let base = c.signature();
@@ -1845,6 +1944,16 @@ mod tests {
         let mut window = c.clone();
         window.hedge.window_ms = 1234;
         assert_ne!(window.signature(), base);
+
+        // A pinned tier and a combo target change the upstream a step reaches, so each must
+        // invalidate the digest the conductor uses to decide whether to recompile.
+        let mut levelled = c.clone();
+        levelled.steps[0].level = Some(crate::dialect::ReasoningLevel::High);
+        assert_ne!(levelled.signature(), base);
+
+        let mut chained = c.clone();
+        chained.steps[0] = ComboStep::from_combo("nested");
+        assert_ne!(chained.signature(), base);
     }
 
     #[test]

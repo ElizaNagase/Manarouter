@@ -36,7 +36,7 @@ export function comboAgeLabel(startedAt, now = Date.now()) {
  * What the block should say, from the activity payload and the current time.
  *
  * States:
- *   live        — a combo request is being served; combo → step plus the word "live"
+ *   live        — a combo request is being served; the combo is the heading, the route is the step alone, plus "live"
  *   recent      — nothing is running; the newest decision, with its age
  *   empty       — the relay is reachable and has never served a combo
  *   unreachable — the control plane (or the relay behind it) could not be asked
@@ -72,15 +72,65 @@ export function comboActivityView(payload, { now = Date.now(), unreachable = fal
   // requests can overlap, and "what is happening now" is the question this block exists for.
   const live = entries.find((entry) => entry.finished_at == null && entry.outcome == null) ?? null;
   const shown = live ?? entries[0];
-  const route = `${shown.combo} → ${shown.step}`;
+  // The combo is already the heading of the block, so repeating it here would show the same name
+  // twice ("expensivesmart expensivesmart → openai-codex/gpt-6-luna"). The route is the step alone;
+  // the tooltip and the live-region sentence keep the combo because they are read out of context.
+  const route = shown.step;
   return {
     state: live ? 'live' : 'recent',
     combo: shown.combo,
     step: shown.step,
     route,
     status: live ? 'live' : comboAgeLabel(shown.started_at, now),
-    title: live ? `Serving ${route}` : `Last combo decision: ${route}`,
+    title: live
+      ? `Serving ${shown.combo}: ${route}`
+      : `Last combo decision: ${shown.combo}: ${route}`,
   };
+}
+
+/**
+ * The combos that saw a request in the last five minutes, one entry each.
+ *
+ * The sidebar answers "what is happening now"; the overview row answers "what has this router
+ * been doing lately". Both read the same ring buffer, so this stays a pure function of the
+ * payload and a clock: dedupe by combo, keep the newest start, count the calls, and put the
+ * combo with a request in flight first.
+ */
+export function recentCombos(payload, { now = Date.now(), windowMs = 5 * 60_000 } = {}) {
+  const entries = Array.isArray(payload?.entries) ? payload.entries.filter(usable) : [];
+  const seen = new Map();
+  for (const entry of entries) {
+    const startedAt = Number(entry.started_at);
+    // A missing or nonsensical timestamp cannot be placed in the window, and a clock slightly
+    // ahead of ours is treated as now rather than as a reason to hide a request that is running.
+    if (!Number.isFinite(startedAt)) continue;
+    const live = entry.finished_at == null && entry.outcome == null;
+    // A still-running request belongs in the row however long ago it started: "live" is the one
+    // thing this box exists to say. Finished entries are the ones the five-minute window bounds.
+    if (!live && startedAt > now + 60_000) continue;
+    if (!live && now - startedAt > windowMs) continue;
+    const current = seen.get(entry.combo);
+    if (!current) {
+      seen.set(entry.combo, {
+        combo: entry.combo,
+        step: entry.step,
+        count: 1,
+        lastStartedAt: startedAt,
+        live,
+      });
+      continue;
+    }
+    current.count += 1;
+    current.live = current.live || live;
+    if (startedAt > current.lastStartedAt) {
+      current.lastStartedAt = startedAt;
+      current.step = entry.step;
+    }
+  }
+  return [...seen.values()].sort((a, b) =>
+    (Number(b.live) - Number(a.live))
+    || (b.lastStartedAt - a.lastStartedAt)
+    || a.combo.localeCompare(b.combo));
 }
 
 /** Whether an entry carries the two names the block renders. */
@@ -118,9 +168,9 @@ export function startComboLive({
   function announce(view) {
     if (!announcer) return;
     const text = view.state === 'live'
-      ? `${view.route} is live`
+      ? `${view.combo}: ${view.route} is live`
       : view.state === 'recent'
-        ? `last combo decision ${view.route}`
+        ? `last combo decision ${view.combo}: ${view.route}`
         : view.status;
     if (text === announced) return;
     announced = text;
@@ -153,7 +203,7 @@ export function startComboLive({
     const route = doc.createElement('div');
     route.className = 'combo-live-route';
     route.textContent = view.route;
-    route.title = view.route;
+    route.title = `${view.combo}: ${view.route}`;
     mount.append(head, route);
   }
 

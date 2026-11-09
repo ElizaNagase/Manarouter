@@ -314,6 +314,22 @@ export function stepModel(step, providers) {
   return models.find((candidate) => candidate?.id === modelId) ?? null;
 }
 
+/**
+ * The provider/model pair a live-health probe can call, or `null` when the step has no single
+ * target to probe.
+ *
+ * A model step is one tiny completion against that model. A combo-target step is not: it expands
+ * to the nested combo's whole step list at compile time, so probing `provider: ""` / `model: ""`
+ * would send a request that names nothing. Those steps are checked by opening the combo they
+ * route to, where each real model step is listed.
+ */
+export function probeTarget(step) {
+  if (!step || typeof step !== 'object' || step.combo) return null;
+  const provider = String(step.provider ?? step.provider_id ?? '').trim();
+  const model = String(step.model ?? step.model_id ?? '').trim();
+  return provider && model ? { provider, model } : null;
+}
+
 /** True when `name` already ends in a reasoning-level suffix, as in `coding-high`. */
 export function endsInLevelName(name) {
   if (typeof name !== 'string' || !name) return false;
@@ -343,8 +359,11 @@ export function stepLabel(step) {
   if (step == null) return '—';
   if (typeof step === 'string') return step;
   if (typeof step === 'object') {
+    // A combo target has no provider and no model: it is a route to another combo, marked so it
+    // cannot be mistaken for a model id that happens to share the name.
+    if (step.combo) return `→ ${step.combo}`;
     const p = step.provider ?? step.provider_id ?? '';
-    const m = step.model ?? step.model_id ?? step.combo ?? '';
+    const m = step.model ?? step.model_id ?? '';
     return [p, m].filter(Boolean).join('/') || (step.id ?? '—');
   }
   return String(step);
@@ -614,4 +633,37 @@ export function quotaWindows(windows) {
       return rankA === rankB ? a.index - b.index : rankA - rankB;
     })
     .map(({ window }) => window);
+}
+
+/**
+ * Whether a cached /api/quota record earns a card.
+ *
+ * Only a quantified window — including an unlimited one — is content. An error is shown on the
+ * card it belongs to; it never creates a card by itself. A record with no window to draw (never
+ * fetched, a provider that reports no fraction, or a first refresh that failed) has nothing to
+ * say about allowance and stays off the page. After a later refresh fails, mergeQuotaRecord keeps
+ * the last-good window, so the error still has a card to sit on.
+ */
+export function quotaAccountVisible(record) {
+  return quotaWindows(record?.windows).length > 0;
+}
+
+/**
+ * Merge one refresh result over the cached record.
+ *
+ * A refresh that fails after returning an empty window list has not learned that the allowance
+ * disappeared — it learned that the provider would not answer. Keep the last-good windows and the
+ * time they were fetched, and let the new error sit beside them. A failed refresh that did return
+ * windows replaces the snapshot normally; so does any successful refresh.
+ */
+export function mergeQuotaRecord(previous, next) {
+  if (next?.error && !quotaWindows(next.windows).length && quotaWindows(previous?.windows).length) {
+    return {
+      ...previous,
+      ...next,
+      windows: previous.windows,
+      fetched_at: next.fetched_at ?? previous.fetched_at,
+    };
+  }
+  return next;
 }

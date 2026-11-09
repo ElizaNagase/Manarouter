@@ -760,6 +760,9 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
  * in words as well — colour alone must never be the only explanation. */
 .chunks {
   display: inline-flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
   gap: 2px;
   align-items: center;
   vertical-align: middle;
@@ -767,6 +770,9 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
 .chunk {
   width: 9px;
   height: 14px;
+  flex: 1 1 9px;
+  min-width: 2px;
+  max-width: 9px;
   border-radius: 2px;
   background: var(--bg3);
   border: 1px solid var(--line2);
@@ -809,6 +815,21 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
   margin-right: 5px;
   vertical-align: 0;
 }
+
+/* Accounts share the width. One card per row left a single short row of numbers stranded in a
+ * 1200 px card and pushed the request ledger below thirteen screens of mostly empty space. */
+.quota-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+  gap: 12px;
+  align-items: start;
+  margin-bottom: 12px;
+}
+.quota-cards .quota-account { margin-bottom: 0; }
+
+/* The account name can contain an e-mail address; a flex item's automatic minimum width would
+ * otherwise push the refresh button out of a narrow card instead of wrapping the address. */
+.quota-account > .toolbar h2 { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 
 /* An account whose worst window is empty should be visible from the page edge, not only from the
  * row that says so. Grey means "no window was quantified", not "fine". */
@@ -932,6 +953,72 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
 }
 .relay-up h2 { margin: 0 0 4px; font-size: 14px; color: var(--green); }
 
+/* ---------- recent combos on the overview ---------- */
+
+.recent-combos { margin-bottom: 12px; container-type: inline-size; }
+.recent-combos-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.recent-combos-head h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--tx3);
+}
+.combo-row {
+  /* auto-fill, not auto-fit: with a single combo the empty tracks stay reserved, so the box keeps
+     the same width as a version stat instead of stretching across the page. */
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  grid-auto-rows: minmax(90px, auto);
+  gap: 8px;
+  overflow: hidden;
+  max-height: 90px;
+  /* The clipped row is the collapsed state; hovering or tabbing into it opens the overflow
+     downward instead of hiding boxes behind a "more" dialog. */
+}
+.combo-row:hover,
+.combo-row:focus-within {
+  max-height: none;
+  overflow: visible;
+}
+.combo-row:has(.combo-row-empty) { display: block; max-height: none; }
+.combo-row .combo-stat {
+  width: auto;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  appearance: none;
+}
+/* The version stat is 74px tall while the eight stats wrap onto two rows (its row has no
+   three-line tile), and 90px once all eight fit on one line. Mirror that with the same 1096px
+   threshold the stat grid needs for eight 130px columns and seven 8px gaps. */
+@container (max-width: 1095px) {
+  .combo-row { grid-auto-rows: minmax(74px, auto); max-height: 74px; }
+}
+@media (max-width: 640px) {
+  .combo-row { grid-auto-rows: minmax(74px, auto); max-height: 74px; }
+}
+.combo-row .combo-stat .k,
+.combo-row .combo-stat .v {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.combo-row .combo-stat:focus-visible { outline: 2px solid var(--pink); outline-offset: 1px; }
+.combo-row-empty { color: var(--tx3); font-size: 12px; padding: 4px 0; }
+
 .empty-state {
   border: 1px dashed var(--line2);
   border-radius: var(--radius);
@@ -1006,13 +1093,139 @@ ol.steps { list-style: none; margin: 0; padding: 0; }
 .step-edit { flex: 1 1 auto; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .step-edit .input { width: auto; flex: 1 1 120px; }
 
+/* A step picker: an input plus a list the page draws. The list floats over the rows below, so
+   the row must not clip it (overflow stays visible) and the wrapper owns the stacking order. */
+.add-step-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+.add-step-row .add-kind { flex: 0 0 82px; width: 82px; }
+.add-step-row > .input { flex: 1 1 140px; min-width: 120px; }
+
+.search-select { position: relative; flex: 1 1 150px; min-width: 120px; }
+.search-select > .input { width: 100%; }
+.search-select-list {
+  position: absolute;
+  z-index: 35;
+  left: 0;
+  right: 0;
+  top: calc(100% + 2px);
+  max-height: 240px;
+  overflow: auto;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--bg2);
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.45);
+}
+.search-select-list li {
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  padding: 5px 7px;
+  border-radius: 4px;
+  font: 12.5px var(--mono);
+  color: var(--tx1);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.search-select-list li:hover,
+.search-select-list li.active { background: var(--bg3); }
+.search-select-list li[aria-selected="true"] { box-shadow: inset 2px 0 0 var(--pink); }
+.search-select-hint { color: var(--tx3); font-family: var(--sans); font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
+.search-select-empty { color: var(--tx3); font-family: var(--sans); cursor: default; }
+.search-select-empty:hover { background: transparent; }
+
 /* ---------- key/value list ---------- */
 
 dl.kv { margin: 0; display: grid; grid-template-columns: minmax(120px, max-content) 1fr; gap: 4px 14px; }
 dl.kv dt { color: var(--tx3); }
 dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 
-/* ---------- drawer (provider detail) ---------- */
+/* ---------- provider list: sort, pins, inline detail ---------- */
+
+.provider-sort {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--tx3);
+  font-size: 11px;
+}
+.provider-sort .input {
+  width: auto;
+  min-width: 138px;
+  padding: 4px 7px;
+  font-size: 12px;
+}
+.provider-sort .hint { margin: 0; white-space: nowrap; }
+
+.provider-table .pin-col { width: 1%; padding-right: 2px; text-align: left; white-space: nowrap; }
+.pin-btn {
+  border: 0;
+  background: none;
+  color: var(--tx3);
+  font-size: 15px;
+  line-height: 1;
+  padding: 2px 3px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.pin-btn:hover { color: var(--pink); background: var(--pink-dim); }
+.pin-btn.pinned { color: var(--pink); }
+.provider-move { width: 18px; height: 16px; padding: 0; margin-left: 1px; color: var(--tx3); }
+.provider-move:hover:not(:disabled) { color: var(--pink); }
+.provider-move:disabled { opacity: 0.25; cursor: default; }
+.tbl tr.row-draggable { cursor: grab; }
+.tbl tr.row-draggable.dragging { opacity: 0.45; }
+.tbl tr.row-draggable.drag-over td { box-shadow: inset 0 2px 0 var(--pink); }
+.tbl tr.pinned-row td:first-child { box-shadow: inset 2px 0 0 var(--pink-dim); }
+
+.provider-work:empty { display: none; }
+.provider-work { padding: 10px 0 14px; }
+.tbl tr.provider-detail-row > td { padding: 0; background: var(--bg0); border-bottom: 1px solid var(--line2); }
+.tbl tr.provider-detail-row:hover > td { background: var(--bg0); }
+.tbl tr.provider-detail-row .work-panel { margin: 0 0 0 30px; scroll-margin-top: 24px; }
+.work-panel {
+  background: var(--bg1);
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.work-panel .drawer-head { background: var(--bg2); }
+.work-panel .drawer-body { padding: 12px 14px 24px; overflow: visible; }
+
+/* ---------- per-model editor ---------- */
+
+.model-table-scroll { max-height: min(48vh, 460px); }
+.tbl .model-price { white-space: nowrap; }
+.model-editor-row td { padding: 0; background: var(--bg2); }
+.model-editor-row[hidden] { display: none; }
+.model-editor {
+  padding: 12px 14px 14px;
+  border-left: 2px solid var(--pink-dim);
+}
+.model-editor-title { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.model-editor-title .mono { color: var(--tx3); font-size: 11.5px; overflow-wrap: anywhere; }
+.model-field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 8px 12px;
+}
+.model-field-grid .field { margin: 0; }
+.model-editor-group { margin-top: 10px; }
+.model-editor-label {
+  display: block;
+  color: var(--tx3);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.model-chip-row { display: flex; flex-wrap: wrap; gap: 4px; margin: 5px 0 0; }
+.model-editor-chip { cursor: pointer; font: inherit; font-size: 11px; padding: 2px 8px; }
+.model-editor-chip:hover { border-color: var(--pink); }
+.model-editor-chip.active { background: var(--pink-dim); border-color: var(--pink); color: var(--tx1); }
+.model-editor-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+
+/* ---------- drawer (combo detail) ---------- */
 
 .drawer {
   position: fixed;
@@ -1038,8 +1251,8 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 .drawer-head h2 { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
 .drawer-head .spacer { flex: 1; }
 .drawer-body { padding: 12px 14px 40px; overflow-y: auto; min-height: 0; }
-.drawer section { margin-bottom: 16px; }
-.drawer section > h3 {
+.drawer section, .work-panel section { margin-bottom: 16px; }
+.drawer section > h3, .work-panel section > h3 {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.06em;
@@ -1213,6 +1426,56 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 @media (max-width: 1100px) {
   #shell { grid-template-columns: 170px minmax(0, 1fr); }
   .combo-layout, .docs-layout { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* Below a tablet the sidebar is a strip above the page, not a 170 px column that leaves a phone
+   with 220 px of content. Navigation scrolls horizontally; the live combo block and footer move
+   out of the way because there is no room to keep them beside the route. */
+@media (max-width: 760px) {
+  #shell {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .main-col { height: auto; min-height: 0; }
+  .sidebar {
+    flex-direction: row;
+    align-items: stretch;
+    padding: 0;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    overflow: visible;
+  }
+  .brand { flex: none; padding: 0 12px; }
+  .sidebar nav { flex: 1 1 auto; min-width: 0; overflow-x: auto; }
+  .sidebar nav ul { display: flex; height: 100%; }
+  .sidebar nav li { flex: none; }
+  .sidebar nav a {
+    display: flex;
+    align-items: center;
+    height: 100%;
+    padding: 10px 9px;
+    white-space: nowrap;
+    border-left: 0;
+    border-bottom: 2px solid transparent;
+  }
+  .sidebar nav a[aria-current="page"] {
+    border-left: 0;
+    border-bottom-color: var(--pink);
+  }
+  .combo-live, .sidebar-foot { display: none; }
+}
+
+@media (max-width: 520px) {
+  .brand-name { display: none; }
+  .brand { padding: 0 10px; }
+}
+
+/* A quota row is name · bar · readout · reset on one line. Once the card is phone-narrow the name
+   column squeezes the bar into a sliver, so the name gets its own line and the bar the card's full
+   width. The chunks themselves shrink (with a 2px floor) instead of overflowing the row. */
+@media (max-width: 520px) {
+  .quota-window { grid-template-columns: minmax(0, 1fr); }
+  .quota-window-usage { grid-column: 1; }
 }
 
 @media (prefers-reduced-motion: reduce) {

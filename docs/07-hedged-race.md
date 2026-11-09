@@ -49,6 +49,30 @@ A combo is an ordered list of steps in **exactly the order the operator put them
 never sorted, never re-weighted by the router, and never inferred from a benchmark. It is the
 operator's statement of preference, and it is the tie-breaker of last resort.
 
+A step normally names a provider and a model. It may instead name another combo by id or name:
+
+```jsonc
+{
+  "name": "Brains",
+  "steps": [
+    { "combo": "Fast" },
+    { "provider": "codex", "model": "cx/gpt-6-astra" }
+  ]
+}
+```
+
+The nested combo is expanded **in place**, at compile time: its enabled steps are spliced into the
+outer step list at the position of the step that named it, in the order the nested combo declares.
+The outer combo keeps its own strategy, retries, hedged race, compression and mid-stream policy.
+The nested combo's strategy, retries and hedge settings are **not** applied — it is not being called
+as a combo, only contributing its step list. Disabled nested steps (and steps whose provider is
+disabled) are omitted exactly as if they were authored on the outer combo; a disabled nested combo
+contributes no steps at all.
+
+A routing loop is rejected when the configuration is validated, with the chain in the error
+(for example `combo a: routing loop a -> b -> a`); compilation retains the same guard for a
+snapshot built by another path. A combo cannot route to itself.
+
 ```jsonc
 {
   "name": "Brains",
@@ -295,10 +319,13 @@ different provider turns a provider outage from a stalled request into a fast, c
 
 ### `stable-fallback` — implemented
 
-Jump straight to a fixed `step`, given as an index into the combo's **own** step list (the wire form is
-`{"mode": "stable-fallback", "step": N}`). The step is renumbered by the compiler onto the surviving
-list, so it must be a step of this combo — there is no separate `stable_model` field, and the target
-need not be a hedge participant.
+Jump straight to a fixed `step`, given as an **authored** index into the combo's own step list
+(the wire form is `{"mode": "stable-fallback", "step": N}`). The compiler rewrites it onto the
+surviving list, so it must be a step of this combo — there is no separate `stable_model` field, and
+the target need not be a hedge participant. When that authored step routes to another combo, the
+rewritten index is the first step the nested combo expands to; normal fallback continues through the
+remaining expanded steps. If the nested target contributes no routable step, the reference cannot be
+honoured and the mode falls back to `pick-highest-passed`.
 
 This is the "on fail" model. It is the right choice when the operator has one model they trust to be
 always available and are willing to trade quality for availability exactly when things go wrong.
@@ -310,8 +337,13 @@ independently of the full ordered step list. A model can therefore be part of th
 without ever being hedged — useful when a model is cheap but rate-limited, or expensive and reserved
 for the case where everything else is down.
 
-When `participants` is empty, the first `hedge.count` enabled steps are used. This is the "first X
-models" behaviour, expressed as a default rather than a separate mechanism.
+These are **authored** indices, not positions in the flattened step list. A step that routes to
+another combo counts as one participant and is rewritten by the compiler to the first step the nested
+combo expands to; the rest of that nested combo remains in the fallback chain but does not join the
+race. If the target expands to nothing, that participant is omitted.
+
+When `participants` is empty, the first `hedge.count` enabled authored steps are used. This is the
+"first X steps" behaviour, expressed as a default rather than a separate mechanism.
 
 ---
 

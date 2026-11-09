@@ -10,6 +10,19 @@ const SOURCES = ['synced', 'manual', 'inferred'];
 const INPUT_MODALITIES = ['text', 'image', 'audio', 'video', 'pdf', 'file'];
 const MODEL_TEST_PROMPT = 'reply with "yes"';
 
+/** Compare two ids case-insensitively, with exact spelling as the tie-break so case variants stay
+ *  together instead of being split by the next sort key. */
+function compareId(a, b) {
+  const folded = String(a).localeCompare(String(b), undefined, { sensitivity: 'base', numeric: true });
+  if (folded !== 0) return folded;
+  return String(a).localeCompare(String(b), undefined, { numeric: true });
+}
+
+/** Model-major row order: all providers of one model are contiguous, then provider order. */
+export function compareModelRows(a, b) {
+  return compareId(a.m.id, b.m.id) || compareId(a.p.id, b.p.id);
+}
+
 export async function renderModels(mount, ctx) {
   let providers = [];
 
@@ -25,6 +38,12 @@ export async function renderModels(mount, ctx) {
   const hiddenOnly = hiddenFilter.input;
   const tableWrap = h('div', { class: 'table-scroll' });
   const count = h('span', { class: 'count' });
+  // Bulk actions are loops over the same per-provider endpoints the detail page uses; there is no
+  // bulk route on the conductor, and inventing one here would give the panel a second source of
+  // truth for what "all models" means.
+  const resyncAll = h('button', { class: 'btn', type: 'button', title: 'Ask every provider to refresh its model list' }, 'Resync all models');
+  const deleteAll = h('button', { class: 'btn btn-danger', type: 'button', title: 'Delete every model from every provider' }, 'Delete all models');
+  const bulkBusy = { value: false };
 
   // A <select> fires both "input" and "change"; binding both rebuilt the table twice per change.
   provSel.addEventListener('change', renderTable);
@@ -32,11 +51,14 @@ export async function renderModels(mount, ctx) {
   search.addEventListener('input', renderTable);
   hiddenOnly.addEventListener('change', renderTable);
 
+  resyncAll.addEventListener('click', resyncAllModels);
+  deleteAll.addEventListener('click', deleteAllModels);
+
   mount.replaceChildren(
     h('div', { class: 'toolbar' },
       provSel, sourceSel, search,
       hiddenFilter.row,
-      h('span', { class: 'spacer' }), count),
+      h('span', { class: 'spacer' }), resyncAll, deleteAll, count),
     tableWrap,
   );
 
@@ -71,7 +93,9 @@ export async function renderModels(mount, ctx) {
         out.push({ p, m });
       }
     }
-    return out;
+    // Model first: every provider offering the same model id sits together, which is how an
+    // operator compares availability and price across providers. The provider is the tie-break.
+    return out.sort(compareModelRows);
   }
 
   function renderTable() {
@@ -294,6 +318,95 @@ export async function renderModels(mount, ctx) {
       await reload();
     } catch (err) {
       ctx.toast.error('Delete failed', err);
+    }
+  }
+
+  // ------------------------------------------------------------------ bulk actions
+
+  function beginBulk(button, label) {
+    bulkBusy.value = true;
+    resyncAll.disabled = true;
+    deleteAll.disabled = true;
+    button.textContent = label;
+  }
+  function endBulk(button, label) {
+    bulkBusy.value = false;
+    resyncAll.disabled = false;
+    deleteAll.disabled = false;
+    button.textContent = label;
+  }
+
+  async function resyncAllModels() {
+    if (bulkBusy.value) return;
+    // Snapshot the roster: reload() replaces `providers` after the loop, and the failure summary
+    // must describe the set that was actually attempted, not whatever came back from the sync.
+    const targets = providers;
+    const total = targets.length;
+    if (!total) { ctx.toast.warning('There are no providers to resync.'); return; }
+    beginBulk(resyncAll, `Resyncing 0/${total}…`);
+    const failed = [];
+    let done = 0;
+    // Sequential on purpose: model sync is an upstream call per provider, and firing 38 at once
+    // is a good way to meet a provider's rate limit and get a partial refresh.
+    for (const p of targets) {
+      resyncAll.textContent = `Resyncing ${done + 1}/${total}…`;
+      try {
+        await api.post(`/api/providers/${encodeURIComponent(p.id)}/models/sync`);
+      } catch (err) {
+        failed.push({ provider: p.id, message: err?.message ?? String(err) });
+      }
+      done += 1;
+    }
+    endBulk(resyncAll, 'Resync all models');
+    try { await reload(); } catch { /* reload() already paints its own error */ }
+    if (failed.length) {
+      const names = failed.map((f) => f.provider).join(', ');
+      ctx.toast.error(`${failed.length} of ${total} provider syncs failed: ${names}. ${failed[0].message}`);
+    } else {
+      ctx.toast.success(`Resynced models for ${total} provider${total === 1 ? '' : 's'}.`);
+    }
+  }
+
+  async function deleteAllModels() {
+    if (bulkBusy.value) return;
+    // Snapshot before the confirmation and loop: reloading mid-loop would shrink the list under
+    // the progress count, and the operator confirmed this exact set.
+    const work = providers.flatMap((p) => (p.models ?? []).map((m) => ({ p, m })));
+    const total = work.length;
+    if (!total) { ctx.toast.warning('There are no models to delete.'); return; }
+    const ok = await ctx.confirm({
+      title: `Delete all ${total} models?`,
+      message: 'Every model entry is removed from every provider. Providers, accounts, client keys and combos are left alone.',
+      warnLines: [
+        'Combos, aliases and clients that name these models stop resolving until the models are added again or a sync brings them back.',
+        'Manual model entries cannot be recovered from the panel.',
+      ],
+      confirmLabel: 'Delete all models',
+      danger: true,
+    });
+    if (!ok) return;
+
+    beginBulk(deleteAll, `Deleting 0/${total}…`);
+    const failed = [];
+    let done = 0;
+    for (const { p, m } of work) {
+      // Number the request about to run, so the last one reads N/N instead of stopping at N-1/N.
+      if (done === 0 || (done + 1) % 5 === 0 || done === total - 1) {
+        deleteAll.textContent = `Deleting ${done + 1}/${total}…`;
+      }
+      try {
+        await api.del(`/api/providers/${encodeURIComponent(p.id)}/models/${encodeURIComponent(m.id)}`);
+      } catch (err) {
+        failed.push({ provider: p.id, model: m.id, message: err?.message ?? String(err) });
+      }
+      done += 1;
+    }
+    endBulk(deleteAll, 'Delete all models');
+    try { await reload(); } catch { /* reload() already paints its own error */ }
+    if (failed.length) {
+      ctx.toast.error(`${failed.length} of ${total} model deletes failed. First: ${failed[0].provider}/${failed[0].model} — ${failed[0].message}`);
+    } else {
+      ctx.toast.success(`Deleted ${total} model${total === 1 ? '' : 's'}.`);
     }
   }
 }
