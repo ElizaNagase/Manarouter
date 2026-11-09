@@ -168,11 +168,15 @@ function makeEl(tag) {
     tagName: String(tag).toUpperCase(),
     children: [],
     dataset: {},
+    attrs: {},
     className: '',
     textContent: '',
     title: '',
+    href: '',
     append(...kids) { this.children.push(...kids); },
     replaceChildren(...kids) { this.children = kids; },
+    setAttribute(k, v) { this.attrs[k] = String(v); },
+    getAttribute(k) { return Object.hasOwn(this.attrs, k) ? this.attrs[k] : null; },
   };
 }
 
@@ -223,10 +227,17 @@ test('the live state is painted as text, with the route and the word live', asyn
   }
 
   assert.equal(doc.mount.dataset.state, 'live');
-  const [head, route] = doc.mount.children;
+  // The block is a deep link to the combo, and the state is not a third visible line: it stays in
+  // the live region so the two readable lines are the combo and the route it chose.
+  const [link] = doc.mount.children;
+  assert.equal(link.tagName, 'A');
+  assert.equal(link.href, '#/combos/expensivesmart');
+  assert.match(link.attrs['aria-label'], /expensivesmart, live at openai-codex\/gpt-6-luna/);
+  const [head, route] = link.children;
   assert.equal(head.children[0].textContent, 'expensivesmart');
   assert.equal(head.children[0].className, 'combo-live-combo');
   assert.equal(head.children[1].textContent, 'live');
+  assert.equal(head.children[1].className, 'sr-only');
   assert.equal(route.textContent, 'openai-codex/gpt-6-luna');
   assert.equal(route.title, 'expensivesmart: openai-codex/gpt-6-luna');
 });

@@ -70,6 +70,8 @@ const initialHealth = { snapshot: { digest: '1111111111111111' } };
 
 globalThis.document = {
   createElement: makeEl,
+  // The provider table's pin and move controls are inline SVG, as in the real panel.
+  createElementNS: (_ns, tag) => makeEl(tag),
   createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
   body: makeEl('body'),
   documentElement: makeEl('html'),

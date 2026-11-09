@@ -17,17 +17,17 @@ All requests are **relative** (`/api/…`); the panel talks only to the origin t
 | `dom.js` | `h()` element builder — the only sanctioned DOM construction. **Exactly one deliberate `innerHTML`** — docs markdown in `view-docs.js`, escaped at the door by `markdown.js` — and server strings (provider labels, model ids, error messages, doc text) enter the DOM as text nodes or `textContent` only. Also: validation-problem → field mapping, error blocks, chips, form fields. |
 | `format.js` | Pure, DOM-free helpers (uptime/age, chip-class selection, problem grouping, port diffing, combo step moves, hedge-enum parsing). See “Testing”. The hedge-enum helpers (`parseWinnerFail` / `buildWinnerFail`) build the backend's internally tagged form; legacy externally tagged documents are still read. |
 | `poll.js` | Health poll scheduler. Chained `setTimeout` (never overlapping), **stops entirely while `document.visibilityState !== 'visible'`** — a background tab must not hammer a loopback socket — and fires one immediate tick on return. |
-| `combo-live.js` | The sidebar's live combo visualizer, under the Combos nav entry. Polls `GET /api/activity` (the control plane proxying the relay's `/control/activity`) every 1.5 s through `poll.js`. `comboActivityView` is the pure decision — in flight, idle with history and its relative age, never run, control plane unreachable — so all four states are tested without a DOM. |
+| `combo-live.js` | The sidebar's live combo visualizer, under the Combos nav entry. Polls `GET /api/activity` (the control plane proxying the relay's `/control/activity`) every 1.5 s through `poll.js`. The block shows the combo and the route it is serving on two lines; when idle it shows the last decision, with its relative age in the tooltip and accessible label rather than a third line. `comboActivityView` is the pure decision — live, recent history, never run, control plane unreachable — so all four states are tested without a DOM. |
 | `toast.js` | Global notification area. Success/error/warning/info map onto the semantic colours; error toasts render the backend's full `details` list. |
 | `dialog.js` | Promise-based confirm dialog (focus trap, Escape, focus restore) and the one-time client-key reveal (no accidental backdrop dismissal; copy button). |
 | `view-login.js` | Password screen when `password_required && !authenticated`. |
 | `view-overview.js` | Health stats, snapshot digest/age, counts, live-updated uptime, and the relay reachability probe (`fetch(url, {mode:'no-cors'})` — opaque but proves the socket answers). |
-| `view-providers.js` | Dense provider table + detail drawer: accounts (add/toggle/delete), models (add manual/hide/delete), timeouts, headers, route overrides, per-provider **Sync models**. Creating a provider opens the account drawer for it immediately, so the new provider is never left without a credential. |
-| `view-combos.js` | Combo list + editor. Step list is drag-reorderable (plus ↑/↓ buttons for keyboard) and **never sorted** — the array order *is* the priority order. Hedge help text summarises `docs/07-hedged-race.md`. |
+| `view-providers.js` | Dense provider table with pinning, four sort modes and drag/arrow reordering, plus an inline detail panel under the selected row: accounts (add/toggle/delete), models (add manual/hide/delete), timeouts, headers, route overrides, per-provider **Sync models**. Creating a provider opens its first-account form immediately, so the new provider is never left without a credential. |
+| `view-combos.js` | Combo list + editor. Step list is drag-reorderable (plus ↑/↓ buttons for keyboard) and **never sorted** — the array order *is* the priority order. Provider/model pickers are searchable, a step may point at another combo (nested routes expand in place; cycles are refused), and unsaved edits are guarded on close, replacement and navigation. Hedge help text summarises `docs/07-hedged-race.md`. |
 | `view-keys.js` | Client keys, allow-lists (one per line), create flow with the show-once plaintext dialog. |
 | `view-aliases.js` | Alias table editor (add + delete; the API has no alias PUT). |
-| `view-models.js` | All models across providers, filtered by provider/source/text/hidden, with hide/show toggles. |
-| `view-quota.js` | Declared windows from the config (real data) + `GET /api/quota`, which exists and renders the **honest empty state** until provider windows are cached, plus the request ledger from `GET /api/usage` — the per-request token count, reported by the provider or estimated by the router. |
+| `view-models.js` | All models across providers, sorted model-first with a provider tie-break and paged 50/100/250/500 rows at a time. Filter by provider, source and text; hide/show or delete individual rows, or resync/delete all models in one confirmed action. |
+| `view-quota.js` | Cached upstream quota windows, grouped by provider and account: chips for every quantified window, one card per account coloured by its most exhausted window, and display-only drag/arrow reordering for both levels. Refresh is explicit (or opt-in on load); the request ledger from `GET /api/usage` follows underneath. |
 | `view-settings.js` | Port editor with apply-on-restart warning, panel password, raw config editor with Validate/Save. |
 | `view-docs.js` | Documentation browser; renders doc text as markdown into `innerHTML`, through `markdown.js`, which escapes raw HTML (`&`/`<`/`>`/`"`/`'`) first, so a doc cannot inject DOM. |
 
@@ -45,19 +45,20 @@ Contracts verified against the conductor implementation (still verify interactiv
    `secret` is **required by the panel** and refused before the request is sent; the only way to
    omit it is to tick "This provider needs no API key" for a local server (Ollama, llama.cpp) that
    genuinely accepts credential-less requests. The OAuth path sends `secret: null`, because the
-   credential comes from the sign-in flow. Panel flow for a new provider: **Add provider** → the
-   account drawer opens for the provider just created → **Add account** (or **Connect** for
-   OAuth) → the detail drawer opens with the account listed.
+   credential comes from the sign-in flow. Panel flow for a new provider: **Add provider** → its
+   first-account form opens immediately → **Add account** (or **Connect** for OAuth) → the inline
+   detail panel opens under the provider row with the account listed.
 2. **Model hide/show** — `POST /api/providers/{id}/models` is treated as an upsert and sent the
    full model object with `hidden` flipped (`hidden` is authored metadata; manual entries win
    over syncs per `docs/03-configuration.md`). If the backend grows a dedicated toggle route,
    change `toggleModelHidden` (providers view) and `toggleHidden` (models view).
 3. **Key rotation** — `POST /api/keys/{id}/rotate` replaces a client key's secret in place, preserves its id and policy, invalidates the old secret after commit, and reveals the new plaintext once. The panel asks for confirmation and uses the one-time copy dialog. This rotates Manarouter client credentials, not upstream provider keys.
-4. **Quota usage** — `GET /api/quota` returns persisted per-account usage aggregates (all recorded
-   time; it is not a live billing-window quota signal). A failure renders an honest unavailable state.
-   **Caveat:** the endpoint exists, but the ledger only reflects traffic that has actually flowed, so in a real
-   deployment this view is always empty. That empty state is honest, not a missing route — see
-   `docs/08-quota-tracking.md`.
+4. **Quota usage** — `GET /api/quota` returns persisted per-account snapshots (`provider`,
+   `account`, `windows`, `fetched_at`, optional `error`). Only a window with a reported fraction is
+   drawn; an account with no quantified window is omitted. A failed refresh keeps the last-good
+   windows and shows the error. `POST /api/providers/{id}/accounts/{accountId}/quota/refresh`
+   refreshes one account and `POST /api/quota/refresh` refreshes all; the page does not poll
+   upstream quota. The recent request ledger is `GET /api/usage?limit=20`.
 5. **Hedge enum** — `hedge.on_winner_fail` is sent in the internally tagged form the backend uses
    (`#[serde(tag = "mode")]` in `crates/mr-core/src/dialect.rs`):
    `{"mode":"rerun-excluding","max_rounds":2}` / `{"mode":"stable-fallback","step":2}` /
@@ -102,97 +103,53 @@ node panel/test/browser.e2e.mjs
 
 For Firefox, use `npx playwright install firefox` then `BROWSER=firefox node panel/test/browser.e2e.mjs`. Playwright is intentionally not a project dependency. Set `PLAYWRIGHT_MODULE` to an installed module path only if it is not resolvable from the checkout; set `CHROMIUM_EXECUTABLE` or `FIREFOX_EXECUTABLE` only if using a browser binary not matched to the installed Playwright version. The test exits with code 2 and setup guidance if Playwright is unavailable. The checkout panel files are served by this test’s own local ephemeral HTTP server.
 
-### Pure functions (`node`, no browser needed)
+### Pure functions and view logic (`node`, no browser needed)
 
-`format.js` touches no DOM, `poll.js` takes injected `doc`/`win`, `dom.js`'s pure helpers
-(`problemParts`, `fieldMatches`) are exported separately. With `node:test`:
+The suite in `panel/test/*.test.mjs` covers the DOM-free helpers and the renderers that can run
+without a browser: API request envelopes, uptime/age formatting, provider presets, probe targets,
+reasoning levels, searchable selects, combo live-state selection, quota display ordering, model
+grouping and paging, markdown escaping, OAuth redirects and provider refresh decisions. Run it
+with:
 
-```js
-// panel/test/format.test.mjs (suggested location for a future harness)
-import { test } from 'node:test';
-import assert from 'node:assert/strict';
-import {
-  formatUptime, portsDirty, describePortChange, groupProblems, fieldMatches,
-  moveStep, remapIndex, remapParticipants, parseWinnerFail, buildWinnerFail,
-  relayProbeUrl, deriveProviderHealth, accountState, healthChipClass,
-} from '../format.js';
-
-test('formatUptime picks the two most significant units', () => {
-  assert.equal(formatUptime(14520), '4 h 2 m');
-  assert.equal(formatUptime(59), '59 s');
-});
-
-test('portsDirty/describePortChange detect a not-yet-live port change', () => {
-  const ports = { relay: { host: '127.0.0.1', port: 8080, running_port: 20900 },
-                  control: { host: '127.0.0.1', port: 20901, running_port: 20901 } };
-  assert.equal(portsDirty(ports), true);
-  assert.deepEqual(describePortChange(ports),
-    ['relay will listen on 127.0.0.1:8080 instead of 127.0.0.1:20900']);
-});
-
-test('moveStep never sorts; remapIndex keeps positional refs pointing at the same row', () => {
-  const steps = ['a', 'b', 'c'];
-  assert.deepEqual(moveStep(steps, 0, 2), ['b', 'c', 'a']);
-  assert.equal(remapIndex(0, 0, 2), 2);      // moved element
-  assert.equal(remapIndex(1, 0, 2), 0);      // shifted left
-  assert.deepEqual(remapParticipants([0, 2], 0, 2), [1, 2]);
-});
-
-test('hedge on_winner_fail round-trips through the tagged wire form', () => {
-  // KNOWN BUG: these assertions pin the *externally* tagged form, which the backend rejects.
-  // The authoritative form is internally tagged — {"mode":"rerun-excluding","max_rounds":3} —
-  // and is pinned by the Rust test named in the "Hedge enum" note above.
-  assert.deepEqual(parseWinnerFail({ 'stable-fallback': { step: 2 } }),
-    { mode: 'stable-fallback', maxRounds: null, step: 2 });
-  assert.deepEqual(buildWinnerFail('rerun-excluding', { maxRounds: 3 }),
-    { 'rerun-excluding': { max_rounds: 3 } });
-});
-
-test('an all-accounts-disabled provider is intentionally neutral, never red', () => {
-  const p = { enabled: true, accounts: [{ enabled: false }, { enabled: false }] };
-  assert.equal(deriveProviderHealth(p).cls, 'chip-neutral');
-  assert.equal(deriveProviderHealth({ enabled: false }).cls, 'chip-neutral');
-});
-
-test('fieldMatches maps deep problem paths onto leaf-named inputs', () => {
-  assert.equal(fieldMatches('window_ms', 'hedge.window_ms'), true);
-  assert.equal(fieldMatches('window_ms', 'steps[0].model'), false);
-});
+```bash
+node --test panel/test/*.test.mjs
 ```
 
-The poller can be exercised with a fake document/window (`createPoller({ tick, doc: fakeDoc,
-win: fakeWin })`) asserting that no `tick` runs while `visibilityState === 'hidden'` and one
-runs immediately on returning to `visible`.
+`browser.e2e.mjs` is separate: it drives the guarded login and client-key dialogs against a local
+mock API in Playwright, without touching the configured conductor. Its setup is above.
 
-**Status: this suite was actually executed against `format.js`/`dom.js` in the building
-environment (Node 24, `/tmp`, kept out of `panel/` to respect the deliverable file list) and
-all assertions passed** — covering uptime/age formatting, chip-class mapping, the
-disabled-provider-is-neutral rule, problem grouping and leaf-field matching, port diffing +
-probe-URL normalisation, step moves and participant remapping, the hedge-enum round-trip, and
-allow-list line handling. To keep it, save the snippet above as `panel/test/format.test.mjs`
-and run `node --test panel/test/`.
+### Current verification
 
-### Syntax check (performed)
+At the time of writing, `node --test panel/test/*.test.mjs` runs 126 tests with no failures, and
+the Rust workspace passes `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`
+and `cargo test --workspace`.
 
-Every module passes `node --check` (Node 24 detects the ES-module syntax; see report).
+The panel was hard-reloaded route by route in headless Chromium at 1280×900 and 390×844. Every
+route — overview, providers, combos, a combo detail, models, keys, aliases, quota and settings —
+finished loading with no uncaught exception, error card, dialog, drawer or page-level horizontal
+overflow. At 390 px the models table scrolls inside its own pane (816 px of table in a 358 px
+column) instead of widening the document.
 
-### What still needs a human in a browser
+### Manual checks for a live install
 
-The panel was **not** executed in a browser in this environment. Manual checklist:
+These need a real backend and, in some cases, deliberate failures:
 
 1. Overview: stats fill from `/api/health`; stop the backend → pill turns red, boot screen
    offers Retry; hide the tab for a minute and confirm (via network inspector) no polls fire.
-2. Providers: **Add provider** → the account drawer opens on its own; submitting with an empty
-   secret is refused inline, ticking "needs no API key" allows it; after adding, the detail drawer
-   opens showing the account. Then toggle/delete an account, add a manual model, hide/show, and
-   Sync models (button must stay disabled while running).
-3. Combos: drag a step and verify participants + stable-step references move with it; save;
-   reload and confirm order survived exactly.
+2. Providers: **Add provider** → its first-account form opens on its own; submitting with an empty
+   secret is refused inline, ticking "needs no API key" allows it; after adding, the inline detail
+   panel opens showing the account. Then toggle/delete an account, add a manual model, hide/show,
+   and Sync models (button must stay disabled while running).
+3. Combos: drag a step and verify positional references move with it; add a nested combo step
+   and confirm it expands in place; try to create a cycle and confirm the error names the chain.
+   Edit a combo, then close the drawer, start a new combo, and navigate away: each path asks first,
+   and keeping the draft must leave exactly one editor with no stale prompt afterwards.
 4. Keys: create → one-time dialog shows `mr-…`; Copy works; deleting asks first.
 5. Settings: change a port → amber chip + persistent banner; restart → pill shows
    “restarting…”, banner clears afterwards.
 6. 401 path: log out in another tab / expire the session → panel returns to login.
-7. 1280×720: no page-level horizontal scrolling on any view; tables scroll internally.
+7. 1280×900 and 390×844: no page-level horizontal scrolling on any view; tables scroll
+   internally.
 
 ## Constraints honoured
 
@@ -205,4 +162,3 @@ The panel was **not** executed in a browser in this environment. Manual checklis
   restore, `aria-label`s on every icon-only button, `aria-current` nav/selection, tables use
   `scope="col"`, rows openable via keyboard (Open button / Enter).
 * Live region for toasts (`aria-live="polite"`, errors `role="alert"`).
-* Panel JS+CSS ≈ 60 KB unminified, well under the 100 KB budget.

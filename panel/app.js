@@ -150,6 +150,7 @@ async function restartFlow() {
 
 const ctx = {
   state,
+  leaveGuard: null, // a view with unsaved work sets this to an async () => boolean
   toast,
   confirm: (opts) => confirmDialog(dialogRoot, opts),
   secretKey: (opts) => secretKeyDialog(dialogRoot, opts),
@@ -164,13 +165,6 @@ const ctx = {
     return () => healthSubs.delete(cb);
   },
 };
-
-  // Navigation guard shared by all views. Returns false to abort navigation when a view has
-  // unsaved changes and the operator declines to leave.
-  function navigateGuard() {
-    if (!ctx.leaveGuard) return true;
-    return ctx.leaveGuard();
-  }
 
 // ---------------------------------------------------------------------------
 // Login gate
@@ -190,6 +184,7 @@ const comboLive = startComboLive({ api });
 function showLogin(notice = null) {
   poller.stop();
   comboLive.stop();
+  ctx.leaveGuard = null;
   shell.hidden = true;
   loginRoot.hidden = false;
   clear(loginRoot);
@@ -213,8 +208,10 @@ async function enterApp() {
   loginRoot.hidden = true;
   clear(loginRoot);
   shell.hidden = false;
-  if (!location.hash) location.hash = '#/overview'; // fires hashchange → first render
-  else renderRoute();
+  // Normalise the first URL without firing a second navigation. The guard is async and belongs to
+  // the hashchange path; boot and explicit retries render directly.
+  if (!location.hash) history.replaceState(null, '', '#/overview');
+  renderRoute();
   await Promise.all([refreshHealth(), refreshPorts()]);
   poller.start();
   comboLive.start();
@@ -238,19 +235,26 @@ const ROUTES = [
 
 // Bumped on every route render: a stale view's late rejection must not touch the current route.
 let routeSeq = 0;
+// The hash whose view is actually on screen. A guard may hold a requested hash back until the
+// operator answers, so location.hash alone is not a reliable description of the DOM.
+let renderedHash = null;
+let navigationInFlight = false;
+let navigationRequestedAgain = false;
+
+function currentHash() {
+  return location.hash || '#/overview';
+}
 
 function renderRoute() {
   const gate = !state.session?.authenticated && state.session?.password_required;
   if (gate) { showLogin(); return;}
 
-  // Abort navigation if the current view has unsaved changes.
-  if (!navigateGuard()) return;
-
   const seq = ++routeSeq; // this render owns <main> until the next navigation
   healthSubs.clear(); // previous view's live subscriptions die here
   clear(drawerRoot);  // drawers are per-view UI state
 
-  const hash = location.hash || '#/overview';
+  const hash = currentHash();
+  renderedHash = hash;
   const route = ROUTES.find((r) => r.re.test(hash)) ?? ROUTES[0];
   const m = hash.match(route.re);
   let param = null;
@@ -272,17 +276,61 @@ function renderRoute() {
     else a.removeAttribute('aria-current');
   }
 
-  clear(mainEl);
-  mainEl.append(h('div', { class: 'toolbar' }, spinner(), h('span', { class: 'count' }, 'Loading…')));
-  route.render(mainEl, ctx, param).catch((err) => {
+  // Each route owns a fresh wrapper, not <main> itself. A view that paints after an await (quota
+  // refreshes its cards, for example) then replaces children on its own detached wrapper instead
+  // of erasing the page the operator has since navigated to. `seq` below still guards errors.
+  const view = h('div', { class: 'route-view' },
+    h('div', { class: 'toolbar' }, spinner(), h('span', { class: 'count' }, 'Loading…')));
+  mainEl.replaceChildren(view);
+  route.render(view, ctx, param).catch((err) => {
     if (seq !== routeSeq) return; // a newer route owns <main>; its error screen is not ours to show
-    clear(mainEl);
+    clear(view);
     const box = errorBlock(err);
     const retry = h('button', { class: 'btn', type: 'button' }, 'Retry');
     retry.addEventListener('click', () => renderRoute());
     box.append(h('div', { class: 'dialog-actions' }, retry));
-    mainEl.append(box);
+    view.append(box);
   });
+}
+
+/**
+ * Apply a hash change, asking the current view before discarding unsaved work.
+ *
+ * The browser changes location.hash before it fires hashchange, so this cannot veto the URL
+ * synchronously. It asks asynchronously and, on refusal, puts the rendered hash back with
+ * replaceState (which does not fire another hashchange). On acceptance the guard is cleared before
+ * rendering so the next page cannot inherit a prompt for a view that is already gone.
+ */
+async function handleHashChange() {
+  if (shell.hidden) return; // login owns the screen
+  if (navigationInFlight) {
+    navigationRequestedAgain = true; // coalesce rapid clicks/back into one final route
+    return;
+  }
+  navigationInFlight = true;
+  try {
+    do {
+      navigationRequestedAgain = false;
+      if (currentHash() === renderedHash) continue;
+
+      const guard = ctx.leaveGuard;
+      if (guard) {
+        let leave = false;
+        try { leave = Boolean(await guard()); } catch { leave = false; }
+        if (!leave) {
+          // Stay on the rendered view: restore the URL the DOM actually represents. Any second
+          // navigation attempted while the dialog was open is discarded too.
+          if (renderedHash) history.replaceState(null, '', renderedHash);
+          navigationRequestedAgain = false;
+          continue;
+        }
+        if (ctx.leaveGuard === guard) ctx.leaveGuard = null;
+      }
+      renderRoute();
+    } while (navigationRequestedAgain || currentHash() !== renderedHash);
+  } finally {
+    navigationInFlight = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -375,15 +423,21 @@ document.getElementById('topbar-health').addEventListener('click', () => {
   location.hash = '#/overview';
 });
 
-window.addEventListener('hashchange', () => {
-  if (shell.hidden) return; // login owns the screen; the gate renders after success
-  renderRoute();
+window.addEventListener('hashchange', () => { void handleHashChange(); });
+
+// One global unload guard, governed by the same flag the router uses. Keeping it here (instead of
+// in each view) means a view that is removed, saved, or reverted cannot leave a stale prompt behind.
+window.addEventListener('beforeunload', (e) => {
+  if (!ctx.leaveGuard) return;
+  e.preventDefault();
+  e.returnValue = '';
 });
 
 function showBootError(err) {
   // Never leave both roots hidden: even an unexpected error during login/app startup must
   // produce a visible, actionable screen rather than a blank dark page.
   poller.stop();
+  ctx.leaveGuard = null;
   shell.hidden = false;
   loginRoot.hidden = true;
   clear(mainEl);

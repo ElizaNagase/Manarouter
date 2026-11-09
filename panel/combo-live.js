@@ -190,6 +190,16 @@ export function startComboLive({
       mount.append(line);
       return;
     }
+    // The whole block is the link to the combo it is describing. The state ("live", an age, or
+    // "control plane unreachable") stays in the live region instead of taking a visible slot: the
+    // two lines an operator reads at a glance are the combo and the route it actually chose.
+    const link = doc.createElement('a');
+    link.className = 'combo-live-link';
+    link.href = `#/combos/${encodeURIComponent(view.combo)}`;
+    link.title = view.title;
+    link.setAttribute('aria-label', view.state === 'live'
+      ? `${view.combo}, live at ${view.route}. Open combo.`
+      : `${view.combo}, last step ${view.route}, ${view.status}. Open combo.`);
     const head = doc.createElement('div');
     head.className = 'combo-live-head';
     const combo = doc.createElement('span');
@@ -197,14 +207,15 @@ export function startComboLive({
     combo.textContent = view.combo;
     combo.title = view.combo;
     const status = doc.createElement('span');
-    status.className = 'combo-live-state';
+    status.className = 'sr-only';
     status.textContent = view.status;
     head.append(combo, status);
     const route = doc.createElement('div');
     route.className = 'combo-live-route';
     route.textContent = view.route;
     route.title = `${view.combo}: ${view.route}`;
-    mount.append(head, route);
+    link.append(head, route);
+    mount.append(link);
   }
 
   async function tick() {

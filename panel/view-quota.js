@@ -5,7 +5,7 @@
 // provider allowance.
 
 import { api } from './api.js';
-import { h, emptyState, errorBlock, toggle } from './dom.js';
+import { h, emptyState, errorBlock, icon, toggle } from './dom.js';
 import {
   QUOTA_STATUS_CRITICAL_AT_OR_BELOW, QUOTA_STATUS_HEALTHY_ABOVE,
   formatQuotaAge, formatQuotaUsage, formatPercent, formatResetInLabel,
@@ -16,6 +16,44 @@ import {
 // Bars by default: a share of a window is a share, and twenty cells made an operator count them.
 // 'chunks' remains supported for a config that asked for it.
 const DEFAULT_DISPLAY = Object.freeze({ mode: 'percentage', chunks: 20, reset_on_load: false });
+
+// Display order is a local preference: it changes nothing about how quota is fetched or which
+// account serves a request. Providers default to the config order; accounts default to the order
+// the quota endpoint returned. A drag writes only the list it changed.
+const QUOTA_PROVIDER_ORDER_KEY = 'manarouter.quota.provider-order';
+const QUOTA_ACCOUNT_ORDER_KEY = 'manarouter.quota.account-order';
+
+function readStoredList(key) {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) ?? '[]');
+    return Array.isArray(value) ? value.filter((id) => typeof id === 'string' && id) : [];
+  } catch {
+    return [];
+  }
+}
+
+function readStoredOrderMap(key) {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) ?? '{}');
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    const out = {};
+    for (const [provider, ids] of Object.entries(value)) {
+      if (Array.isArray(ids)) out[provider] = ids.filter((id) => typeof id === 'string' && id);
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function storeOrder(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export async function renderQuota(mount, ctx) {
   let providers = [];
@@ -30,6 +68,10 @@ export async function renderQuota(mount, ctx) {
   const busyAccounts = new Set();
   const configFieldAvailable = { value: false };
   const localErrors = new Map();
+  let providerOrder = readStoredList(QUOTA_PROVIDER_ORDER_KEY);
+  let accountOrder = readStoredOrderMap(QUOTA_ACCOUNT_ORDER_KEY);
+  let dragAccount = null;
+  let dragProviderId = null;
 
   mount.replaceChildren(h('div', { class: 'card' }, 'Loading provider quota…'));
   const [providerResult, configResult, quotaResult, usageResult] = await Promise.allSettled([
@@ -67,7 +109,7 @@ export async function renderQuota(mount, ctx) {
       .filter(Boolean).join(' ');
   }
 
-  let accountRows = buildAccountRows(providers, records);
+  let accountRows = arrangeAccountRows(buildAccountRows(providers, records));
   render();
 
   // The default is off. Only the documented config field can opt into a provider request on view load.
@@ -116,12 +158,12 @@ export async function renderQuota(mount, ctx) {
       children.push(emptyState('No provider reports a quota.',
         'Add an account, or check a provider whose upstream exposes its remaining allowance.'));
     } else {
-      children.push(renderGlance());
-      // Cards share a responsive grid: at desktop width a long single column wastes most of the
-      // page and pushes the request ledger far below the allowances it explains.
-      const cards = h('div', { class: 'quota-cards' });
-      for (const [index, row] of accountRows.entries()) cards.append(renderAccount(row, index));
-      children.push(cards);
+      // Accounts are grouped under their provider, and both levels can be reordered. Keeping one
+      // flat grid made "which of these belong together" a question of reading every card title.
+      const groups = groupAccountRows(accountRows);
+      accountRows = groups.flatMap((group) => group.rows);
+      children.push(renderGlance(groups));
+      groups.forEach((group, index) => children.push(renderProviderGroup(group, index, groups.length)));
     }
     children.push(renderUsage());
     mount.replaceChildren(...children);
@@ -191,37 +233,44 @@ export async function renderQuota(mount, ctx) {
   // this strip answers the question the page exists for — what is running out, right now. A chip
   // carries its own countdown, so "when does it come back" is answered without a second line, and
   // an account the provider never quantified has no line here at all.
-  function renderGlance() {
+  function renderGlance(groups) {
     const card = h('section', { class: 'card' });
     card.append(h('h2', {}, 'At a glance'));
     const list = h('div', { class: 'quota-glance' });
     let chips = 0;
-    for (const [index, row] of accountRows.entries()) {
-      const windows = quotaWindows(records.get(row.key)?.windows)
-        .map((window) => ({ window, usage: formatQuotaUsage(window, display) }))
-        .filter(({ usage }) => usage.kind === 'percentage' || usage.kind === 'chunks');
-      if (!windows.length) continue;
-      const label = accountLabel(row);
-      const line = h('div', { class: 'quota-glance-account' },
-        h('span', { class: 'quota-glance-name', title: `${row.provider.id} · ${label}` },
-          `${row.provider.id} · ${label}`));
-      const rowChips = h('div', { class: 'quota-glance-chips' });
-      for (const { window, usage } of windows) {
-        const level = quotaStatusLevel(usage.remainingPercent);
-        const family = quotaFamilyLabel(window?.family) || window?.display_name || 'window';
-        const reset = formatResetInLabel(window?.reset_at);
-        rowChips.append(h('button', {
-          class: `quota-chip quota-level-${level}`,
-          type: 'button',
-          title: `${family}: ${formatPercent(usage.remainingPercent)} left · ${reset}`,
-          onclick: () => scrollToAccount(index),
-        },
-        `${family} ${formatPercent(usage.remainingPercent)}`,
-        h('span', { class: 'quota-chip-reset' }, reset)));
-        chips += 1;
+    for (const group of groups) {
+      const providerLine = h('div', { class: 'quota-glance-provider' },
+        h('span', { class: 'mono' }, group.provider.id),
+        group.provider.label && group.provider.label !== group.provider.id
+          ? h('span', { class: 'hint' }, group.provider.label) : '');
+      list.append(providerLine);
+      for (const row of group.rows) {
+        const windows = quotaWindows(records.get(row.key)?.windows)
+          .map((window) => ({ window, usage: formatQuotaUsage(window, display) }))
+          .filter(({ usage }) => usage.kind === 'percentage' || usage.kind === 'chunks');
+        if (!windows.length) continue;
+        const index = accountRows.indexOf(row);
+        const label = accountLabel(row);
+        const line = h('div', { class: 'quota-glance-account' },
+          h('span', { class: 'quota-glance-name', title: `${row.provider.id} · ${label}` }, label));
+        const rowChips = h('div', { class: 'quota-glance-chips' });
+        for (const { window, usage } of windows) {
+          const level = quotaStatusLevel(usage.remainingPercent);
+          const family = quotaFamilyLabel(window?.family) || window?.display_name || 'window';
+          const reset = formatResetInLabel(window?.reset_at);
+          rowChips.append(h('button', {
+            class: `quota-chip quota-level-${level}`,
+            type: 'button',
+            title: `${family}: ${formatPercent(usage.remainingPercent)} left · ${reset}`,
+            onclick: () => scrollToAccount(index),
+          },
+          `${family} ${formatPercent(usage.remainingPercent)}`,
+          h('span', { class: 'quota-chip-reset' }, reset)));
+          chips += 1;
+        }
+        line.append(rowChips);
+        list.append(line);
       }
-      line.append(rowChips);
-      list.append(line);
     }
     if (!chips) {
       card.append(h('p', { class: 'hint' }, 'No cached quota windows yet. Refresh an account to fetch its allowance.'));
@@ -237,11 +286,88 @@ export async function renderQuota(mount, ctx) {
     document.getElementById(accountCardId(index))?.scrollIntoView({ block: 'start' });
   }
 
-  function renderAccount(row, index) {
+  /// One provider, its heading, and the account cards inside it. The whole block is a drag target;
+  /// the heading's grip and arrows are the keyboard and discoverable equivalent.
+  function renderProviderGroup(group, index, total) {
+    const { provider, rows } = group;
+    const head = h('div', {
+      class: 'quota-provider-head',
+      draggable: 'true',
+      title: 'Drag to move this provider block',
+      'data-quota-provider': provider.id,
+    });
+    const grip = h('span', { class: 'icon-btn quota-grip', 'aria-hidden': 'true' }, icon('grip'));
+    const up = h('button', {
+      class: 'icon-btn quota-provider-move', type: 'button',
+      disabled: index === 0,
+      'aria-label': 'Move ' + provider.id + ' block up', title: 'Move provider up',
+    }, icon('up'));
+    const down = h('button', {
+      class: 'icon-btn quota-provider-move', type: 'button',
+      disabled: index === total - 1,
+      'aria-label': 'Move ' + provider.id + ' block down', title: 'Move provider down',
+    }, icon('down'));
+    up.addEventListener('click', (e) => { e.stopPropagation(); moveProviderBlock(provider.id, -1); });
+    down.addEventListener('click', (e) => { e.stopPropagation(); moveProviderBlock(provider.id, 1); });
+    head.append(grip, up, down,
+      h('h2', {}, provider.id),
+      provider.label && provider.label !== provider.id
+        ? h('span', { class: 'quota-provider-label', title: provider.label }, provider.label) : '',
+      h('span', { class: 'quota-provider-count' },
+        `${rows.length} quota${rows.length === 1 ? '' : 's'}`));
+
+    const cards = h('div', { class: 'quota-cards' });
+    for (const row of rows) cards.append(renderAccount(row, group));
+    const section = h('section', {
+      class: 'quota-provider',
+      'data-quota-provider': provider.id,
+      'aria-label': `${provider.id} quota`,
+    }, head, cards);
+
+    head.addEventListener('dragstart', (e) => {
+      if (e.target.closest('button, a, input, select, textarea')) { e.preventDefault(); return; }
+      dragProviderId = provider.id;
+      dragAccount = null;
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move';
+        try { e.dataTransfer.setData('text/plain', provider.id); } catch { /* Firefox only for external drags. */ }
+      }
+      section.classList.add('dragging');
+    });
+    head.addEventListener('dragend', clearDragMarks);
+    section.addEventListener('dragover', (e) => {
+      if (!dragProviderId || dragProviderId === provider.id) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+      section.classList.add('drag-over');
+    });
+    section.addEventListener('dragleave', (e) => {
+      if (!section.contains(e.relatedTarget)) section.classList.remove('drag-over');
+    });
+    section.addEventListener('drop', (e) => {
+      if (!dragProviderId || dragProviderId === provider.id) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const source = dragProviderId;
+      clearDragMarks();
+      reorderProviderBlock(source, provider.id);
+    });
+    return section;
+  }
+
+  function clearDragMarks() {
+    dragAccount = null;
+    dragProviderId = null;
+    mount.querySelectorAll('.dragging, .drag-over')
+      .forEach((node) => node.classList.remove('dragging', 'drag-over'));
+  }
+
+  function renderAccount(row, group) {
     const { provider, key } = row;
+    const index = accountRows.indexOf(row);
+    const position = group.rows.indexOf(row);
     const record = records.get(key);
     const label = accountLabel(row);
-    const title = `${provider.id} · ${label}`;
     // Only windows the provider quantified are drawn — one row if it reports one. An account that
     // quantified nothing never reaches this function: buildAccountRows dropped it.
     const windows = quotaWindows(record?.windows);
@@ -254,16 +380,67 @@ export async function renderQuota(mount, ctx) {
     const card = h('section', {
       class: `card quota-account quota-level-${worst}`,
       id: accountCardId(index),
+      draggable: 'true',
+      'data-quota-account': row.account.id ?? '',
+      'aria-label': `${provider.id} · ${label}`,
     });
-    const header = h('div', { class: 'toolbar' }, h('h2', {}, title));
+    const grip = h('span', {
+      class: 'icon-btn quota-grip', 'aria-hidden': 'true',
+      title: 'Drag to reorder this quota inside ' + provider.id,
+    }, icon('grip'));
+    const up = h('button', {
+      class: 'icon-btn quota-account-move', type: 'button',
+      disabled: position === 0,
+      'aria-label': 'Move ' + label + ' up', title: 'Move quota up',
+    }, icon('up'));
+    const down = h('button', {
+      class: 'icon-btn quota-account-move', type: 'button',
+      disabled: position === group.rows.length - 1,
+      'aria-label': 'Move ' + label + ' down', title: 'Move quota down',
+    }, icon('down'));
+    up.addEventListener('click', (e) => { e.stopPropagation(); moveAccountRow(row, -1); });
+    down.addEventListener('click', (e) => { e.stopPropagation(); moveAccountRow(row, 1); });
+    const titleWrap = h('div', { class: 'quota-account-title' }, grip, up, down, h('h2', { title: `${provider.id} · ${label}` }, label));
+    const header = h('div', { class: 'toolbar quota-account-head' }, titleWrap);
     const refreshButton = h('button', {
       class: 'btn',
       type: 'button',
       disabled: refreshAllBusy || busyAccounts.has(key),
       onclick: () => refreshOne(row),
-    }, busyAccounts.has(key) ? 'Refreshing…' : 'Refresh account');
+    }, busyAccounts.has(key) ? 'Refreshing…' : 'Refresh');
     header.append(refreshButton);
     card.append(header);
+
+    card.addEventListener('dragstart', (e) => {
+      if (e.target.closest('button, a, input, select, textarea')) { e.preventDefault(); return; }
+      e.stopPropagation();
+      dragAccount = row;
+      dragProviderId = null;
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move';
+        try { e.dataTransfer.setData('text/plain', `${provider.id}/${row.account.id}`); } catch { /* Firefox */ }
+      }
+      card.classList.add('dragging');
+    });
+    card.addEventListener('dragend', clearDragMarks);
+    card.addEventListener('dragover', (e) => {
+      if (!dragAccount || dragAccount.provider.id !== provider.id || dragAccount.key === key) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+      card.classList.add('drag-over');
+    });
+    card.addEventListener('dragleave', (e) => {
+      if (!card.contains(e.relatedTarget)) card.classList.remove('drag-over');
+    });
+    card.addEventListener('drop', (e) => {
+      if (!dragAccount || dragAccount.provider.id !== provider.id || dragAccount.key === key) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const source = dragAccount;
+      clearDragMarks();
+      reorderAccountRow(source, row);
+    });
 
     // Age only. The snapshot's source URL and its per-model `details` remain in the API for
     // diagnostics; printed on every card they buried the number this page exists to show.
@@ -368,6 +545,139 @@ export async function renderQuota(mount, ctx) {
       if (next.error) localErrors.set(key, errorMessage(next.error));
       else localErrors.delete(key);
     }
+  }
+
+  // ---------------------------------------------------------------- order and grouping
+
+  /// Group the visible rows by provider, applying the local display order at both levels.
+  /// A provider or account the stored order has never seen keeps its server/config position
+  /// instead of jumping to the bottom of an otherwise untouched page.
+  function groupAccountRows(rows) {
+    const groups = new Map();
+    for (const row of rows) {
+      const id = row.provider.id;
+      if (!groups.has(id)) groups.set(id, { provider: row.provider, rows: [] });
+      groups.get(id).rows.push(row);
+    }
+
+    const configRank = new Map(providers.map((provider, index) => [provider.id, index]));
+    const storedProviderRank = new Map(providerOrder.map((id, index) => [id, index]));
+    const ordered = [...groups.values()].sort((a, b) => {
+      const ar = storedProviderRank.get(a.provider.id);
+      const br = storedProviderRank.get(b.provider.id);
+      if (ar !== undefined || br !== undefined) {
+        if (ar === undefined) return 1;
+        if (br === undefined) return -1;
+        return ar - br;
+      }
+      return (configRank.get(a.provider.id) ?? Number.MAX_SAFE_INTEGER)
+        - (configRank.get(b.provider.id) ?? Number.MAX_SAFE_INTEGER);
+    });
+
+    for (const group of ordered) {
+      const originalRank = new Map(group.rows.map((row, index) => [row.key, index]));
+      const storedAccountRank = new Map((accountOrder[group.provider.id] ?? [])
+        .map((id, index) => [id, index]));
+      group.rows.sort((a, b) => {
+        const ar = storedAccountRank.get(a.account.id);
+        const br = storedAccountRank.get(b.account.id);
+        if (ar !== undefined || br !== undefined) {
+          if (ar === undefined) return 1;
+          if (br === undefined) return -1;
+          return ar - br;
+        }
+        return (originalRank.get(a.key) ?? 0) - (originalRank.get(b.key) ?? 0);
+      });
+    }
+    return ordered;
+  }
+
+  function arrangeAccountRows(rows) {
+    return groupAccountRows(rows).flatMap((group) => group.rows);
+  }
+
+  function saveProviderOrder(groups) {
+    providerOrder = groups.map((group) => group.provider.id);
+    if (!storeOrder(QUOTA_PROVIDER_ORDER_KEY, providerOrder)) {
+      ctx.toast.warning('This browser could not save the quota provider order.');
+    }
+  }
+
+  function saveAccountOrder(providerId, rows) {
+    accountOrder = { ...accountOrder, [providerId]: rows.map((row) => row.account.id) };
+    if (!storeOrder(QUOTA_ACCOUNT_ORDER_KEY, accountOrder)) {
+      ctx.toast.warning('This browser could not save the quota order inside ' + providerId + '.');
+    }
+  }
+
+  function commitProviderGroups(groups) {
+    saveProviderOrder(groups);
+    accountRows = groups.flatMap((group) => group.rows);
+    render();
+  }
+
+  function commitAccountGroup(groups, providerId) {
+    const group = groups.find((candidate) => candidate.provider.id === providerId);
+    if (group) saveAccountOrder(providerId, group.rows);
+    accountRows = groups.flatMap((candidate) => candidate.rows);
+    render();
+  }
+
+  function focusProviderBlock(id) {
+    mount.querySelector(`[data-quota-provider="${CSS.escape(id)}"] .quota-provider-move:not(:disabled)`)?.focus();
+  }
+
+  function focusAccountRow(row) {
+    const index = accountRows.findIndex((candidate) => candidate.key === row.key);
+    if (index >= 0) {
+      mount.querySelector(`#${accountCardId(index)} .quota-account-move:not(:disabled)`)?.focus();
+    }
+  }
+
+  function moveProviderBlock(id, delta) {
+    const groups = groupAccountRows(accountRows);
+    const from = groups.findIndex((group) => group.provider.id === id);
+    const to = from + delta;
+    if (from < 0 || to < 0 || to >= groups.length) return;
+    [groups[from], groups[to]] = [groups[to], groups[from]];
+    commitProviderGroups(groups);
+    focusProviderBlock(id);
+  }
+
+  function reorderProviderBlock(sourceId, targetId) {
+    if (sourceId === targetId) return;
+    const groups = groupAccountRows(accountRows);
+    const from = groups.findIndex((group) => group.provider.id === sourceId);
+    if (from < 0) return;
+    const [moved] = groups.splice(from, 1);
+    const insertAt = groups.findIndex((group) => group.provider.id === targetId);
+    groups.splice(insertAt < 0 ? groups.length : insertAt, 0, moved);
+    commitProviderGroups(groups);
+  }
+
+  function moveAccountRow(row, delta) {
+    const groups = groupAccountRows(accountRows);
+    const group = groups.find((candidate) => candidate.provider.id === row.provider.id);
+    if (!group) return;
+    const from = group.rows.findIndex((candidate) => candidate.key === row.key);
+    const to = from + delta;
+    if (from < 0 || to < 0 || to >= group.rows.length) return;
+    [group.rows[from], group.rows[to]] = [group.rows[to], group.rows[from]];
+    commitAccountGroup(groups, row.provider.id);
+    focusAccountRow(row);
+  }
+
+  function reorderAccountRow(source, target) {
+    if (source.provider.id !== target.provider.id || source.key === target.key) return;
+    const groups = groupAccountRows(accountRows);
+    const group = groups.find((candidate) => candidate.provider.id === source.provider.id);
+    if (!group) return;
+    const from = group.rows.findIndex((candidate) => candidate.key === source.key);
+    if (from < 0) return;
+    const [moved] = group.rows.splice(from, 1);
+    const insertAt = group.rows.findIndex((candidate) => candidate.key === target.key);
+    group.rows.splice(insertAt < 0 ? group.rows.length : insertAt, 0, moved);
+    commitAccountGroup(groups, source.provider.id);
   }
 
   async function saveRefreshOnLoad(enabled) {

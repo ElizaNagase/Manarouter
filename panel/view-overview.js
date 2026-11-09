@@ -98,12 +98,13 @@ export async function renderOverview(mount, ctx) {
         class: 'stat combo-stat',
         type: 'button',
         dataset: { combo: item.combo },
-        title: `${item.combo} ${when}, ${item.count} call${item.count === 1 ? '' : 's'} in the last 5 minutes. Open combos.`,
+        title: `${item.combo} ${when}, ${item.count} call${item.count === 1 ? '' : 's'} in the last 5 minutes. Last step: ${item.step}. Open this combo.`,
       },
       h('div', { class: 'k' },
         `combo · ${item.live ? 'live' : formatAge(item.lastStartedAt)} · ${item.count} call${item.count === 1 ? '' : 's'}`),
-      h('div', { class: 'v' }, item.combo));
-      box.addEventListener('click', () => ctx.navigate('#/combos'));
+      h('div', { class: 'v' }, item.combo),
+      h('div', { class: 'combo-stat-route', title: item.step }, item.step));
+      box.addEventListener('click', () => ctx.navigate(`#/combos/${encodeURIComponent(item.combo)}`));
       comboRow.append(box);
     }
     restoreComboFocus();

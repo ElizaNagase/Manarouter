@@ -6,7 +6,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { compareModelRows } from '../view-models.js';
+import { compareModelRows, pageBounds } from '../view-models.js';
 
 const row = (provider, model) => ({ p: { id: provider }, m: { id: model } });
 const shape = (rows) => rows.map((row) => `${row.m.id}@${row.p.id}`);
@@ -60,4 +60,21 @@ test('provider ids use the same natural order within a model group', () => {
     'same@provider-2',
     'same@provider-10',
   ]);
+});
+
+test('a page is clamped to the rows that exist', () => {
+  assert.deepEqual(pageBounds(10, 1, 4), { page: 1, pages: 3, start: 0, end: 4 });
+  assert.deepEqual(pageBounds(10, 3, 4), { page: 3, pages: 3, start: 8, end: 10 });
+  assert.deepEqual(pageBounds(10, 99, 4), { page: 3, pages: 3, start: 8, end: 10 });
+  assert.deepEqual(pageBounds(10, 0, 4), { page: 1, pages: 3, start: 0, end: 4 });
+});
+
+test('a page size that is zero, negative or not a number still yields one row', () => {
+  for (const size of [0, -5, NaN, 'nope', undefined]) {
+    assert.deepEqual(pageBounds(3, 1, size), { page: 1, pages: 3, start: 0, end: 1 });
+  }
+});
+
+test('an empty list still has one page with an empty range', () => {
+  assert.deepEqual(pageBounds(0, 7, 50), { page: 1, pages: 1, start: 0, end: 0 });
 });

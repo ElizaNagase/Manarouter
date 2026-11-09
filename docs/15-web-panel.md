@@ -30,12 +30,12 @@ The two processes share state through files, not through IPC: the conductor writ
 | View | Shows | Can change |
 |---|---|---|
 | **Overview** | Control-plane uptime, relay reachability, snapshot digest and age, configuration counts, and whether a panel password is set | Nothing |
-| **Providers** | Every provider, its dialect, base URL, auth, key strategy, cooldown scope, account count, and health | Add, edit, enable/disable, remove; add, enable/disable and remove accounts |
-| **Models** | Discovered and hand-entered models per provider | Hide/show, delete, and **test** a model (one small live request; the answer or the upstream error is shown as a toast). The test runs on the relay's loopback probe (`POST /control/probe`), so it goes through the ordinary dispatch path — routing table, dialect translation, account selection, cooldowns and fallbacks — and works for every dialect, not only the OpenAI shape. The route refuses non-loopback callers because it skips the client-key check |
-| **Combos** | Every combo with its steps **in priority order**, each model step's optional pinned reasoning level, and a **Live health** panel | Create, edit, reorder steps, enable/disable, remove, pin a model step's reasoning level, and **check** the steps: one tiny completion per enabled model step through the relay probe, in priority order, so the panel shows which step answers right now and which one failed and why. A step may instead route to another combo; it has no provider, model or level of its own, is shown as a nested combo, and is checked in that combo rather than probed here |
+| **Providers** | Every provider, its dialect, base URL, auth, key strategy, cooldown scope, account count, and health, with that provider's accounts and models inline under its own row | Add, edit, enable/disable, remove; add, enable/disable and remove accounts; pin providers and sort by name, date added, number of keys or manual order, dragging rows or using the arrow buttons to reorder |
+| **Models** | Discovered and hand-entered models per provider, model-first so the same id from several providers sits together, with provider/source/search/hidden filters and paging | Hide/show, delete, and **test** a model (one small live request; the answer or the upstream error is shown as a toast). Paging offers 50, 100, 250 or 500 rows. **Resync all models** and **Delete all models** loop over the per-provider endpoints; deletion still asks for an explicit confirmation. The test runs on the relay's loopback probe (`POST /control/probe`), so it goes through the ordinary dispatch path — routing table, dialect translation, account selection, cooldowns and fallbacks — and works for every dialect, not only the OpenAI shape. The route refuses non-loopback callers because it skips the client-key check |
+| **Combos** | Every combo with its steps **in priority order**, each model step's optional pinned reasoning level, and a **Live health** panel | Create, edit, reorder steps, enable/disable, remove, pin a model step's reasoning level, and **check** the steps: one tiny completion per enabled model step through the relay probe, in priority order, so the panel shows which step answers right now and which one failed and why. A step may instead route to another combo; it has no provider, model or level of its own, is shown as a nested combo, and is checked in that combo rather than probed here. Provider, model and combo pickers are searchable. A cycle between nested combos is refused with the chain that closes it |
 | **Keys** | Client keys by label and prefix | Create (plaintext shown once), edit the policy, rotate the secret in place (new plaintext shown once, old secret invalidated after commit), enable/disable, delete |
 | **Aliases** | Alias to target mappings | Add, remove |
-| **Quota** | Allowances first — a strip of per-account window chips, then one card per account, laid out in a responsive grid so several accounts share a wide page and a phone gets one full-width card, with one row per window the provider actually reported — then the recent request ledger underneath. A provider that quantifies a single window gets a single row, never padding for the families it did not mention; an account with nothing quantified (never fetched, or no reported fraction) is left off the page rather than shown as an empty shell. An account whose refresh *failed* keeps its last-good card and the error when an earlier fetch left a quantified window to show; a failure with no window (including before the first snapshot) stays off the page too | Refresh an account's windows from the provider (key *and* OAuth accounts: the conductor mints the same short-lived token the relay would) |
+| **Quota** | Allowances first, grouped by provider: each provider block has a heading, a strip of its accounts' window chips, and one card per account, laid out so several accounts share a wide page and a phone gets one full-width card, with one row per window the provider actually reported — then the recent request ledger underneath. Provider blocks and the account cards inside them can be dragged or moved with arrow buttons; that changes only this page. A provider that quantifies a single window gets a single row, never padding for the families it did not mention; an account with nothing quantified (never fetched, or no reported fraction) is left off the page rather than shown as an empty shell. An account whose refresh *failed* keeps its last-good card and the error when an earlier fetch left a quantified window to show; a failure with no window (including before the first snapshot) stays off the page too | Refresh an account's windows from the provider (key *and* OAuth accounts: the conductor mints the same short-lived token the relay would); reorder provider blocks and accounts for display |
 | **Settings** | Listen ports, client-key access, upstream proxies, the relay connection pool (including a low-resource profile), quota display, pricing data, the panel password, and the raw configuration | Edit; **ports apply on next restart** |
 | **Documentation** | The top-level files in `docs/`, rendered from markdown | Nothing |
 
@@ -43,10 +43,54 @@ The **Models** view distinguishes discovered from hand-entered metadata explicit
 must never overwrite what a human typed. If the two ever disagreed and the panel did not say which
 was which, the operator would have no way to know why their edit vanished.
 
-The **Quota** view is built to be read in two passes. The strip at the top lists each account's
-windows as chips — name, percentage *left*, colour, `Resets in:` countdown — and clicking a chip
-scrolls to that account's card, so a tired account is found without reading every card. Each card
-takes the colour of its most exhausted window and draws every window the provider reported as a row:
+### Paging and bulk model actions
+
+The Models filters are applied before anything is drawn: provider, source, a case-insensitive
+search over model id and label, and a **hidden only** switch. The matching rows are sorted
+model-first, with the provider as the tie-break, so the same model offered by several providers is
+compared side by side. Only one page is rendered, at 50, 100, 250 or 500 rows. The pager states the
+visible range, the total and the page count, and the page resets when a filter changes. Paging is a
+rendering concern only; it does not change the configuration or what the relay serves.
+
+The two bulk buttons are loops over the same per-provider endpoints used by the detail view, not a
+second bulk API. A resync runs providers one at a time so a sync sweep does not trip their rate
+limits, and reports every provider that failed. **Delete all models** states the exact count and
+warns that combos, aliases and clients naming those models will stop resolving; only an explicit
+confirmation starts it. Provider records, accounts, client keys and combos are left alone.
+
+### Display order is not configuration
+
+Pinning and sorting providers are browser preferences. Pinned providers stay in a group above the
+unpinned ones in every sort mode, and a drag or arrow move freezes the order currently on screen
+and switches the sort to **Manual**. A move never crosses the pinned boundary, because doing so
+would silently change which group the row belongs to. **Date added** means the order the server
+returned the providers in; provider records carry no timestamp. The preference is stored in this
+browser under `manarouter.providers.pins`, `manarouter.providers.order` and
+`manarouter.providers.sort`; another browser sees the server's order.
+
+The Quota page keeps a separate display order: provider blocks first, and the account cards inside
+each provider. Dragging a block or card, or using its arrow buttons, writes only that list to
+`manarouter.quota.provider-order` or `manarouter.quota.account-order`. It never changes which
+account is fetched, which account the relay selects, or the configuration on disk. New providers
+and accounts that are not in a stored list follow the server's order, so a later addition appears
+in a predictable place rather than disappearing.
+
+### Unsaved combo edits
+
+A combo editor tracks whether it has been changed. While it is dirty, a route change asks first:
+**Stay on this page** keeps the editor and its typed values, and **Leave and discard** abandons
+them. The URL is restored to the page that is still on screen when the operator stays, including
+after a browser Back or Forward. Closing the drawer or pressing Escape asks the same question with
+**Keep editing** and **Discard changes**; so does starting a new combo or opening a different
+combo's editor while a draft is open. Saving, deleting, or reverting clears the guard, so the next
+navigation does not produce a stale prompt. A reload or tab close is also blocked while the
+editor is dirty, using the browser's own leave confirmation.
+
+The **Quota** view is built to be read in two passes. It is grouped by provider: each block
+starts with the provider name, and its strip lists that provider's accounts' windows as chips —
+name, percentage *left*, colour, `Resets in:` countdown. Clicking a chip scrolls to that account's
+card inside the same block, so a tired account is found without reading every card. Each card takes
+the colour of its most exhausted window and draws every window the provider reported as a row:
 name, a bar filled with what is **remaining**, the percentage left and used in words, and the reset
 countdown on the right. Green is above 50 % left, amber at 50 % or less, red at 20 % or less, and
 grey when a window is unlimited. The colour is always a second copy of a number the row states in
@@ -65,20 +109,23 @@ It is fed by `GET /api/activity`, which the control plane proxies to the relay's
 and it holds the account cooldowns, and neither fact is written to disk. The block polls every 1.5
 seconds through the panel's shared scheduler, which stops entirely while the tab is hidden.
 
-It has four states, and it says which one it is in words rather than by colour alone:
+It has four states:
 
 | State | Shows |
 |---|---|
-| **live** | The combo and the `provider/model` the relay committed to, with the word *live* and a pulsing dot. A request stays *live* for as long as the client is still receiving it |
-| **recent** | The newest decision and its age (`12s ago`), because a combo that ran an hour ago is still the answer to "what did it do" |
+| **live** | The combo on the first line and the `provider/model` the relay committed to on the second. A green edge and a pulsing dot mark it as in flight; the word *live* is in the accessible label, tooltip and live region instead of taking a third visible line. A request stays *live* for as long as the client is still receiving it |
+| **recent** | The newest decision, with the same two lines, because a combo that ran an hour ago is still the answer to "what did it do". The tooltip and accessible label say it is the last decision |
 | **no combo activity yet** | The relay is reachable and has served no combo since it started |
 | **control plane unreachable** | The panel could not ask. A different sentence from the one above on purpose: "nothing is running" and "I cannot see" are not the same fact, and the panel must not blur them |
 
-The block is a fixed 52 px tall on purpose. It fills and empties as requests come and go, and every
-navigation item below it has to stay exactly where it was; the longest route is clipped with the full
-text in the element's `title`. It is not an `aria-live` region: it is repainted on every poll, and a
-polite region rewritten every 1.5 seconds reads the same sentence over and over. The announcement
-lives in a separate `sr-only` status span that changes only when the state or the route changes.
+The two-line block is a link: clicking it opens the combo it is describing, by name, so the deep
+link works even when the operator has not memorised the combo's id. The block is a fixed 52 px tall
+on purpose. It fills and empties as requests come and go, and every navigation item below it has to
+stay exactly where it was; the longest route is clipped with the full text in the element's
+`title`, and hovering the block expands it in place. It is not an `aria-live` region: it is
+repainted on every poll, and a polite region rewritten every 1.5 seconds reads the same sentence
+over and over. The announcement lives in a separate `sr-only` status span that changes only when
+the state or the route changes.
 
 An entry is finished when the client-facing response body is dropped, so a stream that the client
 abandons is finished promptly rather than waiting for a timer to expire. Restarting the relay forgets

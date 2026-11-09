@@ -146,8 +146,8 @@ body {
  * Fixed height means the longest route must be clipped rather than wrapped — the full text is in
  * the element's title, so nothing is lost, and the layout never moves.
  *
- * Colour never carries meaning alone: each state also says what it is ("live", "12s ago",
- * "control plane unreachable").
+ * Colour never carries meaning alone: the state ("live", "12s ago", "control plane unreachable")
+ * remains in the live region and the title, and the live edge has a pulsing dot.
  */
 .combo-live {
   margin: 2px 16px 8px;
@@ -162,6 +162,14 @@ body {
   font-size: 11px;
   line-height: 1.35;
 }
+
+.combo-live-link {
+  display: block;
+  color: inherit;
+  text-decoration: none;
+  border-radius: 2px;
+}
+.combo-live-link:focus-visible { outline: 1px solid var(--pink); outline-offset: 2px; }
 
 .combo-live-head {
   display: flex;
@@ -182,15 +190,6 @@ body {
 .combo-live-route {
   margin-top: 3px;
   color: var(--tx2);
-}
-
-.combo-live-state {
-  flex: none;
-  color: var(--tx3);
-  font-family: var(--sans);
-  font-size: 10px;
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
 }
 
 .combo-live-empty {
@@ -222,20 +221,20 @@ body {
   overflow-wrap: anywhere;
 }
 
-/* In flight: a green edge and the word itself, plus a dot that pulses while it is true. The
- * animation is decoration — removing it (reduced motion, or a browser that will not run it)
- * leaves the word "live", which is the part that means something. */
+/* In flight: a green edge and a dot that pulses while it is true. The animation is decoration —
+ * removing it (reduced motion, or a browser that will not run it) leaves the green edge, and the
+ * live region still says "live". */
 .combo-live[data-state="live"] { border-left-color: var(--green); }
-.combo-live[data-state="live"] .combo-live-state { color: var(--green); }
 
-.combo-live[data-state="live"] .combo-live-state::before {
+.combo-live[data-state="live"] .combo-live-combo::before {
   content: "";
   display: inline-block;
   width: 5px;
   height: 5px;
-  margin-right: 4px;
+  margin-right: 5px;
   border-radius: 50%;
-  background: currentColor;
+  background: var(--green);
+  vertical-align: 1px;
   animation: combo-live-pulse 1.6s ease-in-out infinite;
 }
 
@@ -245,7 +244,7 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .combo-live[data-state="live"] .combo-live-state::before { animation: none; opacity: 1; }
+  .combo-live[data-state="live"] .combo-live-combo::before { animation: none; opacity: 1; }
 }
 
 /* Cannot ask: amber, and the line says so. Not an error dump — the sidebar is not the place for
@@ -370,6 +369,9 @@ body {
 /* ---------- tables ---------- */
 
 .table-scroll {
+  /* A wide table must not widen the mobile layout viewport. Making the
+     scroller a containing block keeps its sticky header's overflow inside it. */
+  position: relative;
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -417,6 +419,46 @@ table.tbl {
 .tbl .num .icon-btn { margin-left: 3px; }
 .tbl .actions { text-align: right; white-space: nowrap; }
 .tbl .actions > * { margin-left: 4px; }
+
+/* A model row's three controls belong on one line. Stacked, the visibility toggle alone made every
+   row 126px tall and the 4,288-row table more than half a million pixels. */
+.tbl .model-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: nowrap;
+  white-space: nowrap;
+}
+.tbl .model-actions > * { margin-left: 0; }
+.tbl .model-actions .check-row {
+  margin-bottom: 0;
+  flex-wrap: nowrap;
+  gap: 4px;
+}
+.tbl .model-actions .check-row label { flex: none; white-space: nowrap; }
+
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 2px 0;
+}
+.pager[hidden] { display: none; }
+.pager .spacer { flex: 1 1 auto; }
+.pager-range { color: var(--tx2); font-size: 12px; font-variant-numeric: tabular-nums; }
+.pager-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--tx3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.pager .input { width: auto; padding: 4px 6px; font-size: 12px; }
+.pager-pages { color: var(--tx3); font-size: 11.5px; white-space: nowrap; }
 
 /* ---------- chips ---------- */
 
@@ -827,6 +869,69 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
 }
 .quota-cards .quota-account { margin-bottom: 0; }
 
+/* Providers are the outer grouping. The block is a drop target and its heading is the handle;
+ * accounts keep the same grid they had before, so a provider with several quotas still reads as
+ * one row of cards rather than a column of full-width panels. */
+.quota-provider {
+  margin-bottom: 14px;
+  padding: 8px 10px 10px;
+  background: var(--bg0);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  transition: border-color .12s, box-shadow .12s;
+}
+.quota-provider.dragging { opacity: .45; }
+.quota-provider.drag-over { border-color: var(--pink); box-shadow: inset 0 0 0 1px var(--pink); }
+.quota-provider-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  margin-bottom: 9px;
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--line);
+  cursor: grab;
+}
+.quota-provider-head:active { cursor: grabbing; }
+.quota-provider-head h2 {
+  margin: 0 0 0 3px;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 13px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--tx1);
+}
+.quota-provider-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--tx3);
+  font-size: 11.5px;
+}
+.quota-provider-count {
+  margin-left: auto;
+  flex: 0 0 auto;
+  color: var(--tx3);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.quota-provider .quota-cards { margin-bottom: 0; }
+
+.quota-account { transition: border-color .12s, box-shadow .12s; }
+.quota-account.dragging { opacity: .45; }
+.quota-account.drag-over { box-shadow: inset 0 2px 0 var(--pink); }
+.quota-account-head { align-items: flex-start; }
+.quota-account-title { display: flex; align-items: center; gap: 4px; min-width: 0; flex: 1 1 auto; }
+.quota-account-title h2 { flex: 1 1 auto; }
+.quota-grip { flex: 0 0 auto; cursor: grab; color: var(--tx3); opacity: .7; }
+.quota-account:hover .quota-grip,
+.quota-provider-head:hover .quota-grip { opacity: 1; }
+.quota-account-move, .quota-provider-move { width: 18px; height: 18px; padding: 1px; flex: 0 0 auto; }
+
 /* The account name can contain an e-mail address; a flex item's automatic minimum width would
  * otherwise push the refresh button out of a narrow card instead of wrapping the address. */
 .quota-account > .toolbar h2 { margin: 0; min-width: 0; overflow-wrap: anywhere; }
@@ -869,6 +974,19 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
 
 /* The at-a-glance strip: one line per account, its windows as chips that jump to the card. */
 .quota-glance { display: flex; flex-direction: column; margin: 4px 0 8px; }
+.quota-glance-provider {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  margin-top: 8px;
+  padding: 5px 0 3px;
+  border-top: 1px solid var(--line2);
+}
+.quota-glance-provider:first-child { margin-top: 0; border-top: 0; }
+.quota-glance-provider .mono { color: var(--tx1); font-size: 12px; }
+.quota-glance-provider .hint { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.quota-glance-provider + .quota-glance-account { border-top: 0; }
 .quota-glance-account {
   display: flex;
   align-items: center;
@@ -1011,10 +1129,17 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
   .combo-row { grid-auto-rows: minmax(74px, auto); max-height: 74px; }
 }
 .combo-row .combo-stat .k,
-.combo-row .combo-stat .v {
+.combo-row .combo-stat .v,
+.combo-row .combo-stat .combo-stat-route {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.combo-row .combo-stat .combo-stat-route {
+  margin-top: 2px;
+  color: var(--tx3);
+  font-family: var(--mono);
+  font-size: 10.5px;
 }
 .combo-row .combo-stat:focus-visible { outline: 2px solid var(--pink); outline-offset: 1px; }
 .combo-row-empty { color: var(--tx3); font-size: 12px; padding: 4px 0; }
@@ -1170,7 +1295,12 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
   border-radius: 4px;
 }
 .pin-btn:hover { color: var(--pink); background: var(--pink-dim); }
-.pin-btn.pinned { color: var(--pink); }
+.pin-btn.pinned { color: var(--pink); background: var(--pink-dim); }
+.pin-btn svg.i { width: 13px; height: 13px; }
+.pin-btn.pinned svg.i { fill: currentColor; stroke-width: 1; }
+.provider-grip { width: 14px; height: 16px; padding: 0; color: var(--tx3); cursor: grab; opacity: .65; }
+.provider-grip:active { cursor: grabbing; }
+.tbl tr:hover .provider-grip { opacity: 1; }
 .provider-move { width: 18px; height: 16px; padding: 0; margin-left: 1px; color: var(--tx3); }
 .provider-move:hover:not(:disabled) { color: var(--pink); }
 .provider-move:disabled { opacity: 0.25; cursor: default; }
@@ -1443,7 +1573,9 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
     padding: 0;
     border-right: 0;
     border-bottom: 1px solid var(--line);
-    overflow: visible;
+    /* The nav itself scrolls sideways. Clipping the shell keeps that overflow from widening the
+       document on a phone, where a wider layout viewport once shrank the whole page to fit. */
+    overflow: hidden;
   }
   .brand { flex: none; padding: 0 12px; }
   .sidebar nav { flex: 1 1 auto; min-width: 0; overflow-x: auto; }

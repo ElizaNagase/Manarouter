@@ -23,8 +23,21 @@ export function compareModelRows(a, b) {
   return compareId(a.m.id, b.m.id) || compareId(a.p.id, b.p.id);
 }
 
+/** Clamp a one-based page to the rows that exist and return the half-open slice for it. Pages are
+ *  clamped rather than rejected: hiding a model on the last page must leave the operator on that
+ *  page, not on an empty one. */
+export function pageBounds(total, page, pageSize) {
+  const size = Math.max(1, Math.floor(pageSize) || 1);
+  const pages = Math.max(1, Math.ceil(total / size));
+  const current = Math.min(Math.max(1, Math.floor(page) || 1), pages);
+  const start = (current - 1) * size;
+  return { page: current, pages, start, end: Math.min(start + size, total) };
+}
+
 export async function renderModels(mount, ctx) {
   let providers = [];
+  let page = 1;
+  const PAGE_SIZES = [50, 100, 250, 500];
 
   const provSel = h('select', { class: 'input', 'aria-label': 'Filter by provider' });
   const sourceSel = h('select', { class: 'input', 'aria-label': 'Filter by source' },
@@ -37,6 +50,11 @@ export async function renderModels(mount, ctx) {
   });
   const hiddenOnly = hiddenFilter.input;
   const tableWrap = h('div', { class: 'table-scroll' });
+  const pager = h('div', { class: 'pager' });
+  pager.hidden = true;
+  const pageSizeSel = h('select', { class: 'input pager-size', 'aria-label': 'Rows per page' },
+    ...PAGE_SIZES.map((size) => h('option', { value: String(size) }, `${size} / page`)));
+  pageSizeSel.value = '100';
   const count = h('span', { class: 'count' });
   // Bulk actions are loops over the same per-provider endpoints the detail page uses; there is no
   // bulk route on the conductor, and inventing one here would give the panel a second source of
@@ -46,10 +64,12 @@ export async function renderModels(mount, ctx) {
   const bulkBusy = { value: false };
 
   // A <select> fires both "input" and "change"; binding both rebuilt the table twice per change.
-  provSel.addEventListener('change', renderTable);
-  sourceSel.addEventListener('change', renderTable);
-  search.addEventListener('input', renderTable);
-  hiddenOnly.addEventListener('change', renderTable);
+  const applyFilter = () => { page = 1; renderTable(null, true); };
+  provSel.addEventListener('change', applyFilter);
+  sourceSel.addEventListener('change', applyFilter);
+  search.addEventListener('input', applyFilter);
+  hiddenOnly.addEventListener('change', applyFilter);
+  pageSizeSel.addEventListener('change', () => { page = 1; renderTable('size', true); });
 
   resyncAll.addEventListener('click', resyncAllModels);
   deleteAll.addEventListener('click', deleteAllModels);
@@ -60,6 +80,7 @@ export async function renderModels(mount, ctx) {
       hiddenFilter.row,
       h('span', { class: 'spacer' }), resyncAll, deleteAll, count),
     tableWrap,
+    pager,
   );
 
   await reload();
@@ -98,25 +119,30 @@ export async function renderModels(mount, ctx) {
     return out.sort(compareModelRows);
   }
 
-  function renderTable() {
+  function renderTable(focus = null, resetScroll = false) {
     const list = rows();
     const totalModels = providers.reduce((n, p) => n + (p.models?.length ?? 0), 0);
     const hiddenCount = providers.reduce((n, p) => n + (p.models ?? []).filter((m) => m.hidden).length, 0);
-    count.textContent = `${list.length} shown · ${totalModels} across ${providers.length} providers · ${hiddenCount} hidden`;
+    count.textContent = `${list.length} matching · ${totalModels} across ${providers.length} providers · ${hiddenCount} hidden`;
 
     if (!totalModels) {
+      pager.hidden = true;
       tableWrap.replaceChildren(emptyState('No models known.',
         'Models appear here after a provider sync, or when you add one manually in the provider detail.'));
       return;
     }
     if (!list.length) {
+      pager.hidden = true;
       tableWrap.replaceChildren(emptyState('Nothing matches these filters.'));
       return;
     }
 
+    const bounds = pageBounds(list.length, page, Number(pageSizeSel.value));
+    page = bounds.page;
+    const visible = list.slice(bounds.start, bounds.end);
     const tbody = h('tbody');
-    for (const { p, m } of list) {
-      const visibility = toggle('Hidden from relay', {
+    for (const { p, m } of visible) {
+      const visibility = toggle('Hidden', {
         checked: Boolean(m.hidden),
         help: 'Hidden models are excluded from the relay model listing.',
         onChange: (event) => toggleHidden(p, m, event.currentTarget),
@@ -143,7 +169,7 @@ export async function renderModels(mount, ctx) {
         h('td', {}, priceText(m)),
         h('td', {}, metadata),
         h('td', {}, m.hidden ? chip('hidden', 'chip-neutral', 'excluded from the relay\u2019s model listing') : null),
-        h('td', { class: 'actions' }, test, visibility.row, del)));
+        h('td', { class: 'actions model-actions' }, test, visibility.row, del)));
     }
     tableWrap.replaceChildren(
       h('p', { class: 'hint', role: 'note' }, 'Model tests send the fixed prompt reply with "yes" only after you click Test. Requests may consume provider quota.'),
@@ -156,9 +182,46 @@ export async function renderModels(mount, ctx) {
           h('th', { scope: 'col' }, 'Ctx'),
           h('th', { scope: 'col' }, '$/1M in · out'),
           h('th', { scope: 'col' }, 'Reasoning · input'),
-          h('th', { scope: 'col' }, ''),
-          h('th', { scope: 'col' }, ''))),
+          h('th', { scope: 'col' }, h('span', { class: 'sr-only' }, 'Relay visibility')),
+          h('th', { scope: 'col' }, h('span', { class: 'sr-only' }, 'Actions')))),
         tbody));
+    if (resetScroll) tableWrap.scrollTop = 0;
+    renderPager(list.length, bounds, focus);
+  }
+
+  function renderPager(total, bounds, focus) {
+    pager.hidden = false;
+    const go = (next, nextFocus) => { page = next; renderTable(nextFocus, true); };
+
+    const prev = h('button', { class: 'btn btn-sm', type: 'button', 'aria-label': 'Previous page' }, 'Previous');
+    prev.disabled = page <= 1;
+    prev.addEventListener('click', () => go(page - 1, 'prev'));
+
+    const next = h('button', { class: 'btn btn-sm', type: 'button', 'aria-label': 'Next page' }, 'Next');
+    next.disabled = page >= bounds.pages;
+    next.addEventListener('click', () => go(page + 1, 'next'));
+
+    const pageSel = h('select', { class: 'input pager-page', 'aria-label': 'Page' },
+      ...Array.from({ length: bounds.pages }, (_, i) => h('option', { value: String(i + 1) }, String(i + 1))));
+    pageSel.value = String(page);
+    pageSel.addEventListener('change', () => go(Number(pageSel.value), 'page'));
+
+    pager.replaceChildren(
+      h('span', { class: 'pager-range' }, `${bounds.start + 1}–${bounds.end} of ${total}`),
+      h('span', { class: 'spacer' }),
+      h('label', { class: 'pager-control' }, 'Rows ', pageSizeSel),
+      prev,
+      h('label', { class: 'pager-control' }, 'Page ', pageSel),
+      h('span', { class: 'pager-pages' }, `of ${bounds.pages}`),
+      next,
+    );
+
+    // Rebuilding the bar detaches the control that was just used. Put focus back on it so a
+    // keyboard page turn does not fall back to the document body.
+    if (focus === 'prev') prev.focus();
+    else if (focus === 'next') next.focus();
+    else if (focus === 'page') pageSel.focus();
+    else if (focus === 'size') pageSizeSel.focus();
   }
 
   function priceText(m) {

@@ -317,6 +317,13 @@ export async function renderProviders(mount, ctx) {
     tableWrap,
   );
 
+  // Escape closes an inline provider detail even when focus stayed on the row button that opened
+  // it. A modal owns Escape while it is open, and must not close the panel behind it as well.
+  mount.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || !drawerOpen || document.querySelector('.dialog-backdrop')) return;
+    closeDrawer();
+  });
+
   function saveSort(mode) {
     sortMode = mode;
     sortSel.value = mode;
@@ -513,30 +520,33 @@ export async function renderProviders(mount, ctx) {
         'aria-pressed': isPinned ? 'true' : 'false',
         'aria-label': (isPinned ? 'Unpin ' : 'Pin to top ') + p.id,
         title: isPinned ? 'Unpin' : 'Pin to top',
-      }, isPinned ? '★' : '☆');
+      }, icon('pin'));
       pinBtn.addEventListener('click', (e) => { e.stopPropagation(); togglePin(p.id); });
 
-      const pinCell = h('td', { class: 'pin-col' }, pinBtn);
-      if (sortMode === 'manual') {
-        const up = h('button', {
-          class: 'icon-btn provider-move', type: 'button',
-          disabled: index === 0
-            || (pinned.has(ordered[index - 1]?.id) !== isPinned),
-          'aria-label': 'Move ' + p.id + ' up', title: 'Move up',
-        }, icon('up'));
-        const down = h('button', {
-          class: 'icon-btn provider-move', type: 'button',
-          disabled: index === ordered.length - 1
-            || (pinned.has(ordered[index + 1]?.id) !== isPinned),
-          'aria-label': 'Move ' + p.id + ' down', title: 'Move down',
-        }, icon('down'));
-        up.addEventListener('click', (e) => { e.stopPropagation(); moveProvider(p.id, -1); });
-        down.addEventListener('click', (e) => { e.stopPropagation(); moveProvider(p.id, 1); });
-        pinCell.append(up, down);
-      }
+      // Reordering is always available, not only in Manual order: an arrow or a drag freezes the
+      // list as it is and switches the select to Manual. A move never crosses the pin boundary.
+      const grip = h('span', {
+        class: 'icon-btn provider-grip',
+        'aria-hidden': 'true',
+        title: 'Drag to reorder, or use the arrows',
+      }, icon('grip'));
+      const up = h('button', {
+        class: 'icon-btn provider-move', type: 'button',
+        disabled: index === 0 || (pinned.has(ordered[index - 1]?.id) !== isPinned),
+        'aria-label': 'Move ' + p.id + ' up', title: 'Move up',
+      }, icon('up'));
+      const down = h('button', {
+        class: 'icon-btn provider-move', type: 'button',
+        disabled: index === ordered.length - 1
+          || (pinned.has(ordered[index + 1]?.id) !== isPinned),
+        'aria-label': 'Move ' + p.id + ' down', title: 'Move down',
+      }, icon('down'));
+      up.addEventListener('click', (e) => { e.stopPropagation(); moveProvider(p.id, -1); });
+      down.addEventListener('click', (e) => { e.stopPropagation(); moveProvider(p.id, 1); });
+      const pinCell = h('td', { class: 'pin-col' }, grip, pinBtn, up, down);
 
       const tr = h('tr', {
-        class: 'row-click' + (isPinned ? ' pinned-row' : '') + (sortMode === 'manual' ? ' row-draggable' : ''),
+        class: 'row-click row-draggable' + (isPinned ? ' pinned-row' : ''),
         tabindex: '0',
         'data-provider-id': p.id,
       },
@@ -565,39 +575,37 @@ export async function renderProviders(mount, ctx) {
       // not double-trigger through bubbling.
       tr.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target === tr) activate(); });
 
-      if (sortMode === 'manual') {
-        tr.draggable = true;
-        tr.addEventListener('dragstart', (e) => {
-          if (e.target.closest('button, a, input, select, textarea')) { e.preventDefault(); return; }
-          draggedId = p.id;
-          dragSuppressed = true;
-          if (e.dataTransfer) {
-            e.dataTransfer.effectAllowed = 'move';
-            try { e.dataTransfer.setData('text/plain', p.id); } catch { /* Firefox needs this only for external drags. */ }
-          }
-          tr.classList.add('dragging');
-        });
-        tr.addEventListener('dragend', () => {
-          draggedId = null;
-          tr.classList.remove('dragging');
-          tableWrap.querySelectorAll('.drag-over').forEach((row) => row.classList.remove('drag-over'));
-          setTimeout(() => { dragSuppressed = false; }, 0);
-        });
-        tr.addEventListener('dragover', (e) => {
-          if (!draggedId || draggedId === p.id || pinned.has(draggedId) !== isPinned) return;
-          e.preventDefault();
-          if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
-          tr.classList.add('drag-over');
-        });
-        tr.addEventListener('dragleave', () => tr.classList.remove('drag-over'));
-        tr.addEventListener('drop', (e) => {
-          e.preventDefault();
-          tr.classList.remove('drag-over');
-          const source = draggedId;
-          draggedId = null;
-          if (source) reorderProvider(source, p.id);
-        });
-      }
+      tr.draggable = true;
+      tr.addEventListener('dragstart', (e) => {
+        if (e.target.closest('button, a, input, select, textarea')) { e.preventDefault(); return; }
+        draggedId = p.id;
+        dragSuppressed = true;
+        if (e.dataTransfer) {
+          e.dataTransfer.effectAllowed = 'move';
+          try { e.dataTransfer.setData('text/plain', p.id); } catch { /* Firefox needs this only for external drags. */ }
+        }
+        tr.classList.add('dragging');
+      });
+      tr.addEventListener('dragend', () => {
+        draggedId = null;
+        tr.classList.remove('dragging');
+        tableWrap.querySelectorAll('.drag-over').forEach((row) => row.classList.remove('drag-over'));
+        setTimeout(() => { dragSuppressed = false; }, 0);
+      });
+      tr.addEventListener('dragover', (e) => {
+        if (!draggedId || draggedId === p.id || pinned.has(draggedId) !== isPinned) return;
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+        tr.classList.add('drag-over');
+      });
+      tr.addEventListener('dragleave', () => tr.classList.remove('drag-over'));
+      tr.addEventListener('drop', (e) => {
+        e.preventDefault();
+        tr.classList.remove('drag-over');
+        const source = draggedId;
+        draggedId = null;
+        if (source) reorderProvider(source, p.id);
+      });
       tbody.append(tr);
     });
     tableWrap.replaceChildren(h('table', { class: 'tbl provider-table' },
@@ -674,8 +682,14 @@ export async function renderProviders(mount, ctx) {
     head.append(copyButton(provider.id, { className: "btn btn-sm", title: "Copy provider ID" }));
     head.append(closeButton());
     await renderDetail(body, provider);
-    // Keep the panel in view without yanking a background digest refresh around.
-    if (!silent) requestAnimationFrame(() => { if (drawer.isConnected) drawer.scrollIntoView({ block: 'nearest' }); });
+    // Move focus into the panel so Escape reaches its handler even when the opener was activated
+    // by a pointer (or the row was repainted and focus fell back to the document body).
+    if (!silent) {
+      drawer.tabIndex = -1;
+      drawer.focus({ preventScroll: true });
+      // Keep the panel in view without yanking a background digest refresh around.
+      requestAnimationFrame(() => { if (drawer.isConnected) drawer.scrollIntoView({ block: 'nearest' }); });
+    }
   }
 
   function closeButton() {

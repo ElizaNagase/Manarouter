@@ -56,13 +56,18 @@ export async function renderCombos(mount, ctx, selectedId) {
   const formSlot = h('div');
   const left = h('div', { class: 'card' }, h('h2', {}, 'Combos'), listEl);
   const right = h('div', { class: 'card' });
+  // The editor currently mounted in the drawer, if any. It is cleared on close so an old editor's
+  // dirty flag can never keep prompting after its DOM is gone. Declared before any immediate
+  // renderEditor() call below, including the "#/combos/_new" route.
+  let activeEditor = null;
+  let closingEditor = false;
   mount.replaceChildren(
     h('div', { class: 'toolbar' }, newBtn, h('span', { class: 'spacer' }), count),
     formSlot,
     h('div', { class: 'combo-layout' }, left, right),
   );
 
-  newBtn.addEventListener('click', () => renderEditor(null, formSlot));
+  newBtn.addEventListener('click', () => { void startNewEditor(); });
 
   try {
     // list_combos returns { combos: config.combos }; each ComboStep is only provider/model/policy
@@ -74,6 +79,17 @@ export async function renderCombos(mount, ctx, selectedId) {
     return;
   }
   try { providers = await ctx.loadProviders(); } catch { /* combos remain usable without metadata */ }
+
+  // A combo is called by its `name` (e.g. "deepseek"), but its stored id is a UUID. Links from the
+  // sidebar and the overview use the name an operator recognises, so accept either rather than
+  // sending a real combo to "Combo not found". Match the id first: a name that happens to look
+  // like another combo's id should never win over the actual id.
+  if (selectedId && selectedId !== '_new') {
+    const selected = combos.find((c) => c.id === selectedId)
+      ?? combos.find((c) => c.name === selectedId)
+      ?? combos.find((c) => c.label === selectedId);
+    selectedId = selected?.id ?? selectedId;
+  }
 
   renderList();
   count.textContent = `${combos.length} combo${combos.length === 1 ? '' : 's'}`;
@@ -112,7 +128,46 @@ export async function renderCombos(mount, ctx, selectedId) {
   // ------------------------------------------------------------------ detail drawer and summary
 
   function closeDrawer() {
+    // Detach the editor and retract its guard together. A close that only removed the DOM would
+    // leave ctx.leaveGuard pointing at a form that no longer exists, so the next page change would
+    // ask about edits that are already gone.
+    activeEditor?.discard();
     mount.querySelector('.drawer')?.remove();
+    activeEditor = null;
+  }
+
+  // Ask before an editor is replaced, not only before the page changes. New combo and Edit combo
+  // can both be clicked while a drawer is open; either one would otherwise unmount unsaved edits
+  // silently and leave the old guard armed.
+  async function confirmDiscardEditor(message) {
+    const editor = activeEditor;
+    if (!editor?.isDirty()) return true;
+    if (closingEditor) return false;
+    closingEditor = true;
+    try {
+      return await ctx.confirm({
+        title: 'Leave without saving?',
+        message,
+        confirmLabel: 'Discard changes',
+        cancelLabel: 'Keep editing',
+        danger: false,
+      });
+    } finally {
+      closingEditor = false;
+    }
+  }
+
+  async function requestCloseDrawer() {
+    if (!(await confirmDiscardEditor(
+      'This combo has unsaved changes. Closing the editor will discard them.'))) return;
+    closeDrawer();
+  }
+
+  async function startNewEditor() {
+    if (!(await confirmDiscardEditor(
+      'This combo has unsaved changes. Starting a new combo will discard them.'))) return;
+    closeDrawer();
+    renderEditor(null, formSlot);
   }
 
   function drawerShell(title) {
@@ -122,24 +177,35 @@ export async function renderCombos(mount, ctx, selectedId) {
       h('span', { class: 'spacer' }));
     const body = h('div', { class: 'drawer-body' });
     const drawer = h('div', { class: 'drawer', role: 'region', 'aria-label': 'Combo detail' }, head, body);
-    drawer.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
+    drawer.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); void requestCloseDrawer(); }
+    });
     mount.append(drawer);
-    return { head, body };
+    return { drawer, head, body };
   }
 
-  function openEditorDrawer(saved) {
-    const { head, body } = drawerShell(saved ? `Edit combo ${saved.name || saved.id}` : 'New combo');
+  async function openEditorDrawer(saved) {
+    if (!(await confirmDiscardEditor(
+      'This combo has unsaved changes. Opening another combo will discard them.'))) return;
+    const { drawer, head, body } = drawerShell(saved ? `Edit combo ${saved.name || saved.id}` : 'New combo');
     head.append(h('button', {
       class: 'icon-btn', type: 'button', 'aria-label': 'Close combo editor',
-      onclick: closeDrawer,
+      onclick: () => { void requestCloseDrawer(); },
     }, icon('x')));
     renderEditor(saved, body);
+    // A new editor focuses its name field. An existing one has no natural first input, so put
+    // focus on the drawer itself rather than leaving it on the summary button behind it — Escape
+    // must close this editor, and a focused element outside the drawer never reaches its handler.
+    if (!body.contains(document.activeElement)) {
+      drawer.tabIndex = -1;
+      drawer.focus({ preventScroll: true });
+    }
   }
 
   function renderSummary(target, combo) {
     const healthSection = h('section', {});
     const editBtn = h('button', { class: 'btn btn-primary', type: 'button' }, 'Edit combo');
-    editBtn.addEventListener('click', () => openEditorDrawer(combo));
+    editBtn.addEventListener('click', () => { void openEditorDrawer(combo); });
     target.replaceChildren(
       h('h2', {}, combo.label || combo.name || combo.id),
       h('p', { class: 'hint mono' }, `id: ${combo.id}`),
@@ -292,30 +358,29 @@ export async function renderCombos(mount, ctx, selectedId) {
     draft.wf = parseWinnerFail(draft.hedge.on_winner_fail); // working form of the tagged enum
     const savedSnapshot = JSON.stringify(draft);
     let dirty = false;
+    let guard = null;
 
     function markDirty() {
       if (dirty) return;
       dirty = true;
-      ctx.leaveGuard = () => {
-        return ctx.confirm({
-          title: 'Leave without saving?',
-          message: 'This combo has unsaved changes. Leaving will discard them.',
-          confirmLabel: 'Leave and discard',
-          cancelLabel: 'Stay on this page',
-          danger: false,
-        });
-      };
-      window.addEventListener('beforeunload', onBeforeUnload);
+      guard = () => ctx.confirm({
+        title: 'Leave without saving?',
+        message: 'This combo has unsaved changes. Leaving will discard them.',
+        confirmLabel: 'Leave and discard',
+        cancelLabel: 'Stay on this page',
+        danger: false,
+      });
+      ctx.leaveGuard = guard;
     }
     function clearDirty() {
       dirty = false;
-      ctx.leaveGuard = null;
-      window.removeEventListener('beforeunload', onBeforeUnload);
+      // Only retract our own guard: a late clear from an old editor must not disarm a newer one.
+      if (guard && ctx.leaveGuard === guard) ctx.leaveGuard = null;
+      guard = null;
     }
-    function onBeforeUnload(e) {
-      e.preventDefault();
-      e.returnValue = '';
-    }
+    // The drawer owns this editor's lifetime. The router clears the guard after a confirmed page
+    // change, but closing the drawer stays on the same route and must clean up on its own.
+    activeEditor = { isDirty: () => dirty, discard: clearDirty };
 
     const title = h('h2', { style: 'text-transform:none;letter-spacing:0;font-size:14px;' },
       isNew ? 'New combo' : `Editing ${saved.name || saved.id}`);
@@ -586,7 +651,7 @@ export async function renderCombos(mount, ctx, selectedId) {
       try {
         if (isNew) {
           const created = await api.post('/api/combos', payload);
-          ctx.toast.success(`Combo ${created?.id ?? payload.name} created.`);
+          ctx.toast.success(`Combo ${payload.name} created.`);
           clearDirty();
           closeDrawer();
           ctx.navigate(`#/combos/${encodeURIComponent(created?.id ?? payload.name)}`);
@@ -615,13 +680,18 @@ export async function renderCombos(mount, ctx, selectedId) {
       try {
         await api.del(`/api/combos/${encodeURIComponent(saved.id)}`);
         ctx.toast.success('Combo deleted.');
+        // The record is gone, so its editor must not ask to preserve unsaved edits on the way out.
+        clearDirty();
+        closeDrawer();
         ctx.navigate('#/combos');
       } catch (err) {
         ctx.toast.error('Delete failed', err);
       }
     });
 
-    revertBtn.addEventListener('click', () => { clearDirty(); renderEditor(saved); });
+    // Re-render in the same slot: an existing combo's editor lives in the drawer, and the inline
+    // right-hand slot would leave the old, still-dirty drawer mounted beside a second form.
+    revertBtn.addEventListener('click', () => { clearDirty(); renderEditor(saved, target); });
 
     const editor = h('form', { class: 'combo-editor', onsubmit: (e) => e.preventDefault() },
       title,

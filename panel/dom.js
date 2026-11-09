@@ -57,6 +57,7 @@ const ICON_PATHS = {
   pencil: 'M4 12l.8-2.8 6.4-6.4a1.4 1.4 0 0 1 2 2L6.8 11.2 4 12z',
   key: 'M6.2 9.8a2.8 2.8 0 1 0-2.4 1.2h1.2M6.2 9.8L13 3m-2.4 1.4l1.6 1.6',
   play: 'M5 3.5l7 4.5-7 4.5z',
+  pin: 'M9.4 2.2H6.6l.5 4.1L4 9.4V11h3.3v3.7L8 16l.7-1.3V11H12V9.4L8.9 6.3z',
   grip: null, // drawn with circles below
 };
 
