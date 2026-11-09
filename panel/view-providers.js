@@ -678,11 +678,13 @@ export async function renderProviders(mount, ctx) {
     if (label) label.textContent = 'Testing…';
     const started = performance.now();
     try {
+      // `skipAuthRedirect`: the provider's own 401 is forwarded as-is, and treating it as a dead
+      // panel session would sign the operator out over a credential the login form cannot fix.
       const result = await api.post('/api/models/test', {
         provider: p.id,
         model: m.id,
         prompt: 'Reply with the single word OK.',
-      });
+      }, { skipAuthRedirect: true });
       const ms = Math.round(performance.now() - started);
       const answer = typeof result?.response === 'string' ? result.response.trim() : '';
       if (label) label.textContent = 'OK';
@@ -695,10 +697,12 @@ export async function renderProviders(mount, ctx) {
         ? `${p.id} / ${m.id} answered: “${answer.slice(0, 120)}”`
         : `${p.id} / ${m.id} answered with no text.`);
     } catch (err) {
+      // The reason belongs in the message: a toast's second argument is the error's detail *list*
+      // and is dropped when it is not one, so `err` passed there vanished and the operator was left
+      // with "did not answer" and no cause.
       if (label) label.textContent = 'failed';
       button.title = err?.message ?? 'the model did not answer';
-      button.title = err?.message ?? 'the model did not answer';
-      ctx.toast.error(`${p.id} / ${m.id} did not answer`, err);
+      ctx.toast.error(`${p.id} / ${m.id} did not answer: ${err?.message ?? 'the request failed'}`);
     } finally {
       // The verdict stays until the next test, so the button keeps telling the truth rather than
       // resetting to a neutral label that hides what just happened.

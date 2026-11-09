@@ -238,11 +238,14 @@ export async function renderModels(mount, ctx) {
     button.textContent = 'Testing…';
     try {
       const started = performance.now();
+      // `skipAuthRedirect`: a provider that refuses the test with its own 401 is not a dead panel
+      // session — signing in again cannot fix a rejected credential, and the bounce would hide the
+      // models list along with the verdict.
       const result = await api.post('/api/models/test', {
         provider: p.id,
         model: m.id,
         prompt: MODEL_TEST_PROMPT,
-      });
+      }, { skipAuthRedirect: true });
       const elapsed = Math.round(performance.now() - started);
       const reply = result?.response ?? result?.reply ?? result?.output ?? result?.message;
       if (reply === undefined || reply === null) {

@@ -111,16 +111,31 @@ async fn test_model(
             .and_then(|error| error.get("message"))
             .and_then(Value::as_str)
             .unwrap_or("the relay refused the test");
-        // Pass the relay's own status through: a 429 is a rate limit, not a broken credential, and
-        // the panel should say so with the message the route actually produced.
-        return Err(ApiError::upstream(
-            status,
-            format!("the relay answered {status}: {message}"),
-        ));
+        return Err(probe_failure(status, message));
     }
     Ok(Json(
         json!({"provider": request.provider, "model": request.model, "ok": true, "response": parsed.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message")).and_then(|m| m.get("content")).cloned().unwrap_or(Value::Null)}),
     ))
+}
+
+/// The failure to hand back when the probe's route refused.
+///
+/// The relay's status is passed through, with one exception: a `401`. On *this* API a `401` has
+/// exactly one meaning — "the panel session is gone" — and `panel/api.js` acts on it globally by
+/// dropping the operator to the sign-in screen. A provider that rejects a stored credential is not
+/// a dead session: re-entering the panel password cannot fix it, and the bounce hides the model
+/// list along with the verdict the operator was reading. So the refusal is reported as `502`
+/// (the gateway did answer; its upstream refused) and the provider's own `401` stays in the
+/// message, which is where the truth belongs. Everything else is passed through unchanged: a `429`
+/// is a rate limit and a `403` a plan restriction, and the panel should say so with the route's
+/// own words.
+fn probe_failure(upstream: StatusCode, message: &str) -> ApiError {
+    let status = if upstream == StatusCode::UNAUTHORIZED {
+        StatusCode::BAD_GATEWAY
+    } else {
+        upstream
+    };
+    ApiError::upstream(status, format!("the relay answered {upstream}: {message}"))
 }
 
 async fn send_json(
@@ -211,4 +226,48 @@ async fn sync_pricing(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(
         json!({"updated": updated, "manual_overrides_preserved": true, "preserved": preserved, "message": format!("Updated {updated} models; preserved {preserved} manual overrides.")}),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    /// A provider's refusal must reach the panel as a refusal, not as a dead session.
+    ///
+    /// `panel/api.js` treats any `401` as "your session died" and swaps the whole UI for the sign-in
+    /// screen, so a provider that answers `401` to a generation request used to log the operator out
+    /// and bury the model test's real verdict — the reason the panel said "Your session has expired"
+    /// on a perfectly valid session. The status is translated to `502`; the provider's own status and
+    /// words stay in the message, where they are actionable.
+    #[tokio::test]
+    async fn a_provider_refusal_keeps_its_verdict_but_never_borrows_the_sessions_401() {
+        let refused = probe_failure(StatusCode::UNAUTHORIZED, "the key was revoked");
+        let response = refused.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("the relay answered 401 Unauthorized"),
+            "{body}"
+        );
+        assert!(body.contains("the key was revoked"), "{body}");
+        assert!(body.contains("\"code\":\"upstream\""), "{body}");
+
+        // Everything else keeps the route's own status: a rate limit reading as a rate limit is the
+        // point of passing the relay's answer through at all.
+        for (upstream, expected) in [
+            (StatusCode::TOO_MANY_REQUESTS, StatusCode::TOO_MANY_REQUESTS),
+            (StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+            (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND),
+            (StatusCode::PAYMENT_REQUIRED, StatusCode::PAYMENT_REQUIRED),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            let response = probe_failure(upstream, "x").into_response();
+            assert_eq!(response.status(), expected, "{upstream}");
+        }
+    }
 }

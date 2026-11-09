@@ -79,7 +79,10 @@ export const api = {
   request,
   get: (p) => request('GET', p),
   getRaw: (p) => request('GET', p, { rawText: true }),
-  post: (p, body = {}) => request('POST', p, { body }),
+  // `opts` exists for the calls that must not *act* on a 401: a provider's refusal is forwarded with
+  // its own status, and reading that as a dead session would sign the operator out over a credential
+  // the sign-in form cannot fix (see `skipAuthRedirect` in `request`).
+  post: (p, body = {}, opts) => request('POST', p, { body, ...opts }),
   put: (p, body = {}) => request('PUT', p, { body }),
   // The raw-config endpoint is a JSON extractor; a text/plain body is rejected outright. The
   // body is JSON text here, so the default JSON content type is the correct one.

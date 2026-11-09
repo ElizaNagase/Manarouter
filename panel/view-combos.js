@@ -233,11 +233,13 @@ export async function renderCombos(mount, ctx, selectedId) {
           paint();
           const started = performance.now();
           try {
+            // A step's own 401 is a provider refusal, not a dead panel session: report it in this
+            // row instead of signing the operator out mid-check.
             const answer = await api.post('/api/models/test', {
               provider: step.provider,
               model: step.model,
               prompt: 'Reply with the single word OK.',
-            });
+            }, { skipAuthRedirect: true });
             results.set(index, {
               state: 'ok',
               ms: Math.round(performance.now() - started),

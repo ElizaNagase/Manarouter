@@ -151,7 +151,12 @@ request that is mid-answer. Making the restart explicit turns a surprise into a 
   is bound to — a tailnet name or IP included — but a page on any other origin still cannot drive it.
   A same host on a *different* port is a different origin and is refused.
 - Sessions last 12 hours. Logging out revokes that session; changing the password revokes all of
-  them.
+  them. A `401` from the panel's own API means exactly one thing — that session is over — and the
+  panel answers it by returning to the sign-in screen. A *provider* that refuses a credential is a
+  different failure, so the model test reports it with the provider's own status and wording (a
+  provider `401` is surfaced as `502` by `POST /api/models/test`) and leaves you signed in: entering
+  the panel password again cannot fix an expired provider grant, and signing you out would hide the
+  verdict you were reading.
 
 ### Reaching the panel from another device
 
