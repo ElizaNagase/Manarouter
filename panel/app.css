@@ -817,7 +817,7 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
 .quota-account.quota-level-alert { border-left-color: var(--amber); }
 .quota-account.quota-level-critical { border-left-color: var(--red); }
 
-/* name · bar · readout, with the reset line spanning the bar column. */
+/* name · bar · readout, with the reset countdown trailing on the right. */
 .quota-window {
   display: grid;
   grid-template-columns: 58px minmax(0, 1fr);
@@ -829,7 +829,7 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
 }
 .quota-window:first-of-type { border-top: 0; padding-top: 2px; }
 .quota-window-name { font-family: var(--mono); font-size: 12px; color: var(--tx2); }
-.quota-window-usage { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.quota-window-usage { display: flex; align-items: center; gap: 10px; row-gap: 4px; flex-wrap: wrap; min-width: 0; }
 .quota-bar {
   flex: 0 1 320px;
   min-width: 80px;
@@ -843,7 +843,8 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
 .quota-readout { display: inline-flex; gap: 8px; align-items: baseline; white-space: nowrap; }
 .quota-window .quota-pct { color: var(--quota-tone); }
 .quota-used { color: var(--tx3); font-size: 11.5px; font-variant-numeric: tabular-nums; }
-.quota-window .quota-reset { grid-column: 2; margin: 0; }
+/* Pushed to the right edge of the row: it qualifies the number, it is not a footnote under it. */
+.quota-reset-in { margin-left: auto; color: var(--tx3); font-size: 11.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 /* The at-a-glance strip: one line per account, its windows as chips that jump to the card. */
 .quota-glance { display: flex; flex-direction: column; margin: 4px 0 8px; }
@@ -881,6 +882,8 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
   cursor: pointer;
 }
 .quota-chip:hover { border-color: var(--quota-tone); }
+/* The countdown rides inside the chip, a shade quieter than the number it qualifies. */
+.quota-chip-reset { opacity: .72; }
 
 /* ---------- banners, callouts ---------- */
 

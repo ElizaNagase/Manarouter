@@ -4,9 +4,10 @@
 // REMAINING, and every bar, chip and card border consumes that tone. These checks pin the
 // boundaries, because an off-by-one here silently paints a nearly-exhausted window green.
 //
-// Not covered here: the rendered DOM (chip strip, bars, reset lines). That needs a browser —
-// open the Quota page and confirm the chips jump to their card, the bars fill from the left, and
-// the colour matches the percentage written beside the bar.
+// Not covered here: the rendered DOM (chip strip, bars, countdowns) or the account-row filter,
+// which lives in view-quota.js. That needs a browser — open the Quota page and confirm the chips
+// jump to their card, the bars fill from the left, the countdown sits at the right of each row,
+// and the colour matches the percentage written beside the bar.
 //
 // Run: node --test panel/test/quota-display.test.mjs
 
@@ -18,7 +19,11 @@ import {
   QUOTA_STATUS_HEALTHY_ABOVE,
   chunkFill,
   formatQuotaUsage,
+  formatResetIn,
+  formatResetInLabel,
+  quotaFamilyLabel,
   quotaStatusLevel,
+  quotaWindows,
   worstQuotaStatus,
 } from '../format.js';
 
@@ -52,6 +57,45 @@ test('the worst window decides the account, and an empty list stays unknown', ()
   assert.equal(worstQuotaStatus(['critical', 'ok']), 'critical');
 });
 
+test('the countdown beside a percentage names itself and never invents a time', () => {
+  const now = Date.UTC(2026, 0, 1, 12, 0, 0);
+  assert.equal(formatResetInLabel(now + (6 * 86400 + 23 * 3600) * 1000, now), 'Resets in: 6 d 23 h');
+  assert.equal(formatResetInLabel(now + 45_000, now), 'Resets in: 45 s');
+  assert.equal(formatResetInLabel(now - 1, now), 'Resets now');
+  assert.equal(formatResetInLabel(null, now), 'Reset time unknown');
+  assert.equal(formatResetInLabel(undefined, now), 'Reset time unknown');
+  // The sentence form keeps working: the same countdown, phrased for prose.
+  assert.equal(formatResetIn(now + 45_000, now), 'resets in 45 s');
+  assert.equal(formatResetIn(null, now), 'reset time unknown');
+});
+
+test('a provider that quantifies one window gets one row, not three padded ones', () => {
+  const single = [{ family: '1w', fraction_reported: true, remaining_percentage: 100, total: 100 }];
+  assert.equal(quotaWindows(single).length, 1);
+  // Unlimited is an answer and keeps its row; a family the provider never mentioned does not appear.
+  assert.equal(quotaWindows([{ unlimited: true, fraction_reported: true }]).length, 1);
+  assert.deepEqual(quotaWindows(undefined), []);
+  assert.deepEqual(quotaWindows([null, 'nope']), []);
+});
+
+test('silent windows are dropped, and the named families lead in 5h, 1w, 30d order', () => {
+  const windows = [
+    { family: '30d', fraction_reported: true, remaining_percentage: 78, total: 100 },
+    { family: '1w', fraction_reported: true, remaining_percentage: 99.8, total: 100 },
+    { family: { other: { secs: 3600 } }, fraction_reported: true, remaining_percentage: 4, total: 10 },
+    { family: '5h' }, // no fraction: silence is not a measurement, so there is no row
+  ];
+  assert.deepEqual(quotaWindows(windows).map((window) => window.family),
+    ['1w', '30d', { other: { secs: 3600 } }]);
+});
+
+test('a family the panel has no short name for still gets a label', () => {
+  assert.equal(quotaFamilyLabel('1w'), '1w');
+  assert.equal(quotaFamilyLabel({ other: { secs: 3600 } }), 'other (3600s)');
+  assert.equal(quotaFamilyLabel({ other: {} }), 'other');
+  assert.equal(quotaFamilyLabel(null), '');
+  assert.equal(quotaFamilyLabel({}), '');
+});
 test('a window with a reported fraction becomes a percentage the view can colour', () => {
   // total > 0 is what tells the helper the percentage is a real measurement, not a sentinel.
   const usage = formatQuotaUsage(

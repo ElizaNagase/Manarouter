@@ -5,11 +5,11 @@
 // provider allowance.
 
 import { api } from './api.js';
-import { h, chip, emptyState, errorBlock, toggle } from './dom.js';
+import { h, emptyState, errorBlock, toggle } from './dom.js';
 import {
-  QUOTA_FAMILIES, QUOTA_STATUS_CRITICAL_AT_OR_BELOW, QUOTA_STATUS_HEALTHY_ABOVE,
-  formatQuotaAge, formatQuotaUsage, formatPercent, formatResetIn, quotaStatusLevel,
-  worstQuotaStatus,
+  QUOTA_STATUS_CRITICAL_AT_OR_BELOW, QUOTA_STATUS_HEALTHY_ABOVE,
+  formatQuotaAge, formatQuotaUsage, formatPercent, formatResetInLabel,
+  quotaFamilyLabel, quotaStatusLevel, quotaWindows, worstQuotaStatus,
 } from './format.js';
 
 // Bars by default: a share of a window is a share, and twenty cells made an operator count them.
@@ -183,36 +183,40 @@ export async function renderQuota(mount, ctx) {
   }
 
   // One line per account, its windows as colour-coded chips. The cards below are the evidence;
-  // this strip answers the question the page exists for — what is running out, right now.
+  // this strip answers the question the page exists for — what is running out, right now. A chip
+  // carries its own countdown, so "when does it come back" is answered without a second line, and
+  // an account the provider never quantified has no line here at all.
   function renderGlance() {
     const card = h('section', { class: 'card' });
     card.append(h('h2', {}, 'At a glance'));
     const list = h('div', { class: 'quota-glance' });
     let chips = 0;
     for (const [index, row] of accountRows.entries()) {
-      const record = records.get(row.key);
-      if (record?.fetched_at == null) continue;
+      const windows = quotaWindows(records.get(row.key)?.windows)
+        .map((window) => ({ window, usage: formatQuotaUsage(window, display) }))
+        .filter(({ usage }) => usage.kind === 'percentage' || usage.kind === 'chunks');
+      if (!windows.length) continue;
       const label = accountLabel(row);
       const line = h('div', { class: 'quota-glance-account' },
         h('span', { class: 'quota-glance-name', title: `${row.provider.id} · ${label}` },
           `${row.provider.id} · ${label}`));
       const rowChips = h('div', { class: 'quota-glance-chips' });
-      for (const window of accountWindows(record)) {
-        const usage = formatQuotaUsage(window, display);
-        if (usage.kind !== 'percentage' && usage.kind !== 'chunks') continue;
+      for (const { window, usage } of windows) {
         const level = quotaStatusLevel(usage.remainingPercent);
-        const family = familyLabel(window?.family) || window?.display_name || 'window';
-        const reset = window?.reset_at != null ? formatResetIn(window.reset_at) : 'reset time unknown';
+        const family = quotaFamilyLabel(window?.family) || window?.display_name || 'window';
+        const reset = formatResetInLabel(window?.reset_at);
         rowChips.append(h('button', {
           class: `quota-chip quota-level-${level}`,
           type: 'button',
           title: `${family}: ${formatPercent(usage.remainingPercent)} left · ${reset}`,
           onclick: () => scrollToAccount(index),
-        }, `${family} ${formatPercent(usage.remainingPercent)}`));
+        },
+        `${family} ${formatPercent(usage.remainingPercent)}`,
+        h('span', { class: 'quota-chip-reset' }, reset)));
         chips += 1;
       }
-      if (rowChips.childElementCount) list.append(line);
       line.append(rowChips);
+      list.append(line);
     }
     if (!chips) {
       card.append(h('p', { class: 'hint' }, 'No cached quota windows yet. Refresh an account to fetch its allowance.'));
@@ -233,8 +237,11 @@ export async function renderQuota(mount, ctx) {
     const record = records.get(key);
     const label = accountLabel(row);
     const title = `${provider.id} · ${label}`;
+    // Only windows the provider quantified are drawn — one row if it reports one. An account that
+    // quantified nothing never reaches this function: buildAccountRows dropped it.
+    const windows = quotaWindows(record?.windows);
     // A single exhausted window decides the account's tone; averaging the windows would bury it.
-    const worst = worstQuotaStatus(accountWindows(record).map((window) => {
+    const worst = worstQuotaStatus(windows.map((window) => {
       const usage = formatQuotaUsage(window, display);
       return usage.kind === 'percentage' || usage.kind === 'chunks'
         ? quotaStatusLevel(usage.remainingPercent) : 'unknown';
@@ -244,8 +251,6 @@ export async function renderQuota(mount, ctx) {
       id: accountCardId(index),
     });
     const header = h('div', { class: 'toolbar' }, h('h2', {}, title));
-    const neverFetched = record?.fetched_at == null ? chip('never fetched', 'chip-amber', 'No provider quota snapshot cached yet') : null;
-    if (neverFetched) header.append(neverFetched);
     const refreshButton = h('button', {
       class: 'btn',
       type: 'button',
@@ -255,37 +260,25 @@ export async function renderQuota(mount, ctx) {
     header.append(refreshButton);
     card.append(header);
 
-    const source = record?.source || firstWindowSource(record?.windows);
-    const details = displayDetails(record?.details, record?.windows);
-    const meta = [formatQuotaAge(record?.fetched_at)];
-    if (source) meta.push(`Source: ${source}`);
-    if (details.length) meta.push(`Details: ${details.join(' · ')}`);
-    card.append(h('p', { class: 'hint' }, meta.join(' · ')));
+    // Age only. The snapshot's source URL and its per-model `details` remain in the API for
+    // diagnostics; printed on every card they buried the number this page exists to show.
+    card.append(h('p', { class: 'hint' }, formatQuotaAge(record?.fetched_at)));
 
     const error = localErrors.get(key) || record?.error;
     if (error) card.append(errorBlock({ message: errorMessage(error) }));
 
-    // The endpoint may include declared family placeholders before the first fetch; those are not
-    // upstream observations. Only render usage fields once this account has a cached fetch time.
-    const windows = record?.fetched_at != null && Array.isArray(record?.windows) ? record.windows : [];
-    for (const family of QUOTA_FAMILIES) {
-      const window = windows.find((candidate) => familyLabel(candidate?.family) === family);
-      card.append(renderWindow(family, window));
-    }
     for (const window of windows) {
-      if (!QUOTA_FAMILIES.includes(familyLabel(window?.family))) {
-        card.append(renderWindow(familyLabel(window?.family) || 'Other window', window));
-      }
-    }
-    if (!windows.length && !error) {
-      card.append(h('p', { class: 'hint' }, 'No provider quota snapshot cached. Use Refresh account to fetch one.'));
+      card.append(renderWindow(quotaFamilyLabel(window?.family) || window?.display_name || 'Window', window));
     }
     return card;
   }
 
-  // One window: name · bar · readout on the first line, reset time and source underneath. The bar
-  // fills with what is REMAINING — that is the number an operator acts on — and its colour repeats
-  // the percentage written beside it instead of replacing it.
+  // One window: name · bar · readout, with the reset countdown on the right. The bar fills with
+  // what is REMAINING — that is the number an operator acts on — and its colour repeats the
+  // percentage written beside it instead of replacing it.
+  //
+  // Only quantified windows arrive here (see quotaWindows), so there is no N/A branch: a row that
+  // exists always has a number to show.
   function renderWindow(label, window) {
     const usage = formatQuotaUsage(window, display);
     const level = usage.kind === 'percentage' || usage.kind === 'chunks'
@@ -295,8 +288,6 @@ export async function renderQuota(mount, ctx) {
     const info = h('div', { class: 'quota-window-usage' });
     if (usage.kind === 'unlimited') {
       info.append(h('span', { class: 'chunks-na' }, 'Unlimited'));
-    } else if (usage.kind === 'unavailable') {
-      info.append(h('span', { class: 'chunks-na' }, 'N/A — the provider reported no fraction'));
     } else if (usage.kind === 'percentage') {
       info.append(percentageBar(usage), h('span', { class: 'quota-readout' },
         h('strong', { class: 'quota-pct' }, `${formatPercent(usage.remainingPercent)} left`),
@@ -313,18 +304,8 @@ export async function renderQuota(mount, ctx) {
         h('strong', { class: 'quota-pct' }, `${formatPercent(usage.remainingPercent)} left`),
         h('span', { class: 'quota-used' }, `${formatPercent(usage.usedPercent)} used`)));
     }
+    info.append(h('span', { class: 'quota-reset-in' }, formatResetInLabel(window?.reset_at)));
     row.append(info);
-    const sub = [];
-    if (window?.display_name) sub.push(window.display_name);
-    if (window?.source) sub.push(`Source: ${window.source}`);
-    if (window?.reset_at != null) sub.push(formatResetIn(window.reset_at));
-    else sub.push('reset time unknown');
-    if (window?.details?.length) {
-      sub.push(...window.details.map((detail) => detail?.name
-        ? `${detail.name}: ${detail.used ?? 'N/A'}`
-        : String(detail)));
-    }
-    row.append(h('p', { class: 'hint quota-reset' }, sub.join(' · ')));
     return row;
   }
 
@@ -411,11 +392,6 @@ export async function renderQuota(mount, ctx) {
   }
 }
 
-/** The cached windows of one account snapshot; a failed refresh leaves the last good array. */
-function accountWindows(record) {
-  return Array.isArray(record?.windows) ? record.windows : [];
-}
-
 /** A stable DOM id for one account card, so a chip can jump to it. Index-based: keys are opaque. */
 function accountCardId(index) {
   return `quota-account-${index}`;
@@ -465,9 +441,14 @@ function buildAccountRows(providers, records) {
   // The control plane decides which accounts have a quota worth showing: it omits the ones whose
   // provider reports no allowance at all. Rendering every configured account here would put those
   // back on the page with invented `0/0` windows, so the rows come from the quota response.
+  //
+  // Even inside that response, an account is only a row when it has a quantified window. A cached
+  // failure stays: 'the provider would not answer' is a fact, and it is the one case an operator
+  // must see. A snapshot with neither a window nor an error is silence, and silence gets no card.
   const rows = [];
   const byProvider = new Map(providers.map((provider) => [provider.id, provider]));
   for (const [key, record] of records) {
+    if (!quotaWindows(record?.windows).length && record?.error == null) continue;
     const provider = byProvider.get(record.provider) ?? { id: record.provider || '(unknown provider)' };
     const account = (provider.accounts ?? []).find((candidate) => candidate.id === record.account)
       ?? { id: record.account, label: record.label || record.account };
@@ -478,32 +459,6 @@ function buildAccountRows(providers, records) {
 
 function recordKey(provider, account) {
   return `${provider}\u0000${account}`;
-}
-
-function familyLabel(family) {
-  if (typeof family === 'string') return family;
-  if (family && typeof family === 'object' && family.other) {
-    const secs = family.other.secs;
-    return Number.isFinite(secs) ? `other (${secs}s)` : 'other';
-  }
-  return '';
-}
-
-function displayDetails(accountDetails, windows) {
-  const seen = new Set();
-  const result = [];
-  const details = [...(Array.isArray(accountDetails) ? accountDetails : [])];
-  for (const window of windows ?? []) details.push(...(window?.details ?? []));
-  for (const detail of details) {
-    if (!detail || typeof detail !== 'object') continue;
-    const text = detail.name ? `${detail.name}: ${detail.used ?? 'N/A'}` : '';
-    if (text && !seen.has(text)) { seen.add(text); result.push(text); }
-  }
-  return result;
-}
-
-function firstWindowSource(windows) {
-  return windows?.find((window) => window?.source)?.source || null;
 }
 
 function errorMessage(error) {

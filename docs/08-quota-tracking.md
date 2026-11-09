@@ -311,9 +311,18 @@ the decision can be made with information.
 ## How the panel paints a window
 
 The Quota view answers one question — *how much is left, and when does it come back* — so it shows
-the number in words, the bar, the reset instant and the colour together, and every one of those is
-derived from the same snapshot.
+the number in words, the bar and the reset countdown together, and every one of those is derived
+from the same snapshot.
 
+- **Only a window the provider quantified is drawn.** The panel renders the windows that are in the
+  snapshot, in `5h`, `1w`, `30d` order, one row each. A provider that reports a single weekly window
+  gets a single row; the page never pads itself with placeholder rows for families that provider did
+  not mention. This is presentation only — `/api/quota` still carries every window it was told
+  about.
+- **A snapshot with nothing quantified is not a card.** An account that has never been fetched, or
+  whose only window came back without a fraction, is left off the page instead of appearing as an
+  empty shell with three `N/A` rows. An account whose fetch *failed* keeps its card and shows the
+  error, because "the provider would not answer" is a fact worth seeing.
 - **Bars fill with what is REMAINING**, not what is spent. An empty bar means "nothing left", which
   is the thing an operator acts on; a full bar means "fresh window".
 - **Colour is a second copy of the number, never the only copy.** Green above 50 % left, amber at
@@ -322,15 +331,23 @@ derived from the same snapshot.
   in one place and amber in another.
 - **No measurement is grey, not red.** A provider that reports no fraction is `unknown`; painting it
   red would claim exhaustion the data does not support, and painting it green would claim headroom.
+  An unlimited window is shown as `Unlimited` and is grey for the same reason: there is no number to
+  colour.
 - **The worst window decides the account.** A card takes the colour of its most exhausted window,
   because an account with one dead 5 h window is an account to look at whatever its weekly window says.
+- **The countdown belongs to the row, not to a footnote.** `Resets in: 2 h 15 m` trails the
+  percentage on the right of each window. A reset instant in the past reads `Resets now`; a window
+  with no reset instant reads `Reset time unknown` rather than inventing a time.
 - **The at-a-glance strip is a signpost, not a summary.** One line per account lists each window as a
-  chip (name, percentage left, colour, reset countdown); clicking a chip scrolls to that account's
-  card. It exists so the operator can find the tired account without reading every card.
+  chip (name, percentage left, colour, same `Resets in:` countdown); clicking a chip scrolls to that
+  account's card. It exists so the operator can find the tired account without reading every card.
+- **Source and details stay in the API.** The cached snapshot also holds `source` and per-window
+  `details` (for example `retrieveUserQuota` and a per-model remaining count) and `/api/quota`
+  returns them for debugging. The page does not print them: a wall of raw provider keys beside the
+  percentage buries the one number the page exists to show.
 
-Nothing here invents data: a window with no fraction, no reset time, or no fetch is shown as such. The
-page also says how old the snapshot is, because a quota figure without an age is a claim about now
-that nobody made.
+Nothing here invents data: a window with no reset time says so, and the page gives each card the age
+of its snapshot, because a quota figure without an age is a claim about now that nobody made.
 
 ## Limitations
 

@@ -464,12 +464,30 @@ export function formatPercent(pct) {
   return `${pct.toFixed(1)}%`;
 }
 
-/** `in 2 h 15 m`, `in 40 s`, or `reset time unknown`. Never invents a time. */
+/** Whole seconds until a reset instant, or `null` when that instant is unknown. */
+function resetInSeconds(resetAtMs, now) {
+  if (resetAtMs == null || !Number.isFinite(resetAtMs)) return null;
+  return Math.round((resetAtMs - now) / 1000);
+}
+
+/** `resets in 2 h 15 m`, `resets in 40 s`, or `reset time unknown`. Never invents a time. */
 export function formatResetIn(resetAtMs, now = Date.now()) {
-  if (resetAtMs == null || !Number.isFinite(resetAtMs)) return 'reset time unknown';
-  const secs = Math.round((resetAtMs - now) / 1000);
+  const secs = resetInSeconds(resetAtMs, now);
+  if (secs == null) return 'reset time unknown';
   if (secs <= 0) return 'resets now';
   return `resets in ${formatDuration(secs)}`;
+}
+
+/**
+ * The same countdown as a label that can stand beside a percentage: `Resets in: 2 h 15 m`,
+ * `Resets now`, or `Reset time unknown`. The panel puts it on the right of a window, where a
+ * lower-case sentence would read as a footnote; the facts are identical to formatResetIn.
+ */
+export function formatResetInLabel(resetAtMs, now = Date.now()) {
+  const secs = resetInSeconds(resetAtMs, now);
+  if (secs == null) return 'Reset time unknown';
+  if (secs <= 0) return 'Resets now';
+  return `Resets in: ${formatDuration(secs)}`;
 }
 
 /**
@@ -559,4 +577,41 @@ export function worstQuotaStatus(levels) {
     else if (level === 'ok' && worst === 'unknown') worst = 'ok';
   }
   return worst;
+}
+
+/** `5h`, `1w`, `30d`, or `other (3600s)` for a family the panel has no short name for. A family
+ * the provider left blank returns an empty string, so callers can fall back to display_name. */
+export function quotaFamilyLabel(family) {
+  if (typeof family === 'string') return family;
+  if (family && typeof family === 'object' && family.other) {
+    const secs = family.other.secs;
+    return Number.isFinite(secs) ? `other (${secs}s)` : 'other';
+  }
+  return '';
+}
+
+/**
+ * The windows worth drawing, in the panel's family order.
+ *
+ * A provider that quantifies one window gets one row; the families it never mentioned are not
+ * padded with N/A rows, because a row that only says "unknown" is noise an operator has to read
+ * past. A window with no reported fraction is dropped for the same reason: silence is not a
+ * measurement, so there is nothing to paint. `unlimited` is kept — that is an answer.
+ *
+ * Availability is decided from `fraction_reported`, not from the display mode, so this filter is
+ * the same whether the panel asked for bars or chunks.
+ */
+export function quotaWindows(windows) {
+  const order = new Map(QUOTA_FAMILIES.map((family, index) => [family, index]));
+  const unranked = QUOTA_FAMILIES.length;
+  return (Array.isArray(windows) ? windows : [])
+    .filter((window) => window && typeof window === 'object')
+    .map((window, index) => ({ window, index, usage: formatQuotaUsage(window) }))
+    .filter(({ usage }) => usage.kind !== 'unavailable')
+    .sort((a, b) => {
+      const rankA = order.get(quotaFamilyLabel(a.window.family)) ?? unranked;
+      const rankB = order.get(quotaFamilyLabel(b.window.family)) ?? unranked;
+      return rankA === rankB ? a.index - b.index : rankA - rankB;
+    })
+    .map(({ window }) => window);
 }

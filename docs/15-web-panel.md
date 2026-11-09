@@ -35,7 +35,7 @@ The two processes share state through files, not through IPC: the conductor writ
 | **Combos** | Every combo with its steps **in priority order**, each step's optional pinned reasoning level, and a **Live health** panel | Create, edit, reorder steps, enable/disable, remove, pin a step's reasoning level, and **check** the steps: one tiny completion per enabled step through the relay probe, in priority order, so the panel shows which step answers right now and which one failed and why |
 | **Keys** | Client keys by label and prefix | Create (plaintext shown once), edit the policy, rotate the secret in place (new plaintext shown once, old secret invalidated after commit), enable/disable, delete |
 | **Aliases** | Alias to target mappings | Add, remove |
-| **Quota** | Allowances first — a strip of per-account window chips, then one card per account with its windows, cooldowns and reset instants — then the recent request ledger underneath. Only accounts whose provider actually reports an allowance are listed; an account with no quota fetcher is not shown with an invented `0/0` window | Refresh an account's windows from the provider (key *and* OAuth accounts: the conductor mints the same short-lived token the relay would) |
+| **Quota** | Allowances first — a strip of per-account window chips, then one card per account with one row per window the provider actually reported — then the recent request ledger underneath. A provider that quantifies a single window gets a single row, never padding for the families it did not mention; an account with nothing quantified (never fetched, or no reported fraction) is left off the page rather than shown as an empty shell. An account whose fetch *failed* keeps its card and the error | Refresh an account's windows from the provider (key *and* OAuth accounts: the conductor mints the same short-lived token the relay would) |
 | **Settings** | Listen ports, client-key access, upstream proxies, the relay connection pool (including a low-resource profile), quota display, pricing data, the panel password, and the raw configuration | Edit; **ports apply on next restart** |
 | **Documentation** | The top-level files in `docs/`, rendered from markdown | Nothing |
 
@@ -44,13 +44,16 @@ must never overwrite what a human typed. If the two ever disagreed and the panel
 was which, the operator would have no way to know why their edit vanished.
 
 The **Quota** view is built to be read in two passes. The strip at the top lists each account's
-windows as chips — name, percentage *left*, colour, reset countdown — and clicking a chip scrolls to
-that account's card, so a tired account is found without reading every card. Each card takes the
-colour of its most exhausted window and draws every window as a row: name, a bar filled with what is
-**remaining**, the percentage left and used in words, and the reset instant beneath. Green is above
-50 % left, amber at 50 % or less, red at 20 % or less, and grey when the provider reported no
-fraction. The colour is always a second copy of a number the row states in words — it never carries
-the meaning alone, and an unmeasured window is never painted red or green.
+windows as chips — name, percentage *left*, colour, `Resets in:` countdown — and clicking a chip
+scrolls to that account's card, so a tired account is found without reading every card. Each card
+takes the colour of its most exhausted window and draws every window the provider reported as a row:
+name, a bar filled with what is **remaining**, the percentage left and used in words, and the reset
+countdown on the right. Green is above 50 % left, amber at 50 % or less, red at 20 % or less, and
+grey when a window is unlimited. The colour is always a second copy of a number the row states in
+words — it never carries the meaning alone, and a window that arrives without a fraction is not
+drawn at all rather than painted red or green. The page does not print the snapshot's `source` URL
+or its per-window `details`; both stay in `/api/quota` for diagnosis, because beside the percentage
+they buried the number the page exists to show.
 
 ## The live combo block
 
