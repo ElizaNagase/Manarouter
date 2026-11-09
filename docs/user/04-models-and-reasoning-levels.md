@@ -67,7 +67,7 @@ A suffix is a Manarouter routing instruction, not generally a model ID understoo
 | OpenAI-compatible, Copilot, Command Code Go | `reasoning_effort` such as `low`, `medium`, or `high`; `ultra`/`max` normalize to the dialect's supported ceiling `xhigh`. |
 | Codex Responses | `reasoning: {"effort":"…","summary":"auto"}`; `ultra`/`max` normalize to `xhigh`. |
 | Anthropic | `thinking: {"type":"enabled","budget_tokens":N}`; default budgets are 1,024 for `minimal`/`low`, 10,240 for `medium`, and 131,072 for `high` and above. |
-| Google / Antigravity | `generationConfig.thinkingConfig`; `thinkingLevel` is `low` below `high`, `high` at `high` and above, alongside a budget. |
+| Google / Antigravity | `generationConfig.thinkingConfig`; `thinkingLevel` is `low` below `high`, `high` at `high` and above, alongside a budget. Budgets start from the same table as Anthropic and are lowered to fit the model's output limit. |
 
 These are translation defaults, not a guarantee that every model accepts every tier. Provider behavior can change, and the advertised model metadata is the router's current best account of that model. `none` sends no default reasoning fragment. A model-specific `reasoning_wire` override replaces the default fragment for the configured level; it is an operator configuration detail, not something to add to an API request.
 

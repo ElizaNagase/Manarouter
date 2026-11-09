@@ -293,8 +293,11 @@ longer true, and the change is deliberate: reasoning is now a **routing** concep
   reaches none of those has **no** levels and its name gets no suffix.
 - The router rewrites the upstream body per dialect: `reasoning_effort` for OpenAI-shaped dialects,
   `reasoning.effort` for the Responses dialect, `thinking.budget_tokens` for Anthropic, and
-  `generationConfig.thinkingConfig` for Google/Antigravity. Level `none` emits no reasoning field at
-  all, on every dialect. A per-model `reasoning_wire` map replaces the dialect default **wholesale**
+  `generationConfig.thinkingConfig` (nested under `request` for Antigravity) for Google/Antigravity.
+  Level `none` emits no reasoning field at all, on every dialect. A thinking budget is fitted to the
+  model's `max_output_tokens` at compile time and to the request's own `max_tokens` at request time
+  (`fit_thinking_budget`), because a budget the model cannot emit is a `400` on Anthropic and an empty
+  `content` on Gemini. A per-model `reasoning_wire` map replaces the dialect default **wholesale**
   for the levels it names, and `null` at a level means "send nothing".
 - **A client's own explicit reasoning field is never overwritten.** `docs/18-api-reference.md`
   §"Model addressing" has the full table.

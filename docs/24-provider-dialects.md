@@ -610,7 +610,8 @@ Gemini gets `generationConfig.thinkingConfig`, not a field Gemini never reads
 | `open-ai`, `copilot`, `command-code-go` | `{"reasoning_effort": "<effort>"}` |
 | `codex` | `{"reasoning": {"effort": "<effort>", "summary": "auto"}}` |
 | `anthropic` | `{"thinking": {"type": "enabled", "budget_tokens": <n>}}` |
-| `google`, `antigravity` | nothing here — the thinking config is a nested `generationConfig` the translator writes |
+| `google` | `{"generationConfig": {"thinkingConfig": {"thinkingLevel": "low"\|"high", "thinkingBudget": <n>}}}` — `thinkingLevel` is `high` from `medium` upward, and `<n>` starts from the Anthropic table |
+| `antigravity` | the same object nested under `request`, because Antigravity's body is an envelope (`{project, model, request, userAgent}`). At the envelope's top level the upstream answers `400 Unknown name "generationConfig"` |
 
 Level `none` emits **no reasoning field at all, on every dialect**: sending
 `{"reasoning_effort":"none"}` to a provider that does not recognise the value is a 400, and omitting

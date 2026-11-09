@@ -190,13 +190,26 @@ recognise the value is a 400, and omitting the field is how every provider expre
 |---|---|
 | openai, copilot, command-code-go | `{"reasoning_effort":"<level>"}` — `minimal`, `low`, `medium` and `high` as themselves; `xhigh`, `ultra` and `max` all normalised to `high` |
 | codex (Responses) | `{"reasoning":{"effort":"<level>","summary":"auto"}}` — `xhigh` as `xhigh`; `ultra` and `max` normalised to `xhigh` |
-| anthropic | `{"thinking":{"type":"enabled","budget_tokens":N}}` with `N` = 1024 for `minimal`/`low`, 10240 for `medium`, 131072 for `high` and above |
+| anthropic | `{"thinking":{"type":"enabled","budget_tokens":N}}` with `N` = 1024 for `minimal`/`low`, 10240 for `medium`, 131072 for `high` and above, then fitted (below) |
 | google, antigravity | `{"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"\|"high","thinkingBudget":N}}}`, where `thinkingLevel` is `high` from `medium` upward and `low` below it, and `N` is the budget above |
 
 A per-model `reasoning_wire` map in the configuration **replaces the dialect default wholesale** for
 the levels it names — a fragment has to be internally consistent, so merging one field-by-field is not
 possible. `null` at a level means "send nothing at that level", which is a different statement from
 "no opinion".
+
+**A thinking budget is fitted, not asserted.** The budgets above are the table's ceiling for a
+dialect, not a promise about any one model. Anthropic rejects `budget_tokens` at or above the
+request's `max_tokens` (`400`, "`max_tokens` must be greater than `thinking.budget_tokens`"), and a
+Gemini/Antigravity budget is spent out of the same candidate allowance as the answer, so a budget
+larger than the allowance produces a successful response whose `content` is empty — the thinking
+used the whole allowance and the upstream stopped with `MAX_TOKENS`. So the compiled fragment is
+fitted twice: at compile time to the model's declared `max_output_tokens`, and at request time to the
+`max_tokens` (or `max_completion_tokens`, or Gemini's `generationConfig.maxOutputTokens`) the body
+actually states. Fitting means *lowering* to leave 4096 tokens of room for the answer; if that leaves
+less than 1024 the fragment is dropped entirely rather than sent as a number the upstream would
+refuse. A model that declares no output limit keeps the table's budget, because there is nothing to
+fit it to.
 
 Two more properties of the rewrite:
 

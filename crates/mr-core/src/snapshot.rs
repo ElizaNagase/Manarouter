@@ -1815,7 +1815,7 @@ fn reasoning_fragments(dialect: Dialect, model: &ModelEntry, levels: u32) -> [Op
         if levels & (1u32 << level.rank()) == 0 {
             continue;
         }
-        let fragment = match model
+        let mut fragment = match model
             .reasoning_wire
             .as_ref()
             .and_then(|map| map.get(&level))
@@ -1826,6 +1826,15 @@ fn reasoning_fragments(dialect: Dialect, model: &ModelEntry, levels: u32) -> [Op
             Some(value) => Some(value.clone()),
             None => dialect_reasoning_fragment(dialect, level),
         };
+        // A budget larger than the model can emit is a request the upstream refuses (Anthropic)
+        // or an answer that never gets written (Gemini spends it all thinking). The model's own
+        // `max_output_tokens` is the only honest ceiling, and clamping only lowers a number, so an
+        // authored `reasoning_wire` is fitted by the same rule instead of being trusted blindly.
+        if let Some(value) = fragment.as_mut() {
+            if !fit_thinking_budget(value, model.max_output_tokens) {
+                fragment = None;
+            }
+        }
         out[level.rank() as usize] = fragment.and_then(|value| serde_json::to_string(&value).ok());
     }
     out
@@ -1914,7 +1923,13 @@ fn effort_spelling(dialect: Dialect, level: ReasoningLevel) -> &'static str {
 /// The thinking-token budget for a level, ported from OmniRoute's `EFFORT_BUDGETS` (MIT).
 ///
 /// Claude's `thinking.budget_tokens` has to be a real number, so unlike `reasoning_effort` there is
-/// nothing to omit. The relay clamps this against the request's `max_tokens` when the client set one which is why the constant is deliberately the provider's own maximum rather than a computed guess.
+/// nothing to omit. `high` is deliberately the provider's own maximum rather than a computed guess,
+/// and it is only a starting point: what a model can actually emit is the *model's* ceiling, not
+/// this table's, so [`fit_thinking_budget`] fits the number to the ceiling a model declares and the
+/// relay fits it again to the `max_tokens` a particular request states. Sending 131072 to a model
+/// that can emit 64000 is not merely wasteful — Anthropic rejects the pair outright with
+/// `max_tokens must be greater than thinking.budget_tokens` — so this table alone must never reach
+/// a body.
 const fn thinking_budget(level: ReasoningLevel) -> u32 {
     match level {
         ReasoningLevel::None => 0,
@@ -1925,6 +1940,89 @@ const fn thinking_budget(level: ReasoningLevel) -> u32 {
         | ReasoningLevel::Ultra
         | ReasoningLevel::Max => 131_072,
     }
+}
+
+/// Room left under a ceiling so an answer can follow the thinking that was paid for.
+///
+/// A budget that consumes the whole output allowance is the empty-answer failure: the model thinks
+/// until the candidate is exhausted, the upstream reports `MAX_TOKENS`, and a client that does not
+/// render reasoning sees a successful reply with no text in it.
+pub const THINKING_HEADROOM_TOKENS: u32 = 4096;
+
+/// The smallest thinking budget worth sending.
+///
+/// Anthropic refuses `budget_tokens` below 1024, and below this there is no room to think *and*
+/// answer anyway, so a budget squeezed under it is dropped by omitting the field entirely rather
+/// than by sending a number the upstream will reject.
+pub const MIN_THINKING_BUDGET: u32 = 1024;
+
+/// The spellings a dialect may use for a thinking budget.
+const BUDGET_KEYS: [&str; 4] = [
+    "budget_tokens",
+    "budgetTokens",
+    "thinking_budget",
+    "thinkingBudget",
+];
+
+/// Does anything in `value` name a thinking budget?
+fn mentions_thinking_budget(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, inner)| {
+            BUDGET_KEYS.contains(&key.as_str()) || mentions_thinking_budget(inner)
+        }),
+        serde_json::Value::Array(items) => items.iter().any(mentions_thinking_budget),
+        _ => false,
+    }
+}
+
+/// Lower every thinking budget inside `value` to at most `cap`, in place.
+fn lower_thinking_budgets(value: &mut serde_json::Value, cap: u32) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, inner) in map.iter_mut() {
+                if BUDGET_KEYS.contains(&key.as_str()) {
+                    if let Some(number) = inner.as_u64() {
+                        if number > u64::from(cap) {
+                            *inner = serde_json::Value::from(cap);
+                        }
+                        continue;
+                    }
+                }
+                lower_thinking_budgets(inner, cap);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                lower_thinking_budgets(item, cap);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Fit the thinking budget in `fragment` under `ceiling` output tokens, in place.
+///
+/// Returns whether the fragment still says anything worth sending. `false` means the ceiling leaves
+/// no room to both think and answer, and the caller must drop the fragment rather than send a
+/// thinking level the model cannot honour.
+///
+/// A `None` ceiling leaves a fragment that names a budget untouched: a model that declares no
+/// output limit has said nothing to fit against, and inventing one would be inventing a capability.
+/// Clamping only ever lowers a number, so it is safe to apply to a fragment the operator authored
+/// as well as to a dialect default.
+pub fn fit_thinking_budget(fragment: &mut serde_json::Value, ceiling: Option<u32>) -> bool {
+    if !mentions_thinking_budget(fragment) {
+        return true;
+    }
+    let Some(ceiling) = ceiling else {
+        return true;
+    };
+    let cap = ceiling.saturating_sub(THINKING_HEADROOM_TOKENS);
+    if cap < MIN_THINKING_BUDGET {
+        return false;
+    }
+    lower_thinking_budgets(fragment, cap);
+    true
 }
 
 /// `fnv1a64` over the routing-relevant fields of a compiled combo.
@@ -4638,6 +4736,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_thinking_budget_is_fitted_to_the_models_own_output_ceiling() {
+        let fragment_for = |dialect: Dialect, ceiling: Option<u32>| {
+            let mut config = Config::default();
+            let mut p = level_provider("p1", vec![with_levels("m1", &[ReasoningLevel::High])]);
+            p.dialect = dialect;
+            p.models[0].max_output_tokens = ceiling;
+            config.providers = vec![p];
+            RoutingSnapshot::compile(&config).unwrap().providers()[0].steps[0].reasoning_json
+                [ReasoningLevel::High.rank() as usize]
+                .as_deref()
+                .map(|text| serde_json::from_str::<serde_json::Value>(text).unwrap())
+        };
+
+        // Anthropic refuses `budget_tokens` at or above `max_tokens`, so a budget at the model's
+        // own ceiling makes every request a 400. The answer needs room too, hence the headroom.
+        assert_eq!(
+            fragment_for(Dialect::Anthropic, Some(64_000)),
+            Some(serde_json::json!({
+                "thinking": { "type": "enabled", "budget_tokens": 59_904 }
+            }))
+        );
+
+        // Gemini spends the same allowance on thinking, which is how a reply arrives carrying
+        // nothing but thoughts: the candidate budget is exhausted before any text is written.
+        assert_eq!(
+            fragment_for(Dialect::Google, Some(65_536)),
+            Some(serde_json::json!({
+                "generationConfig": {
+                    "thinkingConfig": { "thinkingLevel": "high", "thinkingBudget": 61_440 }
+                }
+            }))
+        );
+        assert_eq!(
+            fragment_for(Dialect::Antigravity, Some(64_000)),
+            Some(serde_json::json!({
+                "request": {
+                    "generationConfig": {
+                        "thinkingConfig": { "thinkingLevel": "high", "thinkingBudget": 59_904 }
+                    }
+                }
+            }))
+        );
+
+        // A ceiling with no room left to both think and answer drops the field entirely: a clamped
+        // 1024 budget under a 4096 ceiling is a request that cannot produce an answer at all.
+        assert_eq!(fragment_for(Dialect::Anthropic, Some(4_096)), None);
+
+        // A model that declares no ceiling keeps the table's budget — there is nothing to fit to,
+        // and inventing a ceiling would be inventing a capability.
+        assert_eq!(
+            fragment_for(Dialect::Anthropic, None),
+            Some(serde_json::json!({
+                "thinking": { "type": "enabled", "budget_tokens": 131_072 }
+            }))
+        );
+    }
     #[test]
     fn each_dialect_maps_a_level_onto_the_field_it_actually_understands() {
         let fragments = |dialect: Dialect| {

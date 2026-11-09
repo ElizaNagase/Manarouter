@@ -538,6 +538,8 @@ fn apply_reasoning_level(
     let mut body: serde_json::Value = serde_json::from_slice(outgoing).map_err(|_| {
         "the request body is not JSON, so a reasoning level cannot be applied".to_string()
     })?;
+    // Read before the body is borrowed mutably: the cap decides how much of it thinking may take.
+    let output_cap = stated_output_cap(&body);
     let Some(object) = body.as_object_mut() else {
         return Ok(None);
     };
@@ -561,8 +563,19 @@ fn apply_reasoning_level(
     }
 
     if let Some(fragment) = fragment {
-        let fragment: serde_json::Value = serde_json::from_str(fragment)
+        let mut fragment: serde_json::Value = serde_json::from_str(fragment)
             .map_err(|_| "the compiled reasoning fragment is not valid JSON".to_string())?;
+        // The compiled budget is already fitted to the model's own ceiling. This fits it to the
+        // ceiling *this* request states, because Anthropic rejects `budget_tokens` at or above
+        // `max_tokens` outright, and a budget that eats the whole allowance is how a Gemini answer
+        // arrives with nothing in `content` but thoughts.
+        if let Some(cap) = output_cap {
+            if !mr_core::snapshot::fit_thinking_budget(&mut fragment, Some(cap)) {
+                // No room left to both think and answer: send no level rather than one the
+                // upstream will refuse.
+                fragment = serde_json::Value::Object(serde_json::Map::new());
+            }
+        }
         if merge_reasoning(object, &fragment) {
             changed = true;
         }
@@ -574,6 +587,32 @@ fn apply_reasoning_level(
     serde_json::to_vec(&body)
         .map(Some)
         .map_err(|_| "the rewritten request body could not be encoded".to_string())
+}
+
+/// The output cap a request states, in whichever spelling and nesting its dialect uses.
+///
+/// Only the two placements a real body uses are read: the top level (`max_tokens` for the Anthropic
+/// and OpenAI shapes, `max_completion_tokens` and `max_output_tokens` for the newer OpenAI ones) and
+/// `generationConfig`, which Gemini spells `maxOutputTokens` and Antigravity nests under `request`.
+/// A number anywhere else is not a cap on the answer, so it is deliberately not searched for.
+fn stated_output_cap(body: &serde_json::Value) -> Option<u32> {
+    fn read(object: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<u32> {
+        keys.iter()
+            .find_map(|key| object.get(*key).and_then(serde_json::Value::as_u64))
+            .and_then(|value| u32::try_from(value).ok())
+    }
+    let top = body.as_object()?;
+    read(
+        top,
+        &["max_tokens", "max_completion_tokens", "max_output_tokens"],
+    )
+    .or_else(|| {
+        let generation = top
+            .get("generationConfig")
+            .or_else(|| top.get("request")?.get("generationConfig"))?
+            .as_object()?;
+        read(generation, &["maxOutputTokens", "max_output_tokens"])
+    })
 }
 
 /// Recursively merge `fragment` into `object`, returning whether anything was written.
@@ -3902,6 +3941,57 @@ mod tests {
             );
         }
         map
+    }
+
+    #[test]
+    fn a_stated_output_cap_is_read_from_the_shapes_that_actually_carry_one() {
+        let cap = |body: &str| stated_output_cap(&serde_json::from_str(body).unwrap());
+        assert_eq!(cap(r#"{"max_tokens":8000}"#), Some(8000));
+        assert_eq!(cap(r#"{"max_completion_tokens":4096}"#), Some(4096));
+        assert_eq!(cap(r#"{"max_output_tokens":2048}"#), Some(2048));
+        assert_eq!(
+            cap(r#"{"generationConfig":{"maxOutputTokens":65536}}"#),
+            Some(65536)
+        );
+        // Antigravity's envelope buries the Gemini payload under `request`.
+        assert_eq!(
+            cap(r#"{"model":"m","request":{"generationConfig":{"maxOutputTokens":64000}}}"#),
+            Some(64000)
+        );
+        // A number in prose is not a cap on the answer.
+        assert_eq!(cap(r#"{"messages":[{"content":"max_tokens is 5"}]}"#), None);
+    }
+
+    #[test]
+    fn the_relay_fits_a_thinking_budget_under_the_requests_own_max_tokens() {
+        // The Antigravity failure this pins: the compiled budget was under the model's ceiling but
+        // far over the request's `max_tokens`, and Anthropic answered 400 `max_tokens` must be
+        // greater than `thinking.budget_tokens` — a clash the relay could see coming, because both
+        // numbers are in the body it is already rewriting.
+        let mut step = step(Dialect::Anthropic, "http://upstream");
+        step.reasoning_json[mr_core::dialect::ReasoningLevel::High.rank() as usize] =
+            Some(r#"{"thinking":{"type":"enabled","budget_tokens":59904}}"#.to_string());
+
+        let body =
+            br#"{"model":"m","max_tokens":8000,"messages":[{"role":"user","content":"hi"}]}"#;
+        let rewritten = apply_reasoning_level(body, &step, false, None)
+            .unwrap()
+            .expect("the fragment has to be rewritten, so the body changes");
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(value["thinking"]["budget_tokens"], 8000 - 4096);
+        // Everything else the client sent survives the rewrite untouched.
+        assert_eq!(value["max_tokens"], 8000);
+        assert_eq!(value["messages"][0]["content"], "hi");
+
+        // With no room to think and answer, no level is sent at all rather than a budget the
+        // upstream would refuse.
+        let tiny = br#"{"model":"m","max_tokens":2000}"#;
+        assert!(
+            apply_reasoning_level(tiny, &step, false, None)
+                .unwrap()
+                .is_none(),
+            "a clamp to nothing must leave the body byte-for-byte alone"
+        );
     }
 
     fn step(dialect: Dialect, base_url: &str) -> StepPlan {
