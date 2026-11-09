@@ -308,6 +308,30 @@ Retention is the operator's decision. There is no default pruning, because silen
 operator's usage history is worse than an unpruned database, and the panel shows the file's size so
 the decision can be made with information.
 
+## How the panel paints a window
+
+The Quota view answers one question — *how much is left, and when does it come back* — so it shows
+the number in words, the bar, the reset instant and the colour together, and every one of those is
+derived from the same snapshot.
+
+- **Bars fill with what is REMAINING**, not what is spent. An empty bar means "nothing left", which
+  is the thing an operator acts on; a full bar means "fresh window".
+- **Colour is a second copy of the number, never the only copy.** Green above 50 % left, amber at
+  50 % or less, red at 20 % or less. The thresholds live in one exported constant pair in
+  `panel/format.js` and every chip, bar and card border asks it, so the same window cannot be green
+  in one place and amber in another.
+- **No measurement is grey, not red.** A provider that reports no fraction is `unknown`; painting it
+  red would claim exhaustion the data does not support, and painting it green would claim headroom.
+- **The worst window decides the account.** A card takes the colour of its most exhausted window,
+  because an account with one dead 5 h window is an account to look at whatever its weekly window says.
+- **The at-a-glance strip is a signpost, not a summary.** One line per account lists each window as a
+  chip (name, percentage left, colour, reset countdown); clicking a chip scrolls to that account's
+  card. It exists so the operator can find the tired account without reading every card.
+
+Nothing here invents data: a window with no fraction, no reset time, or no fetch is shown as such. The
+page also says how old the snapshot is, because a quota figure without an age is a claim about now
+that nobody made.
+
 ## Limitations
 
 Stated so they are not discovered later. Most of these describe the intended accounting; only what

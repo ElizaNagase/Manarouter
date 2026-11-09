@@ -7,10 +7,14 @@
 import { api } from './api.js';
 import { h, chip, emptyState, errorBlock, toggle } from './dom.js';
 import {
-  QUOTA_FAMILIES, formatQuotaAge, formatQuotaUsage, formatPercent, formatResetIn,
+  QUOTA_FAMILIES, QUOTA_STATUS_CRITICAL_AT_OR_BELOW, QUOTA_STATUS_HEALTHY_ABOVE,
+  formatQuotaAge, formatQuotaUsage, formatPercent, formatResetIn, quotaStatusLevel,
+  worstQuotaStatus,
 } from './format.js';
 
-const DEFAULT_DISPLAY = Object.freeze({ mode: 'chunks', chunks: 20, reset_on_load: false });
+// Bars by default: a share of a window is a share, and twenty cells made an operator count them.
+// 'chunks' remains supported for a config that asked for it.
+const DEFAULT_DISPLAY = Object.freeze({ mode: 'percentage', chunks: 20, reset_on_load: false });
 
 export async function renderQuota(mount, ctx) {
   let providers = [];
@@ -95,8 +99,15 @@ export async function renderQuota(mount, ctx) {
       children.push(h('p', { class: 'hint' },
         'Refresh-on-load is unavailable: the config API did not return quota.display.reset_on_load.'));
     }
+    // The colour scale is stated once, in words, before any bar uses it. Colour repeats a number
+    // the row already spells out; it never carries a fact on its own.
     children.push(h('p', { class: 'quota-legend' },
-      h('span', { class: 'swatch', 'aria-hidden': 'true' }), ' remaining', ' · gray = used'));
+      h('span', { class: 'quota-legend-dot quota-level-ok', 'aria-hidden': 'true' }),
+      ` above ${QUOTA_STATUS_HEALTHY_ABOVE}% left `,
+      h('span', { class: 'quota-legend-dot quota-level-alert', 'aria-hidden': 'true' }),
+      ` ${QUOTA_STATUS_HEALTHY_ABOVE}% or less `,
+      h('span', { class: 'quota-legend-dot quota-level-critical', 'aria-hidden': 'true' }),
+      ` ${QUOTA_STATUS_CRITICAL_AT_OR_BELOW}% or less`));
 
     // Allowances first, traffic second: the question this page answers is "how much is left",
     // and the request ledger is the supporting detail underneath it.
@@ -104,7 +115,8 @@ export async function renderQuota(mount, ctx) {
       children.push(emptyState('No provider reports a quota.',
         'Add an account, or check a provider whose upstream exposes its remaining allowance.'));
     } else {
-      for (const row of accountRows) children.push(renderAccount(row));
+      children.push(renderGlance());
+      for (const [index, row] of accountRows.entries()) children.push(renderAccount(row, index));
     }
     children.push(renderUsage());
     mount.replaceChildren(...children);
@@ -164,12 +176,73 @@ export async function renderQuota(mount, ctx) {
     return card;
   }
 
-  function renderAccount(row) {
-    const { provider, account, key } = row;
+  function accountLabel(row) {
+    const record = records.get(row.key);
+    const { account } = row;
+    return account.label || account.identity || record?.label || account.id || record?.account || 'Account';
+  }
+
+  // One line per account, its windows as colour-coded chips. The cards below are the evidence;
+  // this strip answers the question the page exists for — what is running out, right now.
+  function renderGlance() {
+    const card = h('section', { class: 'card' });
+    card.append(h('h2', {}, 'At a glance'));
+    const list = h('div', { class: 'quota-glance' });
+    let chips = 0;
+    for (const [index, row] of accountRows.entries()) {
+      const record = records.get(row.key);
+      if (record?.fetched_at == null) continue;
+      const label = accountLabel(row);
+      const line = h('div', { class: 'quota-glance-account' },
+        h('span', { class: 'quota-glance-name', title: `${row.provider.id} · ${label}` },
+          `${row.provider.id} · ${label}`));
+      const rowChips = h('div', { class: 'quota-glance-chips' });
+      for (const window of accountWindows(record)) {
+        const usage = formatQuotaUsage(window, display);
+        if (usage.kind !== 'percentage' && usage.kind !== 'chunks') continue;
+        const level = quotaStatusLevel(usage.remainingPercent);
+        const family = familyLabel(window?.family) || window?.display_name || 'window';
+        const reset = window?.reset_at != null ? formatResetIn(window.reset_at) : 'reset time unknown';
+        rowChips.append(h('button', {
+          class: `quota-chip quota-level-${level}`,
+          type: 'button',
+          title: `${family}: ${formatPercent(usage.remainingPercent)} left · ${reset}`,
+          onclick: () => scrollToAccount(index),
+        }, `${family} ${formatPercent(usage.remainingPercent)}`));
+        chips += 1;
+      }
+      if (rowChips.childElementCount) list.append(line);
+      line.append(rowChips);
+    }
+    if (!chips) {
+      card.append(h('p', { class: 'hint' }, 'No cached quota windows yet. Refresh an account to fetch its allowance.'));
+      return card;
+    }
+    card.append(list);
+    card.append(h('p', { class: 'hint' },
+      'Remaining share of each window, coloured by the scale above. Select a chip to jump to the account.'));
+    return card;
+  }
+
+  function scrollToAccount(index) {
+    document.getElementById(accountCardId(index))?.scrollIntoView({ block: 'start' });
+  }
+
+  function renderAccount(row, index) {
+    const { provider, key } = row;
     const record = records.get(key);
-    const label = account.label || account.identity || record?.label || account.id || record?.account || 'Account';
+    const label = accountLabel(row);
     const title = `${provider.id} · ${label}`;
-    const card = h('section', { class: 'card quota-account' });
+    // A single exhausted window decides the account's tone; averaging the windows would bury it.
+    const worst = worstQuotaStatus(accountWindows(record).map((window) => {
+      const usage = formatQuotaUsage(window, display);
+      return usage.kind === 'percentage' || usage.kind === 'chunks'
+        ? quotaStatusLevel(usage.remainingPercent) : 'unknown';
+    }));
+    const card = h('section', {
+      class: `card quota-account quota-level-${worst}`,
+      id: accountCardId(index),
+    });
     const header = h('div', { class: 'toolbar' }, h('h2', {}, title));
     const neverFetched = record?.fetched_at == null ? chip('never fetched', 'chip-amber', 'No provider quota snapshot cached yet') : null;
     if (neverFetched) header.append(neverFetched);
@@ -210,29 +283,35 @@ export async function renderQuota(mount, ctx) {
     return card;
   }
 
+  // One window: name · bar · readout on the first line, reset time and source underneath. The bar
+  // fills with what is REMAINING — that is the number an operator acts on — and its colour repeats
+  // the percentage written beside it instead of replacing it.
   function renderWindow(label, window) {
-    const row = h('div', { class: 'quota-window' });
-    row.append(h('strong', {}, label));
-    const info = h('div', { class: 'quota-window-usage' });
     const usage = formatQuotaUsage(window, display);
+    const level = usage.kind === 'percentage' || usage.kind === 'chunks'
+      ? quotaStatusLevel(usage.remainingPercent) : 'unknown';
+    const row = h('div', { class: `quota-window quota-level-${level}` });
+    row.append(h('strong', { class: 'quota-window-name' }, label));
+    const info = h('div', { class: 'quota-window-usage' });
     if (usage.kind === 'unlimited') {
       info.append(h('span', { class: 'chunks-na' }, 'Unlimited'));
     } else if (usage.kind === 'unavailable') {
-      info.append(h('span', { class: 'chunks-na' }, 'N/A'));
+      info.append(h('span', { class: 'chunks-na' }, 'N/A — the provider reported no fraction'));
     } else if (usage.kind === 'percentage') {
-      const bar = percentageBar(usage.remainingPercent, usage.usedPercent);
-      info.append(bar, h('span', { class: 'quota-pct' },
-        `${formatPercent(usage.remainingPercent)} remaining · ${formatPercent(usage.usedPercent)} used`));
+      info.append(percentageBar(usage), h('span', { class: 'quota-readout' },
+        h('strong', { class: 'quota-pct' }, `${formatPercent(usage.remainingPercent)} left`),
+        h('span', { class: 'quota-used' }, `${formatPercent(usage.usedPercent)} used`)));
     } else {
       const cells = h('div', { class: 'chunks', role: 'img',
-        'aria-label': `${formatPercent(usage.remainingPercent)} remaining, ${formatPercent(usage.usedPercent)} used` });
+        'aria-label': `${formatPercent(usage.remainingPercent)} left, ${formatPercent(usage.usedPercent)} used` });
       for (let index = 0; index < usage.total; index += 1) {
         const remainingCells = usage.remaining;
         const isHalf = usage.half && index === remainingCells;
         cells.append(h('span', { class: `chunk${index < remainingCells ? ' on' : isHalf ? ' half' : ''}` }));
       }
-      info.append(cells, h('span', { class: 'quota-pct' },
-        `${formatPercent(usage.remainingPercent)} remaining · ${formatPercent(usage.usedPercent)} used`));
+      info.append(cells, h('span', { class: 'quota-readout' },
+        h('strong', { class: 'quota-pct' }, `${formatPercent(usage.remainingPercent)} left`),
+        h('span', { class: 'quota-used' }, `${formatPercent(usage.usedPercent)} used`)));
     }
     row.append(info);
     const sub = [];
@@ -245,23 +324,15 @@ export async function renderQuota(mount, ctx) {
         ? `${detail.name}: ${detail.used ?? 'N/A'}`
         : String(detail)));
     }
-    row.append(h('p', { class: 'hint' }, sub.join(' · ')));
+    row.append(h('p', { class: 'hint quota-reset' }, sub.join(' · ')));
     return row;
   }
 
-  function percentageBar(remaining, used) {
-    const bar = h('div', { class: 'quota-percentage-bar', role: 'img',
-      'aria-label': `${formatPercent(remaining)} remaining, ${formatPercent(used)} used` });
-    Object.assign(bar.style, {
-      display: 'flex', width: 'min(100%, 320px)', height: '14px', margin: '4px 0',
-      overflow: 'hidden', borderRadius: '3px', background: 'var(--bg3)',
-      border: '1px solid var(--line2)', boxSizing: 'border-box',
-    });
-    const fill = h('span', { 'aria-hidden': 'true' });
-    Object.assign(fill.style, {
-      display: 'block', width: `${Math.min(100, Math.max(0, remaining))}%`,
-      flex: 'none', background: 'var(--pink)',
-    });
+  function percentageBar(usage) {
+    const bar = h('div', { class: 'quota-bar', role: 'img',
+      'aria-label': `${formatPercent(usage.remainingPercent)} left, ${formatPercent(usage.usedPercent)} used` });
+    const fill = h('span', { class: 'quota-bar-fill', 'aria-hidden': 'true' });
+    fill.style.width = `${Math.min(100, Math.max(0, usage.remainingPercent))}%`;
     bar.append(fill);
     return bar;
   }
@@ -338,6 +409,16 @@ export async function renderQuota(mount, ctx) {
     }
     render();
   }
+}
+
+/** The cached windows of one account snapshot; a failed refresh leaves the last good array. */
+function accountWindows(record) {
+  return Array.isArray(record?.windows) ? record.windows : [];
+}
+
+/** A stable DOM id for one account card, so a chip can jump to it. Index-based: keys are opaque. */
+function accountCardId(index) {
+  return `quota-account-${index}`;
 }
 
 // A token count that is not known is not zero: it is shown as a dash.

@@ -772,10 +772,10 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
   border: 1px solid var(--line2);
   display: inline-block;
 }
-.chunk.on { background: var(--pink); border-color: var(--pink); }
+.chunk.on { background: var(--quota-tone, var(--pink)); border-color: var(--quota-tone, var(--pink)); }
 .chunk.half {
-  background: linear-gradient(to right, var(--pink) 50%, var(--bg3) 50%);
-  border-color: var(--pink);
+  background: linear-gradient(to right, var(--quota-tone, var(--pink)) 50%, var(--bg3) 50%);
+  border-color: var(--quota-tone, var(--pink));
 }
 .chunks-na { color: var(--tx3); font-family: var(--mono); font-size: 12px; }
 .quota-pct { font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; }
@@ -789,6 +789,98 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
   vertical-align: -1px;
   margin: 0 3px 0 0;
 }
+
+/* ---------- quota windows: one colour scale, bars, glance chips ---------- */
+
+/* Green above 50% left, amber at 50% or less, red at 20% or less — the thresholds live in
+ * format.js (QUOTA_STATUS_*) and every element here only consumes the tone they pick. Pink is
+ * deliberately absent: in this panel pink means "interactive", never "healthy". */
+.quota-level-ok { --quota-tone: var(--green); --quota-tone-dim: var(--green-dim); }
+.quota-level-alert { --quota-tone: var(--amber); --quota-tone-dim: var(--amber-dim); }
+.quota-level-critical { --quota-tone: var(--red); --quota-tone-dim: var(--red-dim); }
+.quota-level-unknown { --quota-tone: var(--tx3); --quota-tone-dim: var(--bg3); }
+
+.quota-legend-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--quota-tone);
+  margin-right: 5px;
+  vertical-align: 0;
+}
+
+/* An account whose worst window is empty should be visible from the page edge, not only from the
+ * row that says so. Grey means "no window was quantified", not "fine". */
+.quota-account { border-left: 3px solid var(--line2); }
+.quota-account.quota-level-ok { border-left-color: var(--green); }
+.quota-account.quota-level-alert { border-left-color: var(--amber); }
+.quota-account.quota-level-critical { border-left-color: var(--red); }
+
+/* name · bar · readout, with the reset line spanning the bar column. */
+.quota-window {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  column-gap: 12px;
+  row-gap: 2px;
+  align-items: center;
+  padding: 9px 0;
+  border-top: 1px solid var(--line);
+}
+.quota-window:first-of-type { border-top: 0; padding-top: 2px; }
+.quota-window-name { font-family: var(--mono); font-size: 12px; color: var(--tx2); }
+.quota-window-usage { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.quota-bar {
+  flex: 0 1 320px;
+  min-width: 80px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg3);
+  border: 1px solid var(--line2);
+  overflow: hidden;
+}
+.quota-bar-fill { display: block; height: 100%; border-radius: 999px; background: var(--quota-tone); }
+.quota-readout { display: inline-flex; gap: 8px; align-items: baseline; white-space: nowrap; }
+.quota-window .quota-pct { color: var(--quota-tone); }
+.quota-used { color: var(--tx3); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.quota-window .quota-reset { grid-column: 2; margin: 0; }
+
+/* The at-a-glance strip: one line per account, its windows as chips that jump to the card. */
+.quota-glance { display: flex; flex-direction: column; margin: 4px 0 8px; }
+.quota-glance-account {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 4px 0;
+  border-top: 1px solid var(--line);
+}
+.quota-glance-account:first-child { border-top: 0; }
+.quota-glance-name {
+  flex: 0 1 190px;
+  min-width: 120px;
+  color: var(--tx2);
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.quota-glance-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.quota-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--quota-tone);
+  background: var(--quota-tone-dim);
+  border: 1px solid color-mix(in srgb, var(--quota-tone) 40%, transparent);
+  cursor: pointer;
+}
+.quota-chip:hover { border-color: var(--quota-tone); }
 
 /* ---------- banners, callouts ---------- */
 

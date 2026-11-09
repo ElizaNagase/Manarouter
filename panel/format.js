@@ -525,3 +525,38 @@ export function formatQuotaUsage(quota, { mode = 'chunks', chunks = 20 } = {}) {
     usedPercent: 100 - percent,
   };
 }
+
+/**
+ * The colour policy for a quota window, in one place.
+ *
+ * The thresholds are on what is REMAINING: above 50% is healthy, 50% or less is degraded, 20% or
+ * less is critical. Every chip, bar and account border asks this function, so one number can never
+ * be painted two ways on one page. A window the provider never quantified is "unknown" — which is
+ * not the same as exhausted, and must not be painted red.
+ */
+export const QUOTA_STATUS_HEALTHY_ABOVE = 50;
+export const QUOTA_STATUS_CRITICAL_AT_OR_BELOW = 20;
+
+/** One of ok, alert, critical or unknown for a remaining percentage. */
+export function quotaStatusLevel(remainingPercent) {
+  const pct = remainingPercent == null ? NaN : Number(remainingPercent);
+  if (!Number.isFinite(pct)) return 'unknown';
+  if (pct <= QUOTA_STATUS_CRITICAL_AT_OR_BELOW) return 'critical';
+  if (pct <= QUOTA_STATUS_HEALTHY_ABOVE) return 'alert';
+  return 'ok';
+}
+
+/**
+ * The worst level among several windows: critical beats alert beats ok, and nothing known stays
+ * unknown. An account with one exhausted window is an account in trouble, whatever its other
+ * windows say — so this never averages.
+ */
+export function worstQuotaStatus(levels) {
+  let worst = 'unknown';
+  for (const level of levels ?? []) {
+    if (level === 'critical') return 'critical';
+    if (level === 'alert') worst = 'alert';
+    else if (level === 'ok' && worst === 'unknown') worst = 'ok';
+  }
+  return worst;
+}
