@@ -292,6 +292,14 @@ bad frame must not kill a response already half-delivered — and what is *emitt
 documented camelCase (`functionCall`, `usageMetadata`, …) while what is *read* accepts camelCase
 first and snake_case as a fallback (`google.rs:21-28`).
 
+**End of body closes the answer.** Gemini normally puts a `finishReason` on its last candidate, but
+not every upstream does; a deprecation notice or a proxy that closes after the text can omit it.
+A clean end of body is therefore closed by `google::finish_stream` with a synthesized `STOP` plus
+the usual terminator, even when no terminal frame was seen. Both the `google` dialect and the
+`antigravity` envelope around it go through this path. A transport error is different: the relay
+does not synthesize completion after a broken body (`crates/manarouter-relay/src/server.rs`,
+`flush_stream_chunk`).
+
 **A caveat about the shipped template.** The only `google` template is `gemini`, and it authenticates
 with `?key=…` (`catalog/providers.toml`). The relay explicitly does not apply query-parameter
 authentication: it logs "query-parameter authentication is not applied; the credential will be
@@ -360,6 +368,8 @@ streams an answer regardless and rejects `store: true` (`responses.rs:71-76`).
   never with a synthesized `finish_reason: "stop"`, which would claim the answer finished. The last
   line in the buffer is flushed first, because a cut body ends without a trailing newline
   (`responses.rs:852-864`, and `flush_stream_chunk` in `crates/manarouter-relay/src/server.rs`).
+  Google is the deliberate exception for a *clean* end of body: Gemini may omit `finishReason`, so
+  that case synthesizes `STOP`; a Google body error still ends without a completion.
 - The terminator is where the two client shapes diverge: a Chat Completions client needs a final
   `finish_reason` chunk and `data: [DONE]`, while a Responses client terminates on
   `response.completed` and treats `[DONE]` as protocol noise — so `[DONE]` is suppressed for

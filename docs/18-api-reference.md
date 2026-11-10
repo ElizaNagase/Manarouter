@@ -336,7 +336,9 @@ data: [DONE]
 - **Keepalive comments** (`: keepalive`) from an upstream are passed through unchanged. The relay does
   not generate its own, so a long gap in a stream it is translating is a long gap on the wire.
 - **`data: [DONE]`** terminates a completed translated stream. It is not appended after an error: a
-  stream that breaks mid-body simply ends.
+  stream that breaks mid-body simply ends. A Gemini stream that reaches a clean end of body without
+  a `finishReason` is completed with a synthesized `finish_reason: "stop"` first, because a strict
+  Chat client rejects an unterminated stream even when all the text arrived.
 - **`manarouter.retry`** is the router-specific event emitted when the winning model failed
   mid-stream, bytes were already on the wire, and the combo's policy is `restart`:
 

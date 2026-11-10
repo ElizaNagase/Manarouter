@@ -3478,8 +3478,8 @@ async fn build_client_response(
             .map(Some)
             .chain(futures_util::stream::once(async { None }));
         let stream = frames.scan(
-            (Vec::<u8>::new(), false),
-            move |(pending, started), frame| {
+            (Vec::<u8>::new(), false, false),
+            move |(pending, started, failed), frame| {
                 if !*started {
                     *started = true;
                     mr_dialects::reset_stream_state();
@@ -3502,12 +3502,16 @@ async fn build_client_response(
                             &chunk,
                         )
                     }),
-                    Some(Err(e)) => Some(vec![Err(e)]),
+                    Some(Err(e)) => {
+                        *failed = true;
+                        Some(vec![Err(e)])
+                    }
                     None => Some(flush_stream_chunk(
                         &ctx,
                         &mut commandcode,
                         &mut responses,
                         pending,
+                        *failed,
                     )),
                 };
                 async move { Some(out) }
@@ -3666,6 +3670,7 @@ fn flush_stream_chunk(
     commandcode: &mut mr_dialects::commandcode::Translator,
     responses: &mut mr_dialects::responses::Translator,
     pending: &mut Vec<u8>,
+    upstream_failed: bool,
 ) -> Vec<Result<Bytes, hyper::Error>> {
     let mut out = Vec::new();
     if !pending.is_empty() {
@@ -3684,6 +3689,23 @@ fn flush_stream_chunk(
             if !line.is_empty() {
                 out.push(Ok(translated_frame(&line)));
             }
+        }
+    }
+    // Gemini (and the Antigravity envelope around it) does not always state a reason for
+    // finishing. A clean end of body is still the end of the answer, and a strict Chat client
+    // rejects an unterminated stream even when every token arrived. A broken body is different:
+    // it ends without a synthesized completion.
+    if matches!(ctx.upstream_dialect, Dialect::Google | Dialect::Antigravity)
+        && !ctx.is_passthrough()
+        && !upstream_failed
+    {
+        match mr_dialects::google::finish_stream(ctx) {
+            Ok(lines) => {
+                for line in lines {
+                    out.push(Ok(translated_frame(&line)));
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not close the translated Gemini stream"),
         }
     }
     out
@@ -4962,7 +4984,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}",
             ),
         );
-        let out = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending);
+        let out = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending, false);
         let text = out
             .into_iter()
             .map(Result::unwrap)
@@ -4984,7 +5006,100 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         );
         assert!(pending.is_empty(), "the buffer is drained");
         // A second flush, as the body ending twice would do, says nothing again.
-        assert!(flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending).is_empty());
+        assert!(flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending, false).is_empty());
+    }
+
+    /// A Gemini body that ends cleanly without a finish reason is still closed as an answer.
+    ///
+    /// Antigravity answers a retired model with a notice carried as ordinary candidate text and no
+    /// `finishReason`. The relay used to forward that text and end the body, which a strict Chat
+    /// client reports as `Stream ended without finish_reason` — the text never reaches the reader.
+    /// End of body is the end of the answer, so it gets a terminal chunk and `[DONE]`.
+    #[test]
+    fn a_gemini_stream_without_a_finish_reason_is_closed_at_end_of_body() {
+        for upstream_dialect in [Dialect::Google, Dialect::Antigravity] {
+            let ctx = TranslateCtx {
+                route: RouteKind::ChatCompletions,
+                client_dialect: Dialect::OpenAi,
+                upstream_dialect,
+                upstream_model: "antigravity/gemini-3.8-flash-tiered",
+                client_streaming: true,
+                session_id: None,
+            };
+            mr_dialects::reset_stream_state();
+            let mut cc = mr_dialects::commandcode::Translator::new();
+            let mut open = mr_dialects::responses::Translator::new();
+            let mut pending = Vec::new();
+            translate_stream_chunk(
+                &ctx,
+                &mut cc,
+                &mut open,
+                &mut pending,
+                &Bytes::from_static(
+                    b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"notice\"}]}}]}",
+                ),
+            );
+            let text = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending, false)
+                .into_iter()
+                .map(Result::unwrap)
+                .map(|b| String::from_utf8(b.to_vec()).unwrap())
+                .collect::<String>();
+
+            assert!(
+                text.contains("notice"),
+                "{upstream_dialect:?}: the delivered text survives: {text:?}"
+            );
+            assert!(
+                text.contains(r#""finish_reason":"stop""#),
+                "{upstream_dialect:?}: {text:?}"
+            );
+            assert!(
+                text.trim_end().ends_with("[DONE]"),
+                "{upstream_dialect:?}: {text:?}"
+            );
+            assert!(
+                flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending, false).is_empty(),
+                "{upstream_dialect:?}: closing twice says nothing the second time"
+            );
+        }
+    }
+
+    /// A Gemini body that breaks is not dressed up as a completed answer.
+    #[test]
+    fn a_broken_gemini_stream_is_not_closed_as_complete() {
+        let ctx = TranslateCtx {
+            route: RouteKind::ChatCompletions,
+            client_dialect: Dialect::OpenAi,
+            upstream_dialect: Dialect::Google,
+            upstream_model: "gemini-2.0-flash",
+            client_streaming: true,
+            session_id: None,
+        };
+        mr_dialects::reset_stream_state();
+        let mut cc = mr_dialects::commandcode::Translator::new();
+        let mut open = mr_dialects::responses::Translator::new();
+        let mut pending = Vec::new();
+        translate_stream_chunk(
+            &ctx,
+            &mut cc,
+            &mut open,
+            &mut pending,
+            &Bytes::from_static(
+                b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"half\"}]}}]}",
+            ),
+        );
+        let text = flush_stream_chunk(&ctx, &mut cc, &mut open, &mut pending, true)
+            .into_iter()
+            .map(Result::unwrap)
+            .map(|b| String::from_utf8(b.to_vec()).unwrap())
+            .collect::<String>();
+
+        assert!(text.contains("half"), "what arrived is kept: {text:?}");
+        assert!(
+            !text.contains(r#""finish_reason":"stop""#),
+            "no invented completion: {text:?}"
+        );
+        assert!(!text.contains("[DONE]"), "no completion sentinel: {text:?}");
     }
 
     /// Two Command Code answers in flight on the gateway at once must not share translation state.

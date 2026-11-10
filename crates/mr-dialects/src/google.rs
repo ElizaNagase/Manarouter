@@ -973,6 +973,37 @@ pub fn sse_to_pivot(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<String>> {
     })
 }
 
+/// Close a Gemini stream that reached end of body without a `finishReason`.
+///
+/// Gemini normally states a finish reason on its last candidate. Not every upstream does: a
+/// deprecation notice, a proxy that closes the body after the text, or a provider that simply
+/// omits the field leaves the pivot stream without its terminal chunk. A Chat Completions client
+/// then holds the answer open until the connection dies, and a strict parser reports
+/// `Stream ended without finish_reason` instead of showing the text it already received.
+///
+/// A clean end of body is the end of the answer, so this synthesizes a `STOP` terminal. It is
+/// only called when no body error was seen and no terminal frame was emitted; a transport error
+/// still ends the stream without claiming completion.
+pub fn finish_stream(ctx: &TranslateCtx<'_>) -> Result<Vec<String>> {
+    GOOGLE_STREAM_STATE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(state) = slot.as_mut() else {
+            return Ok(Vec::new());
+        };
+        if state.done {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        translate_stream_item(
+            ctx,
+            &json!({"candidates": [{"finishReason": "STOP"}]}),
+            state,
+            &mut out,
+        )?;
+        Ok(out)
+    })
+}
+
 /// Translate one Gemini stream frame: accumulate state, append frames to `out`.
 fn translate_stream_item(
     ctx: &TranslateCtx<'_>,
@@ -1867,6 +1898,7 @@ mod tests {
         )
         .unwrap();
         assert!(again.is_empty());
+        assert!(finish_stream(&c).unwrap().is_empty());
     }
 
     #[test]
@@ -1930,7 +1962,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_noise_is_skipped_and_no_finish_means_no_done() {
+    fn stream_noise_is_skipped_and_clean_eof_closes_the_answer() {
         reset_stream_state();
         let c = ctx();
         assert!(sse_to_pivot(&c, "keep-alive commentary")
@@ -1945,7 +1977,16 @@ mod tests {
         .unwrap();
         assert!(
             !partial.iter().any(|f| f.contains("[DONE]")),
-            "a truncated stream must not claim completion"
+            "a frame without a finish reason is not the end while the body is still open"
+        );
+
+        let end = finish_stream(&c).unwrap();
+        assert_eq!(end.len(), 2, "terminal chunk then [DONE]");
+        assert_eq!(chunk(&end[0])["choices"][0]["finish_reason"], "stop");
+        assert!(end[1].contains("[DONE]"));
+        assert!(
+            finish_stream(&c).unwrap().is_empty(),
+            "a closed stream is not closed twice"
         );
     }
 
