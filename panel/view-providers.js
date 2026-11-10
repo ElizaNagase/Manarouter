@@ -1,9 +1,9 @@
 // view-providers.js — dense provider table with the selected provider's detail inline under its
 // own row (no detached drawer).
 //
-// Table: pin/manual-move column, id, label, dialect, accounts (state chips), models count, health.
-// Inline detail: accounts (add/enable/disable/delete), models (add manual / hide / delete / edit),
-// timeouts, headers, route overrides, and the per-provider "sync models" action.
+// Table: pin/manual-move column, provider identity (name, id, dialect), account and model counts,
+// health. Inline detail: accounts (add/enable/disable/delete), models (add manual / hide / delete /
+// edit), timeouts, headers, route overrides, and the per-provider "sync models" action.
 //
 // NOTE ON SERVER STRINGS: provider ids, labels, model ids and error text come from the server
 // and from third-party catalogues. Everything is attached with textContent (via h()); there is
@@ -11,7 +11,8 @@
 
 import { api } from './api.js';
 import {
-  h, icon, chip, field, toggle, kv, emptyState, errorBlock, applyFieldErrors, clearFieldErrors, copyButton,
+  h, icon, chip, field, toggle, kv, emptyState, errorBlock, applyFieldErrors, clearFieldErrors,
+  copyButton, copyText,
 } from './dom.js';
 import {
   deriveProviderHealth, accountState, formatAge, formatCompact, providerLevels, declaredLevels,
@@ -170,6 +171,62 @@ const PROVIDER_SORT_MODES = [
 ];
 const PROVIDER_SORT_IDS = new Set(PROVIDER_SORT_MODES.map(([id]) => id));
 
+// A provider's label is optional, and seven of the live rows have none. An id-only row is still a
+// row an operator has to identify at a glance, so fall back to the id as words. These aliases cover
+// the hosts whose ids are not readable at a glance; labels always win when the server sends one.
+const PROVIDER_NAME_ALIASES = Object.freeze({
+  cheaperinference: 'Cheaper Inference',
+  commandcodego: 'Command Code Go',
+  freetheai: 'FreeTheAI',
+  local8100: 'Local 8100',
+  onerouter: 'OneRouter',
+  uncloseai: 'Unclose AI',
+  vllm: 'vLLM',
+});
+const PROVIDER_NAME_WORDS = Object.freeze({
+  ai: 'AI',
+  api: 'API',
+  gpt: 'GPT',
+  llm: 'LLM',
+  nvidia: 'NVIDIA',
+  openai: 'OpenAI',
+  openrouter: 'OpenRouter',
+  ovh: 'OVH',
+  vllm: 'vLLM',
+});
+
+function providerDisplayName(id) {
+  const raw = String(id ?? '').trim();
+  if (!raw) return 'Unnamed provider';
+  const alias = PROVIDER_NAME_ALIASES[raw.toLowerCase()];
+  if (alias) return alias;
+  return raw.split(/[-_.\s]+/).filter(Boolean).map((part) => {
+    const known = PROVIDER_NAME_WORDS[part.toLowerCase()];
+    if (known) return known;
+    return part.charAt(0).toUpperCase() + part.slice(1);
+  }).join(' ');
+}
+
+// Health is server-reported when available and derived otherwise. Its chip class is the only
+// colour signal the formatter returns, so translate that into a small status dot.
+function healthTone(health) {
+  const match = /chip-(green|amber|red|neutral)/.exec(health?.cls ?? '');
+  return match ? match[1] : 'neutral';
+}
+
+// Defensive: the current provider payload has no error field, but if a later control plane adds
+// one the table should show it rather than silently claiming a provider is healthy.
+function providerIssue(provider) {
+  for (const value of [provider?.last_error, provider?.lastError, provider?.error]) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (value && typeof value === 'object') {
+      const message = value.message ?? value.detail ?? value.error;
+      if (typeof message === 'string' && message.trim()) return message.trim();
+    }
+  }
+  return '';
+}
+
 function storedIdList(key) {
   try {
     const parsed = JSON.parse(localStorage.getItem(key) ?? '[]');
@@ -197,7 +254,7 @@ function storeIdList(key, ids) {
 const PROVIDER_PRESETS = {
   // Standard LLM APIs — bearer auth, OpenAI/Anthropic-shaped endpoints.
   providers: [
-    { name: 'Custom (manual)', dialect: 'open-ai', baseUrl: '', auth: 'bearer', hint: 'Fill everything in yourself.' },
+    { name: 'Custom (manual)', dialect: 'open-ai', baseUrl: '', auth: 'bearer', hint: 'No defaults; set the dialect, base URL, and auth manually.' },
     { name: 'OpenAI', dialect: 'open-ai', baseUrl: 'https://api.openai.com/v1', auth: 'bearer', hint: 'api.openai.com. Add your OpenAI API key as an account secret after saving.' },
     { name: 'OpenRouter', dialect: 'open-ai', baseUrl: 'https://openrouter.ai/api/v1', auth: 'bearer', hint: 'openrouter.ai. Add your OpenRouter API key as an account secret after saving.' },
     { name: 'Groq', dialect: 'open-ai', baseUrl: 'https://api.groq.com/openai/v1', auth: 'bearer', hint: 'groq.com. Add your Groq API key as an account secret after saving.' },
@@ -241,6 +298,13 @@ export async function renderProviders(mount, ctx) {
   let providers = [];
   let drawerId = null;
   let drawerOpen = false;
+  // True only while the inline provider detail is the panel in workWrap. The form and account
+  // drawers also use drawerId, but clicking their row should still open the provider detail.
+  let detailOpen = false;
+  // The open provider form, if any. Its page-leave guard and dirty flag live here so every close
+  // path can ask before a half-filled provider is thrown away.
+  let activeForm = null;
+  let filterText = '';
   // Keep in-progress inline number edits across any redraw caused by a refresh or another action.
   const inlineDrafts = new Map();
   // Pins, manual order and the selected sort are browser preferences, never router config.
@@ -257,14 +321,17 @@ export async function renderProviders(mount, ctx) {
   let draggedId = null;
   let dragSuppressed = false;
 
+  // Scopes every override in lab-providers.css to this view; the shared sheet is untouched.
+  mount.classList?.add('providers-view');
+
   const tableWrap = h('div', { class: 'table-scroll' });
   // The provider detail used to be a fixed right-hand overlay. It is now a panel in the page,
   // expanded directly under the provider's own row, so opening a provider never scrolls past
   // the rest of a long list to find it.
   const workWrap = h('div', { class: 'provider-work' });
   let detailRow = null;
-  const count = h('span', { class: 'count' });
-  const newBtn = h('button', { class: 'btn btn-primary', type: 'button' }, 'New provider');
+  const count = h('span', { class: 'count provider-count', 'aria-live': 'polite' });
+  const newBtn = h('button', { class: 'btn btn-primary provider-add', type: 'button' }, icon('plus'), 'Add provider');
   // Per-account quota cache: key = "providerId|accountId" -> { remaining, total, windows, error, fetched_at }
   const quotaCache = new Map();
   let quotaLoaded = false;
@@ -290,18 +357,28 @@ export async function renderProviders(mount, ctx) {
     }
     return quotaCache;
   }
-  const refreshBtn = h('button', { class: 'btn', type: 'button' }, 'Refresh');
+  const refreshBtn = h('button', { class: 'btn btn-ghost provider-refresh', type: 'button' }, icon('sync'), 'Refresh');
   const sortSel = h('select', { class: 'input', 'aria-label': 'Sort providers' },
     ...PROVIDER_SORT_MODES.map(([id, text]) => h('option', { value: id }, text)));
   sortSel.value = sortMode;
-  const sortHint = h('span', { class: 'hint' }, 'Pinned providers stay on top.');
   const sortControl = h('label', { class: 'provider-sort' },
-    h('span', { class: 'provider-sort-label' }, 'Sort'), sortSel, sortHint);
-  // The preference is an explicit opt-out from warnings, never an automatic delete action. Keeping
-  // the checkbox in the list toolbar also makes reversing it discoverable without opening a drawer.
-  const deleteWarning = toggle('Do not warn me again', {
+    h('span', { class: 'provider-sort-label' }, 'Sort'), sortSel);
+  const filterInput = h('input', {
+    class: 'input provider-filter',
+    type: 'search',
+    placeholder: 'Filter by name, ID, or dialect',
+    'aria-label': 'Filter providers by name, ID, or dialect',
+    autocomplete: 'off',
+    spellcheck: 'false',
+  });
+  filterInput.addEventListener('input', () => {
+    filterText = filterInput.value.trim().toLowerCase();
+    renderTable();
+  });
+  // Deleting still asks for an explicit click. The opt-out belongs at the bottom of the list, where
+  // it reads as a preference about deletion rather than another action competing with Add provider.
+  const deleteWarning = toggle('Do not warn before deleting a provider', {
     checked: deleteProviderWarningDisabled(),
-    hint: 'Provider deletion still requires an explicit Delete click.',
   });
   deleteWarning.input.addEventListener('change', () => {
     try {
@@ -311,11 +388,22 @@ export async function renderProviders(mount, ctx) {
       ctx.toast.warning('This browser could not save the provider deletion preference.');
     }
   });
+  const listFoot = h('div', { class: 'provider-list-foot' },
+    h('p', { class: 'provider-list-hint' }, 'Pinned providers stay on top. Drag a row to reorder.'),
+    h('div', { class: 'provider-delete-pref' },
+      deleteWarning.row,
+      h('p', { class: 'hint' }, 'Deleting a provider still requires an explicit Delete click.')));
+  const toolbar = h('div', { class: 'toolbar provider-toolbar' },
+    // The count belongs to the list the filter is narrowing, so it sits with the filter rather
+    // than floating between the two groups. The right side holds only things you can act on.
+    h('div', { class: 'provider-filter-wrap' }, filterInput, count),
+    h('div', { class: 'provider-tools' },
+      sortControl,
+      h('span', { class: 'toolbar-divider', 'aria-hidden': 'true' }),
+      refreshBtn,
+      newBtn));
 
-  mount.replaceChildren(
-    h('div', { class: 'toolbar' }, sortControl, newBtn, refreshBtn, deleteWarning.row, h('span', { class: 'spacer' }), count),
-    tableWrap,
-  );
+  mount.replaceChildren(toolbar, tableWrap, listFoot);
 
   // Escape closes an inline provider detail even when focus stayed on the row button that opened
   // it. A modal owns Escape while it is open, and must not close the panel behind it as well.
@@ -399,7 +487,7 @@ export async function renderProviders(mount, ctx) {
   }
 
   sortSel.addEventListener('change', () => switchSort(sortSel.value));
-  newBtn.addEventListener('click', () => openFormDrawer(null));
+  newBtn.addEventListener('click', () => { void openFormDrawer(null); });
   refreshBtn.addEventListener('click', () => reload(true));
 
   // Out-of-band writes have to reach this table on their own.
@@ -468,29 +556,158 @@ export async function renderProviders(mount, ctx) {
     renderTable();
     if (drawerId) {
       const fresh = providers.find((p) => p.id === drawerId);
-      if (fresh) openDetailDrawer(fresh, { silent: true });
+      if (fresh) await openDetailDrawer(fresh, { silent: true });
       else closeDrawer();
     }
   }
 
+  function providerMatches(p) {
+    if (!filterText) return true;
+    return [p.id, p.label, p.dialect].some((value) => String(value ?? '').toLowerCase().includes(filterText));
+  }
+
+  // The number carries the weight; the unit stays muted. No border or fill: six boxed counts in a
+  // row turn the table into a row of badges, and the eye stops treating the provider name as the title.
+  function countMetric(value, unit, { muted = false, empty = false, title = null } = {}) {
+    if (empty) return h('span', { class: 'provider-metric is-empty', title }, 'No accounts');
+    return h('span', {
+      class: 'provider-metric' + (muted ? ' is-muted' : ''),
+      title,
+    },
+      h('span', { class: 'provider-metric-n' }, String(value)),
+      ' ',
+      h('span', { class: 'provider-metric-unit' }, unit));
+  }
+
+  // The old row repeated a worded Copy button under every id. An icon-only control preserves the
+  // action without adding 38 identical labels to the scan path; the icon and title confirm success.
+  function copyIdButton(id) {
+    const label = 'Copy provider ID ' + id;
+    const btn = h('button', {
+      class: 'icon-btn provider-copy',
+      type: 'button',
+      title: 'Copy provider ID',
+      'aria-label': label,
+    }, icon('copy'));
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const ok = await copyText(id);
+      btn.replaceChildren(icon(ok ? 'check' : 'x'));
+      btn.classList.toggle('copy-ok', ok);
+      btn.title = ok ? 'Copied' : 'Copy failed';
+      btn.setAttribute('aria-label', ok ? 'Copied provider ID ' + id : 'Could not copy provider ID ' + id);
+      setTimeout(() => {
+        btn.replaceChildren(icon('copy'));
+        btn.classList.remove('copy-ok');
+        btn.title = 'Copy provider ID';
+        btn.setAttribute('aria-label', label);
+      }, 1600);
+    });
+    return btn;
+  }
+
+  function emptyAddButton() {
+    const btn = h('button', { class: 'btn btn-primary', type: 'button' }, icon('plus'), 'Add provider');
+    btn.addEventListener('click', () => { void openFormDrawer(null); });
+    return btn;
+  }
+
+  function endDrag() {
+    draggedId = null;
+    document.body?.classList.remove('provider-dragging');
+    tableWrap.querySelectorAll('.drag-over, .dragging').forEach((row) => {
+      row.classList.remove('drag-over');
+      row.classList.remove('dragging');
+    });
+    setTimeout(() => { dragSuppressed = false; }, 0);
+  }
+
+  function providerTable(tbody) {
+    return h('table', { class: 'tbl provider-table' },
+      h('thead', {}, h('tr', {},
+        h('th', { scope: 'col', class: 'pin-col' }, h('span', { class: 'sr-only' }, 'Pin and reorder')),
+        h('th', { scope: 'col' }, 'Provider'),
+        h('th', { scope: 'col', class: 'provider-accounts-col' }, 'Accounts'),
+        h('th', { scope: 'col', class: 'provider-models-col' }, 'Models'),
+        h('th', { scope: 'col', class: 'provider-health-col' }, 'Health'),
+        h('th', { scope: 'col', class: 'actions-col' }, 'Actions'))),
+      tbody);
+  }
+
   function renderTable() {
     const ordered = orderedProviders();
-    count.textContent = `${providers.length} provider${providers.length === 1 ? '' : 's'}`;
-    if (!providers.length) {
-      tableWrap.replaceChildren(emptyState('No providers configured yet.',
-        'A provider is an upstream account source (OpenAI, Anthropic, a proxy…) that the router forwards to.'));
+    const visible = ordered.filter(providerMatches);
+    const total = providers.length;
+    const totalLabel = `${total} provider${total === 1 ? '' : 's'}`;
+    // Split the count so the numerals carry weight and the unit stays a quiet label. A single text
+    // node made "38 providers" read as loose metadata between two unrelated controls.
+    const countParts = [h('strong', { class: 'provider-count-n' }, String(filterText ? visible.length : total))];
+    if (filterText) countParts.push(' of ', h('strong', { class: 'provider-count-n' }, String(total)));
+    countParts.push(total === 1 ? ' provider' : ' providers');
+    count.replaceChildren(...countParts);
+    count.title = filterText ? `Filtered by “${filterInput.value.trim()}”` : totalLabel;
+    listFoot.hidden = total === 0;
+    tableWrap.classList.toggle('is-empty', total === 0 || visible.length === 0);
+
+    if (!total) {
+      // With the create form open the empty card would sit behind a panel that has no table to
+      // belong to. Render the normal table shell instead so the form has a place in the list.
+      if (drawerOpen) {
+        tableWrap.classList.remove('is-empty');
+        tableWrap.replaceChildren(providerTable(h('tbody')));
+        placeDetailRow();
+        return;
+      }
+      tableWrap.replaceChildren(h('div', { class: 'provider-empty' },
+        h('div', { class: 'provider-empty-mark', 'aria-hidden': 'true' }, icon('plus')),
+        h('h2', {}, 'No providers yet'),
+        h('p', {}, 'A provider is an upstream account source — OpenAI, Anthropic, a proxy — that the router forwards to. Add one, then connect an account and sync its models.'),
+        emptyAddButton()));
       return;
     }
+
+    if (!visible.length) {
+      const clear = h('button', { class: 'btn btn-sm', type: 'button' }, 'Clear filter');
+      clear.addEventListener('click', () => {
+        filterInput.value = '';
+        filterText = '';
+        renderTable();
+        filterInput.focus();
+      });
+      tableWrap.replaceChildren(h('div', { class: 'provider-empty is-filtered' },
+        h('h2', {}, 'No providers match “', filterInput.value.trim(), '”'),
+        h('p', {}, 'Try a provider name, ID, or dialect. The filter matches any part of the value.'),
+        clear));
+      return;
+    }
+
+    // A filter that hides the open provider would leave its detail row hanging under the next one.
+    if (detailOpen && drawerId && !visible.some((p) => p.id === drawerId)) closeDrawer();
+
     const tbody = h('tbody');
-    ordered.forEach((p, index) => {
+    visible.forEach((p) => {
       const health = deriveProviderHealth(p);
+      const tone = healthTone(health);
+      const healthLabel = health.label ? health.label.charAt(0).toUpperCase() + health.label.slice(1) : 'Unknown';
+      const issue = providerIssue(p);
       const accounts = Array.isArray(p.accounts) ? p.accounts : [];
       const enabledCount = accounts.filter((a) => a && a.enabled !== false).length;
       const models = Array.isArray(p.models) ? p.models : [];
       const isPinned = pinned.has(p.id);
+      const isOpen = detailOpen && drawerId === p.id;
+      const label = typeof p.label === 'string' ? p.label.trim() : '';
+      const name = label || providerDisplayName(p.id);
 
-      const openBtn = h('button', { class: 'btn btn-sm', type: 'button' }, 'Open');
-      openBtn.addEventListener('click', (e) => { e.stopPropagation(); openDetailDrawer(p); });
+      const openBtn = h('button', {
+        class: 'btn btn-sm provider-open',
+        type: 'button',
+        'aria-expanded': isOpen ? 'true' : 'false',
+      }, isOpen ? 'Close' : 'Open');
+      openBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (detailOpen && drawerId === p.id) closeDrawer();
+        else void openDetailDrawer(p);
+      });
 
       // A provider with no accounts cannot serve anything, and the fix is a single action.
       // Surfacing it on the row means adding credentials is one click from the list rather than:
@@ -515,35 +732,79 @@ export async function renderProviders(mount, ctx) {
       }, icon('grip'));
       const pinCell = h('td', { class: 'pin-col' }, grip, pinBtn);
 
+      // A dialect that just repeats the id is noise: "antigravity" twice tells you nothing. Keep
+      // the reserved meta line so rows stay the same height, but leave it empty in that case.
+      const dialect = String(p.dialect ?? '').trim();
+      const showDialect = dialect !== '' && dialect.toLowerCase() !== String(p.id).toLowerCase();
+      const identity = h('td', { class: 'provider-cell' },
+        h('div', { class: 'provider-title-row' },
+          h('span', { class: 'provider-disclosure', 'aria-hidden': 'true' }, h('span', { class: 'provider-chevron' })),
+          h('span', { class: 'provider-name', title: name }, name),
+          h('span', { class: 'provider-id mono', title: 'Provider ID: ' + p.id }, p.id),
+          copyIdButton(p.id)),
+        h('div', { class: 'provider-sub' },
+          showDialect
+            ? h('span', { class: 'provider-dialect', title: 'API dialect' }, dialect)
+            : null));
+
+      // "1/3 accounts" says more than a count plus a coloured dot, and it stops the account column
+      // reusing the health column's status-dot language for a different meaning.
+      const accountsMetric = accounts.length
+        ? countMetric(
+          enabledCount < accounts.length ? `${enabledCount}/${accounts.length}` : accounts.length,
+          accounts.length === 1 ? 'account' : 'accounts',
+          {
+            muted: enabledCount === 0,
+            title: `${enabledCount} of ${accounts.length} account${accounts.length === 1 ? '' : 's'} enabled`,
+          })
+        : countMetric(0, 'accounts', { empty: true, title: 'No accounts configured' });
+      const modelsMetric = countMetric(models.length, models.length === 1 ? 'model' : 'models', {
+        muted: models.length === 0,
+        title: models.length === 0 ? 'No models synced yet' : `${models.length} models`,
+      });
+
       const tr = h('tr', {
-        class: 'row-click row-draggable' + (isPinned ? ' pinned-row' : ''),
+        class: 'row-click row-draggable'
+          + (isPinned ? ' pinned-row' : '')
+          + (isOpen ? ' is-open' : ''),
         tabindex: '0',
         'data-provider-id': p.id,
       },
         pinCell,
-        h('td', { class: 'mono' }, p.id, ' ', copyButton(p.id, { className: 'btn btn-sm icon-btn', title: 'Copy provider ID' })),
-        h('td', {}, p.label ?? ''),
-        h('td', {}, chip(p.dialect ?? '—')),
-        h('td', {}, accountSummary(accounts, enabledCount)),
-        h('td', { class: 'num' }, String(models.length)),
-        h('td', {}, chip(health.label, health.cls, 'health: ' + health.key)),
+        identity,
+        h('td', { class: 'provider-accounts-cell' }, accountsMetric),
+        h('td', { class: 'provider-models-cell' }, modelsMetric),
+        h('td', { class: 'provider-health-cell' },
+          h('span', { class: 'provider-health is-' + tone, title: 'Health: ' + health.key },
+            h('span', { class: 'provider-health-dot', 'aria-hidden': 'true' }),
+            healthLabel),
+          issue ? h('span', { class: 'provider-last-error', title: issue }, issue) : null),
         h('td', { class: 'actions' },
           ...(needsAccount
             ? [(() => {
-                const label = p.auth?.type === 'oauth' ? 'Connect' : 'Add account';
-                const btn = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, label);
-                btn.addEventListener('click', (e) => { e.stopPropagation(); openAccountDrawer(p.id); });
+                const actionLabel = p.auth?.type === 'oauth' ? 'Connect' : 'Add account';
+                const btn = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, actionLabel);
+                btn.addEventListener('click', (e) => { e.stopPropagation(); void openAccountDrawer(p.id); });
                 return btn;
               })()]
             : []),
           openBtn),
       );
 
-      const activate = () => { if (!dragSuppressed) openDetailDrawer(p); };
+      const activate = () => {
+        if (dragSuppressed) return;
+        if (detailOpen && drawerId === p.id) closeDrawer();
+        else void openDetailDrawer(p);
+      };
       tr.addEventListener('click', activate);
-      // Enter opens only when the row itself is focused; Enter on the inner Open button must
-      // not double-trigger through bubbling.
-      tr.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target === tr) activate(); });
+      // The row is the disclosure control. Enter and Space open only when the row itself is
+      // focused; activating the inner Open button must not bubble into a second open.
+      tr.addEventListener('keydown', (e) => {
+        if ((e.key === 'Enter' || e.key === ' ') && e.target === tr) {
+          e.preventDefault();
+          activate();
+        }
+      });
 
       tr.draggable = true;
       tr.addEventListener('dragstart', (e) => {
@@ -554,56 +815,37 @@ export async function renderProviders(mount, ctx) {
           e.dataTransfer.effectAllowed = 'move';
           try { e.dataTransfer.setData('text/plain', p.id); } catch { /* Firefox needs this only for external drags. */ }
         }
+        document.body?.classList.add('provider-dragging');
         tr.classList.add('dragging');
       });
-      tr.addEventListener('dragend', () => {
-        draggedId = null;
-        tr.classList.remove('dragging');
-        tableWrap.querySelectorAll('.drag-over').forEach((row) => row.classList.remove('drag-over'));
-        setTimeout(() => { dragSuppressed = false; }, 0);
-      });
+      tr.addEventListener('dragend', endDrag);
       tr.addEventListener('dragover', (e) => {
         if (!draggedId || draggedId === p.id || pinned.has(draggedId) !== isPinned) return;
         e.preventDefault();
         if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+        // Only one insertion line at a time; dragging up and down leaves stale classes otherwise.
+        tableWrap.querySelectorAll('tr.drag-over').forEach((row) => {
+          if (row !== tr) row.classList.remove('drag-over');
+        });
         tr.classList.add('drag-over');
       });
-      tr.addEventListener('dragleave', () => tr.classList.remove('drag-over'));
+      tr.addEventListener('dragleave', (e) => {
+        if (e.relatedTarget && tr.contains(e.relatedTarget)) return;
+        tr.classList.remove('drag-over');
+      });
       tr.addEventListener('drop', (e) => {
         e.preventDefault();
-        tr.classList.remove('drag-over');
         const source = draggedId;
-        draggedId = null;
+        endDrag();
         if (source) reorderProvider(source, p.id);
       });
       tbody.append(tr);
     });
-    tableWrap.replaceChildren(h('table', { class: 'tbl provider-table' },
-      h('thead', {}, h('tr', {},
-        h('th', { scope: 'col', class: 'pin-col' }, h('span', { class: 'sr-only' }, 'Pin and reorder')),
-        h('th', { scope: 'col' }, 'ID'),
-        h('th', { scope: 'col' }, 'Provider Name'),
-        h('th', { scope: 'col' }, 'Dialect'),
-        h('th', { scope: 'col' }, 'Accounts'),
-        h('th', { scope: 'col' }, 'Models'),
-        h('th', { scope: 'col' }, 'Health'),
-        h('th', { scope: 'col' }, ''))),
-      tbody));
-    if (drawerOpen) placeDetailRow();
-  }
-
-  function accountSummary(accounts, enabledCount) {
-    const wrap = h('div', {});
-    if (!accounts.length) wrap.append(h('span', { class: 'hint' }, 'none'));
-    else {
-      wrap.append(h('span', {}, `${enabledCount}/${accounts.length} enabled`));
-      for (const a of accounts.slice(0, 4)) {
-        const s = accountState(a);
-        wrap.append(chip(s.label, s.cls, `account ${a.id ?? ''}: ${s.key}`));
-      }
-      if (accounts.length > 4) wrap.append(chip(`+${accounts.length - 4}`));
+    tableWrap.replaceChildren(providerTable(tbody));
+    if (drawerOpen) {
+      placeDetailRow();
+      if (detailOpen) syncRowState(drawerId, true);
     }
-    return wrap;
   }
 
   // ------------------------------------------------------------------ drawer
@@ -614,14 +856,79 @@ export async function renderProviders(mount, ctx) {
       detailRow.remove();
       detailRow = null;
     }
-    if (!drawerId) return;
+    const row = h('tr', { class: 'provider-detail-row' }, h('td', { colspan: '6' }, workWrap));
+    // The genuine empty state has no table, but its Add provider button still opens this form.
+    // Give the form the normal table shell rather than leaving workWrap detached from the page.
+    let tbody = tableWrap.querySelector('tbody');
+    if (!tbody) {
+      tbody = h('tbody');
+      tableWrap.classList.remove('is-empty');
+      tableWrap.replaceChildren(providerTable(tbody));
+    }
+    if (!drawerId) {
+      // A new provider has no row to sit under yet. Put the form at the top of the list, where
+      // the action that opened it is, instead of leaving it detached from the document.
+      detailRow = row;
+      tbody.prepend(detailRow);
+      return;
+    }
     const anchor = tableWrap.querySelector('tr[data-provider-id="' + CSS.escape(drawerId) + '"]');
     if (!anchor) return;
-    detailRow = h('tr', { class: 'provider-detail-row' }, h('td', { colspan: '8' }, workWrap));
+    detailRow = row;
     anchor.after(detailRow);
   }
 
+  // Keep the row's Open/Close affordance honest when the panel is opened, replaced or closed.
+  function syncRowState(id, open) {
+    if (!id) return;
+    tableWrap.querySelectorAll('tr[data-provider-id]').forEach((row) => {
+      if (row.getAttribute('data-provider-id') !== id) return;
+      row.classList.toggle('is-open', open);
+      const btn = row.querySelector('.provider-open');
+      if (!btn) return;
+      btn.textContent = open ? 'Close' : 'Open';
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+  }
+
+  function releaseForm(form = activeForm) {
+    if (!form) return;
+    form.dirty = false;
+    if (form.guard && ctx.leaveGuard === form.guard) ctx.leaveGuard = null;
+    form.guard = null;
+    if (activeForm === form) activeForm = null;
+  }
+
+  async function confirmDiscardForm(message) {
+    const form = activeForm;
+    if (!form?.dirty) return true;
+    if (form.confirming) return false;
+    form.confirming = true;
+    try {
+      return await ctx.confirm({
+        title: 'Leave without saving?',
+        message,
+        confirmLabel: 'Discard changes',
+        cancelLabel: 'Keep editing',
+        // Discarding a draft is destructive, so focus starts on Keep editing rather than the
+        // button that throws the work away.
+        danger: true,
+      });
+    } finally {
+      form.confirming = false;
+    }
+  }
+
+  async function requestCloseDrawer(message = 'This provider has unsaved changes. Closing the form will discard them.') {
+    if (!(await confirmDiscardForm(message))) return;
+    closeDrawer();
+  }
+
   function closeDrawer() {
+    releaseForm();
+    const closingId = drawerId;
+    const wasDetail = detailOpen;
+    detailOpen = false;
     drawerId = null;
     drawerOpen = false;
     if (detailRow) {
@@ -629,6 +936,10 @@ export async function renderProviders(mount, ctx) {
       detailRow = null;
     }
     workWrap.replaceChildren();
+    if (wasDetail) syncRowState(closingId, false);
+    // Closing the create form in the empty state must bring the empty card back; the table shell
+    // was only there to host the form.
+    if (!providers.length) renderTable();
   }
 
   function drawerShell(title, ariaLabel) {
@@ -637,7 +948,11 @@ export async function renderProviders(mount, ctx) {
       h('span', { class: 'spacer' }));
     const body = h('div', { class: 'drawer-body' });
     const drawer = h('div', { class: 'work-panel', role: 'region', 'aria-label': ariaLabel ?? title }, head, body);
-    drawer.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
+    drawer.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      void requestCloseDrawer();
+    });
     workWrap.replaceChildren(drawer);
     drawerOpen = true;
     placeDetailRow();
@@ -645,10 +960,13 @@ export async function renderProviders(mount, ctx) {
   }
 
   async function openDetailDrawer(provider, { silent = false } = {}) {
+    if (!(await confirmDiscardForm('This provider has unsaved changes. Opening a provider will discard them.'))) return;
     closeDrawer();
     drawerId = provider.id;
+    detailOpen = true;
     const title = provider.label ? provider.label + ' (' + provider.id + ')' : String(provider.id);
     const { drawer, head, body } = drawerShell(title);
+    syncRowState(provider.id, true);
     head.append(copyButton(provider.id, { className: "btn btn-sm", title: "Copy provider ID" }));
     head.append(closeButton());
     await renderDetail(body, provider);
@@ -662,9 +980,9 @@ export async function renderProviders(mount, ctx) {
     }
   }
 
-  function closeButton() {
-    const b = h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Close provider detail' }, icon('x'));
-    b.addEventListener('click', closeDrawer);
+  function closeButton(label = 'Close provider detail') {
+    const b = h('button', { class: 'icon-btn', type: 'button', 'aria-label': label }, icon('x'));
+    b.addEventListener('click', () => { void requestCloseDrawer(); });
     return b;
   }
 
@@ -674,8 +992,11 @@ export async function renderProviders(mount, ctx) {
     body.replaceChildren();
 
     // --- summary ---
+    // The heading already carries "(id)", so a dialect chip that only repeats the id is redundant.
+    const dialect = String(p.dialect ?? '').trim();
+    const showDialect = dialect !== '' && dialect.toLowerCase() !== String(p.id).toLowerCase();
     const meta = h('div', { style: 'display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;' },
-      chip(p.dialect ?? '—'),
+      showDialect ? chip(dialect) : null,
       chip(health.label, health.cls, `health: ${health.key}`),
       p.enabled === false ? chip('provider disabled', 'chip-neutral', 'intentionally off — not an error') : null,
       p.models_synced_at ? chip(`models synced ${formatAge(p.models_synced_at)}`) : null);
@@ -705,7 +1026,7 @@ export async function renderProviders(mount, ctx) {
       }
     });
 
-    editBtn.addEventListener('click', () => openFormDrawer(p));
+    editBtn.addEventListener('click', () => { void openFormDrawer(p); });
 
     enableBtn.addEventListener('click', async () => {
       enableBtn.disabled = true;
@@ -776,7 +1097,7 @@ export async function renderProviders(mount, ctx) {
           buildInlineAccountNumber(p, a, 'weight', 'weight'),
           h('td', { class: 'actions' }, toggle, buildInlineAccountSecret(p, a), del)));
       }
-      accSection.append(h('div', { class: 'table-scroll', style: 'max-height:200px;' },
+      accSection.append(h('div', { class: 'table-scroll provider-accounts-scroll' },
         h('table', { class: 'tbl' },
           h('thead', {}, h('tr', {},
             h('th', { scope: 'col' }, 'ID'), h('th', { scope: 'col' }, 'Label'),
@@ -1155,7 +1476,6 @@ export async function renderProviders(mount, ctx) {
   /// cell: the drawer is ~490px wide and six columns plus an input pushed the table into a
   /// horizontal scrollbar that squeezed the id column to one character per line.
   function buildInlineAccountSecret(p, account) {
-    const cell = h('td', { class: 'actions' });
     // An icon button, not a labelled one: the account table is already crowded. The label lives in
     // aria-label/title, which is what a screen reader announces.
     const edit = h('button', {
@@ -1163,10 +1483,9 @@ export async function renderProviders(mount, ctx) {
       'aria-label': `Replace the API key for account ${account.id}`,
       title: 'Replace API key',
     }, icon('key'));
-    cell.append(edit);
 
     edit.addEventListener('click', () => {
-      const row = cell.closest('tr');
+      const row = edit.closest('tr');
       if (!row) return;
       // Only one editor at a time: a second click must not stack rows.
       row.nextElementSibling?.classList.contains('inline-editor') && row.nextElementSibling.remove();
@@ -1214,7 +1533,7 @@ export async function renderProviders(mount, ctx) {
         }
       });
     });
-    return cell;
+    return edit;
   }
 
   function buildInlineAccountNumber(p, account, key, label) {
@@ -1223,7 +1542,8 @@ export async function renderProviders(mount, ctx) {
       await api.put(`/api/providers/${encodeURIComponent(p.id)}/accounts/${encodeURIComponent(account.id)}`,
         { ...account, [key]: value });
       await reload(true);
-    }, (err) => ctx.toast.error(`Could not update account ${label}`, err), { allowNegative: key === 'priority' });
+    }, (err) => ctx.toast.error(`Could not update account ${label}`, err),
+    { allowNegative: key === 'priority', iconOnly: true });
   }
 
   function buildInlineModelNumber(p, model, key, label) {
@@ -1234,10 +1554,12 @@ export async function renderProviders(mount, ctx) {
     }, (err) => ctx.toast.error(`Could not update model ${label}`, err), { compact: true });
   }
 
-  function buildInlineNumericCell(value, label, slot, persist, reportError, { compact = false, suffix = '', allowNegative = false } = {}) {
-    const cell = h('td', { class: compact ? 'num' : '' });
+  function buildInlineNumericCell(value, label, slot, persist, reportError, { compact = false, suffix = '', allowNegative = false, iconOnly = false } = {}) {
+    const cell = h('td', { class: compact || iconOnly ? 'num' : '' });
     const showValue = (n) => n == null ? '—' : `${compact ? formatCompact(Number(n)) : n}${suffix}`;
-    const edit = compact
+    // Two full "Edit" buttons per account row read as four identical actions. A quiet pencil keeps
+    // the number as the thing being scanned; its aria-label and title still name the field.
+    const edit = compact || iconOnly
       ? h('button', { class: 'icon-btn', type: 'button', 'aria-label': `Edit ${label}`, title: `Edit ${label}` }, icon('pencil'))
       : h('button', { class: 'btn btn-sm', type: 'button', 'aria-label': `Edit ${label}` }, 'Edit');
     const renderView = () => cell.replaceChildren(h('span', { class: 'mono' }, showValue(value)), edit);
@@ -2018,13 +2340,14 @@ export async function renderProviders(mount, ctx) {
       ctx.toast.warning('Account added, but the provider list could not be refreshed. Reload the page to see it.');
     }
     const fresh = providers.find((x) => x.id === providerId);
-    if (fresh) openDetailDrawer(fresh);
+    if (fresh) await openDetailDrawer(fresh);
     else if (refreshed) ctx.toast.warning(`Account added, but provider ${providerId} was not in the refreshed list.`);
   }
 
   // After creating a provider, go straight to adding its first account so the operator can paste
   // the API key right away instead of hunting for the field in another drawer.
   async function openAccountDrawer(providerId) {
+    if (!(await confirmDiscardForm('This provider has unsaved changes. Adding an account will discard them.'))) return;
     const p = providers.find((x) => x.id === providerId);
     if (!p) {
       // Provider not in the local snapshot (a concurrent reload can clobber it). Never fail
@@ -2057,10 +2380,33 @@ export async function renderProviders(mount, ctx) {
   }
 
   /** Create (p === null) or edit an existing provider. */
-  function openFormDrawer(p) {
+  async function openFormDrawer(p) {
+    if (!(await confirmDiscardForm('This provider has unsaved changes. Opening another provider form will discard them.'))) return;
     closeDrawer();
+    const formState = { dirty: false, guard: null, confirming: false };
+    activeForm = formState;
+    function markDirty() {
+      if (formState.dirty) return;
+      formState.dirty = true;
+      const guard = () => ctx.confirm({
+        title: 'Leave without saving?',
+        message: 'This provider has unsaved changes. Leaving this page will discard them.',
+        confirmLabel: 'Leave and discard',
+        cancelLabel: 'Stay on this page',
+        // A route change is the other way to lose the draft; keep the safe action focused.
+        danger: true,
+      });
+      formState.guard = guard;
+      ctx.leaveGuard = guard;
+    }
+    function clearDirty() {
+      formState.dirty = false;
+      // Only retract this form's guard: a late save from an old form must not disarm a newer one.
+      if (formState.guard && ctx.leaveGuard === formState.guard) ctx.leaveGuard = null;
+      formState.guard = null;
+    }
     const { head, body } = drawerShell(p ? `Edit provider ${p.id}` : 'New provider');
-    head.append(closeButton());
+    head.append(closeButton(p ? 'Close edit provider form' : 'Close new provider form'));
 
     const isEdit = Boolean(p);
     const idIn = h('input', { class: 'input mono', type: 'text', 'data-field': 'id', value: p?.id ?? '', disabled: isEdit });
@@ -2156,7 +2502,7 @@ export async function renderProviders(mount, ctx) {
 
     const save = h('button', { class: 'btn btn-primary', type: 'submit' }, isEdit ? 'Save changes' : 'Create provider');
     const cancel = h('button', { class: 'btn', type: 'button' }, 'Cancel');
-    cancel.addEventListener('click', () => closeDrawer());
+    cancel.addEventListener('click', () => { void requestCloseDrawer(); });
 
     const form = h('form', { novalidate: true },
       h('div', { class: 'grid-fields' },
@@ -2178,7 +2524,12 @@ export async function renderProviders(mount, ctx) {
       prewarmToggle.row,
       enabledToggle.row,
       field('Note (optional)', note),
-      h('div', { class: 'dialog-actions' }, cancel, save));
+      h('div', { class: 'dialog-actions provider-form-actions' }, cancel, save));
+
+    // Mark dirty only on operator input. Programmatic preset/initial values above must not arm a
+    // guard before the form has anything worth keeping.
+    form.addEventListener('input', markDirty);
+    form.addEventListener('change', markDirty);
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -2218,6 +2569,10 @@ export async function renderProviders(mount, ctx) {
           ctx.toast.success(`Provider ${payload.id} created.`);
         }
 
+        // The draft is committed; retract the guard before the panel is replaced by the detail
+        // or the account drawer. Refresh/navigation failures below are not unsaved form edits.
+        clearDirty();
+
         // The write above is committed once it succeeds. Refresh failures and post-create
         // navigation failures are reported separately — they never mask a successful create.
         if (!isEdit) {
@@ -2244,6 +2599,12 @@ export async function renderProviders(mount, ctx) {
 
     body.append(form);
     if (!isEdit) idIn.focus();
+    // On a short window the form is taller than the visible page. Pull its bottom edge into view
+    // once it exists so Cancel and Create provider are reachable without hunting for them.
+    requestAnimationFrame(() => {
+      const panel = workWrap.querySelector('.work-panel');
+      if (panel?.isConnected) panel.scrollIntoView({ block: 'nearest' });
+    });
   }
 
   // Always a fresh read on mount. The shared cache is filled once per page load, and a provider

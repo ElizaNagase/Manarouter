@@ -10,6 +10,11 @@
      stub did as well. -->
 <link rel="icon" type="image/svg+xml" href="./logo.svg">
 <link rel="stylesheet" href="./app.css">
+<link rel="stylesheet" href="./lab.css">
+<link rel="stylesheet" href="./lab-providers.css">
+<link rel="stylesheet" href="./lab-models.css">
+<link rel="stylesheet" href="./lab-combos.css">
+<link rel="stylesheet" href="./lab-quota.css">
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
@@ -37,21 +42,15 @@
       <nav aria-label="Primary">
         <ul id="nav-list">
           <li><a href="#/overview"  data-route="overview">Overview</a></li>
+          <li class="nav-label" aria-hidden="true">Configure</li>
           <li><a href="#/providers" data-route="providers">Providers</a></li>
-          <li><a href="#/combos"    data-route="combos">Combos</a>
-            <!-- The live combo visualizer. It sits inside the Combos item so it reads as part of
-                 that entry. Filled by panel/combo-live.js.
-                 The block itself is deliberately not a live region: it is repainted on every poll,
-                 and a politely-announced region rewritten every 1.5 s reads the same sentence over
-                 and over. The announcement lives in the sibling `sr-only` status span, which only
-                 changes when the state or the route does. -->
-            <div id="combo-live" class="combo-live"></div>
-            <span id="combo-live-announce" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></span>
-          </li>
-          <li><a href="#/keys"      data-route="keys">Keys</a></li>
-          <li><a href="#/aliases"   data-route="aliases">Aliases</a></li>
+          <li><a href="#/combos"    data-route="combos">Combos</a></li>
           <li><a href="#/models"    data-route="models">Models</a></li>
+          <li><a href="#/aliases"   data-route="aliases">Aliases</a></li>
+          <li class="nav-label" aria-hidden="true">Access</li>
+          <li><a href="#/keys"      data-route="keys">Keys</a></li>
           <li><a href="#/quota"     data-route="quota">Quota</a></li>
+          <li class="nav-label" aria-hidden="true">System</li>
           <li><a href="#/settings"  data-route="settings">Settings</a></li>
           <li><a href="#/docs"      data-route="docs">Documentation</a></li>
         </ul>
@@ -67,7 +66,15 @@
 
     <div class="main-col">
       <header class="topbar">
-        <h1 id="topbar-title" class="topbar-title">Overview</h1>
+        <div id="topbar-title" class="topbar-title" aria-hidden="true">Overview</div>
+        <!-- The live route. It used to be a nested tile under "Combos" in the sidebar, where the
+             provider/model could only be ellipsized; here the whole route is readable and the link
+             still opens the combo it names. Filled by combo-live.js. The block itself is not a live
+             region: it is repainted on every poll. The announcement lives in the sibling status
+             span, which only changes when the state or the route does. -->
+        <div id="combo-live" class="combo-live"></div>
+        <span id="combo-live-announce" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></span>
+        <span class="topbar-spacer" aria-hidden="true"></span>
         <!-- button, not span: it navigates to the overview, so it must be keyboard reachable -->
         <button id="topbar-health" class="health-pill" type="button" aria-label="Control plane status">
           <span class="dot dot-idle" aria-hidden="true"></span>

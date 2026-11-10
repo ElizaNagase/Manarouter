@@ -6,15 +6,18 @@ import { h, chip, field, toggle, errorBlock, applyFieldErrors, clearFieldErrors 
 import { describePortChange } from './format.js';
 
 export async function renderSettings(mount, ctx) {
-  const portsCard = h('div', { class: 'card' }, h('h2', {}, 'Listen ports'));
+  const portsCard = h('div', { class: 'card wide' }, h('h2', {}, 'Listen ports'));
   const latencyCard = h('div', { class: 'card' }, h('h2', {}, 'Relay connection pool'));
   const accessCard = h('div', { class: 'card' }, h('h2', {}, 'Client-key access'));
-  const proxiesCard = h('div', { class: 'card' }, h('h2', {}, 'Upstream proxies'));
+  const proxiesCard = h('div', { class: 'card wide' }, h('h2', {}, 'Upstream proxies'));
   const quotaDisplayCard = h('div', { class: 'card' }, h('h2', {}, 'Quota display'));
   const pricingCard = h('div', { class: 'card' }, h('h2', {}, 'Pricing data'));
   const passwordCard = h('div', { class: 'card' }, h('h2', {}, 'Panel password'));
-  const rawCard = h('div', { class: 'card' }, h('h2', {}, 'Raw configuration'));
-  mount.replaceChildren(portsCard, latencyCard, accessCard, proxiesCard, quotaDisplayCard, pricingCard, passwordCard, rawCard);
+  const rawCard = h('div', { class: 'card wide' }, h('h2', {}, 'Raw configuration'));
+  // Eight full-width cards made Settings a long single column with no reading rhythm. A two-up
+  // grid keeps the wide forms (ports, proxies, raw JSON) full width and pairs the short ones.
+  mount.replaceChildren(h('div', { class: 'settings-grid' },
+    portsCard, latencyCard, accessCard, proxiesCard, quotaDisplayCard, pricingCard, passwordCard, rawCard));
 
   await Promise.all([renderPorts(), renderPassword(), renderLatency(), renderAccess(), renderProxies(), renderQuotaDisplay(), renderPricing()]);
   renderRaw(); // sequential on purpose: the textarea is heavy and it can stream in last

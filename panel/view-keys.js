@@ -51,18 +51,24 @@ export async function renderKeys(mount, ctx) {
     }
     const tbody = h('tbody');
     for (const k of keys) {
-      const editBtn = h('button', { class: 'btn btn-sm', type: 'button' }, 'Edit');
+      const editBtn = h('button', { class: 'btn btn-sm btn-ghost', type: 'button' }, 'Edit');
       editBtn.addEventListener('click', () => { editingId = k.id; renderForm(k); tableWrap.scrollIntoView({ block: 'nearest' }); });
-      const rotateBtn = h('button', { class: 'btn btn-sm', type: 'button' }, 'Rotate');
+      const rotateBtn = h('button', { class: 'btn btn-sm btn-ghost', type: 'button' }, 'Rotate');
       rotateBtn.addEventListener('click', () => rotateKey(k));
-      const delBtn = h('button', { class: 'btn btn-danger btn-sm', type: 'button' }, 'Delete');
+      const delBtn = h('button', { class: 'btn btn-sm btn-ghost btn-quiet-danger', type: 'button' }, 'Delete');
       delBtn.addEventListener('click', () => deleteKey(k));
+      // An empty allow-list means "no restriction", which is a fact about the key — not a missing
+      // value. A bare em dash read as "unknown" and repeated down the table as visual noise.
+      const allowCell = (list) => {
+        const summary = allowSummary(list);
+        return summary ? h('td', { class: 'mono' }, summary) : h('td', { class: 'cell-dim' }, 'all');
+      };
       tbody.append(h('tr', {},
         h('td', {}, k.label ?? ''),
         h('td', { class: 'mono' }, k.prefix ?? '(prefix unavailable)'),
         h('td', {}, k.enabled === false ? chip('disabled', 'chip-neutral') : chip('enabled', 'chip-green')),
-        h('td', { class: 'mono' }, allowSummary(k.allow_models)),
-        h('td', { class: 'mono' }, allowSummary(k.allow_routes)),
+        allowCell(k.allow_models),
+        allowCell(k.allow_routes),
         h('td', { class: 'num' }, k.limit_requests ? formatCompact(k.limit_requests) : '∞'),
         h('td', {}, rollingCaps(k.limits)),
         h('td', { class: 'actions' }, editBtn, rotateBtn, delBtn)));
@@ -84,7 +90,7 @@ export async function renderKeys(mount, ctx) {
   }
 
   function allowSummary(list) {
-    if (!list || !list.length) return '—';
+    if (!list || !list.length) return null;
     if (list.length <= 2) return list.join(' ');
     return `${list.slice(0, 2).join(' ')} +${list.length - 2}`;
   }

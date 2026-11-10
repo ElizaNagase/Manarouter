@@ -211,7 +211,9 @@ export async function renderQuota(mount, ctx) {
         h('td', {}, row?.estimated ? 'estimated by the router' : 'reported by the provider')));
     }
     table.append(body);
-    card.append(table);
+    // A seven-column usage table cannot shrink below a phone. It scrolls inside its own frame
+    // instead of pushing the card (and the page) wider than the viewport.
+    card.append(h('div', { class: 'table-scroll' }, table));
     const totals = usage?.totals ?? {};
     card.append(h('p', { class: 'hint' },
       `${totals.requests ?? rows.length} request(s), `
@@ -297,12 +299,15 @@ export async function renderQuota(mount, ctx) {
       'data-quota-provider': provider.id,
     });
     const grip = h('span', { class: 'icon-btn quota-grip', 'aria-hidden': 'true' }, icon('grip'));
+    // The human name leads; the machine id is the quiet second line. Printing "ANTIGRAVITY" next
+    // to "Google Antigravity / Gemini Code Assist" said the same thing twice in two alphabets.
+    const named = Boolean(provider.label) && provider.label !== provider.id;
     head.append(grip,
-      h('h2', {}, provider.id),
-      provider.label && provider.label !== provider.id
-        ? h('span', { class: 'quota-provider-label', title: provider.label }, provider.label) : '',
+      h('h2', { class: 'quota-provider-label', title: provider.id },
+        named ? provider.label : provider.id),
+      named ? h('span', { class: 'quota-provider-id' }, provider.id) : '',
       h('span', { class: 'quota-provider-count' },
-        `${rows.length} quota${rows.length === 1 ? '' : 's'}`));
+        `${rows.length} account${rows.length === 1 ? '' : 's'}`));
 
     const cards = h('div', { class: 'quota-cards' });
     for (const row of rows) cards.append(renderAccount(row, group));

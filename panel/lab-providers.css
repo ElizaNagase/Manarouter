@@ -1,0 +1,557 @@
+/* lab-providers.css — view-level overrides for the 20902 lab. Tokens and shared components live in lab.css. */
+
+/* The providers list is the view's whole page, so the shell's saturated primary button (a
+   gradient with a glow) reads as an alarm next to the calm rose accent. A tinted rose fill keeps
+   it the one primary action without turning it into the loudest thing on the screen. */
+.providers-view .btn-primary {
+  background: var(--pink-dim);
+  border-color: rgba(224, 112, 155, 0.52);
+  color: #f2c9d9;
+  font-weight: 600;
+  box-shadow: none;
+}
+.providers-view .btn-primary:hover {
+  background: rgba(224, 112, 155, 0.2);
+  border-color: var(--pink);
+  color: #fae0ea;
+}
+.providers-view .btn-primary:active { background: rgba(224, 112, 155, 0.26); }
+.providers-view .btn-primary:focus-visible {
+  outline: 2px solid rgba(224, 112, 155, 0.5);
+  outline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------- toolbar */
+
+.providers-view .provider-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 12px;
+  margin-bottom: 12px;
+}
+.providers-view .provider-filter-wrap {
+  flex: 1 1 300px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 440px;
+  min-width: 0;
+}
+.providers-view .provider-filter {
+  flex: 1 1 240px;
+  width: 100%;
+  max-width: 340px;
+  background: transparent;
+  border-color: var(--line);
+  font-size: 12.5px;
+  font-weight: 400;
+}
+.providers-view .provider-filter:hover { border-color: var(--line2); }
+.providers-view .provider-filter::placeholder { color: var(--tx3); }
+.providers-view .provider-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+.providers-view .provider-count {
+  flex: none;
+  padding-left: 9px;
+  border-left: 1px solid var(--line);
+  color: var(--tx3);
+  font-size: 11px;
+  line-height: 16px;
+  letter-spacing: 0.005em;
+  white-space: nowrap;
+}
+.providers-view .provider-count-n {
+  color: var(--tx2);
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.providers-view .provider-sort {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.providers-view .provider-sort-label {
+  color: var(--tx3);
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.providers-view .provider-sort .input {
+  width: 128px;
+  height: 28px;
+  padding: 0 24px 0 6px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--tx2);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.providers-view .provider-sort .input:hover {
+  border-color: var(--line2);
+  background: var(--bg2);
+}
+.providers-view .provider-sort .input:focus,
+.providers-view .provider-sort .input:focus-visible {
+  border-color: var(--pink-deep);
+  background: var(--bg2);
+}
+.providers-view .toolbar-divider {
+  width: 1px;
+  height: 18px;
+  background: var(--line);
+  flex: none;
+}
+.providers-view .provider-refresh {
+  height: 28px;
+  padding: 0 8px;
+  color: var(--tx2);
+  font-size: 11.5px;
+}
+.providers-view .provider-refresh svg.i { width: 13px; height: 13px; }
+.providers-view .provider-add {
+  height: 30px;
+  padding: 0 12px;
+  font-size: 12.5px;
+}
+.providers-view .provider-add svg.i { width: 13px; height: 13px; }
+
+/* ---------------------------------------------------------------- table */
+
+.providers-view .table-scroll {
+  border-color: var(--line);
+  background: var(--bg1);
+}
+.providers-view .table-scroll.is-empty {
+  border: 0;
+  background: transparent;
+  overflow: visible;
+}
+.providers-view .provider-table {
+  table-layout: fixed;
+  min-width: 780px;
+}
+.providers-view .provider-table .pin-col { width: 56px; }
+.providers-view .provider-table th:nth-child(2) { width: auto; }
+.providers-view .provider-table .provider-accounts-col { width: 118px; }
+.providers-view .provider-table .provider-models-col { width: 102px; }
+.providers-view .provider-table .provider-health-col { width: 142px; }
+.providers-view .provider-table .actions-col { width: 176px; }
+
+.providers-view .provider-table thead th {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg0);
+  color: var(--tx3);
+  font-size: 9.5px;
+  letter-spacing: 0.09em;
+}
+.providers-view .provider-table thead th.pin-col { padding-left: 10px; }
+.providers-view .provider-table thead th.provider-accounts-col,
+.providers-view .provider-table thead th.provider-models-col { padding-left: 4px; }
+.providers-view .provider-table thead th.provider-health-col { padding-left: 8px; }
+.providers-view .provider-table thead th.actions-col {
+  padding-right: 18px;
+  text-align: right;
+}
+.providers-view .provider-table tbody td.actions { padding-right: 18px; }
+
+.providers-view .provider-table tbody td {
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.045);
+  background: transparent;
+  transition: background 120ms var(--ease);
+}
+.providers-view .provider-table tbody tr:last-child td { border-bottom: 0; }
+.providers-view .provider-table tbody tr:hover td { background: rgba(255, 255, 255, 0.022); }
+.providers-view .provider-table tbody tr.pinned-row td:first-child {
+  box-shadow: inset 2px 0 0 rgba(224, 112, 155, 0.42);
+}
+.providers-view .provider-table tbody tr.is-open td { background: rgba(224, 112, 155, 0.05); }
+.providers-view .provider-table tbody tr.is-open:hover td { background: rgba(224, 112, 155, 0.065); }
+.providers-view .provider-table tbody tr.is-open td:first-child {
+  box-shadow: inset 2px 0 0 var(--pink);
+}
+
+/* The pin column stays quiet until the row is touched; a pinned row keeps only its icon and
+   hairline, not a permanent pill. */
+.providers-view .provider-table .pin-col {
+  padding-right: 0;
+  padding-left: 10px;
+  white-space: nowrap;
+}
+.providers-view .pin-btn {
+  opacity: 0.18;
+  transition: opacity 120ms var(--ease), background 120ms var(--ease), color 120ms var(--ease);
+}
+.providers-view .provider-table tr:hover .pin-btn,
+.providers-view .pin-btn:focus-visible { opacity: 0.8; }
+.providers-view .pin-btn.pinned { opacity: 1; background: transparent; }
+.providers-view .pin-btn.pinned:hover { background: var(--pink-dim); }
+.providers-view .provider-grip {
+  opacity: 0.18;
+  cursor: grab;
+  transition: opacity 120ms var(--ease);
+}
+.providers-view .provider-table tr:hover .provider-grip { opacity: 0.75; }
+.providers-view .provider-grip:active,
+body.provider-dragging .providers-view .provider-grip { cursor: grabbing; }
+body.provider-dragging { user-select: none; cursor: grabbing; }
+body.provider-dragging .providers-view .provider-table tr.row-draggable { cursor: grabbing; }
+
+/* Same movement language as combo steps: the source row dims, the destination gets one insertion
+   line, and the pointer changes while a row is in flight. */
+.providers-view .provider-table tr.dragging td {
+  opacity: 0.4;
+  background: transparent;
+}
+.providers-view .provider-table tr.drag-over td {
+  background: rgba(224, 112, 155, 0.035);
+  box-shadow: inset 0 2px 0 var(--pink);
+}
+.providers-view .provider-table tr.drag-over td:first-child {
+  box-shadow: inset 0 2px 0 var(--pink), inset 2px 0 0 rgba(224, 112, 155, 0.42);
+}
+
+/* ---------------------------------------------------------------- identity */
+
+.providers-view .provider-cell { overflow: hidden; }
+.providers-view .provider-title-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.providers-view .provider-disclosure {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 10px;
+  height: 16px;
+  color: var(--tx3);
+  opacity: 0.55;
+  transition: opacity 120ms var(--ease);
+}
+.providers-view .provider-chevron {
+  display: block;
+  width: 5px;
+  height: 5px;
+  border-right: 1.25px solid currentColor;
+  border-bottom: 1.25px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 140ms var(--ease);
+}
+.providers-view .provider-table tr:hover .provider-disclosure { opacity: 0.9; }
+.providers-view .provider-table tr.is-open .provider-disclosure { opacity: 1; color: var(--pink); }
+.providers-view .provider-table tr.is-open .provider-chevron { transform: rotate(45deg); }
+.providers-view .provider-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--tx1);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.005em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.providers-view .provider-id {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 38%;
+  overflow: hidden;
+  color: var(--tx3);
+  font-size: 10.5px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A hairline separator keeps the name and the machine ID from reading as one long string. */
+.providers-view .provider-id::before {
+  content: '·';
+  margin-right: 7px;
+  color: var(--line2);
+}
+.providers-view .provider-copy {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  color: var(--tx3);
+  opacity: 0;
+  transition: opacity 120ms var(--ease), color 120ms var(--ease);
+}
+.providers-view .provider-copy svg.i { width: 11px; height: 11px; }
+.providers-view .provider-table tr:hover .provider-copy,
+.providers-view .provider-copy:focus-visible { opacity: 1; }
+.providers-view .provider-copy:hover { color: var(--tx1); }
+.providers-view .provider-copy.copy-ok { color: var(--green); opacity: 1; }
+.providers-view .provider-sub {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 15px;
+  margin-top: 4px;
+  padding-left: 17px;
+  min-width: 0;
+}
+.providers-view .provider-dialect {
+  color: var(--tx3);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  line-height: 1.55;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- metrics */
+
+.providers-view .provider-metric {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  color: var(--tx3);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.providers-view .provider-metric-n {
+  color: var(--tx2);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.providers-view .provider-metric-unit {
+  color: var(--tx3);
+  font-size: 10px;
+  font-weight: 400;
+}
+.providers-view .provider-metric.is-muted .provider-metric-n {
+  color: var(--tx3);
+  font-weight: 500;
+}
+.providers-view .provider-metric.is-empty {
+  color: rgba(217, 164, 65, 0.78);
+  font-size: 10px;
+}
+
+/* ---------------------------------------------------------------- health */
+
+.providers-view .provider-health-cell { overflow: hidden; }
+.providers-view .provider-health {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--tx2);
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: nowrap;
+}
+.providers-view .provider-health-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--tx3);
+}
+.providers-view .provider-health.is-green .provider-health-dot {
+  background: var(--green);
+  box-shadow: 0 0 0 2px rgba(76, 195, 138, 0.1);
+}
+.providers-view .provider-health.is-amber { color: #dcb878; }
+.providers-view .provider-health.is-amber .provider-health-dot { background: var(--amber); }
+.providers-view .provider-health.is-red { color: #eb9a9a; }
+.providers-view .provider-health.is-red .provider-health-dot { background: var(--red); }
+.providers-view .provider-health.is-neutral { color: var(--tx3); }
+.providers-view .provider-last-error {
+  display: block;
+  max-width: 100%;
+  margin-top: 3px;
+  overflow: hidden;
+  color: rgba(239, 106, 106, 0.8);
+  font-size: 10px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- actions */
+
+.providers-view .provider-table .actions {
+  padding-left: 4px;
+}
+.providers-view .provider-open {
+  min-width: 52px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--tx3);
+}
+.providers-view .provider-table tr:hover .provider-open {
+  border-color: var(--line2);
+  background: var(--bg2);
+  color: var(--tx2);
+}
+.providers-view .provider-open[aria-expanded="true"] {
+  border-color: rgba(224, 112, 155, 0.4);
+  background: var(--pink-dim);
+  color: #f0c3d4;
+}
+.providers-view .provider-open:focus-visible {
+  border-color: var(--pink-deep);
+  color: var(--tx1);
+  opacity: 1;
+}
+
+/* ---------------------------------------------------------------- detail */
+
+.providers-view .provider-work {
+  padding: 0 12px 14px 54px;
+}
+.providers-view .provider-work .work-panel {
+  display: flex;
+  flex-direction: column;
+  max-height: min(820px, calc(100vh - 120px));
+  margin: 0;
+  border-radius: var(--radius);
+  box-shadow: none;
+}
+/* A long provider form used to push its Save button below the fold. The panel keeps its heading
+   and actions in place while the body scrolls, so the decision is always reachable. */
+.providers-view .provider-work .drawer-body {
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+.providers-view .provider-form-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  margin-top: 16px;
+  padding: 12px 0 2px;
+  background: var(--bg1);
+}
+.providers-view .provider-work .drawer-body {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line2) transparent;
+}
+/* Five accounts used to be cut through the middle of the next row by a 200px inner cap. Let the
+   panel's own scrollbar carry the section instead of nesting a second, barely visible scroller. */
+.providers-view .provider-accounts-scroll {
+  max-height: none;
+}
+.providers-view .provider-detail-row > td {
+  padding: 0;
+  background: var(--bg0);
+  border-bottom: 1px solid var(--line);
+}
+.providers-view .provider-detail-row:hover > td { background: var(--bg0); }
+
+/* ---------------------------------------------------------------- empty states */
+
+.providers-view .provider-empty {
+  max-width: 560px;
+  margin: 52px auto 56px;
+  padding: 30px 26px;
+  border: 1px dashed var(--line2);
+  border-radius: var(--radius-lg);
+  background: rgba(255, 255, 255, 0.012);
+  text-align: center;
+}
+.providers-view .provider-empty-mark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  margin: 0 auto 14px;
+  border: 1px solid var(--line2);
+  border-radius: 50%;
+  background: var(--bg2);
+  color: var(--tx2);
+}
+.providers-view .provider-empty-mark svg.i { width: 15px; height: 15px; }
+.providers-view .provider-empty h2 {
+  margin: 0;
+  color: var(--tx1);
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.providers-view .provider-empty p {
+  max-width: 46ch;
+  margin: 7px auto 0;
+  color: var(--tx3);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.providers-view .provider-empty .btn { margin-top: 18px; }
+.providers-view .provider-empty.is-filtered {
+  margin-top: 36px;
+  padding: 26px;
+  border-style: solid;
+  border-color: var(--line);
+}
+.providers-view .provider-empty.is-filtered h2 { font-size: 14px; }
+.providers-view .provider-empty.is-filtered .btn { margin-top: 14px; }
+
+/* ---------------------------------------------------------------- footer */
+
+.providers-view .provider-list-foot {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  margin-top: 10px;
+  padding: 2px 3px 0;
+}
+.providers-view .provider-list-hint {
+  margin: 0;
+  padding-top: 3px;
+  color: var(--tx3);
+  font-size: 10.5px;
+  line-height: 1.55;
+}
+.providers-view .provider-delete-pref { flex: none; text-align: right; }
+.providers-view .provider-delete-pref .check-row {
+  justify-content: flex-end;
+  margin: 0;
+  gap: 6px;
+}
+.providers-view .provider-delete-pref .check-row label {
+  color: var(--tx3);
+  font-size: 11px;
+}
+.providers-view .provider-delete-pref .check-row:hover label { color: var(--tx2); }
+.providers-view .provider-delete-pref .hint {
+  margin: 2px 0 0;
+  color: var(--tx3);
+  font-size: 10px;
+  line-height: 1.45;
+  opacity: 0.8;
+}
+.providers-view .provider-list-foot[hidden] { display: none; }
+
+/* ---------------------------------------------------------------- narrow */
+
+@media (max-width: 860px) {
+  .providers-view .provider-filter-wrap {
+    flex-basis: 100%;
+    max-width: none;
+  }
+  .providers-view .provider-filter { max-width: none; }
+  .providers-view .provider-tools {
+    width: 100%;
+    margin-left: 0;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+  }
+  .providers-view .provider-tools .count { margin-right: auto; }
+  .providers-view .provider-work { padding-left: 12px; }
+}

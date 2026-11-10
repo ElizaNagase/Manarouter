@@ -1,0 +1,126 @@
+/* lab-quota.css — quota view refinements.
+ *
+ * The page already groups accounts by provider and lets both a provider block and an account row
+ * be dragged. What it lacked was the visual grammar to show that: the groups read as a flat stack
+ * of cards, account names did not line up with their windows, and the at-a-glance summary repeated
+ * the cards below at the same weight. Everything here is a refinement of existing markup.
+ */
+
+/* A provider is a group, not another card: one hairline box around its accounts. */
+.quota-provider {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--bg1);
+  padding: 0;
+  margin-bottom: 14px;
+  overflow: hidden;
+}
+
+.quota-provider-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0;
+  padding: 10px 14px;
+  background: #151a1b;
+  border-bottom: 1px solid var(--line);
+  cursor: grab;
+}
+.quota-provider-head:active { cursor: grabbing; }
+.quota-provider-head .grip, .quota-provider-head [data-grip] { color: var(--tx3); }
+.quota-provider-head h2.quota-provider-label {
+  font-size: 12.5px;
+  font-weight: 620;
+  color: var(--tx1);
+  letter-spacing: 0;
+  text-transform: none;
+  margin: 0;
+}
+.quota-provider-count {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 8px;
+  border: 1px solid var(--line2);
+  border-radius: 999px;
+  background: var(--bg2);
+  color: var(--tx3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.quota-provider-id {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--tx3);
+}
+
+.quota-cards { display: grid; gap: 0; padding: 0; }
+.quota-cards .quota-account {
+  border: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.045);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  margin: 0;
+  padding: 10px 14px;
+}
+.quota-cards .quota-account:last-child { border-bottom: 0; }
+.quota-cards .quota-account:hover { background: rgba(255, 255, 255, 0.022); }
+
+.quota-account-head { margin: 0 0 7px; min-height: 0; align-items: center; gap: 10px; }
+.quota-account-title { min-width: 0; flex: 1 1 auto; align-items: baseline; }
+.quota-account-title h2 {
+  font-size: 12.5px;
+  font-weight: 560;
+  opacity: 1;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--tx1);
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A long account identity is data, not decoration: monospace keeps the tail readable. */
+.quota-account [data-quota-account] { font-family: var(--mono); }
+
+.quota-window-name { font-size: 11.5px; color: var(--tx2); }
+.quota-window-reset, .quota-chip-reset { color: var(--tx3); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+/* At a glance: a summary is a list of numbers, not a second wall of cards. */
+.quota-glance { display: grid; gap: 2px; }
+.quota-glance-provider {
+  margin: 10px 0 3px;
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--tx3);
+}
+.quota-glance-provider:first-child { margin-top: 0; }
+.quota-glance-account {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 5px 6px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.quota-glance-account:hover { background: rgba(255, 255, 255, 0.035); }
+.quota-glance-name {
+  flex: 0 0 280px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--tx2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.quota-glance-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-left: auto; justify-content: flex-end; }
+
+.quota-legend { color: var(--tx3); font-size: 11.5px; }
+
+/* Drag feedback shared with combo steps: the source dims, the target gets an insertion edge. */
+.quota-provider.dragging, .quota-account.dragging { opacity: 0.45; }
+.quota-provider.drag-over { box-shadow: inset 0 2px 0 var(--pink); }
+.quota-account.drag-over { box-shadow: inset 0 2px 0 var(--pink); }

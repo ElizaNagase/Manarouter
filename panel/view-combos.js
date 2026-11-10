@@ -28,6 +28,48 @@ import { createSearchSelect } from './search-select.js';
 // scope, because the view can render a selected combo before its own body reaches a later `const`.
 const checked = new Map();
 
+// List preferences live in this browser, like the provider list: the combo route is global config,
+// but which rows an operator has pinned and the order they dragged them into are viewing choices,
+// not part of the routing document. Saving them server-side would turn one person's tidy list into
+// everyone's order.
+const COMBO_SORT_KEY = 'manarouter.combos.sort';
+const COMBO_PINS_KEY = 'manarouter.combos.pins';
+const COMBO_ORDER_KEY = 'manarouter.combos.order';
+const COMBO_SORTS = new Set(['manual', 'name', 'steps', 'recent']);
+const COMBO_SORT_OPTIONS = [
+  ['manual', 'Manual'],
+  ['name', 'Name'],
+  ['steps', 'Most steps'],
+  ['recent', 'Recently used'],
+];
+
+function storedIdList(key) {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(key) ?? '[]');
+    return Array.isArray(parsed) ? parsed.filter((id) => typeof id === 'string' && id) : [];
+  } catch {
+    return [];
+  }
+}
+
+function storeIdList(key, ids) {
+  try {
+    localStorage.setItem(key, JSON.stringify(ids));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function storedComboSort() {
+  try {
+    const value = localStorage.getItem(COMBO_SORT_KEY);
+    return COMBO_SORTS.has(value) ? value : 'manual';
+  } catch {
+    return 'manual';
+  }
+}
+
 const STRATEGIES = [
   ['priority', 'priority', 'Always start at step 1; on failure fall to step 2, and so on. Deterministic and sticky: the cheapest in upstream spend, and it keeps upstream prompt caches warm because the same model sees the conversation every turn.'],
   ['round-robin', 'round-robin', 'Each call starts at the next step (n mod len) and falls forward in priority order from there, wrapping. Rotation chooses the starting point only — after a failure the request still degrades down your order. The common use is rotating across accounts of one provider, whose per-account rate limits are independent.'],
@@ -49,25 +91,45 @@ const FAIL_MODES = [
 export async function renderCombos(mount, ctx, selectedId) {
   let combos = [];
   let providers = [];
+  let pinned = new Set(storedIdList(COMBO_PINS_KEY));
+  let manualOrder = storedIdList(COMBO_ORDER_KEY);
+  let sortMode = storedComboSort();
+  let activityEntries = [];
+  let activityByCombo = new Map();
+  let draggedId = null;
+  let dragSuppressed = false;
+  const tileStates = new Map();
 
   const listEl = h('ul', { class: 'combo-list' });
   const newBtn = h('button', { class: 'btn btn-primary', type: 'button' }, 'New combo');
   const count = h('span', { class: 'count' });
+  const sortSel = h('select', { class: 'input combo-sort', 'aria-label': 'Sort combos' },
+    ...COMBO_SORT_OPTIONS.map(([value, label]) => h('option', { value }, label)));
+  sortSel.value = sortMode;
   const formSlot = h('div');
-  const left = h('div', { class: 'card' }, h('h2', {}, 'Combos'), listEl);
-  const right = h('div', { class: 'card' });
+  const left = h('div', { class: 'card combo-list-card' },
+    h('div', { class: 'combo-list-head' },
+      h('div', { class: 'combo-list-title' }, h('h2', {}, 'Combos'), count),
+      h('label', { class: 'combo-sort-field' }, h('span', {}, 'Sort'), sortSel)),
+    listEl);
+  const right = h('div', { class: 'card combo-detail-card' });
   // The editor currently mounted in the drawer, if any. It is cleared on close so an old editor's
   // dirty flag can never keep prompting after its DOM is gone. Declared before any immediate
   // renderEditor() call below, including the "#/combos/_new" route.
   let activeEditor = null;
   let closingEditor = false;
   mount.replaceChildren(
-    h('div', { class: 'toolbar' }, newBtn, h('span', { class: 'spacer' }), count),
+    h('div', { class: 'toolbar' }, newBtn, h('span', { class: 'spacer' })),
     formSlot,
     h('div', { class: 'combo-layout' }, left, right),
   );
 
+  // One creation affordance, in context: with nothing selected the empty detail panel owns New;
+  // once a combo is open the toolbar owns it. Visibility (not display) keeps the toolbar height,
+  // so choosing a row does not shift the whole grid down by 44px. This is applied after the
+  // catalogue resolves, because the first combo is selected automatically.
   newBtn.addEventListener('click', () => { void startNewEditor(); });
+  sortSel.addEventListener('change', () => switchSort(sortSel.value));
 
   try {
     // list_combos returns { combos: config.combos }; each ComboStep is only provider/model/policy
@@ -79,6 +141,8 @@ export async function renderCombos(mount, ctx, selectedId) {
     return;
   }
   try { providers = await ctx.loadProviders(); } catch { /* combos remain usable without metadata */ }
+  seedComboPreferences();
+  try { setActivity(extractList(await api.get('/api/activity'), 'entries')); } catch { setActivity([]); }
 
   // A combo is called by its `name` (e.g. "deepseek"), but its stored id is a UUID. Links from the
   // sidebar and the overview use the name an operator recognises, so accept either rather than
@@ -90,39 +154,340 @@ export async function renderCombos(mount, ctx, selectedId) {
       ?? combos.find((c) => c.label === selectedId);
     selectedId = selected?.id ?? selectedId;
   }
+  // A master-detail page opens on its first row. Leaving the detail pane empty on a page that
+  // already lists four routes reads as unfinished, and forces a click before the page says
+  // anything useful. A truly empty catalogue still gets the empty state below.
+  if (!selectedId && combos.length) selectedId = orderedCombos()[0]?.id ?? null;
+  newBtn.style.visibility = selectedId && selectedId !== '_new' ? '' : 'hidden';
 
   renderList();
   count.textContent = `${combos.length} combo${combos.length === 1 ? '' : 's'}`;
 
   if (selectedId === '_new') {
     renderEditor(null, formSlot);
-    right.replaceChildren(emptyState('Create a combo.', 'Add a name and one or more steps to get started.'));
+    right.classList.add('is-empty');
+    right.replaceChildren(h('div', { class: 'combo-empty combo-empty-new' },
+      h('p', { class: 'combo-empty-kicker' }, 'New combo'),
+      h('h2', {}, 'Build a route on the right'),
+      h('p', {}, 'Give it a name, then add model steps in the order a request should try them.'),
+      h('button', { class: 'btn', type: 'button', onclick: () => { void startNewEditor(); } }, 'New combo')));
   } else if (selectedId) {
     const found = combos.find((c) => c.id === selectedId);
     if (found) renderSummary(right, found);
-    else right.replaceChildren(emptyState('Combo not found.', 'It may have been deleted.'));
+    else {
+      right.classList.add('is-empty');
+      right.replaceChildren(emptyState('Combo not found.', 'It may have been deleted.'));
+    }
   } else {
-    right.replaceChildren(combos.length
-      ? emptyState('Select a combo on the left.', 'Or create a new one.')
-      : emptyState('No combos yet.',
-        'A combo is a named model: clients call it like any model, and it resolves to an ordered list of steps.'));
+    renderEmptyDetail();
+  }
+
+  const activityTimer = setInterval(() => { void refreshActivity(); }, 5000);
+  async function refreshActivity() {
+    if (!mount.isConnected) { clearInterval(activityTimer); return; }
+    if (document.hidden) return;
+    try {
+      const payload = await api.get('/api/activity');
+      if (!mount.isConnected) { clearInterval(activityTimer); return; }
+      setActivity(extractList(payload, 'entries'));
+    } catch {
+      // Activity is an enhancement; a gap in it must never disturb the list an operator is editing.
+    }
   }
 
   // ------------------------------------------------------------------ list
 
-  function renderList() {
-    listEl.replaceChildren();
-    for (const c of combos) {
-      const btn = h('button', { type: 'button', 'aria-current': c.id === selectedId ? 'true' : null },
-        h('div', { class: 'cname' }, c.name || c.id),
-        h('div', { class: 'cmeta' },
-          `${(c.steps ?? []).length} step${(c.steps ?? []).length === 1 ? '' : 's'}`,
-          chip(c.strategy ?? 'priority'),
-          c.hedge?.enabled ? chip('hedged', 'chip-pink', 'hedged race enabled') : null,
-          c.enabled === false ? chip('off') : null));
-      btn.addEventListener('click', () => ctx.navigate(`#/combos/${encodeURIComponent(c.id)}`));
-      listEl.append(h('li', {}, btn));
+  function seedComboPreferences() {
+    const ids = new Set(combos.map((c) => c.id));
+    pinned = new Set([...pinned].filter((id) => ids.has(id)));
+    const next = [];
+    const seen = new Set();
+    for (const id of manualOrder) {
+      if (ids.has(id) && !seen.has(id)) { seen.add(id); next.push(id); }
     }
+    for (const combo of combos) {
+      if (!seen.has(combo.id)) { seen.add(combo.id); next.push(combo.id); }
+    }
+    manualOrder = next;
+    storeIdList(COMBO_PINS_KEY, [...pinned]);
+    storeIdList(COMBO_ORDER_KEY, manualOrder);
+  }
+
+  function setActivity(entries) {
+    activityEntries = entries;
+    activityByCombo = new Map();
+    for (const entry of entries) {
+      if (!entry || typeof entry.combo !== 'string') continue;
+      const combo = combos.find((c) => c.name === entry.combo || c.id === entry.combo);
+      if (!combo) continue;
+      const current = activityByCombo.get(combo.id) ?? { live: false, last: 0 };
+      if (entry.finished_at == null && entry.outcome == null) current.live = true;
+      const started = Number(entry.started_at);
+      if (Number.isFinite(started)) current.last = Math.max(current.last, started);
+      activityByCombo.set(combo.id, current);
+    }
+    for (const [id, el] of tileStates) {
+      const combo = combos.find((c) => c.id === id);
+      if (combo) paintTileState(el, combo);
+    }
+  }
+
+  function paintTileState(el, combo) {
+    const state = activityByCombo.get(combo.id);
+    el.classList.toggle('is-live', Boolean(state?.live));
+    el.replaceChildren(
+      h('span', { class: 'combo-live-dot', 'aria-hidden': 'true' }),
+      document.createTextNode(state?.live ? 'live' : 'idle'));
+    el.title = state?.live
+      ? 'A request is running through this combo now.'
+      : state?.last
+        ? `Last used ${agoLabel(state.last)}.`
+        : 'No request recorded in this session.';
+  }
+
+  function agoLabel(timestamp) {
+    const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+    if (seconds < 45) return 'just now';
+    if (seconds < 3600) return `${Math.max(1, Math.round(seconds / 60))}m ago`;
+    if (seconds < 86400) return `${Math.round(seconds / 3600)}h ago`;
+    return `${Math.round(seconds / 86400)}d ago`;
+  }
+
+  // Manual order is the only order that belongs to the operator, so every other mode is a pure
+  // view over the same array. Pins are a separate stable partition on top: pinning never mutates
+  // manual order, and a drag never crosses the pinned boundary.
+  function orderedCombos() {
+    const manualPos = new Map(manualOrder.map((id, index) => [id, index]));
+    const configPos = new Map(combos.map((combo, index) => [combo.id, index]));
+    const base = (combo) => manualPos.has(combo.id) ? manualPos.get(combo.id) : combos.length + configPos.get(combo.id);
+    const list = combos.slice();
+    if (sortMode === 'name') {
+      list.sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id, undefined, { sensitivity: 'base' }) || base(a) - base(b));
+    } else if (sortMode === 'steps') {
+      list.sort((a, b) => (b.steps?.length ?? 0) - (a.steps?.length ?? 0) || base(a) - base(b));
+    } else if (sortMode === 'recent') {
+      list.sort((a, b) => (activityByCombo.get(b.id)?.last ?? 0) - (activityByCombo.get(a.id)?.last ?? 0) || base(a) - base(b));
+    } else {
+      list.sort((a, b) => base(a) - base(b));
+    }
+    return [
+      ...list.filter((combo) => pinned.has(combo.id)),
+      ...list.filter((combo) => !pinned.has(combo.id)),
+    ];
+  }
+
+  function comboHref(id) {
+    return `#/combos/${encodeURIComponent(id)}`;
+  }
+
+  function focusTile(id, selector = '.tile-main') {
+    for (const li of listEl.children) {
+      if (li.dataset.comboId === id) { li.querySelector(selector)?.focus({ preventScroll: true }); return; }
+    }
+  }
+
+  function renderList() {
+    const canReorder = sortMode === 'manual';
+    listEl.classList.toggle('is-manual', canReorder);
+    listEl.replaceChildren();
+    tileStates.clear();
+    for (const c of orderedCombos()) {
+      const steps = Array.isArray(c.steps) ? c.steps : [];
+      const first = steps[0];
+      const route = first ? stepLabel(first) : 'No steps yet';
+      const selected = c.id === selectedId;
+      const isPinned = pinned.has(c.id);
+      const state = h('span', { class: 'tile-state' });
+      tileStates.set(c.id, state);
+      paintTileState(state, c);
+
+      const pinBtn = h('button', {
+        class: 'pin-btn' + (isPinned ? ' pinned' : ''),
+        type: 'button',
+        'aria-pressed': isPinned ? 'true' : 'false',
+        'aria-label': (isPinned ? 'Unpin ' : 'Pin ') + (c.name || c.id),
+        title: isPinned ? 'Unpin' : 'Pin',
+      }, icon('pin'));
+      pinBtn.addEventListener('click', (event) => {
+        event.stopPropagation();
+        togglePin(c.id);
+      });
+
+      const grip = h('span', {
+        class: 'combo-grip' + (canReorder ? '' : ' is-disabled'),
+        title: canReorder ? 'Drag to reorder (Alt+↑/↓)' : 'Switch to Manual to reorder',
+        'aria-hidden': 'true',
+      }, icon('grip'));
+
+      const anchor = h('a', {
+        class: 'tile-main',
+        href: comboHref(c.id),
+        'aria-current': selected ? 'page' : null,
+        'aria-label': `${c.name || c.id}, ${steps.length} step${steps.length === 1 ? '' : 's'}, ${c.enabled === false ? 'disabled' : 'enabled'}`,
+      },
+        h('div', { class: 'tile-top' },
+          h('span', { class: 'tile-name' }, c.name || c.id),
+          c.enabled === false ? chip('off') : null),
+        h('div', { class: 'tile-route mono', title: route }, route),
+        h('div', { class: 'tile-meta' },
+          h('span', { class: 'tile-count' }, `${steps.length} step${steps.length === 1 ? '' : 's'}`),
+          state));
+
+      const li = h('li', {
+        class: 'combo-tile' + (selected ? ' is-selected' : '') + (isPinned ? ' is-pinned' : ''),
+        'data-combo-id': c.id,
+        draggable: canReorder ? 'true' : 'false',
+      }, grip, anchor, pinBtn);
+
+      li.addEventListener('click', (event) => {
+        if (dragSuppressed) {
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
+        if (event.target.closest('button, a')) return;
+        ctx.navigate(comboHref(c.id));
+      });
+      li.addEventListener('keydown', (event) => {
+        if (!canReorder) return;
+        if (!event.altKey || (event.key !== 'ArrowUp' && event.key !== 'ArrowDown')) return;
+        const list = orderedCombos();
+        const index = list.findIndex((combo) => combo.id === c.id);
+        const target = list[index + (event.key === 'ArrowUp' ? -1 : 1)];
+        if (!target) return;
+        event.preventDefault();
+        reorderCombo(c.id, target.id, event.key === 'ArrowUp' ? 'before' : 'after');
+        focusTile(c.id);
+      });
+
+      li.addEventListener('dragstart', (event) => {
+        if (!canReorder) { event.preventDefault(); return; }
+        if (event.target.closest('button, a')) { event.preventDefault(); return; }
+        draggedId = c.id;
+        dragSuppressed = true;
+        if (event.dataTransfer) {
+          event.dataTransfer.effectAllowed = 'move';
+          try { event.dataTransfer.setData('text/plain', c.id); } catch { /* External drags only. */ }
+        }
+        document.body?.classList.add('combo-dragging');
+        li.classList.add('dragging');
+      });
+      li.addEventListener('dragend', endDrag);
+      li.addEventListener('dragover', (event) => {
+        if (!canReorder || !draggedId || draggedId === c.id) return;
+        if (pinned.has(draggedId) !== isPinned) return;
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+        const rect = li.getBoundingClientRect();
+        const after = event.clientY > rect.top + rect.height / 2;
+        for (const row of listEl.children) row.classList.remove('drag-over', 'drag-after');
+        li.classList.add('drag-over');
+        li.classList.toggle('drag-after', after);
+      });
+      li.addEventListener('dragleave', () => li.classList.remove('drag-over', 'drag-after'));
+      li.addEventListener('drop', (event) => {
+        event.preventDefault();
+        const source = draggedId;
+        const position = li.classList.contains('drag-after') ? 'after' : 'before';
+        endDrag();
+        if (source) reorderCombo(source, c.id, position);
+      });
+
+      listEl.append(li);
+    }
+  }
+
+  function endDrag() {
+    draggedId = null;
+    document.body?.classList.remove('combo-dragging');
+    for (const row of listEl.children) row.classList.remove('dragging', 'drag-over', 'drag-after');
+    setTimeout(() => { dragSuppressed = false; }, 0);
+  }
+
+  // Reorder the saved array itself, not the visible order. Pins sit above the array for display,
+  // so freezing the screen into the array here would move a pinned combo to the top permanently.
+  function reorderCombo(sourceId, targetId, position) {
+    if (sourceId === targetId) return false;
+    if (sortMode !== 'manual') return false;
+    if (pinned.has(sourceId) !== pinned.has(targetId)) return false;
+    const known = combos.map((combo) => combo.id);
+    const order = manualOrder.filter((id) => known.includes(id));
+    for (const id of known) if (!order.includes(id)) order.push(id);
+    const from = order.indexOf(sourceId);
+    if (from < 0) return false;
+    order.splice(from, 1);
+    let to = order.indexOf(targetId);
+    if (to < 0) return false;
+    if (position === 'after') to += 1;
+    order.splice(to, 0, sourceId);
+    manualOrder = order;
+    if (!storeIdList(COMBO_ORDER_KEY, manualOrder)) {
+      ctx.toast.warning('This browser could not save the combo order.');
+    }
+    renderList();
+    return true;
+  }
+
+  // Sorting is a view over the saved manual array. It must never rewrite that array: switching to
+  // Name and back has to return the operator to exactly the order they left, not a sorted snapshot.
+  function switchSort(mode) {
+    if (!COMBO_SORTS.has(mode) || mode === sortMode) return;
+    sortMode = mode;
+    try { localStorage.setItem(COMBO_SORT_KEY, sortMode); } catch { /* The mode still applies this visit. */ }
+    renderList();
+  }
+
+  function togglePin(id) {
+    if (pinned.has(id)) pinned.delete(id);
+    else pinned.add(id);
+    if (!storeIdList(COMBO_PINS_KEY, [...pinned])) {
+      ctx.toast.warning('This browser could not save pinned combos.');
+    }
+    renderList();
+    focusTile(id, '.pin-btn');
+  }
+
+  function renderEmptyDetail() {
+    right.classList.add('is-empty');
+    const recent = recentCombos();
+    const newButton = h('button', { class: 'btn btn-primary', type: 'button' }, 'New combo');
+    newButton.addEventListener('click', () => { void startNewEditor(); });
+    if (!combos.length) {
+      right.replaceChildren(h('div', { class: 'combo-empty' },
+        h('p', { class: 'combo-empty-kicker' }, 'Combos'),
+        h('h2', {}, 'No combos yet'),
+        h('p', {}, 'A combo is a named model. Clients call it like any model, and it resolves to an ordered list of steps.'),
+        newButton));
+      return;
+    }
+    right.replaceChildren(h('div', { class: 'combo-empty' },
+      h('p', { class: 'combo-empty-kicker' }, 'Combo detail'),
+      h('h2', {}, 'Select a combo'),
+      h('p', {}, 'Open a route to inspect its steps, live health, and order.'),
+      recent.length
+        ? h('div', { class: 'combo-recent' },
+          h('h3', { class: 'section-label' }, 'Recently used'),
+          h('ul', {}, ...recent.map((combo) => h('li', {},
+            h('a', { href: comboHref(combo.id) },
+              h('span', { class: 'combo-recent-name' }, combo.name || combo.id),
+              h('span', { class: 'combo-recent-route mono' }, combo.steps?.[0] ? stepLabel(combo.steps[0]) : 'no steps'))))))
+        : h('p', { class: 'combo-empty-note' }, 'No recent activity yet.'),
+      newButton));
+  }
+
+  function recentCombos() {
+    const seen = new Set();
+    const result = [];
+    const entries = [...activityEntries].sort((a, b) => (Number(b?.started_at) || 0) - (Number(a?.started_at) || 0));
+    for (const entry of entries) {
+      if (!entry || typeof entry.combo !== 'string') continue;
+      const combo = combos.find((c) => c.name === entry.combo || c.id === entry.combo);
+      if (!combo || seen.has(combo.id)) continue;
+      seen.add(combo.id);
+      result.push(combo);
+      if (result.length === 3) break;
+    }
+    return result;
   }
 
   // ------------------------------------------------------------------ detail drawer and summary
@@ -150,7 +515,7 @@ export async function renderCombos(mount, ctx, selectedId) {
         message,
         confirmLabel: 'Discard changes',
         cancelLabel: 'Keep editing',
-        danger: false,
+        danger: true,
       });
     } finally {
       closingEditor = false;
@@ -184,15 +549,19 @@ export async function renderCombos(mount, ctx, selectedId) {
     return { drawer, head, body };
   }
 
-  async function openEditorDrawer(saved) {
+  async function openEditorDrawer(saved, options = {}) {
     if (!(await confirmDiscardEditor(
       'This combo has unsaved changes. Opening another combo will discard them.'))) return;
-    const { drawer, head, body } = drawerShell(saved ? `Edit combo ${saved.name || saved.id}` : 'New combo');
+    const copy = options.copy === true && saved;
+    const title = copy
+      ? `Duplicate combo ${saved.name || saved.id}`
+      : saved ? `Edit combo ${saved.name || saved.id}` : 'New combo';
+    const { drawer, head, body } = drawerShell(title);
     head.append(h('button', {
       class: 'icon-btn', type: 'button', 'aria-label': 'Close combo editor',
       onclick: () => { void requestCloseDrawer(); },
     }, icon('x')));
-    renderEditor(saved, body);
+    renderEditor(saved, body, options);
     // A new editor focuses its name field. An existing one has no natural first input, so put
     // focus on the drawer itself rather than leaving it on the summary button behind it — Escape
     // must close this editor, and a focused element outside the drawer never reaches its handler.
@@ -202,40 +571,123 @@ export async function renderCombos(mount, ctx, selectedId) {
     }
   }
 
+  // A copy is a new callable name. Suffix rather than overwrite; the editor still lets the
+  // operator rename it before Create, so this only has to be unique and recognisable.
+  function duplicateComboName(base) {
+    const root = `${base || 'combo'}-copy`;
+    let name = root;
+    let suffix = 2;
+    while (combos.some((combo) => combo.name === name)) name = `${root}-${suffix++}`;
+    return name;
+  }
+
   function renderSummary(target, combo) {
-    const healthSection = h('section', {});
+    target.classList.remove('is-empty');
+    const steps = Array.isArray(combo.steps) ? combo.steps : [];
+    const firstEnabled = steps.findIndex((step) => step.enabled !== false);
+    const statusSlots = new Map();
     const editBtn = h('button', { class: 'btn btn-primary', type: 'button' }, 'Edit combo');
     editBtn.addEventListener('click', () => { void openEditorDrawer(combo); });
+    const duplicateBtn = h('button', { class: 'btn', type: 'button' }, 'Duplicate');
+    duplicateBtn.addEventListener('click', () => { void openEditorDrawer(combo, { copy: true }); });
+
+    const stepItems = steps.map((step, i) => {
+      const statusSlot = h('span', { class: 'combo-step-status' });
+      statusSlots.set(i, statusSlot);
+      const off = step.enabled === false;
+      let role;
+      let condition;
+      if (off) {
+        role = 'disabled';
+        condition = 'skipped when this combo compiles';
+      } else if (i === firstEnabled) {
+        role = combo.strategy === 'reset-aware-priority' ? 'primary · reset-aware' : 'primary';
+        condition = 'first enabled step';
+      } else if (i < firstEnabled || firstEnabled < 0) {
+        role = 'fallback';
+        condition = 'used when earlier steps are unavailable';
+      } else {
+        role = combo.strategy === 'reset-aware-priority' ? 'fallback · reset-aware' : 'fallback';
+        condition = combo.strategy === 'reset-aware-priority'
+          ? 'skips while its accounts cool down'
+          : 'tried when earlier steps fail';
+      }
+      const extras = [];
+      if (step.combo) extras.push(`expands ${step.combo}`);
+      if (step.level) extras.push(`runs at ${step.level}`);
+      if (step.weight) extras.push(`weight ${step.weight}`);
+      if (combo.hedge?.enabled && (combo.hedge.participants ?? []).includes(i)) extras.push('hedge participant');
+      return h('li', { class: 'combo-step' + (off ? ' is-off' : '') },
+        h('span', { class: 'combo-step-num mono', 'aria-hidden': 'true' }, String(i + 1)),
+        h('div', { class: 'combo-step-body' },
+          h('div', { class: 'combo-step-route' },
+            h('span', { class: 'combo-step-ref mono' }, stepLabel(step)),
+            !step.combo && step.level
+              ? chip(`at ${step.level}`, 'chip-neutral', 'reasoning level this step runs at')
+              : null,
+            step.combo ? chip('nested combo', 'chip-neutral', `this step expands the steps of ${step.combo}`) : null,
+            statusSlot),
+          h('div', { class: 'combo-step-sub' },
+            h('span', { class: 'combo-role' }, role),
+            h('span', { class: 'combo-condition' }, extras.length ? `${condition} · ${extras.join(' · ')}` : condition))));
+    });
+
+    const header = h('header', { class: 'combo-detail-head' },
+      h('div', { class: 'combo-detail-identity' },
+        h('p', { class: 'combo-kicker' }, strategyKicker(combo)),
+        // The UUID is an implementation detail; the name is what clients call and what an
+        // operator recognises. It stays in the URL, not in the reading order of the page.
+        h('h2', { class: 'combo-detail-name' }, combo.label || combo.name || combo.id)),
+      h('div', { class: 'combo-detail-side' },
+        h('div', { class: 'combo-badges' },
+          chip(`${steps.length} step${steps.length === 1 ? '' : 's'}`),
+          combo.enabled === false ? chip('disabled') : chip('enabled', 'chip-green'),
+          combo.hedge?.enabled ? chip('hedged', 'chip-pink', 'hedged race enabled') : null),
+        h('div', { class: 'combo-detail-actions' }, duplicateBtn, editBtn)));
+
+    const healthSection = h('section', { class: 'combo-health' });
     target.replaceChildren(
-      h('h2', {}, combo.label || combo.name || combo.id),
-      h('p', { class: 'hint mono' }, `id: ${combo.id}`),
-      h('p', { class: 'hint' }, combo.name || combo.id),
-      h('div', { class: 'cmeta' },
-        chip(`strategy: ${combo.strategy ?? 'priority'}`),
-        combo.hedge?.enabled ? chip('hedged', 'chip-pink', 'hedged race enabled') : null,
-        combo.enabled === false ? chip('off') : chip('enabled', 'chip-green')),
-      h('section', {},
-        h('h3', {}, 'Steps — priority order'),
-        h('ol', { class: 'steps' }, ...(combo.steps ?? []).map((step, i) => {
-          // A combo target has no model of its own to pin a level on: the nested combo supplies
-          // its steps' levels. Showing a ladder here would offer a control with no routing effect.
-          const comboStep = Boolean(step.combo);
-          const model = comboStep ? null : stepModel(step, providers);
-          const levelsForStep = comboStep ? [] : modelLevels(model, stepProvider(step, providers));
-          const defaultLevel = model?.default_reasoning_level;
-          const offersLevel = defaultLevel && levelsForStep.includes(defaultLevel);
-          return h('li', { class: 'step-row' },
-            h('span', { class: 'step-pos' }, String(i + 1)),
-            h('span', { class: 'step-ref mono' }, stepLabel(step)),
-            !comboStep && step.level ? chip(`at ${step.level}`, 'chip-neutral', 'reasoning level this step runs at') : null,
-            ...levelsForStep.map((level) => chip(String(level), 'chip-neutral', 'Reasoning level offered by this model')),
-            defaultLevel && !offersLevel ? chip(`default ${defaultLevel}`, 'chip-pink', 'Model-specific default reasoning level') : null,
-            step.enabled === false ? chip('off') : null);
-        }))),
-      healthSection,
-      h('div', { class: 'dialog-actions' }, editBtn),
-    );
-    renderHealth(healthSection, combo);
+      header,
+      h('p', { class: 'combo-purpose' }, comboPurpose(combo)),
+      h('section', { class: 'combo-steps-section' },
+        h('h3', { class: 'section-label' }, 'Steps · priority order'),
+        steps.length
+          ? h('ol', { class: 'combo-steps' }, ...stepItems)
+          : h('p', { class: 'hint' }, 'This combo has no steps yet, so it cannot route a request.')),
+      healthSection);
+    renderHealth(healthSection, combo, statusSlots);
+  }
+
+  function strategyKicker(combo) {
+    const strategy = combo.strategy ?? 'priority';
+    if (strategy === 'reset-aware-priority') return 'Combo · reset-aware priority';
+    if (strategy === 'round-robin') return 'Combo · round-robin';
+    return 'Combo · priority route';
+  }
+
+  // One sentence that says what will actually happen to a request, not a repetition of the chips.
+  // The detailed rules live in the steps and the docs; this is the answer to "what is this thing?"
+  function comboPurpose(combo) {
+    const steps = Array.isArray(combo.steps) ? combo.steps : [];
+    const enabled = steps.filter((step) => step.enabled !== false);
+    const first = enabled[0] ?? steps[0];
+    const count = enabled.length;
+    if (!steps.length) return 'No steps yet. Add a model step or a nested combo before clients can call this name.';
+    if (combo.enabled === false) {
+      return `Disabled. Clients calling “${combo.name || combo.id}” cannot route through it until the combo is enabled.`;
+    }
+    if (combo.hedge?.enabled) {
+      const participants = Array.isArray(combo.hedge.participants) ? combo.hedge.participants.length : count;
+      const windowMs = Number(combo.hedge.window_ms) || 0;
+      return `Hedged race across ${participants || count} step${(participants || count) === 1 ? '' : 's'} with a ${windowMs} ms window. The highest-priority participant that answers inside the window wins.`;
+    }
+    if ((combo.strategy ?? 'priority') === 'round-robin') {
+      return `Round-robin route across ${count} enabled step${count === 1 ? '' : 's'}. Each call starts at the next step and falls forward through the order from there.`;
+    }
+    if (combo.strategy === 'reset-aware-priority') {
+      return `Reset-aware priority across ${count} enabled step${count === 1 ? '' : 's'}, starting with ${first ? stepLabel(first) : '—'}. A step whose accounts are all cooling down drops below usable steps and returns when its quota resets.`;
+    }
+    return `Priority route across ${count} enabled step${count === 1 ? '' : 's'}, starting with ${first ? stepLabel(first) : '—'}. Each later step is a fallback when the ones above it fail.`;
   }
 
   /** One step's outcome, as the checker left it. */
@@ -254,47 +706,44 @@ export async function renderCombos(mount, ctx, selectedId) {
   // operator's click: nothing here runs on page load or on a timer. A step that routes to another
   // combo has no provider/model pair of its own, so it is listed but not probed; the nested combo
   // carries the model steps that can answer.
-  function renderHealth(section, combo) {
-    const steps = (combo.steps ?? []).map((step, index) => ({ step, index }));
-    const checkable = steps.flatMap(({ step, index }) => {
+  function renderHealth(section, combo, statusSlots) {
+    const steps = Array.isArray(combo.steps) ? combo.steps : [];
+    const checkable = steps.flatMap((step, index) => {
       const target = step.enabled === false ? null : probeTarget(step);
       return target ? [{ step, index, target }] : [];
     });
-    const run = h('button', { class: 'btn btn-small', type: 'button' }, 'Check steps');
-    const out = h('div', {});
+    const summary = h('p', { class: 'hint combo-health-summary' });
+    const run = h('button', { class: 'btn btn-sm', type: 'button' }, 'Check steps');
 
     const paint = () => {
       const results = checked.get(combo.id) ?? new Map();
       const answered = checkable.filter(({ index }) => results.get(index)?.state === 'ok');
       const failed = checkable.filter(({ index }) => results.get(index)?.state === 'failed');
-      out.replaceChildren(
-        h('ol', { class: 'steps' }, ...steps.map(({ step, index }) => {
-          const status = results.get(index);
-          return h('li', { class: 'step-row' },
-            h('span', { class: 'step-pos' }, String(index + 1)),
-            h('span', { class: 'step-ref mono' }, stepLabel(step)),
-            !step.combo && step.level ? chip(`at ${step.level}`, 'chip-neutral', 'pinned reasoning level') : null,
-            step.combo
-              ? chip('nested combo', 'chip-neutral', 'this step runs another combo\u2019s steps; open that combo to check them')
-              : statusChip(status),
-            status?.message && status.state === 'failed'
-              ? h('span', { class: 'hint' }, status.message)
-              : null);
-        })),
-        checkable.length && results.size
-          ? h('p', { class: 'hint' },
-            answered.length
-              ? `${answered.length} of ${checkable.length} answering${failed.length ? `, ${failed.length} failing` : ''}.`
-              : `Nothing answered${failed.length ? `: ${failed.map(({ index }) => `step ${index + 1}`).join(', ')}` : ''}.`)
-          : h('p', { class: 'hint' },
-            checkable.length
-              ? 'Each check sends one trivial completion per enabled model step, in priority order; a step that routes to another combo is not probed here.'
-              : 'No enabled model steps to check; a step that routes to another combo is checked in that combo.'));
+      for (const [index, slot] of statusSlots) {
+        const step = steps[index];
+        if (!step || step.combo || step.enabled === false) {
+          slot.replaceChildren();
+          continue;
+        }
+        const status = results.get(index);
+        slot.replaceChildren(...(status ? [statusChip(status)] : []));
+        slot.title = status?.message ?? '';
+      }
+      if (!checkable.length) {
+        summary.textContent = 'No enabled model steps to check; a step that routes to another combo is checked in that combo.';
+      } else if (!results.size) {
+        summary.textContent = `Sends one trivial completion per enabled model step, in order. Nothing runs until you ask.`;
+      } else if (answered.length) {
+        summary.textContent = `${answered.length} of ${checkable.length} answering${failed.length ? `, ${failed.length} failing` : ''}.`;
+      } else {
+        summary.textContent = `Nothing answered${failed.length ? `: ${failed.map(({ index }) => `step ${index + 1}`).join(', ')}` : ''}.`;
+      }
     };
 
     run.addEventListener('click', async () => {
       if (run.disabled) return;
       run.disabled = true;
+      run.textContent = 'Checking…';
       const results = new Map();
       checked.set(combo.id, results);
       try {
@@ -327,21 +776,33 @@ export async function renderCombos(mount, ctx, selectedId) {
         }
       } finally {
         run.disabled = false;
+        run.textContent = 'Check steps';
       }
     });
 
     paint();
     section.replaceChildren(
-      h('div', { class: 'cmeta' }, h('h3', {}, 'Live health'), run),
-      out);
+      h('div', { class: 'combo-health-head' },
+        h('div', {},
+          h('h3', { class: 'section-label' }, 'Live health'),
+          summary),
+        run));
   }
 
   // ------------------------------------------------------------------ editor
 
-  function renderEditor(saved, target = right) {
-    const isNew = saved === null;
+  function renderEditor(saved, target = right, options = {}) {
+    const copy = options.copy === true && saved;
+    const isNew = saved === null || Boolean(copy);
     // Draft is a deep copy: edits are local until Save; Revert re-reads from `combos`.
-    const draft = isNew ? newDraft() : JSON.parse(JSON.stringify(saved));
+    const draft = isNew
+      ? (copy ? JSON.parse(JSON.stringify(saved)) : newDraft())
+      : JSON.parse(JSON.stringify(saved));
+    if (copy) {
+      // The id belongs to the source record; keeping it would turn Create into an overwrite.
+      delete draft.id;
+      draft.name = duplicateComboName(saved.name || saved.id);
+    }
     // Normalise the hedge object defensively: a combo saved without one must not crash the
     // editor, and the defaults here mirror the backend's (count 3, window 800 ms, TTFB metric).
     draft.hedge = {
@@ -368,7 +829,7 @@ export async function renderCombos(mount, ctx, selectedId) {
         message: 'This combo has unsaved changes. Leaving will discard them.',
         confirmLabel: 'Leave and discard',
         cancelLabel: 'Stay on this page',
-        danger: false,
+        danger: true,
       });
       ctx.leaveGuard = guard;
     }
@@ -383,7 +844,7 @@ export async function renderCombos(mount, ctx, selectedId) {
     activeEditor = { isDirty: () => dirty, discard: clearDirty };
 
     const title = h('h2', { style: 'text-transform:none;letter-spacing:0;font-size:14px;' },
-      isNew ? 'New combo' : `Editing ${saved.name || saved.id}`);
+      copy ? 'Copy details' : isNew ? 'New combo' : `Editing ${saved.name || saved.id}`);
     const nameIn = h('input', { class: 'input mono', type: 'text', 'data-field': 'name', value: draft.name ?? '', placeholder: 'callable model name, e.g. Brains' });
     const labelIn = h('input', { class: 'input', type: 'text', 'data-field': 'label', value: draft.label ?? '' });
 
@@ -715,7 +1176,8 @@ export async function renderCombos(mount, ctx, selectedId) {
           field('Retry delay (ms)', retryDelay)),
         affinityToggle.row,
         comboEnabledToggle.row),
-      h('div', { class: 'dialog-actions' }, revertBtn, delBtn, saveBtn),
+      // A draft has nothing to revert or delete yet; disabled controls read as a trap.
+      h('div', { class: 'dialog-actions' }, isNew ? null : revertBtn, isNew ? null : delBtn, saveBtn),
     );
 
     nameIn.addEventListener('input', () => { draft.name = nameIn.value; markDirty(); });

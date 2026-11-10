@@ -154,7 +154,25 @@ const ctx = {
   toast,
   confirm: (opts) => confirmDialog(dialogRoot, opts),
   secretKey: (opts) => secretKeyDialog(dialogRoot, opts),
-  navigate: (hash) => { location.hash = hash; },
+  // Programmatic navigation must ask the same unsaved-work guard the hash router asks, but before
+  // the URL changes. Letting hashchange prompt after the fact meant a refused navigation had
+  // already pushed a history entry, so Stay had to rewrite the URL and Back behaved oddly.
+  navigate: async (hash) => {
+    if (!hash || hash === location.hash) return;
+    const guard = ctx.leaveGuard;
+    if (!guard) { location.hash = hash; return; }
+    if (navigationInFlight) return;
+    navigationInFlight = true;
+    try {
+      let leave = false;
+      try { leave = Boolean(await guard()); } catch { leave = false; }
+      if (!leave) return;
+      if (ctx.leaveGuard === guard) ctx.leaveGuard = null;
+      location.hash = hash;
+    } finally {
+      navigationInFlight = false;
+    }
+  },
   loadProviders,
   refreshPorts,
   refreshHealth,
@@ -253,9 +271,16 @@ function renderRoute() {
   healthSubs.clear(); // previous view's live subscriptions die here
   clear(drawerRoot);  // drawers are per-view UI state
 
-  const hash = currentHash();
+  let hash = currentHash();
+  let route = ROUTES.find((r) => r.re.test(hash));
+  if (!route) {
+    // An unknown hash (stale bookmark, typo) renders the overview. Rewrite the URL to match what
+    // is on screen so the sidebar highlights Overview and a reload does not fall back silently again.
+    hash = '#/overview';
+    history.replaceState(null, '', hash);
+    route = ROUTES[0];
+  }
   renderedHash = hash;
-  const route = ROUTES.find((r) => r.re.test(hash)) ?? ROUTES[0];
   const m = hash.match(route.re);
   let param = null;
   if (m && m[1]) {
@@ -265,7 +290,6 @@ function renderRoute() {
   }
 
   document.title = `Manarouter — ${route.title}`;
-  document.getElementById('topbar-title').textContent = route.title;
   for (const a of document.querySelectorAll('#nav-list a')) {
     const navRoute = ROUTES.find((r) => r.id === a.dataset.route);
     if (navRoute) {
@@ -279,9 +303,14 @@ function renderRoute() {
   // Each route owns a fresh wrapper, not <main> itself. A view that paints after an await (quota
   // refreshes its cards, for example) then replaces children on its own detached wrapper instead
   // of erasing the page the operator has since navigated to. `seq` below still guards errors.
+  // The page header is a sibling of the view, not a child: every view starts by clearing its own
+  // wrapper, so a header inside it would be erased the moment the view painted.
+  const head = h('header', { class: 'page-head' },
+    h('h1', { class: 'page-title' }, route.title),
+    route.navTitle ? h('p', { class: 'page-sub' }, route.navTitle) : null);
   const view = h('div', { class: 'route-view' },
     h('div', { class: 'toolbar' }, spinner(), h('span', { class: 'count' }, 'Loading…')));
-  mainEl.replaceChildren(view);
+  mainEl.replaceChildren(head, view);
   route.render(view, ctx, param).catch((err) => {
     if (seq !== routeSeq) return; // a newer route owns <main>; its error screen is not ours to show
     clear(view);
@@ -315,6 +344,15 @@ async function handleHashChange() {
 
       const guard = ctx.leaveGuard;
       if (guard) {
+        // A dialog is already asking something (the combo editor's own close confirmation, for
+        // example). Opening the page guard on top would stack two modals and leave a ghost when the
+        // first is dismissed. Treat this transition as refused and put the URL back; the operator
+        // finishes the question in front of them first.
+        if (dialogRoot.childElementCount > 0) {
+          if (renderedHash) history.replaceState(null, '', renderedHash);
+          navigationRequestedAgain = false;
+          continue;
+        }
         let leave = false;
         try { leave = Boolean(await guard()); } catch { leave = false; }
         if (!leave) {
@@ -354,16 +392,17 @@ function updateHealthPill() {
     return;
   }
   dot.className = 'dot dot-green';
-  text.textContent = `v${state.health.version ?? '?'} · up ${formatUptime(state.health.uptime_secs)}`;
+  // The version lives once, on the Overview; the top bar only answers "is the control plane up,
+  // and for how long". Repeating the version in three places was noise, not reassurance.
+  text.textContent = `healthy · up ${formatUptime(state.health.uptime_secs)}`;
   pill.setAttribute('aria-label', `Control plane healthy, version ${state.health.version ?? 'unknown'} — open overview`);
 }
 
 function updateSidebarMeta() {
   const el = document.getElementById('sidebar-meta');
-  const snap = state.health?.snapshot;
   el.replaceChildren(
     state.health
-      ? `v${state.health.version ?? '?'} · ${truncateMiddle(snap?.digest ?? '', 6, 4) || 'no snapshot'}`
+      ? `v${state.health.version ?? '?'}`
       : 'disconnected',
   );
 }
@@ -421,6 +460,18 @@ onUnauthorized(() => {
 
 document.getElementById('topbar-health').addEventListener('click', () => {
   location.hash = '#/overview';
+});
+
+// Sidebar and in-page links are plain anchors: the browser would move the URL before any guard
+// could run. Intercept them only when a view has unsaved work, and route them through navigate()
+// so the prompt happens first and a refusal leaves no stray history entry.
+document.addEventListener('click', (e) => {
+  if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  if (!ctx.leaveGuard || !shell.contains(e.target)) return;
+  const a = e.target.closest?.('a[href^="#/"]');
+  if (!a || a.target === '_blank' || a.hasAttribute('download')) return;
+  e.preventDefault();
+  void ctx.navigate(a.getAttribute('href'));
 });
 
 window.addEventListener('hashchange', () => { void handleHashChange(); });

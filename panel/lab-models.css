@@ -1,0 +1,575 @@
+/* lab-models.css — view-level overrides for the 20902 lab. Tokens and shared components live in lab.css. */
+
+/* The shell's page head repeats the route name and says nothing about the catalogue. The view
+ * supplies its own title, with the count that is the actual reason this page exists. */
+#main:has(.models-head) > .page-head { display: none; }
+
+/* ---------- heading ---------- */
+
+.models-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px 28px;
+  flex-wrap: wrap;
+  margin: 0 0 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.models-head-copy { min-width: 0; }
+
+.models-headline {
+  margin: 0;
+  font-size: 21px;
+  font-weight: 620;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  color: var(--tx1);
+}
+.models-headline strong {
+  color: var(--tx1);
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.models-coverage {
+  margin: 5px 0 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--tx2);
+  font-variant-numeric: tabular-nums;
+}
+
+.models-bulk {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+/* Destructive, but not the page's primary act: keep the red for the hover confirmation. */
+.models-bulk .btn-danger {
+  border-color: var(--line2);
+  color: var(--tx3);
+}
+.models-bulk .btn-danger:hover:not(:disabled) {
+  border-color: var(--red);
+  color: var(--red);
+  background: var(--red-dim);
+}
+
+/* ---------- controls ---------- */
+
+.models-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px 14px;
+  flex-wrap: wrap;
+  margin: 0 0 12px;
+}
+
+.models-search {
+  position: relative;
+  flex: 1 1 360px;
+  max-width: 640px;
+  min-width: 220px;
+}
+/* A CSS magnifier avoids adding a search glyph to the shared icon set for one field. */
+.models-search::before {
+  content: "";
+  position: absolute;
+  left: 12px;
+  top: 10px;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--tx3);
+  border-radius: 50%;
+  pointer-events: none;
+}
+.models-search::after {
+  content: "";
+  position: absolute;
+  left: 21px;
+  top: 20px;
+  width: 6px;
+  height: 1.5px;
+  background: var(--tx3);
+  transform: rotate(45deg);
+  transform-origin: left center;
+  pointer-events: none;
+}
+.models-search:focus-within::before { border-color: var(--pink); }
+.models-search:focus-within::after { background: var(--pink); }
+
+.models-controls .input {
+  width: auto;
+  height: 34px;
+  padding: 5px 9px;
+  font-size: 12.5px;
+}
+.models-search .input {
+  width: 100%;
+  padding-left: 33px;
+  background: var(--bg1);
+}
+.models-search .input:focus {
+  background: var(--bg2);
+  border-color: var(--pink-deep);
+}
+
+.models-filters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-left: 10px;
+  border-left: 1px solid var(--line);
+}
+.models-provider-filter { width: 190px; max-width: 220px; }
+.models-source-filter { width: 126px; }
+
+.models-hidden-filter {
+  margin: 0;
+  gap: 6px;
+  flex-wrap: nowrap;
+  white-space: nowrap;
+}
+.models-hidden-filter label {
+  font-size: 12px;
+  color: var(--tx2);
+  cursor: pointer;
+}
+.models-hidden-filter input { width: 13px; height: 13px; }
+
+.models-count {
+  margin-left: auto;
+  color: var(--tx2);
+  font-size: 12px;
+  line-height: 30px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- table ---------- */
+
+.models-table-scroll {
+  max-height: clamp(320px, calc(100vh - 335px), 920px);
+}
+
+.models-table {
+  table-layout: fixed;
+  min-width: 1120px;
+}
+
+/* Fixed layout makes the id column own its remaining width and lets the rest hold their shape.
+ * Widths are deliberately generous around the id: a truncated id is recoverable from its title,
+ * a wrapped one makes every row a different height and destroys scanning. */
+.models-col-model { width: auto; }
+.models-col-label { width: 220px; }
+.models-col-provider { width: 140px; }
+.models-col-source { width: 72px; }
+.models-col-ctx { width: 72px; }
+.models-col-price { width: 116px; }
+.models-col-reasoning { width: 182px; }
+.models-col-actions { width: 190px; }
+
+.models-table thead th {
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
+/* Column coverage lives in each header's title. A second line under Ctx/Reasoning read as part of the
+ * column name and made an already dense header look crowded. */
+.models-table tbody td {
+  padding-top: 7px;
+  padding-bottom: 7px;
+}
+
+.models-row { cursor: pointer; }
+.models-row:focus { outline: none; }
+.models-row:focus-visible {
+  outline: 2px solid var(--pink-deep);
+  outline-offset: -2px;
+}
+.models-row:focus-visible td { background: var(--bg3); }
+
+.models-model-cell { overflow: hidden; }
+.models-model-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.models-id {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--tx1);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.models-chevron {
+  flex: none;
+  color: var(--tx3);
+  font-size: 15px;
+  line-height: 1;
+  opacity: 0;
+  transform: translateX(-2px);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.models-row:hover .models-chevron,
+.models-row:focus-visible .models-chevron,
+.models-row.row-selected .models-chevron {
+  opacity: 1;
+  transform: translateX(0);
+}
+.models-row.row-selected .models-chevron { color: var(--pink); }
+
+.models-label-cell {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--tx2);
+  font-size: 12.5px;
+}
+.models-derived-name { color: var(--tx3); }
+
+.models-provider-cell { overflow: hidden; }
+.models-provider {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+  padding: 1px 6px;
+  border-color: var(--line);
+  background: var(--bg2);
+  color: var(--tx2);
+  font-size: 10.5px;
+  letter-spacing: 0.01em;
+}
+
+.models-source {
+  color: var(--tx3);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.models-ctx,
+.models-price {
+  color: var(--tx2);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.models-ctx { color: var(--tx2); }
+
+.models-reasoning-cell { overflow: hidden; }
+.models-levels,
+.models-modalities {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.models-levels {
+  color: var(--tx2);
+  font-size: 10.5px;
+  letter-spacing: 0.01em;
+}
+.models-modalities {
+  margin-top: 1px;
+  color: var(--tx3);
+  font-size: 10px;
+}
+
+.models-row.is-hidden .models-id { color: var(--tx2); }
+.models-row.is-hidden .models-label-cell { color: var(--tx3); }
+
+/* The cell buttons end 10px from the edge; the heading should sit over them, not the padding. */
+.models-table thead th.models-actions-head { padding-right: 10px; text-align: right; }
+.models-actions-cell { padding-right: 10px; }
+.models-actions-inner {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  white-space: nowrap;
+}
+/* Row actions stay legible but stop competing with the data until the row is touched. */
+.models-actions-inner .btn {
+  height: 24px;
+  padding: 0 7px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--tx3);
+  font-size: 11px;
+}
+.models-actions-inner .btn:hover:not(:disabled),
+.models-actions-inner .btn:focus-visible {
+  border-color: var(--line2);
+  background: var(--bg3);
+  color: var(--tx1);
+}
+.models-actions-inner .btn-primary {
+  background: transparent;
+  color: var(--tx2);
+  box-shadow: none;
+}
+.models-actions-inner .btn-primary:hover:not(:disabled),
+.models-actions-inner .btn-primary:focus-visible {
+  border-color: var(--pink-deep);
+  background: var(--pink-dim);
+  color: var(--pink);
+}
+.models-actions-inner .btn-danger:hover:not(:disabled),
+.models-actions-inner .btn-danger:focus-visible {
+  border-color: var(--red);
+  background: var(--red-dim);
+  color: var(--red);
+}
+
+.models-visibility {
+  margin: 0;
+  gap: 4px;
+  flex-wrap: nowrap;
+}
+.models-visibility label {
+  color: var(--tx3);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.models-visibility input {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+}
+.models-row:hover .models-visibility label,
+.models-row:focus-within .models-visibility label { color: var(--tx2); }
+
+/* Loading, failures and empty catalogues share one calm panel where the table would be. */
+.models-loading {
+  padding: 48px 24px;
+  color: var(--tx3);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+.models-table-scroll:has(> .empty-state) {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: clamp(320px, 48vh, 460px);
+}
+.models-table-scroll > .empty-state {
+  margin: 0;
+  max-width: 560px;
+  padding: 22px 28px;
+  border: 0;
+  background: transparent;
+}
+.models-table-scroll > .empty-state > div {
+  color: var(--tx1);
+  font-size: 15px;
+  font-weight: 600;
+}
+.models-empty-actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 18px;
+}
+.models-table-scroll > .form-errors { margin: 18px; }
+.models-retry { margin-top: 10px; }
+
+.models-note {
+  margin: 8px 2px 0;
+  max-width: 78ch;
+  color: var(--tx2);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+/* ---------- detail drawer ---------- */
+
+.models-drawer { width: min(600px, 94vw); }
+.models-drawer:focus { outline: none; }
+.models-drawer .drawer-head {
+  align-items: flex-start;
+  padding: 12px 16px;
+  background: var(--bg2);
+}
+.models-drawer-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.models-drawer-title h2 {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--tx1);
+  font-size: 15px;
+  font-weight: 620;
+}
+.models-drawer-id {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--tx3);
+  font-size: 11px;
+}
+.models-drawer .drawer-body { padding: 2px 16px 36px; }
+.models-detail-section { margin-bottom: 22px; }
+.models-detail-section:first-child { margin-top: 12px; }
+
+.model-facts {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr);
+  gap: 9px 14px;
+  margin: 10px 0 0;
+  align-items: start;
+}
+.model-facts dt {
+  padding-top: 1px;
+  color: var(--tx2);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.model-facts dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--tx1);
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.model-fact.is-missing dd { color: var(--tx3); }
+.model-facts code {
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg2);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.models-id-value {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.models-copy-id { height: 22px; padding: 0 6px; font-size: 10.5px; }
+.models-inline {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px 8px;
+  flex-wrap: wrap;
+}
+.models-muted { color: var(--tx3); }
+
+.models-chip-row { display: flex; flex-wrap: wrap; gap: 4px; }
+.models-chip-row .chip { font-size: 10.5px; }
+
+.models-action-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 12px 0 14px;
+}
+.models-detail-hide {
+  margin: 0 0 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.models-detail-hide .check-row { margin: 0; }
+.models-detail-hide label { font-size: 12px; }
+.models-detail-actions > .hint {
+  max-width: 58ch;
+  margin-top: 10px;
+  line-height: 1.55;
+}
+
+/* The metadata editor lives inline in the drawer now, not behind a disclosure. It is a form for
+ * an occasional edit, so it stays quiet until the reader reaches it. */
+.model-metadata { margin-top: 4px; }
+.model-metadata > .hint {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg2);
+  color: var(--tx3);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+.field-label {
+  display: block;
+  margin: 14px 0 7px;
+  color: var(--tx3);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.model-meta-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+}
+.model-meta-options .check-row {
+  margin: 0;
+  gap: 5px;
+  flex-wrap: nowrap;
+}
+.model-meta-options .check-row label {
+  color: var(--tx2);
+  font-size: 11.5px;
+}
+.model-metadata .field { margin: 0 0 4px; }
+.model-metadata .field > label {
+  color: var(--tx2);
+  font-size: 11.5px;
+}
+.model-metadata .field .input { width: 100%; }
+.model-metadata > .btn { margin-top: 12px; }
+
+/* ---------- narrow ---------- */
+
+@media (max-width: 900px) {
+  .models-head { flex-direction: column; gap: 12px; }
+  .models-bulk { width: 100%; }
+  .models-search { flex-basis: 100%; max-width: none; }
+  .models-filters {
+    width: 100%;
+    padding-left: 0;
+    border-left: 0;
+  }
+  .models-provider-filter,
+  .models-source-filter {
+    flex: 1 1 140px;
+    width: auto;
+    max-width: none;
+  }
+  .models-hidden-filter { flex: 0 0 auto; }
+  .models-count { margin-left: 0; }
+}
+
+@media (max-width: 620px) {
+  .models-headline { font-size: 18px; }
+  .models-bulk .btn { flex: 1 1 auto; }
+  .model-facts { grid-template-columns: 1fr; gap: 2px; }
+  .model-facts dt { margin-top: 8px; }
+  .models-drawer { width: 100vw; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .models-chevron { transition: none; }
+}

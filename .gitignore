@@ -40,3 +40,7 @@ plan.md.bak
 
 # --- sweep output ---
 /issues.md
+
+# --- panel lab (local preview server) ---
+/panel-lab/
+/tools/panel-lab/

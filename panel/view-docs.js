@@ -87,6 +87,13 @@ export async function renderDocs(mount, ctx, selected) {
     });
     body.innerHTML = renderMarkdown(text); // safe — see the SECURITY NOTE at the top of this file
 
+    // Most documents open with their own H1, which repeats the title already stated by the card
+    // header above the body. Drop that one duplicate so the pane does not say the same thing twice;
+    // a document whose first heading is something else keeps it.
+    const docTitle = docs.find((d) => docName(d) === name)?.title ?? name;
+    const firstHeading = body.querySelector('h1');
+    if (firstHeading && firstHeading.textContent.trim() === String(docTitle).trim()) firstHeading.remove();
+
     const downloadBtn = h('button', { class: 'btn btn-ghost btn-sm', type: 'button' }, 'Download');
     downloadBtn.addEventListener('click', () => downloadRaw(text, name));
 
@@ -95,7 +102,7 @@ export async function renderDocs(mount, ctx, selected) {
     content.replaceChildren(
       h('div', { class: 'toolbar' },
         h('h2', { style: 'margin:0;font-size:13px;font-weight:600;text-transform:none;letter-spacing:0;' },
-          docs.find((d) => docName(d) === name)?.title ?? name),
+          docTitle),
         h('span', { class: 'spacer' }),
         downloadBtn),
       body,

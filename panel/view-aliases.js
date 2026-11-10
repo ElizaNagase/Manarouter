@@ -27,12 +27,14 @@ export async function renderAliases(mount, ctx) {
     h('div', { class: 'grid-fields' },
       field('From', fromIn),
       field('To', toIn)),
-    addBtn);
+    h('div', { class: 'form-actions' }, addBtn));
 
+  // The count belongs to the list, not to the page chrome: it sits with the table it counts, after
+  // the add form, so it never floats above unrelated controls.
   mount.replaceChildren(
-    h('div', { class: 'toolbar' }, h('span', { class: 'spacer' }), count),
     addForm,
     generatedToggle.row,
+    h('div', { class: 'toolbar' }, h('span', { class: 'spacer' }), count),
     tableWrap,
   );
 

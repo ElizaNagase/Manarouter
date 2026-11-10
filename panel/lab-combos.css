@@ -1,0 +1,610 @@
+/* lab-combos.css — view-level overrides for the 20902 lab. Tokens and shared components live in lab.css. */
+
+/* The list is a dense index, not a second page of cards: one hairline per row, the route always
+   fully readable, and only the controls that change the selection or the order. The detail pane
+   starts at the top instead of stretching to meet the viewport. */
+.combo-layout {
+  grid-template-columns: 356px minmax(0, 1fr);
+  align-items: start;
+}
+
+.combo-list-card {
+  padding: 0;
+  overflow: hidden;
+}
+
+.combo-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 11px 14px 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.combo-list-title {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
+
+.combo-list-title h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.combo-list-title .count {
+  color: var(--tx3);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.combo-sort-field {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+}
+
+.combo-sort-field > span {
+  color: var(--tx3);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.input.combo-sort {
+  width: auto;
+  height: 25px;
+  padding: 0 22px 0 7px;
+  border-radius: var(--radius-sm);
+  background: var(--bg2);
+  color: var(--tx2);
+  font-size: 11px;
+}
+
+.combo-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.combo-tile {
+  position: relative;
+  display: grid;
+  grid-template-columns: 11px minmax(0, 1fr) 23px;
+  align-items: start;
+  gap: 7px;
+  padding: 9px 11px 11px 9px;
+  background: var(--bg1);
+  transition: background-color 120ms ease;
+}
+
+.combo-tile + .combo-tile {
+  border-top: 1px solid var(--line);
+}
+
+.combo-tile:hover,
+.combo-tile:focus-within {
+  background: var(--bg2);
+}
+
+.combo-tile.is-selected {
+  background: var(--pink-dim);
+  box-shadow: inset 2px 0 0 var(--pink);
+}
+
+.combo-tile.is-selected:hover,
+.combo-tile.is-selected:focus-within {
+  background: var(--pink-dim);
+}
+
+.combo-tile.dragging {
+  opacity: 0.42;
+  background: var(--bg2);
+}
+
+.combo-tile.drag-over::before {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  top: -1px;
+  left: 7px;
+  right: 7px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--pink);
+}
+
+/* Dropping below the midpoint inserts after the row; the line must follow the pointer. */
+.combo-tile.drag-over.drag-after::before {
+  top: auto;
+  bottom: -1px;
+}
+
+body.combo-dragging,
+body.combo-dragging * {
+  cursor: grabbing !important;
+}
+
+.combo-grip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 11px;
+  height: 24px;
+  margin-top: 1px;
+  color: var(--tx3);
+  opacity: 0.28;
+  cursor: grab;
+}
+
+.combo-grip svg.i {
+  width: 12px;
+  height: 12px;
+}
+
+.combo-tile:hover .combo-grip,
+.combo-tile:focus-within .combo-grip,
+.combo-tile.is-selected .combo-grip {
+  opacity: 0.75;
+}
+
+/* Drag is a manual-mode operation; an autosorted view has no stable position to drop into. */
+.combo-grip.is-disabled {
+  visibility: hidden;
+}
+
+.combo-grip:active {
+  cursor: grabbing;
+}
+
+.tile-main {
+  display: block;
+  min-width: 0;
+  color: inherit;
+  text-decoration: none;
+  border-radius: 4px;
+  outline: none;
+}
+
+.tile-main:focus-visible {
+  outline: 2px solid var(--pink);
+  outline-offset: 2px;
+}
+
+.tile-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tile-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--tx1);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.tile-top .chip {
+  flex: 0 0 auto;
+  font-size: 9.5px;
+  padding: 0 5px;
+  line-height: 16px;
+}
+
+.tile-route {
+  max-width: 100%;
+  min-width: 0;
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+  color: var(--tx2);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.tile-meta {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 4px;
+  color: var(--tx2);
+  font-size: 10.5px;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+}
+
+.tile-count,
+.tile-strategy,
+.tile-hedged {
+  flex: 0 0 auto;
+}
+
+.tile-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  flex: 0 0 auto;
+  color: var(--tx2);
+  white-space: nowrap;
+}
+
+.combo-live-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--tx3);
+}
+
+.tile-state.is-live {
+  color: var(--tx2);
+}
+
+.tile-state.is-live .combo-live-dot {
+  background: var(--pink);
+}
+
+.combo-tile .pin-btn {
+  width: 23px;
+  height: 23px;
+  margin-top: -1px;
+  opacity: 0.38;
+}
+
+.combo-tile .pin-btn.pinned,
+.combo-tile:hover .pin-btn,
+.combo-tile .pin-btn:focus-visible {
+  opacity: 1;
+}
+
+.combo-tile .pin-btn svg.i {
+  width: 12px;
+  height: 12px;
+}
+
+/* Selected combo: identity, one sentence about behaviour, then the authored order. The steps are
+   read-only prose, so they get no card border; the health button writes status into the same rows
+   instead of rendering a second copy of the route. */
+.combo-detail-card {
+  padding: 0;
+  overflow: hidden;
+}
+
+.combo-detail-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 15px 20px 0;
+}
+
+.combo-detail-identity {
+  min-width: 0;
+}
+
+.combo-kicker {
+  margin: 0 0 3px;
+  color: var(--tx3);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.combo-detail-name {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+
+.combo-detail-id {
+  margin: 3px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--tx3);
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.combo-detail-side {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.combo-badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.combo-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.combo-badges .chip {
+  font-size: 10px;
+  line-height: 18px;
+}
+
+.combo-purpose {
+  margin: 0;
+  padding: 11px 20px 14px;
+  border-bottom: 1px solid var(--line);
+  color: var(--tx2);
+  font-size: 12.5px;
+  line-height: 1.55;
+  max-width: 82ch;
+}
+
+.combo-steps-section {
+  padding: 14px 20px 4px;
+}
+
+.combo-steps-section .section-label,
+.combo-health .section-label {
+  margin: 0;
+  color: var(--tx3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.075em;
+  text-transform: uppercase;
+}
+
+.combo-steps {
+  margin: 7px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.combo-step {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  padding: 10px 0 11px;
+}
+
+.combo-step + .combo-step {
+  border-top: 1px solid var(--line);
+}
+
+.combo-step-num {
+  padding-top: 1px;
+  color: var(--tx3);
+  font-size: 10.5px;
+  line-height: 1.5;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.combo-step-body {
+  min-width: 0;
+}
+
+.combo-step-route {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+}
+
+.combo-step-ref {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--tx1);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.45;
+}
+
+.combo-step-route .chip {
+  flex: 0 0 auto;
+  font-size: 9.5px;
+  line-height: 17px;
+  padding: 0 5px;
+}
+
+.combo-step-status {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  margin-left: auto;
+}
+
+.combo-step-status .chip {
+  font-size: 9.5px;
+  line-height: 17px;
+  padding: 0 5px;
+}
+
+.combo-step-sub {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 6px;
+  margin-top: 2px;
+  color: var(--tx3);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.combo-role {
+  flex: 0 0 auto;
+  color: var(--tx2);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.combo-condition {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--tx2);
+}
+
+.combo-step.is-off .combo-step-ref {
+  color: var(--tx3);
+}
+
+.combo-step.is-off .combo-role {
+  color: var(--tx3);
+}
+
+.combo-health {
+  margin-top: 4px;
+  padding: 12px 20px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.combo-health-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.combo-health-summary {
+  margin: 3px 0 0;
+  max-width: 76ch;
+  color: var(--tx2);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.combo-health .btn-sm {
+  flex: 0 0 auto;
+}
+
+/* No selection is a small choice panel, not an empty canvas. The card frame is removed so the
+   grid cell cannot paint a tall dashed pane; the compact panel supplies its own border. */
+.combo-detail-card.is-empty {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.combo-empty {
+  max-width: 430px;
+  padding: 17px 18px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--bg1);
+}
+
+.combo-empty-kicker {
+  margin: 0 0 4px;
+  color: var(--tx3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.075em;
+  text-transform: uppercase;
+}
+
+.combo-empty h2 {
+  margin: 0 0 5px;
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.combo-empty > p:not(.combo-empty-kicker) {
+  margin: 0 0 13px;
+  color: var(--tx2);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.combo-empty > .btn {
+  margin-top: 2px;
+}
+
+.combo-recent {
+  margin: 3px 0 14px;
+  padding-top: 11px;
+  border-top: 1px solid var(--line);
+}
+
+.combo-recent .section-label {
+  margin: 0 0 5px;
+  color: var(--tx3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.075em;
+  text-transform: uppercase;
+}
+
+.combo-recent ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.combo-recent a {
+  display: block;
+  margin: 0 -5px;
+  padding: 4px 5px;
+  border-radius: 5px;
+  color: inherit;
+  text-decoration: none;
+}
+
+.combo-recent a:hover,
+.combo-recent a:focus-visible {
+  background: var(--bg2);
+}
+
+.combo-recent a:focus-visible {
+  outline: 2px solid var(--pink);
+  outline-offset: 0;
+}
+
+.combo-recent-name {
+  display: block;
+  color: var(--tx1);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.combo-recent-route {
+  display: block;
+  margin-top: 1px;
+  overflow-wrap: anywhere;
+  color: var(--tx3);
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+
+.combo-empty-note {
+  margin: 0 0 12px;
+  color: var(--tx3);
+  font-size: 11px;
+}
+
+@media (max-width: 980px) {
+  .combo-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .combo-detail-card.is-empty {
+    max-width: none;
+  }
+}
