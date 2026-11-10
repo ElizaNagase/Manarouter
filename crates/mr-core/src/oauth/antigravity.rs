@@ -143,6 +143,25 @@ fn validated_project_id(project: &Value) -> Result<&str> {
         .ok_or_else(|| oauth_error("Cloud Code returned malformed project metadata"))
 }
 
+/// The project an `onboardUser` call should carry, from the operator environment.
+///
+/// `GOOGLE_CLOUD_PROJECT` is gemini-cli's documented escape hatch for an account whose
+/// `loadCodeAssist` named no project (see `docs/12-oauth-antigravity.md`). It is deliberately not
+/// applied to `free-tier`: that tier onboards into a managed project Google owns, and naming one
+/// there is what produces `Precondition Failed`. A value that is not shaped like a project id is
+/// refused here, where the message can say which variable was wrong.
+fn project_override_for(tier: &str, raw: Option<&str>) -> Result<Option<String>> {
+    let Some(raw) = raw.map(str::trim).filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    if tier == "free-tier" {
+        return Ok(None);
+    }
+    validated_project_id(&Value::String(raw.to_owned()))
+        .map(|id| Some(id.to_owned()))
+        .map_err(|_| oauth_error("GOOGLE_CLOUD_PROJECT is not a valid project id"))
+}
+
 fn store_cloudcode_context(tokens: &mut TokenSet, project_id: &str, tier: Option<&str>) {
     tokens.extra.insert(
         "cloudcode_project_id".into(),
@@ -171,6 +190,13 @@ fn store_cloudcode_context(tokens: &mut TokenSet, project_id: &str, tier: Option
 /// neither the IDE fingerprint nor the daily host while the quota reader sent both, which is why
 /// an account that already served requests could not be added back. The refusal text is still
 /// quoted verbatim when a tier genuinely is unavailable; only Google decides that part.
+///
+/// `VALIDATION_REQUIRED` is the code that must not be read as a billing verdict. It was observed
+/// on 2026-11-10 on a login that offered `standard-tier` alone and refused `free-tier` for an
+/// account Google had not verified; the text then in place told the operator to enable Cloud
+/// billing, which answers a different question and costs money. When that code is present the
+/// refusal says what Google actually asked for, and carries Google's `validationUrl` when the
+/// response supplies one.
 fn tier_refusal(load_code_assist: &Value, chosen_tier: &str) -> String {
     let allowed: Vec<&str> = load_code_assist
         .get("allowedTiers")
@@ -182,6 +208,9 @@ fn tier_refusal(load_code_assist: &Value, chosen_tier: &str) -> String {
                 .collect()
         })
         .unwrap_or_default();
+
+    let mut validation_url: Option<String> = None;
+
     let ineligible: Vec<String> = load_code_assist
         .get("ineligibleTiers")
         .and_then(Value::as_array)
@@ -196,24 +225,62 @@ fn tier_refusal(load_code_assist: &Value, chosen_tier: &str) -> String {
                         .unwrap_or("?");
                     let why = tier
                         .get("reasonMessage")
+                        .or_else(|| tier.get("validationErrorMessage"))
                         .and_then(Value::as_str)
                         .map(|message| format!(": {message}"))
                         .unwrap_or_default();
+                    if let Some(url) = tier
+                        .get("validationUrl")
+                        .or_else(|| tier.get("validation_url"))
+                        .and_then(Value::as_str)
+                        .filter(|u| !u.is_empty())
+                    {
+                        if validation_url.is_none() {
+                            validation_url = Some(url.to_owned());
+                        }
+                    }
                     format!("{id} ({code}){why}")
                 })
                 .collect()
         })
         .unwrap_or_default();
 
-    let mut refusal = format!(
-        "Cloud Code would onboard this account only as `{chosen_tier}`, which needs a Google Cloud \
-         project with billing enabled; onboarding is not attempted without one"
-    );
+    let is_validation_required = load_code_assist
+        .get("ineligibleTiers")
+        .and_then(Value::as_array)
+        .map(|tiers| {
+            tiers
+                .iter()
+                .any(|t| t.get("reasonCode").and_then(Value::as_str) == Some("VALIDATION_REQUIRED"))
+        })
+        .unwrap_or(false);
+
+    // Two refusals wear the same shape. `VALIDATION_REQUIRED` is Google asking for the *account*
+    // to be verified, and enabling Cloud billing does not answer it; any other code is a tier
+    // verdict, and the missing piece there is a project the account can bill. Telling an operator
+    // whose account is unverified to enable billing sends them to pay for the wrong thing, so the
+    // two cases are kept apart and each ends with the step it actually needs.
+    let mut refusal = if is_validation_required {
+        String::from(
+            "Cloud Code refused this account before onboarding with VALIDATION_REQUIRED: Google \
+             requires this account to be verified, which is a check on Google's side and not the \
+             billing refusal; the account has to pass it before onboarding can succeed",
+        )
+    } else {
+        format!(
+            "Cloud Code would onboard this account only as `{chosen_tier}`, which needs a Google \
+             Cloud project with billing enabled; onboarding is not attempted without one. Set \
+             GOOGLE_CLOUD_PROJECT to a project this account can bill, then retry the login"
+        )
+    };
     if allowed.len() > 1 || allowed.first().is_some_and(|id| *id != chosen_tier) {
         refusal.push_str(&format!(" (offered: {})", allowed.join(", ")));
     }
     if !ineligible.is_empty() {
         refusal.push_str(&format!("; refused: {}", ineligible.join("; ")));
+    }
+    if let Some(url) = validation_url {
+        refusal.push_str(&format!("; verification page: {url}"));
     }
     refusal
 }
@@ -572,14 +639,37 @@ impl OAuthPlatform for Antigravity {
             .and_then(|t| t.get("id"))
             .and_then(Value::as_str)
             .unwrap_or("legacy-tier");
-        if tier != "free-tier" {
+
+        // The project to onboard into. A `free-tier` request must carry no project field at all:
+        // that tier uses a managed project Google owns, and naming any project there answers
+        // `Precondition Failed`. The paid tiers are the other way round - a project is exactly what
+        // they need - and GOOGLE_CLOUD_PROJECT is the documented escape hatch when loadCodeAssist
+        // names no project and no billing project has been set up for the account.
+        let project_override =
+            project_override_for(tier, std::env::var("GOOGLE_CLOUD_PROJECT").ok().as_deref())?;
+
+        if tier != "free-tier" && project_override.is_none() {
             return Err(oauth_error(tier_refusal(&value, tier)));
         }
-        let onboard_body = serde_json::json!({"tierId": tier, "metadata": {
-            "ideType": if self.tier == ClientTier::Ide { "ANTIGRAVITY" } else { "IDE_UNSPECIFIED" },
-            "platform": platform_name(), "pluginType": "GEMINI"
-        }})
-        .to_string();
+
+        let mut onboard_json = serde_json::json!({
+            "tierId": tier,
+            "metadata": {
+                "ideType": if self.tier == ClientTier::Ide { "ANTIGRAVITY" } else { "IDE_UNSPECIFIED" },
+                "platform": platform_name(),
+                "pluginType": "GEMINI"
+            }
+        });
+        if let Some(ref project_id) = project_override {
+            if let Some(obj) = onboard_json.as_object_mut() {
+                obj.insert(
+                    "cloudaicompanionProject".into(),
+                    Value::String(project_id.clone()),
+                );
+                obj.insert("duetProject".into(), Value::String(project_id.clone()));
+            }
+        }
+        let onboard_body = onboard_json.to_string();
         let reply = http
             .post_json(
                 &format!("{base}/v1internal:onboardUser"),
@@ -627,10 +717,13 @@ impl OAuthPlatform for Antigravity {
                 }
                 let project = operation
                     .pointer("/response/cloudaicompanionProject")
+                    .or_else(|| operation.pointer("/response/duetProject"));
+                let project_id = project
+                    .and_then(|p| validated_project_id(p).ok())
+                    .or(project_override.as_deref())
                     .ok_or_else(|| {
                         oauth_error("Cloud Code onboarding completed without a project")
                     })?;
-                let project_id = validated_project_id(project)?;
                 store_cloudcode_context(tokens, project_id, Some(tier));
                 return Ok(());
             }
@@ -978,6 +1071,94 @@ mod tests {
         let refusal = tier_refusal(&reply, "legacy-tier");
         assert!(refusal.contains("`legacy-tier`"), "{refusal}");
         assert!(refusal.contains("billing"), "{refusal}");
+        // A refusal an operator cannot act on is a dead end: name the escape hatch we honour.
+        assert!(refusal.contains("GOOGLE_CLOUD_PROJECT"), "{refusal}");
         assert!(!refusal.contains("refused:"), "{refusal}");
+    }
+
+    #[test]
+    fn a_refused_tier_with_validation_required_surfaces_url_and_guidance() {
+        let reply = serde_json::json!({
+            "allowedTiers": [{"id": "standard-tier", "isDefault": true}],
+            "ineligibleTiers": [{
+                "reasonCode": "VALIDATION_REQUIRED",
+                "reasonMessage": "Your current account is not eligible for Gemini Code Assist for individuals at this time.",
+                "validationErrorMessage": "Verify your account to continue.",
+                "validationUrl": "https://accounts.google.com/signin/continue?test=1",
+                "tierId": "free-tier"
+            }]
+        });
+
+        let refusal = tier_refusal(&reply, "standard-tier");
+        assert!(refusal.contains("VALIDATION_REQUIRED"), "{refusal}");
+        // Google's own words are what tells the operator what to do next.
+        assert!(
+            refusal.contains("free-tier (VALIDATION_REQUIRED)"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("Your current account is not eligible"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("verification page"), "{refusal}");
+        assert!(
+            refusal.contains("https://accounts.google.com/signin/continue?test=1"),
+            "{refusal}"
+        );
+        // The one thing this refusal must not say: that enabling billing answers it.
+        assert!(
+            !refusal.contains("needs a Google Cloud project with billing enabled"),
+            "{refusal}"
+        );
+    }
+
+    /// The verification URL is accepted under either spelling Google has answered with:
+    /// `validationUrl` is what the response captured on 2026-11-10 carried, `validation_url` is
+    /// the spelling other Cloud Code surfaces use, and either one is the operator's way to the
+    /// check.
+    #[test]
+    fn a_validation_url_is_read_under_either_spelling() {
+        for field in ["validationUrl", "validation_url"] {
+            let reply = serde_json::json!({
+                "allowedTiers": [{"id": "standard-tier", "isDefault": true}],
+                "ineligibleTiers": [{
+                    "reasonCode": "VALIDATION_REQUIRED",
+                    "tierId": "free-tier",
+                    field: "https://accounts.google.com/signin/continue?test=2"
+                }]
+            });
+            let refusal = tier_refusal(&reply, "standard-tier");
+            assert!(refusal.contains("continue?test=2"), "{field}: {refusal}");
+        }
+    }
+
+    /// The environment project belongs to the paid tiers, and has to look like a project id.
+    #[test]
+    fn an_environment_project_is_kept_for_paid_tiers_and_dropped_for_free() {
+        assert_eq!(
+            project_override_for("standard-tier", Some("  my-project-1  ")).expect("valid id"),
+            Some("my-project-1".to_owned())
+        );
+        // `free-tier` onboards into a managed project Google owns, so a project field on that
+        // request is what Google answers with `Precondition Failed`.
+        assert_eq!(
+            project_override_for("free-tier", Some("my-project-1")).expect("dropped"),
+            None
+        );
+        assert_eq!(
+            project_override_for("legacy-tier", Some("   ")).expect("blank"),
+            None
+        );
+        assert_eq!(
+            project_override_for("legacy-tier", None).expect("unset"),
+            None
+        );
+        // A typo is named here rather than sent upstream.
+        let error = project_override_for("legacy-tier", Some("my project"))
+            .expect_err("a value that is not a project id is refused");
+        assert!(
+            error.to_string().contains("GOOGLE_CLOUD_PROJECT"),
+            "{error}"
+        );
     }
 }

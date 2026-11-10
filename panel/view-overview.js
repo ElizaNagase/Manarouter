@@ -4,7 +4,7 @@
 import { api } from './api.js';
 import { h, chip, spinner } from './dom.js';
 import { formatUptime, formatAge, truncateMiddle, relayProbeUrl, extractList, formatCompact } from './format.js';
-import { recentCombos } from './combo-live.js';
+import { comboRoutePreview, recentCombos } from './combo-live.js';
 
 export async function renderOverview(mount, ctx) {
   const alive = { on: true };
@@ -215,10 +215,9 @@ export async function renderOverview(mount, ctx) {
 
     for (const c of combos) {
       const recent = recentsMap.get(c.name);
-      const isLive = recent?.live;
+      const preview = comboRoutePreview(c, recent);
+      const isLive = preview.live;
       const isActive = Boolean(recent);
-      const firstStep = c.steps?.find((s) => s.enabled) ?? c.steps?.[0];
-      const stepRoute = firstStep ? `${firstStep.provider}/${firstStep.model}` : 'no steps configured';
       const stepCount = c.steps?.length ?? 0;
       const strategyName = c.strategy === 'reset-aware-priority' ? 'RESET-AWARE' : (c.strategy ?? 'priority').toUpperCase();
 
@@ -233,7 +232,7 @@ export async function renderOverview(mount, ctx) {
             h('span', { class: 'dot ' + (isLive ? 'dot-green' : isActive ? 'dot-idle' : 'dot-neutral'), 'aria-hidden': 'true' }),
             h('span', { class: 'combo-tile-name' }, c.name)),
           chip(strategyName, 'chip-neutral')),
-        h('div', { class: 'combo-tile-route mono', title: stepRoute }, stepRoute),
+        h('div', { class: 'combo-tile-route mono', title: preview.title }, preview.route),
         h('div', { class: 'combo-tile-foot' },
           h('span', { class: 'combo-tile-steps' }, `${stepCount} step${stepCount === 1 ? '' : 's'}`),
           isLive

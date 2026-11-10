@@ -21,6 +21,7 @@ import {
   parseWinnerFail, buildWinnerFail, toggleParticipant,
   stepModel, stepProvider, modelLevels, providerLevels, probeTarget,
 } from './format.js';
+import { comboActivityIndex, comboRoutePreview } from './combo-live.js';
 import { createSearchSelect } from './search-select.js';
 
 // A check's result outlives the selection that produced it: an operator who checks three combos and
@@ -98,7 +99,7 @@ export async function renderCombos(mount, ctx, selectedId) {
   let activityByCombo = new Map();
   let draggedId = null;
   let dragSuppressed = false;
-  const tileStates = new Map();
+  const tileParts = new Map();
 
   const listEl = h('ul', { class: 'combo-list' });
   const newBtn = h('button', { class: 'btn btn-primary', type: 'button' }, 'New combo');
@@ -215,34 +216,36 @@ export async function renderCombos(mount, ctx, selectedId) {
 
   function setActivity(entries) {
     activityEntries = entries;
-    activityByCombo = new Map();
-    for (const entry of entries) {
-      if (!entry || typeof entry.combo !== 'string') continue;
-      const combo = combos.find((c) => c.name === entry.combo || c.id === entry.combo);
-      if (!combo) continue;
-      const current = activityByCombo.get(combo.id) ?? { live: false, last: 0 };
-      if (entry.finished_at == null && entry.outcome == null) current.live = true;
-      const started = Number(entry.started_at);
-      if (Number.isFinite(started)) current.last = Math.max(current.last, started);
-      activityByCombo.set(combo.id, current);
-    }
-    for (const [id, el] of tileStates) {
+    activityByCombo = comboActivityIndex(combos, entries);
+    for (const [id, parts] of tileParts) {
       const combo = combos.find((c) => c.id === id);
-      if (combo) paintTileState(el, combo);
+      if (combo) paintTileState(parts, combo);
     }
   }
 
-  function paintTileState(el, combo) {
+  /** The idle route: the configured first step, or the placeholder the list always showed. */
+  function comboConfiguredRoute(combo) {
+    const steps = Array.isArray(combo.steps) ? combo.steps : [];
+    return steps[0] ? stepLabel(steps[0]) : 'No steps yet';
+  }
+
+  function paintTileState(parts, combo) {
     const state = activityByCombo.get(combo.id);
-    el.classList.toggle('is-live', Boolean(state?.live));
-    el.replaceChildren(
+    parts.state.classList.toggle('is-live', Boolean(state?.live));
+    parts.state.replaceChildren(
       h('span', { class: 'combo-live-dot', 'aria-hidden': 'true' }),
       document.createTextNode(state?.live ? 'live' : 'idle'));
-    el.title = state?.live
+    parts.state.title = state?.live
       ? 'A request is running through this combo now.'
       : state?.last
         ? `Last used ${agoLabel(state.last)}.`
         : 'No request recorded in this session.';
+    // The route follows the relay's decision while this combo is live, and returns to the
+    // configured starting point when it is not: a serving step must not get stuck on the tile.
+    const configuredRoute = comboConfiguredRoute(combo);
+    const preview = comboRoutePreview(combo, state ? { live: state.live, step: state.step } : null);
+    parts.route.textContent = preview.source === 'serving' ? preview.route : configuredRoute;
+    parts.route.title = preview.live ? preview.title : configuredRoute;
   }
 
   function agoLabel(timestamp) {
@@ -290,16 +293,16 @@ export async function renderCombos(mount, ctx, selectedId) {
     const canReorder = sortMode === 'manual';
     listEl.classList.toggle('is-manual', canReorder);
     listEl.replaceChildren();
-    tileStates.clear();
+    tileParts.clear();
     for (const c of orderedCombos()) {
       const steps = Array.isArray(c.steps) ? c.steps : [];
-      const first = steps[0];
-      const route = first ? stepLabel(first) : 'No steps yet';
       const selected = c.id === selectedId;
       const isPinned = pinned.has(c.id);
       const state = h('span', { class: 'tile-state' });
-      tileStates.set(c.id, state);
-      paintTileState(state, c);
+      const route = h('div', { class: 'tile-route mono' });
+      const parts = { state, route };
+      tileParts.set(c.id, parts);
+      paintTileState(parts, c);
 
       const pinBtn = h('button', {
         class: 'pin-btn' + (isPinned ? ' pinned' : ''),
@@ -328,7 +331,7 @@ export async function renderCombos(mount, ctx, selectedId) {
         h('div', { class: 'tile-top' },
           h('span', { class: 'tile-name' }, c.name || c.id),
           c.enabled === false ? chip('off') : null),
-        h('div', { class: 'tile-route mono', title: route }, route),
+        route,
         h('div', { class: 'tile-meta' },
           h('span', { class: 'tile-count' }, `${steps.length} step${steps.length === 1 ? '' : 's'}`),
           state));

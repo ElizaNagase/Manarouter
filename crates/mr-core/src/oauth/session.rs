@@ -619,8 +619,34 @@ impl Default for OAuthSessions {
     }
 }
 
+/// Bound what an upstream error can push into the log and the panel, keeping both of its ends.
+///
+/// Both ends matter, and a one-sided cut is what hid Google's verdict from the operator on
+/// 2026-11-10: "Cloud Code would onboard this account only as `standard-tier`, ... refused:
+/// free-tier (VALIDATION_REQUIRED): Your current ac" is where the message stopped. The head named
+/// the failure and the tail named the reason code that explains it, and the 240-character ceiling
+/// that was there cut the second off mid-word. A message at or under the ceiling now passes
+/// through whole; a longer one keeps most of its head and the rest of its tail, so a provider
+/// cannot flood the panel while its own verdict stays visible. Provider-supplied text has its own
+/// narrower ceiling (`refresh::clip`).
 fn safe_error(error: impl std::fmt::Display) -> String {
-    error.to_string().chars().take(240).collect()
+    const CAP: usize = 1000;
+    const ELISION: &str = " ... ";
+    let message = error.to_string();
+    if message.chars().count() <= CAP {
+        return message;
+    }
+    let budget = CAP - ELISION.chars().count();
+    let head: String = message.chars().take(budget * 3 / 5).collect();
+    let tail: String = message
+        .chars()
+        .rev()
+        .take(budget * 2 / 5)
+        .collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}{ELISION}{tail}")
 }
 
 #[cfg(test)]
@@ -1009,5 +1035,33 @@ mod tests {
             .await
             .expect_err("the provider binding must match");
         assert!(error.contains("binding does not match"), "{error}");
+    }
+
+    /// A provider message reaches the operator whole, and an oversized one keeps both ends.
+    ///
+    /// The 240-character ceiling that used to be here is why a `Cloud Code` sign-in failure was
+    /// seen in the panel ending "... refused: free-tier (VALIDATION_REQUIRED): Your current ac":
+    /// the tier and the code that explains it were in the part that was cut.
+    #[test]
+    fn safe_error_keeps_a_provider_message_whole_and_both_ends_of_a_flood() {
+        let reason = format!(
+            "invalid state: oauth: Cloud Code refused this account; refused: free-tier \
+             (VALIDATION_REQUIRED): {}",
+            "Google wants this account verified. ".repeat(8)
+        );
+        let kept = safe_error(&reason);
+        assert_eq!(
+            kept, reason,
+            "a message under the ceiling is passed through whole"
+        );
+        assert!(kept.contains("VALIDATION_REQUIRED"), "{kept}");
+
+        let flood = safe_error(format!("head {} tail-marker", "x".repeat(4000)));
+        assert!(flood.chars().count() <= 1000, "{}", flood.chars().count());
+        assert!(flood.starts_with("head "), "the head must survive: {flood}");
+        assert!(
+            flood.ends_with("tail-marker"),
+            "the tail must survive: {flood}"
+        );
     }
 }

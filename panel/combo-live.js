@@ -88,6 +88,14 @@ export function comboActivityView(payload, { now = Date.now(), unreachable = fal
   };
 }
 
+/** An entry the overview may count: a named combo, or a still-running request whose step the
+ * relay did not report (the run is real even when its route is missing, so it must not vanish). */
+function reportable(entry) {
+  if (!entry || typeof entry.combo !== 'string' || !entry.combo) return false;
+  if (typeof entry.step === 'string' && entry.step) return true;
+  return entry.finished_at == null && entry.outcome == null;
+}
+
 /**
  * The combos that saw a request in the last five minutes, one entry each.
  *
@@ -95,9 +103,14 @@ export function comboActivityView(payload, { now = Date.now(), unreachable = fal
  * been doing lately". Both read the same ring buffer, so this stays a pure function of the
  * payload and a clock: dedupe by combo, keep the newest start, count the calls, and put the
  * combo with a request in flight first.
+ *
+ * `step` is the step of the entry that decides the row's state: the newest still-running entry
+ * when the combo is live, otherwise the newest started entry. A newer finished request must never
+ * supply the step of a combo that is still live — that is how "LIVE NOW" came to name a step the
+ * relay had already left.
  */
 export function recentCombos(payload, { now = Date.now(), windowMs = 5 * 60_000 } = {}) {
-  const entries = Array.isArray(payload?.entries) ? payload.entries.filter(usable) : [];
+  const entries = Array.isArray(payload?.entries) ? payload.entries.filter(reportable) : [];
   const seen = new Map();
   for (const entry of entries) {
     const startedAt = Number(entry.started_at);
@@ -117,20 +130,117 @@ export function recentCombos(payload, { now = Date.now(), windowMs = 5 * 60_000 
         count: 1,
         lastStartedAt: startedAt,
         live,
+        liveStartedAt: live ? startedAt : null,
+        stepStartedAt: startedAt,
       });
       continue;
     }
     current.count += 1;
-    current.live = current.live || live;
-    if (startedAt > current.lastStartedAt) {
-      current.lastStartedAt = startedAt;
+    if (startedAt > current.lastStartedAt) current.lastStartedAt = startedAt;
+    if (live) {
+      current.live = true;
+      // Two overlapping runs: the newest one is what the relay is serving, deterministically.
+      // Equal timestamps keep the first seen, which is the relay's newest-first order.
+      if (current.liveStartedAt === null || startedAt > current.liveStartedAt) {
+        current.liveStartedAt = startedAt;
+        current.step = entry.step;
+      }
+    } else if (current.liveStartedAt === null && startedAt > current.stepStartedAt) {
+      // No running entry yet: the newest finished decision is the best step we have.
       current.step = entry.step;
+      current.stepStartedAt = startedAt;
     }
   }
-  return [...seen.values()].sort((a, b) =>
+  const rows = [...seen.values()];
+  for (const row of rows) {
+    delete row.liveStartedAt;
+    delete row.stepStartedAt;
+  }
+  return rows.sort((a, b) =>
     (Number(b.live) - Number(a.live))
     || (b.lastStartedAt - a.lastStartedAt)
     || a.combo.localeCompare(b.combo));
+}
+
+/**
+ * Per-combo activity for the combos list, keyed by combo id: whether a request is running, the
+ * newest start, and the step a running request is on.
+ *
+ * `step` exists because that list paints a "live" badge beside the route, and a live badge must
+ * name the step being served, not the configured first step. As in `recentCombos`, the step is the
+ * newest in-flight entry's, and only an in-flight entry can supply it: a request that already
+ * finished must never be labelled as serving.
+ *
+ * Pure: no DOM. Entries whose combo is not in `combos` are ignored, so a stale name cannot
+ * resurrect a deleted combo.
+ */
+export function comboActivityIndex(combos, entries) {
+  const list = Array.isArray(combos) ? combos : [];
+  const index = new Map();
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    if (!entry || typeof entry.combo !== 'string') continue;
+    const combo = list.find((c) => c && (c.name === entry.combo || c.id === entry.combo));
+    if (!combo) continue;
+    const current = index.get(combo.id)
+      ?? { live: false, last: 0, step: undefined, liveStartedAt: null };
+    const started = Number(entry.started_at);
+    if (entry.finished_at == null && entry.outcome == null) {
+      current.live = true;
+      // Two overlapping runs: the newest one is what the relay is serving. An unusable timestamp
+      // does not win over a usable one, and equal timestamps keep the first seen (relay order).
+      if (current.liveStartedAt === null || !Number.isFinite(current.liveStartedAt)
+        || (Number.isFinite(started) && started > current.liveStartedAt)) {
+        current.liveStartedAt = started;
+        current.step = entry.step;
+      }
+    }
+    if (Number.isFinite(started)) current.last = Math.max(current.last, started);
+    index.set(combo.id, current);
+  }
+  for (const state of index.values()) delete state.liveStartedAt;
+  return index;
+}
+
+/** The tile's route when a combo has no usable step at all. */
+const NO_STEPS = 'no steps configured';
+
+/** "provider/model" for a configured step, or '' when either half is missing or not a string. */
+function configuredStepRoute(step) {
+  const provider = typeof step?.provider === 'string' ? step.provider.trim() : '';
+  const model = typeof step?.model === 'string' ? step.model.trim() : '';
+  return provider && model ? `${provider}/${model}` : '';
+}
+
+/**
+ * What the overview tile should name as a combo's route, from the combo config and its recent
+ * activity (one entry from `recentCombos`, or undefined).
+ *
+ * A running or recently-finished request is the truth about which step served; the configured
+ * first step is only the starting point, and naming it while the relay is on step 5 is the lie
+ * this function exists to remove. When there is no activity — or the activity did not report a
+ * usable step — the configured first enabled step is shown, exactly as the tile did before.
+ *
+ * Pure: no DOM. `source` says which of the two meanings the route carries, so the view can keep
+ * the tooltip honest without re-deriving the decision.
+ */
+export function comboRoutePreview(combo, recent = null) {
+  const steps = Array.isArray(combo?.steps) ? combo.steps : [];
+  // Preserve the historical idle choice: the first truthy `enabled`, else the first step.
+  const firstStep = steps.find((step) => step?.enabled) ?? steps[0];
+  const configuredRoute = configuredStepRoute(firstStep);
+  const servedRoute = typeof recent?.step === 'string' ? recent.step.trim() : '';
+  const serving = Boolean(servedRoute);
+  const live = Boolean(recent?.live);
+  const route = serving ? servedRoute : (configuredRoute || NO_STEPS);
+  const title = serving
+    ? (live ? `Serving now: ${route}` : `Served recently: ${route}`)
+    : (live ? 'Serving now: step not reported' : `Starts at: ${route}`);
+  return {
+    route,
+    live,
+    source: serving ? 'serving' : 'starts-at',
+    title,
+  };
 }
 
 /** Whether an entry carries the two names the block renders. */

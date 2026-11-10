@@ -837,7 +837,10 @@ impl ModalityError {
                 first.as_str(),
                 other.as_str(),
             )),
-            Self::UnsupportedType { .. } => Some("routing.defaults".to_owned()),
+            // An unknown *type* is not a routing problem: no `routing.defaults` key can teach
+            // the relay a spelling it does not know, so naming one would send the operator to a
+            // line that cannot change the answer.
+            Self::UnsupportedType { .. } => None,
         }
     }
 }
@@ -886,7 +889,7 @@ impl std::fmt::Display for ModalityError {
             }
             Self::UnsupportedType { wire_type } => write!(
                 f,
-                "the request contains a content part of type \"{wire_type}\", which is not an input modality this build recognises, so no routing.defaults entry can be chosen for it (configured keys live under routing.defaults)",
+                "the request contains a content part of type \"{wire_type}\", which this build does not recognise as text or as an input modality; no routing.defaults entry applies to it, so the part has to be dropped by the client or this relay has to learn the type",
             ),
         }
     }
@@ -966,7 +969,7 @@ enum PartKind {
 ///
 /// Unknown content-block kinds are errors rather than guessed as text: a provider may have added a
 /// new modality, and sending its payload to a model that cannot read it would silently violate the
-/// "always forward media" promise. The small ignore-list covers known text, tool and thinking parts
+/// "always forward media" promise. The ignore-list covers known text, tool and reasoning parts
 /// that are not input modalities; metadata and tool schemas never reach this function because the
 /// detector walks only message/input content arrays.
 fn classify_part(wire_type: &str) -> PartKind {
@@ -977,9 +980,17 @@ fn classify_part(wire_type: &str) -> PartKind {
         return PartKind::Modality(*modality);
     }
     match wire_type {
-        "text" | "input_text" | "output_text" | "tool_use" | "tool_result" | "tool_calls"
-        | "function_call" | "function" | "thinking" | "thinking_delta" | "redacted_thinking"
-        | "text_delta" | "refusal" => PartKind::Ignored,
+        // Prose, and the tool plumbing that carries it.
+        "text" | "input_text" | "output_text" | "text_delta" | "refusal" | "tool_use"
+        | "tool_result" | "tool_calls" | "function_call" | "function" => PartKind::Ignored,
+        // Reasoning the model wrote, replayed as part of the transcript. It is text, not a new
+        // modality — and this relay emits precisely this shape itself: the Responses translator
+        // turns an assistant turn's `reasoning_content` into
+        // `{"type":"reasoning","content":[{"type":"reasoning_text",…}]}`. Detection runs on the
+        // *translated* body, so calling these unknown refused requests the relay had just built
+        // (a 400 on 2026-11-10 that no `routing.defaults` entry could have fixed).
+        "reasoning" | "reasoning_text" | "summary_text" | "thinking" | "thinking_delta"
+        | "redacted_thinking" | "thought" => PartKind::Ignored,
         _ => PartKind::Unsupported,
     }
 }
@@ -1248,13 +1259,45 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_media_type_names_routing_defaults_and_its_type() {
+    fn an_unknown_media_type_names_its_type_and_offers_no_setting() {
         let body = serde_json::json!({
             "messages": [{"role": "user", "content": [{"type": "video_frame"}]}]
         });
-        let error = detect_input_modalities(&body).unwrap_err().to_string();
-        assert!(error.contains("routing.defaults"), "{error}");
-        assert!(error.contains("video_frame"), "{error}");
+        let error = detect_input_modalities(&body).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("video_frame"), "{message}");
+        // Setting a `routing.defaults` key cannot teach the relay a type it does not know, so
+        // `setting()` names none rather than sending the operator to a line that cannot help.
+        assert_eq!(error.setting(), None, "{message}");
+    }
+
+    #[test]
+    fn replayed_reasoning_is_text_and_not_a_modality() {
+        // The exact shape the relay's own Responses translator emits for an assistant turn that
+        // carried `reasoning_content`, which a Responses client round-trips verbatim. Modality
+        // detection runs on the translated body, so this has to classify as text — not as an
+        // unknown type, and not as an unsupported modality that would rewrite the model.
+        let mut body = serde_json::json!({
+            "model": "text/model",
+            "input": [
+                {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "plan"}]},
+                {"role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+            ]
+        });
+        assert_eq!(
+            detect_input_modalities(&body).expect("reasoning is text"),
+            Vec::new()
+        );
+        assert_eq!(
+            rewrite_model_for_modalities(
+                &mut body,
+                |modality| modality == InputModality::Text,
+                &routing_defaults(),
+            )
+            .expect("no media, nothing to refuse"),
+            None
+        );
+        assert_eq!(body["model"], "text/model");
     }
 
     #[test]

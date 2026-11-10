@@ -30,4 +30,14 @@ The rules are narrow on purpose:
 
 If no default is configured for the modality, the request fails with HTTP 501 as before. Setting a default makes an unsupported request work *only* when that default names a model that really accepts the modality.
 
+### A part type the relay cannot classify
+
+Detection runs on the request body as the upstream will receive it, after any dialect translation — so the same helper inspects a passthrough body and a translated one. Each content part is sorted into one of three groups: a type that names a modality this build routes (`image_url`, `input_image`, `audio`, `video_url`, …); text, tool calls, tool results, and the reasoning or thinking blocks the supported dialects emit (`text`, `tool_use`, `reasoning`, `reasoning_text`, `thinking`, …), which are never modalities; and everything else, which is refused with HTTP 400 (`invalid_request_error`) naming the unrecognised type.
+
+No `routing.defaults` key applies to that last group: a setting cannot teach the relay a spelling it does not know, so the error says as much instead of pointing at a key that does not exist. The part has to be dropped by the client, or the relay has to learn the type in a new build. Refusing is deliberate — guessing that an unknown part is text would forward content the model cannot read and hide the mismatch behind a confident answer about something else.
+
+Two document types deserve naming, because the relay holds a setting for them and no part type reaches it: `routing.defaults.pdf` and `routing.defaults.file` exist, are validated, and are hashed into the routing snapshot, while no spelling in the detection table maps to the `pdf` or `file` modality. A `file` part, a `document` block, or the Responses API's `input_file` therefore lands in the refused group above, and those two keys are never consulted.
+
+Widening detection is a routing decision rather than a spelling the relay can fix on its own: one `input_file` part may be a PDF or a spreadsheet, and which of the two keys to honour follows from which it is. Until a build decides that, send the document's text as `input_text`.
+
 For errors, verify the route and payload first, then use [Troubleshooting](10-troubleshooting.md). Keep provider credentials and client keys out of requests shared for support; see [Security and credentials](11-security.md).

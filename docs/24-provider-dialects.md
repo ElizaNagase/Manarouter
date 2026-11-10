@@ -673,6 +673,11 @@ target that also lacks the modality, or names no known model, fails with HTTP `5
 ([the implementation status](23-implementation-status.md)). The modality is decided from the
 *request body*, after translation, so the check sees the shape the upstream will actually receive.
 
+A part whose `type` names neither a routed modality nor a text, tool or reasoning block is refused with
+HTTP `400` rather than guessed at (`crates/manarouter-relay/src/upstream.rs`, `MEDIA_TYPES` and
+`classify_part`), and `pdf`/`file` are the two modalities that have settings but no spelling the detector
+knows yet — [Images, audio and video](user/07-images-audio-video.md) lists the three groups.
+
 ### The model id
 
 A dialect decides where the model id lives, and this is the single most common integration mistake:

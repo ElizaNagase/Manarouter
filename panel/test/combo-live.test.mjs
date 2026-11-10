@@ -9,7 +9,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { comboActivityView, comboAgeLabel, recentCombos, startComboLive } from '../combo-live.js';
+import { comboActivityIndex, comboActivityView, comboAgeLabel, comboRoutePreview, recentCombos, startComboLive } from '../combo-live.js';
 
 const T0 = 1_793_641_349_000;
 
@@ -30,6 +30,18 @@ const inFlight = (overrides = {}) => ({
   started_at: T0,
   finished_at: null,
   outcome: null,
+  ...overrides,
+});
+
+const deepseekCombo = (overrides = {}) => ({
+  name: 'deepseek',
+  steps: [
+    { provider: 'openadapter', model: 'DeepSeek-V4.1-Flash', enabled: true },
+    { provider: 'moonmath', model: 'deepseek-v4.1-flash', enabled: true },
+    { provider: 'tokenharbor', model: 'deepseek-v4.1-flash:free', enabled: true },
+    { provider: 'commandcodego', model: 'deepseek-v4.1-flash', enabled: true },
+    { provider: 'opencode-go', model: 'deepseek-v4.1-flash', enabled: true },
+  ],
   ...overrides,
 });
 
@@ -141,6 +153,151 @@ test('an activity payload that cannot be read yields no overview boxes rather th
   for (const payload of [null, {}, { entries: [null, 'nonsense', { combo: 'x' }] }]) {
     assert.deepEqual(recentCombos(payload, { now: T0 }), []);
   }
+});
+
+// ---------------------------------------------------------------------------
+// The overview tile's route: the relay's current decision when there is one,
+// the configured starting point only when there is not.
+// ---------------------------------------------------------------------------
+
+test('a live combo names the step being served, not its configured first step', () => {
+  const recent = recentCombos(
+    { entries: [inFlight({ combo: 'deepseek', step: 'opencode-go/deepseek-v4.1-flash' })] },
+    { now: T0 + 2_000 },
+  )[0];
+  const preview = comboRoutePreview(deepseekCombo(), recent);
+  assert.equal(preview.route, 'opencode-go/deepseek-v4.1-flash');
+  assert.notEqual(preview.route, 'openadapter/DeepSeek-V4.1-Flash');
+  assert.equal(preview.live, true);
+  assert.equal(preview.source, 'serving');
+  assert.equal(preview.title, 'Serving now: opencode-go/deepseek-v4.1-flash');
+});
+
+test('a finished-but-recent combo still names the step that served it', () => {
+  const recent = recentCombos(
+    { entries: [finished({ combo: 'deepseek', step: 'tokenharbor/deepseek-v4.1-flash:free' })] },
+    { now: T0 + 2_000 },
+  )[0];
+  const preview = comboRoutePreview(deepseekCombo(), recent);
+  assert.equal(preview.route, 'tokenharbor/deepseek-v4.1-flash:free');
+  assert.equal(preview.live, false);
+  assert.equal(preview.source, 'serving');
+  assert.equal(preview.title, 'Served recently: tokenharbor/deepseek-v4.1-flash:free');
+});
+
+test('an idle combo falls back to its first enabled step, labelled as the start', () => {
+  const preview = comboRoutePreview(deepseekCombo());
+  assert.equal(preview.route, 'openadapter/DeepSeek-V4.1-Flash');
+  assert.equal(preview.live, false);
+  assert.equal(preview.source, 'starts-at');
+  assert.equal(preview.title, 'Starts at: openadapter/DeepSeek-V4.1-Flash');
+});
+
+test('an idle combo skips a disabled first step', () => {
+  const combo = deepseekCombo({
+    steps: [
+      { provider: 'off', model: 'disabled-first', enabled: false },
+      { provider: 'on', model: 'enabled-second', enabled: true },
+    ],
+  });
+  const preview = comboRoutePreview(combo);
+  assert.equal(preview.route, 'on/enabled-second');
+  assert.equal(preview.source, 'starts-at');
+});
+
+test('a missing or non-string recent step falls back and never renders undefined', () => {
+  for (const step of [undefined, null, 42, '', '   ']) {
+    const preview = comboRoutePreview(deepseekCombo(), { combo: 'deepseek', step, live: false });
+    assert.equal(preview.route, 'openadapter/DeepSeek-V4.1-Flash');
+    assert.equal(preview.source, 'starts-at');
+    assert.doesNotMatch(preview.title, /undefined/);
+  }
+  // A still-live entry with no reported step is honest about the gap instead of claiming the
+  // configured first step is what is running.
+  const live = comboRoutePreview(deepseekCombo(), { combo: 'deepseek', step: null, live: true });
+  assert.equal(live.route, 'openadapter/DeepSeek-V4.1-Flash');
+  assert.equal(live.title, 'Serving now: step not reported');
+});
+
+test('a combo with no usable steps yields one stable placeholder', () => {
+  for (const combo of [
+    { name: 'empty', steps: [] },
+    { name: 'missing' },
+    { name: 'malformed', steps: [{ provider: 'only-provider', enabled: true }] },
+  ]) {
+    const preview = comboRoutePreview(combo);
+    assert.equal(preview.route, 'no steps configured');
+    assert.equal(preview.source, 'starts-at');
+    assert.equal(preview.title, 'Starts at: no steps configured');
+  }
+});
+
+// The step a row names belongs to the request that decides the row's state. A newer *finished*
+// request must not lend its route to a combo that is still serving, or the panel reports a step
+// the relay has already left — the bug this pair of tests exists to keep out.
+test('a running request older than a newer finished one still supplies the live step', () => {
+  const entries = [
+    finished({ combo: 'deepseek', step: 'openadapter/DeepSeek-V4.1-Flash', started_at: T0 + 5_000 }),
+    inFlight({ combo: 'deepseek', step: 'opencode-go/deepseek-v4.1-flash', started_at: T0 }),
+  ];
+  const [row] = recentCombos({ entries }, { now: T0 + 6_000 });
+  assert.equal(row.live, true);
+  assert.equal(row.step, 'opencode-go/deepseek-v4.1-flash');
+  const preview = comboRoutePreview(deepseekCombo(), row);
+  assert.equal(preview.route, 'opencode-go/deepseek-v4.1-flash');
+  assert.equal(preview.title, 'Serving now: opencode-go/deepseek-v4.1-flash');
+});
+
+test('overlapping runs name the newest running step, whichever order the ring reports', () => {
+  const older = inFlight({ combo: 'deepseek', step: 'moonmath/deepseek-v4.1-flash', started_at: T0 });
+  const newer = inFlight({ combo: 'deepseek', step: 'opencode-go/deepseek-v4.1-flash', started_at: T0 + 2_000 });
+  for (const entries of [[newer, older], [older, newer]]) {
+    const [row] = recentCombos({ entries }, { now: T0 + 3_000 });
+    assert.equal(row.live, true);
+    assert.equal(row.step, 'opencode-go/deepseek-v4.1-flash');
+  }
+});
+
+test('a running request whose route the relay did not report is live without a route claim', () => {
+  const [row] = recentCombos(
+    { entries: [inFlight({ combo: 'deepseek', step: undefined })] },
+    { now: T0 + 1_000 },
+  );
+  assert.equal(row.live, true);
+  assert.equal(row.step, undefined);
+  const preview = comboRoutePreview(deepseekCombo(), row);
+  assert.equal(preview.route, 'openadapter/DeepSeek-V4.1-Flash');
+  assert.equal(preview.title, 'Serving now: step not reported');
+});
+
+test('the combos list keys activity by combo id and keeps the running step', () => {
+  const combos = [{ id: 'c1', name: 'deepseek' }, { id: 'c2', name: 'other' }];
+  const index = comboActivityIndex(combos, [
+    finished({ combo: 'deepseek', step: 'openadapter/DeepSeek-V4.1-Flash', started_at: T0 + 5_000 }),
+    inFlight({ combo: 'deepseek', step: 'opencode-go/deepseek-v4.1-flash', started_at: T0 }),
+    finished({ combo: 'other', step: 'x/y', started_at: T0 + 1_000 }),
+    // A name no configured combo carries must not resurrect a deleted one.
+    inFlight({ combo: 'deleted', step: 'gone/model', started_at: T0 + 9_000 }),
+  ]);
+  assert.equal(index.size, 2);
+  const live = index.get('c1');
+  assert.equal(live.live, true);
+  assert.equal(live.step, 'opencode-go/deepseek-v4.1-flash');
+  assert.equal(live.last, T0 + 5_000);
+  const idle = index.get('c2');
+  assert.equal(idle.live, false);
+  // Idle means idle: a finished request supplies no serving step for the list to paint.
+  assert.equal(idle.step, undefined);
+  assert.equal(idle.last, T0 + 1_000);
+});
+
+test('a finished entry never supplies a serving step, even when it is the newest', () => {
+  const index = comboActivityIndex(
+    [{ id: 'c1', name: 'deepseek' }],
+    [finished({ combo: 'deepseek', step: 'newer/model', started_at: T0 + 5_000 })],
+  );
+  assert.equal(index.get('c1').live, false);
+  assert.equal(index.get('c1').step, undefined);
 });
 
 test('relative ages are stated in one unit that fits the sidebar', () => {

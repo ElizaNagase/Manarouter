@@ -235,6 +235,37 @@ So the request shape is tier-dependent:
 The tier to request is chosen as: the first entry of `allowedTiers[]` whose `isDefault` is set;
 otherwise `legacy-tier`. Known `UserTierId` values are `free-tier`, `legacy-tier` and `standard-tier`.
 
+### `VALIDATION_REQUIRED`: verification, not billing
+
+Not every `ineligibleTiers[]` entry means the account cannot have a tier. Each entry carries a
+`reasonCode`, and one of them, `VALIDATION_REQUIRED`, means Google wants the **account holder** to
+clear a check of its own (identity or eligibility verification) before the tier can be onboarded.
+It is a check on Google's side, and enabling Cloud billing does not answer it: billing is a
+different refusal, the tier refusal above.
+
+The response also says where to go: `validationUrl`, which some Cloud Code surfaces spell
+`validation_url` (both are read), usually beside `validationErrorMessage`. The refusal therefore
+names the code, quotes Google's own words for the refused tier, and appends the page:
+
+> Cloud Code refused this account before onboarding with VALIDATION_REQUIRED: Google requires this
+> account to be verified, which is a check on Google's side and not the billing refusal; the account
+> has to pass it before onboarding can succeed (offered: standard-tier); refused: free-tier
+> (VALIDATION_REQUIRED): Your current account is not eligible …; verification page: https://…
+
+What an operator can do, in order:
+
+1. Open the verification page for that Google account and complete the check, then retry the login.
+2. If `allowedTiers` offers a paid tier and the account can bill a Google Cloud project, set
+   `GOOGLE_CLOUD_PROJECT=<project-id>` and retry. The login then attempts onboarding into that
+   project instead of refusing for want of one. That removes this refusal only; whether Google
+   accepts the account is still Google's call. The variable is ignored for `free-tier`, which
+   onboards into a managed project Google owns — sending a project there is the
+   `Precondition Failed` trap above.
+
+Nothing in this refusal is a defect in Manarouter, and the relay must not paper over it by
+falling back to a tier Google refused: a route that silently uses an unentitled account fails
+later, on the first inference, with an error that names nothing.
+
 ### The long-running operation
 
 `onboardUser` returns an operation. Poll
