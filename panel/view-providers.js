@@ -1125,13 +1125,28 @@ export async function renderProviders(mount, ctx) {
     });
     hideFailedToggle.row.classList.add('provider-models-hide-toggle');
 
+    const searchInput = h('input', {
+      class: 'input mono provider-models-search',
+      type: 'search',
+      placeholder: 'Search models…',
+      'aria-label': 'Search models for ' + (p.label || p.id),
+      autocomplete: 'off',
+      spellcheck: 'false',
+    });
+
+    const modelMatchCount = h('span', { class: 'hint provider-models-match-count mono' });
+
     const modelHead = h('div', { class: 'provider-models-head' },
-      h('h3', {}, `Models (${models.length})`),
-      models.length ? h('div', { class: 'provider-models-actions' }, hideFailedToggle.row, testAllBtn) : null,
+      h('div', { class: 'provider-models-title-wrap' },
+        h('h3', {}, `Models (${models.length})`),
+        modelMatchCount,
+      ),
+      models.length ? h('div', { class: 'provider-models-actions' }, searchInput, hideFailedToggle.row, testAllBtn) : null,
     );
     const modelSection = h('section', {}, modelHead);
+    let modelTb = null;
     if (models.length) {
-      const modelTb = h('tbody');
+      modelTb = h('tbody');
       let testingProviderModels = false;
       testAllBtn.addEventListener('click', async () => {
         if (testingProviderModels) {
@@ -1266,6 +1281,28 @@ export async function renderProviders(mount, ctx) {
     } else {
       modelSection.append(emptyState('No models yet.', 'Run “Sync models” or add one manually below.'));
     }
+
+      function filterProviderModels(query) {
+        const q = String(query ?? '').trim().toLowerCase();
+        let matched = 0;
+        for (const m of models) {
+          const idMatches = m.id.toLowerCase().includes(q);
+          const labelMatches = (m.label || '').toLowerCase().includes(q);
+          const visible = !q || idMatches || labelMatches;
+          const tr = modelTb ? modelTb.querySelector(`tr[data-model-id="${CSS.escape(m.id)}"]`) : null;
+          if (tr) tr.hidden = !visible;
+          const editorRow = tr?.nextElementSibling?.classList.contains('model-editor-row') ? tr.nextElementSibling : null;
+          if (editorRow && !visible) editorRow.hidden = true;
+          if (visible) matched += 1;
+        }
+        if (q) {
+          modelMatchCount.textContent = `· ${matched} of ${models.length} matching`;
+        } else {
+          modelMatchCount.textContent = '';
+        }
+      }
+      searchInput.addEventListener('input', () => filterProviderModels(searchInput.value));
+
     modelSection.append(buildModelForm(p));
     body.append(modelSection);
 

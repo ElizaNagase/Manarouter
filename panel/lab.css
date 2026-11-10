@@ -35,9 +35,9 @@
   --red: #ef6a6a;
   --red-dim: rgba(239, 106, 106, 0.12);
 
-  --radius: 2px;
-  --radius-sm: 2px;
-  --radius-lg: 2px;
+  --radius: 0px;
+  --radius-sm: 0px;
+  --radius-lg: 0px;
   --shadow-1: none;
   --shadow-2: 0 4px 16px rgba(0, 0, 0, 0.7);
   --ease: cubic-bezier(0.1, 0.9, 0.2, 1);
@@ -842,3 +842,59 @@ table.tbl { border-collapse: separate; border-spacing: 0; width: 100%; }
 /* A submit button under a two-up field grid gets its own row, so it reads as the form's action
    rather than as a third field tucked under the first column. */
 .form-actions { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+
+/* ---------- Harsher brutalist overrides ---------- */
+
+*, *::before, *::after {
+  border-radius: 0 !important;
+}
+
+.card, .stat, .dialog, .btn, .input, .table-scroll, .work-panel, .model-inline-detail, .chip, .health-pill, .combo-live-link, .toolbar .count {
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
+
+.btn {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.btn-primary {
+  background: #b53867 !important;
+  border: 1px solid #d4497e !important;
+  color: #fff !important;
+}
+.btn-primary:hover {
+  background: #c84377 !important;
+  border-color: #e55b90 !important;
+}
+
+.chip {
+  border-radius: 0 !important;
+  border: 1px solid var(--line2);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.dot {
+  border-radius: 0 !important;
+  width: 6px;
+  height: 6px;
+}
+
+.dialog {
+  border-radius: 0 !important;
+  border: 1px solid var(--line2) !important;
+  background: #101416 !important;
+  box-shadow: 0 0 0 1px var(--line2), 0 24px 60px #000 !important;
+}
+
+tbody tr.row-selected {
+  border-left: 3px solid var(--pink) !important;
+}

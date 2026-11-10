@@ -417,17 +417,20 @@ body.provider-dragging .providers-view .provider-table tr.row-draggable { cursor
 .providers-view .provider-work .work-panel {
   display: flex;
   flex-direction: column;
-  max-height: min(820px, calc(100vh - 120px));
+  max-height: none !important;
   margin: 0;
-  border-radius: var(--radius);
-  box-shadow: none;
+  border-radius: 0 !important;
+  border: 1px solid var(--line2);
+  border-left: 3px solid var(--pink);
+  background: var(--bg1);
+  box-shadow: none !important;
 }
 /* A long provider form used to push its Save button below the fold. The panel keeps its heading
    and actions in place while the body scrolls, so the decision is always reachable. */
 .providers-view .provider-work .drawer-body {
   min-height: 0;
-  overflow-y: auto;
-  scrollbar-gutter: stable;
+  overflow: visible !important;
+  max-height: none !important;
 }
 .providers-view .provider-form-actions {
   position: sticky;
@@ -579,4 +582,36 @@ body.provider-dragging .providers-view .provider-table tr.row-draggable { cursor
   color: var(--tx2);
   cursor: pointer;
   white-space: nowrap;
+}
+
+/* Unbox provider models table so the website flows naturally down */
+.providers-view .model-table-scroll {
+  max-height: none !important;
+  overflow: visible !important;
+}
+
+.provider-models-title-wrap {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.provider-models-title-wrap h3 {
+  margin: 0;
+  border-bottom: 0 !important;
+  padding-bottom: 0 !important;
+}
+.provider-models-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.provider-models-search {
+  width: 220px;
+  height: 26px;
+  font-size: 11px;
+}
+.provider-models-match-count {
+  font-size: 11px;
+  color: var(--tx3);
 }

@@ -430,45 +430,43 @@ export async function renderModels(mount, ctx) {
   }
 
   let selectedKey = null;
-  let drawer = null;
-  let drawerHead = null;
-  let drawerBody = null;
-  let drawerClose = null;
+  let detailRow = null;
 
-  // ------------------------------------------------------------------ drawer
+  function closeDetail({ restoreFocus = true } = {}) {
+    const previous = selectedKey;
+    selectedKey = null;
+    if (detailRow) {
+      detailRow.remove();
+      detailRow = null;
+    }
+    paintSelection();
+    if (restoreFocus) focusRow(previous);
+  }
 
-  function ensureDrawer() {
-    if (drawer) return;
-    drawer = h('div', {
-      class: 'drawer models-drawer',
-      id: 'models-detail-drawer',
-      role: 'region',
-      'aria-label': 'Model detail',
-      tabindex: '-1',
-    });
-    drawerClose = h('button', {
-      class: 'icon-btn',
-      type: 'button',
-      'aria-label': 'Close model detail',
-      title: 'Close (Escape)',
-    }, icon('x'));
-    drawerClose.addEventListener('click', () => closeDetail());
-    drawerHead = h('div', { class: 'drawer-head' });
-    drawerBody = h('div', { class: 'drawer-body' });
-    drawer.append(drawerHead, drawerBody);
-    // The row restores focus on close, so a keyboard operator lands where they left off.
-    drawer.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape') {
-        event.stopPropagation();
-        closeDetail();
+  function openDetail(p, m) {
+    const key = keyOf(p, m);
+    if (detailRow && selectedKey === key) {
+      closeDetail();
+      return;
+    }
+    closeDetail({ restoreFocus: false });
+    selectedKey = key;
+    paintSelection();
+
+    const anchorRow = tableWrap.querySelector(`tbody tr[data-key="${CSS.escape(key)}"]`);
+    if (!anchorRow) return;
+
+    const panel = buildInlineModelDetail(p, m);
+    const colCount = anchorRow.children.length || 8;
+    detailRow = h('tr', { class: 'model-detail-row' },
+      h('td', { colspan: String(colCount) }, panel));
+
+    anchorRow.after(detailRow);
+    requestAnimationFrame(() => {
+      if (detailRow?.isConnected) {
+        detailRow.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
       }
     });
-    // Clicking prose in the drawer would otherwise move focus to the document body, where Escape
-    // no longer reaches the drawer.
-    drawer.addEventListener('mousedown', () => {
-      if (!drawer.contains(document.activeElement)) drawer.focus({ preventScroll: true });
-    });
-    mount.append(drawer);
   }
 
   function fact(label, value, { title = null, missing = false } = {}) {
@@ -477,21 +475,39 @@ export async function renderModels(mount, ctx) {
       h('dd', { title: title ?? null }, value));
   }
 
-  function renderDetail(p, m, { focus = false } = {}) {
-    ensureDrawer();
-    const hadFocus = drawer.contains(document.activeElement);
+  function buildInlineModelDetail(p, m) {
     const label = labelText(m);
     const derived = deriveDisplayName(m.id);
     const heading = label || derived || 'Model detail';
 
-    const titleBlock = h('div', { class: 'models-drawer-title' },
+    const panel = h('div', {
+      class: 'model-inline-detail',
+      role: 'region',
+      'aria-label': txt('Detail for ', m.id),
+      tabindex: '-1',
+    });
+
+    const closeBtn = h('button', {
+      class: 'icon-btn',
+      type: 'button',
+      'aria-label': 'Close model detail',
+      title: 'Close (Escape)',
+    }, icon('x'));
+    closeBtn.addEventListener('click', () => closeDetail());
+
+    const titleBlock = h('div', { class: 'model-inline-title' },
       h('h2', { title: heading }, heading),
-      h('span', { class: 'models-drawer-id mono', title: m.id }, m.id));
-    drawerHead.replaceChildren(titleBlock, h('span', { class: 'spacer' }), drawerClose);
+      h('span', { class: 'model-inline-id mono', title: m.id }, m.id),
+      copyButton(m.id, { label: 'Copy id', className: 'btn btn-sm' }));
+
+    const head = h('div', { class: 'model-inline-head' },
+      titleBlock,
+      h('span', { class: 'spacer' }),
+      closeBtn);
 
     const source = m.source ?? 'synced';
     const synced = m.synced_at ? formatAge(m.synced_at) : '';
-    const ctx = contextLength(m);
+    const ctxLen = contextLength(m);
     const out = maxOutput(m);
     const { input: priceIn, output: priceOut } = priceParts(m);
     const levels = modelLevels(m, p);
@@ -501,40 +517,30 @@ export async function renderModels(mount, ctx) {
       : '';
     const inputs = modalities(m);
 
-    const identity = h('section', { class: 'models-detail-section' },
+    const identity = h('section', { class: 'model-inline-section' },
       h('h3', {}, 'Identity'),
       h('dl', { class: 'model-facts' },
-        fact('Model id', h('span', { class: 'models-id-value' },
-          h('code', { class: 'mono' }, m.id),
-          copyButton(m.id, { label: 'Copy id', className: 'btn btn-sm models-copy-id' }))),
+        fact('Model id', h('code', { class: 'mono' }, m.id)),
         fact('Provider', h('span', { class: 'models-inline' },
           h('code', { class: 'mono' }, p.id),
           p.label ? h('span', { class: 'models-muted' }, txt(' · ', p.label)) : null)),
-        fact('Source', source, { title: 'Provenance: synced, entered manually, or inferred by the server.' }),
-        fact('Visibility', m.hidden
-          ? 'Hidden: excluded from the relay listing.'
-          : 'Listed in the relay.'),
-        fact('Last synced', synced || 'Not reported', {
-          missing: !synced,
-          title: m.synced_at ? String(m.synced_at) : null,
-        })));
+        fact('Source', source),
+        fact('Visibility', m.hidden ? 'Hidden: excluded from relay listing' : 'Listed in relay'),
+        fact('Last synced', synced || 'Not reported', { missing: !synced })));
 
     const pricingFacts = priceIn === null && priceOut === null
-      ? [fact('Pricing', 'This provider does not report pricing for this model.', { missing: true })]
+      ? [fact('Pricing', 'Not reported by provider', { missing: true })]
       : [
-        fact('Input price', priceIn === null ? 'Not reported' : '$' + fmt(priceIn) + ' per 1M tokens', { missing: priceIn === null }),
-        fact('Output price', priceOut === null ? 'Not reported' : '$' + fmt(priceOut) + ' per 1M tokens', { missing: priceOut === null }),
+        fact('Input price', priceIn === null ? 'Not reported' : '$' + fmt(priceIn) + ' / 1M tokens', { missing: priceIn === null }),
+        fact('Output price', priceOut === null ? 'Not reported' : '$' + fmt(priceOut) + ' / 1M tokens', { missing: priceOut === null }),
       ];
-    const capabilities = h('section', { class: 'models-detail-section' },
+
+    const capabilities = h('section', { class: 'model-inline-section' },
       h('h3', {}, 'Reported capabilities'),
       h('dl', { class: 'model-facts' },
-        fact('Context length', ctx === null
-          ? 'This provider does not report context length for this model.'
-          : fmt(ctx) + ' tokens', { missing: ctx === null, title: ctx === null ? null : fmt(ctx) + ' tokens' }),
+        fact('Context length', ctxLen === null ? 'Not reported' : fmt(ctxLen) + ' tokens', { missing: ctxLen === null }),
         ...pricingFacts,
-        fact('Max output', out === null
-          ? 'This provider does not report a maximum output length for this model.'
-          : fmt(out) + ' tokens', { missing: out === null })));
+        fact('Max output', out === null ? 'Not reported' : fmt(out) + ' tokens', { missing: out === null })));
 
     const levelChips = levels.length
       ? h('span', { class: 'models-chip-row' }, ...levels.map((level) => chip(
@@ -542,29 +548,29 @@ export async function renderModels(mount, ctx) {
         level === effectiveDefault ? 'chip-pink' : 'chip-neutral',
         level === effectiveDefault ? 'Default reasoning level' : 'Reasoning level',
       )))
-      : 'No reasoning levels are advertised for this model.';
-    const declaredText = declared.length
-      ? declared.join(', ')
-      : 'Nothing declared; levels are derived from the provider.';
+      : 'No reasoning levels advertised.';
+
+    const declaredText = declared.length ? declared.join(', ') : 'Derived from provider';
     const inputsText = inputs.length
       ? h('span', { class: 'models-chip-row' }, ...inputs.map((modality) => chip(modality, 'chip-neutral')))
-      : 'No input modalities are declared; the server derives them.';
-    const reasoning = h('section', { class: 'models-detail-section' },
+      : 'Derives from server';
+
+    const reasoning = h('section', { class: 'model-inline-section' },
       h('h3', {}, 'Reasoning & input'),
       h('dl', { class: 'model-facts' },
         fact('Effective levels', levelChips),
-        fact('Default', effectiveDefault || 'Inherits the global default.'),
+        fact('Default', effectiveDefault || 'Inherits global default'),
         fact('Declared', declaredText),
-        fact('Input', inputsText)));
+        fact('Input modalities', inputsText)));
 
-    const metadata = h('section', { class: 'models-detail-section' },
+    const metadata = h('section', { class: 'model-inline-section model-inline-meta-section' },
       h('h3', {}, 'Metadata overrides'),
       modelMetadataEditor(p, m));
 
+    // Actions
     const addToCombo = buildAddToComboDropdown(p, m, { className: 'btn btn-primary btn-sm' });
-
     const test = h('button', {
-      class: 'btn btn-primary btn-sm',
+      class: 'btn btn-sm',
       type: 'button',
       'aria-label': txt('Test ', m.id, ' on provider ', p.id),
     }, 'Test model');
@@ -577,46 +583,35 @@ export async function renderModels(mount, ctx) {
     }, 'Delete model');
     del.addEventListener('click', () => deleteModel(p, m));
 
-    const hide = toggle('Hidden from the relay listing', {
+    const hide = toggle('Hidden from relay listing', {
       checked: Boolean(m.hidden),
       help: 'Hidden models remain configured but are excluded from the relay model listing.',
     });
     hide.row.classList.add('models-detail-hide');
     hide.input.addEventListener('change', () => toggleHidden(p, m, hide.input));
 
-    const actions = h('section', { class: 'models-detail-section models-detail-actions' },
-      h('h3', {}, 'Actions'),
-      h('div', { class: 'models-action-row' }, addToCombo, test, del),
-      hide.row,
-      h('p', { class: 'hint' }, 'Testing sends a fixed prompt and may consume provider quota. Deleting removes the model from this panel; a later sync may re-add it.'));
+    const actionsBar = h('div', { class: 'model-inline-actions-bar' },
+      h('div', { class: 'model-inline-actions-left' }, addToCombo, test, del, hide.row),
+      h('span', { class: 'hint' }, 'Testing sends a small prompt and may consume provider quota.'));
 
-    drawerBody.replaceChildren(identity, actions, capabilities, reasoning, metadata);
-    if (focus || hadFocus) drawerClose.focus({ preventScroll: true });
-  }
+    const grid = h('div', { class: 'model-inline-grid' },
+      identity,
+      capabilities,
+      reasoning,
+      metadata);
 
-  function closeDetail({ restoreFocus = true } = {}) {
-    const previous = selectedKey;
-    selectedKey = null;
-    if (drawer) {
-      drawer.remove();
-      drawer = null;
-      drawerHead = null;
-      drawerBody = null;
-    }
-    paintSelection();
-    if (restoreFocus) focusRow(previous);
-  }
+    const body = h('div', { class: 'model-inline-body' }, actionsBar, grid);
 
-  function openDetail(p, m) {
-    const key = keyOf(p, m);
-    if (drawer && selectedKey === key) {
-      closeDetail();
-      return;
-    }
-    selectedKey = key;
-    paintSelection();
-    ensureDrawer();
-    renderDetail(p, m, { focus: true });
+    panel.append(head, body);
+
+    panel.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        closeDetail();
+      }
+    });
+
+    return panel;
   }
 
   function paintSelection() {
@@ -996,6 +991,20 @@ export async function renderModels(mount, ctx) {
     h('thead', {}, header),
     tbody);
 
+    if (selectedKey) {
+      const match = visible.find(({ p, m }) => keyOf(p, m) === selectedKey);
+      if (match) {
+        const anchor = tbody.querySelector(`tr[data-key="${CSS.escape(selectedKey)}"]`);
+        if (anchor) {
+          const panel = buildInlineModelDetail(match.p, match.m);
+          detailRow = h('tr', { class: 'model-detail-row' },
+            h('td', { colspan: String(colgroup.children.length || 8) }, panel));
+          anchor.after(detailRow);
+        }
+      } else {
+        detailRow = null;
+      }
+    }
     tableWrap.replaceChildren(table);
     paintSelection();
     if (resetScroll) tableWrap.scrollTop = 0;
