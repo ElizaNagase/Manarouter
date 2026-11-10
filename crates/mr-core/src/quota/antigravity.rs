@@ -45,7 +45,9 @@
 //! every non-internal model the account actually sees rather than a pinned list that would go
 //! stale.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -53,7 +55,7 @@ use serde_json::{json, Value};
 
 use crate::dialect::Dialect;
 use crate::error::{Error, Result};
-use crate::quota::http::QuotaRequest;
+use crate::quota::http::{HyperQuotaHttp, QuotaHttp, QuotaRequest};
 use crate::quota::registry::{QuotaAccount, QuotaFetchContext, QuotaFetcher};
 use crate::quota::types::{QuotaDetail, QuotaWindow, UsageQuota, WindowFamily};
 
@@ -84,10 +86,207 @@ pub const SOURCE_CATALOG: &str = "fetchAvailableModels";
 /// The `source` recorded for a weekly summary row.
 pub const SOURCE_WEEKLY: &str = "retrieveUserQuotaSummary";
 
-/// The IDE client version OmniRoute falls back to when it cannot reach the release feed.
-pub const IDE_FALLBACK_VERSION: &str = "2.1.1";
-/// The CLI client version OmniRoute falls back to.
-pub const CLI_FALLBACK_VERSION: &str = "1.1.5";
+/// The public release feed for the Antigravity IDE. It is the endpoint the IDE's own updater
+/// polls, needs no credential, and answers with a JSON array of {version, execution_id, ...}.
+pub const IDE_RELEASE_FEED_URL: &str =
+    "https://antigravity-ide-auto-updater-974169037036.us-central1.run.app/releases";
+/// The CLI's latest GitHub release; the CLI publishes no update feed of its own.
+pub const CLI_RELEASE_URL: &str =
+    "https://api.github.com/repos/google-antigravity/antigravity-cli/releases/latest";
+/// How long a resolved version is trusted before the sources are polled again (upstream uses six
+/// hours too).
+pub const VERSION_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+/// A version probe must never be a reason a request waits.
+const VERSION_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// How soon to retry a failed probe, so a boot without network recovers instead of waiting a full
+/// interval with the fallback in place.
+const VERSION_RETRY: Duration = Duration::from_secs(5 * 60);
+
+/// The IDE client version until the release feed answers.
+///
+/// This is not decoration. The Cloud Code backend refuses clients below a rolling minimum with
+/// "This version of Antigravity is no longer supported", and the same constant feeds the quota
+/// reader and the login path, so a frozen literal breaks all three at once. It sat at 2.1.1
+/// while the IDE moved to 2.6.0; ide_version() exists so that cannot silently happen again.
+pub const IDE_FALLBACK_VERSION: &str = "2.6.0";
+/// The CLI client version until GitHub answers.
+pub const CLI_FALLBACK_VERSION: &str = "1.5.3";
+
+static IDE_VERSION_CACHE: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+static CLI_VERSION_CACHE: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+fn version_cache(
+    cell: &'static OnceLock<RwLock<Option<String>>>,
+) -> &'static RwLock<Option<String>> {
+    cell.get_or_init(|| RwLock::new(None))
+}
+
+fn cached_version(cell: &'static OnceLock<RwLock<Option<String>>>, fallback: &str) -> String {
+    version_cache(cell)
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn store_version(cell: &'static OnceLock<RwLock<Option<String>>>, version: String) {
+    *version_cache(cell)
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(version);
+}
+
+/// The IDE version requests should present right now.
+///
+/// The last resolved value is kept even past its interval: an old-but-recent version is a better
+/// guess than a constant, and the refresher replaces it as soon as a probe succeeds.
+pub fn ide_version() -> String {
+    cached_version(&IDE_VERSION_CACHE, IDE_FALLBACK_VERSION)
+}
+
+/// The CLI version requests should present right now.
+pub fn cli_version() -> String {
+    cached_version(&CLI_VERSION_CACHE, CLI_FALLBACK_VERSION)
+}
+
+/// The numeric parts of a version, ignoring a leading 'v' and any pre-release/build suffix.
+fn version_parts(version: &str) -> Option<Vec<u64>> {
+    let core = version.trim().trim_start_matches('v');
+    let core = core.split(['-', '+']).next()?;
+    let mut parts = Vec::with_capacity(3);
+    for part in core.split('.') {
+        parts.push(part.parse::<u64>().ok()?);
+    }
+    (!parts.is_empty()).then_some(parts)
+}
+
+/// Compare two versions by their numeric parts, so 2.10.0 sorts above 2.6.0.
+fn version_cmp(left: &str, right: &str) -> Ordering {
+    let mut left = version_parts(left).unwrap_or_default();
+    let mut right = version_parts(right).unwrap_or_default();
+    let width = left.len().max(right.len());
+    left.resize(width, 0);
+    right.resize(width, 0);
+    left.cmp(&right)
+}
+
+/// The highest version in an IDE release feed.
+fn parse_ide_feed(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    value
+        .as_array()?
+        .iter()
+        .filter_map(|entry| entry.get("version").and_then(Value::as_str))
+        .filter(|version| version_parts(version).is_some())
+        .max_by(|left, right| version_cmp(left, right))
+        .map(|version| version.trim_start_matches('v').to_owned())
+}
+
+/// The tag of the CLI's latest GitHub release.
+fn parse_cli_release(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    for key in ["tag_name", "name"] {
+        let Some(text) = value.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let version = text.trim().trim_start_matches('v');
+        if version_parts(version).is_some() {
+            return Some(version.to_owned());
+        }
+    }
+    None
+}
+
+async fn fetch_ide_version(http: &dyn QuotaHttp) -> Option<String> {
+    let request = QuotaRequest::get(IDE_RELEASE_FEED_URL)
+        .header("Accept", "application/json")
+        .header(
+            "User-Agent",
+            concat!("manarouter/", env!("CARGO_PKG_VERSION")),
+        )
+        .timeout(VERSION_FETCH_TIMEOUT);
+    let response = http.request(request).await.ok()?;
+    if !response.is_success() {
+        return None;
+    }
+    parse_ide_feed(&response.body_str())
+}
+
+async fn fetch_cli_version(http: &dyn QuotaHttp) -> Option<String> {
+    let request = QuotaRequest::get(CLI_RELEASE_URL)
+        .header("Accept", "application/vnd.github+json")
+        .header(
+            "User-Agent",
+            concat!("manarouter/", env!("CARGO_PKG_VERSION")),
+        )
+        .timeout(VERSION_FETCH_TIMEOUT);
+    let response = http.request(request).await.ok()?;
+    if !response.is_success() {
+        return None;
+    }
+    parse_cli_release(&response.body_str())
+}
+
+/// Read both sources and install what answered, reporting whether each one did.
+async fn refresh_versions(http: &dyn QuotaHttp) -> (bool, bool) {
+    let ide = fetch_ide_version(http).await;
+    if let Some(version) = &ide {
+        tracing::info!(version = %version, "resolved the Antigravity IDE client version");
+        store_version(&IDE_VERSION_CACHE, version.clone());
+    }
+    let cli = fetch_cli_version(http).await;
+    if let Some(version) = &cli {
+        tracing::debug!(version = %version, "resolved the Antigravity CLI client version");
+        store_version(&CLI_VERSION_CACHE, version.clone());
+    }
+    (ide.is_some(), cli.is_some())
+}
+
+/// Keep ide_version() and cli_version() current for the life of the process.
+///
+/// The relay starts this once; the request path only ever reads the cache. A failed probe retries
+/// sooner than the normal interval because the first one often runs during boot, before the network
+/// is up, and a six-hour wait from there would leave the fallback in place all day.
+pub fn spawn_version_refresher() {
+    tokio::spawn(async {
+        loop {
+            let (ide, cli) = match HyperQuotaHttp::new() {
+                Ok(http) => refresh_versions(&http).await,
+                Err(error) => {
+                    tracing::debug!(%error, "the Antigravity version probe has no HTTP client");
+                    (false, false)
+                }
+            };
+            let delay = if ide && cli {
+                VERSION_CACHE_TTL
+            } else {
+                VERSION_RETRY
+            };
+            tokio::time::sleep(delay).await;
+        }
+    });
+}
+
+/// Rewrite the Antigravity/<version> token a recorded client User-Agent carries to the version
+/// resolved from the release feed.
+///
+/// The catalogue records the browser string the IDE presents, but its version is a literal that
+/// ages out exactly like the constants did. Rewriting the one token keeps an operator's recorded
+/// fingerprint intact while making the version authoritative. None means the value is already
+/// current or carries no token to rewrite.
+pub fn user_agent_with_current_ide_version(value: &str) -> Option<String> {
+    const MARKER: &str = "Antigravity/";
+    let start = value.find(MARKER)? + MARKER.len();
+    let rest = &value[start..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(rest.len());
+    let found = &rest[..end];
+    if found.is_empty() {
+        return None;
+    }
+    let current = ide_version();
+    (found != current).then(|| format!("{}{}{}", &value[..start], current, &rest[end..]))
+}
 
 /// The normalised quota base upstream divides a `0.0..=1.0` fraction into.
 const NORMALIZED_BASE: f64 = 1000.0;
@@ -210,14 +409,16 @@ fn client_profile(account: &QuotaAccount) -> String {
 
 /// The `User-Agent` for a profile. The platform token is pinned to the native desktop
 /// fingerprint (`darwin/arm64`) because that is what the upstream backend expects, exactly as
-/// OmniRoute pins it.
+/// OmniRoute pins it; the version is the one resolved from the release feed, so it cannot rot the
+/// way a literal does.
 fn user_agent(profile: &str) -> String {
     if profile == "cli" {
         format!(
-            "antigravity/cli/{CLI_FALLBACK_VERSION} (aidev_client; os_type=darwin; arch=arm64; auth_method=consumer)"
+            "antigravity/cli/{} (aidev_client; os_type=darwin; arch=arm64; auth_method=consumer)",
+            cli_version()
         )
     } else {
-        format!("antigravity/ide/{IDE_FALLBACK_VERSION} darwin/arm64")
+        format!("antigravity/ide/{} darwin/arm64", ide_version())
     }
 }
 
@@ -1220,10 +1421,8 @@ mod tests {
             header(first, "authorization"),
             Some("Bearer test-token-not-a-real-secret")
         );
-        assert_eq!(
-            header(first, "user-agent"),
-            Some("antigravity/ide/2.1.1 darwin/arm64")
-        );
+        let expected = format!("antigravity/ide/{IDE_FALLBACK_VERSION} darwin/arm64");
+        assert_eq!(header(first, "user-agent"), Some(expected.as_str()));
         assert_eq!(header(first, "content-type"), Some("application/json"));
         assert_eq!(
             serde_json::from_slice::<Value>(&first.body).expect("body is JSON"),
@@ -1293,7 +1492,10 @@ mod tests {
 
         let seen = http.seen();
         let ua = header(&seen[0], "user-agent").expect("a user agent");
-        assert!(ua.starts_with("antigravity/cli/1.1.5"), "{ua}");
+        assert!(
+            ua.starts_with(&format!("antigravity/cli/{CLI_FALLBACK_VERSION}")),
+            "{ua}"
+        );
     }
 
     #[test]
@@ -1356,5 +1558,66 @@ mod tests {
         let live = payload(EMPTY);
         let quota = parse(&catalog, Some(&live), None).expect("catalog still answers");
         assert_eq!(quota.source.as_deref(), Some("fetchAvailableModels"));
+    }
+
+    /// The feed is an array of releases, and only the highest one is this client.
+    #[test]
+    fn the_release_feed_resolves_to_its_highest_version() {
+        let feed =
+            r#"[{"version":"2.5.5"},{"version":"2.6.0"},{"version":"2.10.0"},{"version":"2.5.2"}]"#;
+        assert_eq!(parse_ide_feed(feed).as_deref(), Some("2.10.0"));
+        assert_eq!(
+            parse_ide_feed(r#"[{"version":"not-a-version"},{"version":"2.6.0"}]"#).as_deref(),
+            Some("2.6.0")
+        );
+        assert_eq!(parse_ide_feed("not JSON"), None);
+        assert_eq!(parse_ide_feed("[]"), None);
+    }
+
+    #[test]
+    fn the_cli_release_tag_is_normalised() {
+        assert_eq!(
+            parse_cli_release(r#"{"tag_name":"v1.5.3"}"#).as_deref(),
+            Some("1.5.3")
+        );
+        assert_eq!(
+            parse_cli_release(r#"{"name":"1.6.0"}"#).as_deref(),
+            Some("1.6.0")
+        );
+        assert_eq!(parse_cli_release(r#"{"tag_name":"nightly"}"#), None);
+        assert_eq!(parse_cli_release("{}"), None);
+    }
+
+    /// Both profiles present the resolved version, not a literal that can rot.
+    #[test]
+    fn the_client_user_agent_carries_the_resolved_version() {
+        assert_eq!(
+            user_agent("ide"),
+            format!("antigravity/ide/{} darwin/arm64", ide_version())
+        );
+        assert!(
+            user_agent("cli").starts_with(&format!("antigravity/cli/{}", cli_version())),
+            "{}",
+            user_agent("cli")
+        );
+    }
+
+    /// The catalogue records a browser string; only its version token may change.
+    #[test]
+    fn only_the_antigravity_version_token_is_rewritten() {
+        let current = ide_version();
+        let recorded = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/2.1.1 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36";
+        assert_eq!(
+            user_agent_with_current_ide_version(recorded),
+            Some(recorded.replace("Antigravity/2.1.1", &format!("Antigravity/{current}")))
+        );
+        let current_ua = format!("Antigravity/{current} Chrome/142.0.7444.175");
+        assert_eq!(user_agent_with_current_ide_version(&current_ua), None);
+        assert_eq!(user_agent_with_current_ide_version("curl/8.0"), None);
+        assert_eq!(user_agent_with_current_ide_version("Antigravity/"), None);
+        assert_eq!(
+            user_agent_with_current_ide_version("Antigravity/2.1.1"),
+            Some(format!("Antigravity/{current}"))
+        );
     }
 }

@@ -3337,6 +3337,27 @@ fn upstream_headers(
         );
     }
 
+    // Cloud Code refuses clients below a rolling minimum build ("This version of Antigravity is
+    // no longer supported"). The recorded fingerprint is a browser User-Agent whose version is a
+    // literal, so rewrite just that token from the release feed; every other recorded header stays
+    // exactly as the operator configured it.
+    if step.dialect == Dialect::Antigravity {
+        if let Some(rewritten) = map
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok())
+            .and_then(mr_core::quota::antigravity::user_agent_with_current_ide_version)
+        {
+            match HeaderValue::from_str(&rewritten) {
+                Ok(value) => {
+                    map.insert("user-agent", value);
+                }
+                Err(_) => {
+                    tracing::warn!("the resolved Antigravity user agent is not a valid header");
+                }
+            }
+        }
+    }
+
     map
 }
 
@@ -5771,6 +5792,49 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             &[],
         );
         assert!(!out.contains_key("x-command-code-version"));
+    }
+
+    #[test]
+    fn antigravity_inference_carries_the_resolved_client_version() {
+        // Cloud Code refuses clients below a rolling minimum build, and the catalogue records a
+        // literal version that ages out. The relay rewrites that one token on the way out, so a
+        // saved provider config written months ago cannot pin the client to an old build.
+        const RECORDED: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/2.1.1 Chrome/142.0.7444.175 Electron/39.2.3 Safari/537.36";
+        let mut p = provider_plan();
+        p.headers
+            .insert("user-agent".to_owned(), RECORDED.to_owned());
+        let head = scan_request_head(br#"{"model":"m"}"#);
+        let out = upstream_headers(
+            &p,
+            &step(Dialect::Antigravity, "https://example.com"),
+            None,
+            &HeaderMap::new(),
+            &head,
+            false,
+            None,
+            &[],
+        );
+        let user_agent = out.get("user-agent").unwrap().to_str().unwrap();
+        assert!(user_agent.contains(&format!(
+            "Antigravity/{}",
+            mr_core::quota::antigravity::ide_version()
+        )));
+        assert!(!user_agent.contains("Antigravity/2.1.1"));
+
+        // Only Antigravity gets the rewrite: another provider keeps the recorded header verbatim.
+        let mut other = provider_plan();
+        other.headers = p.headers.clone();
+        let out = upstream_headers(
+            &other,
+            &step(Dialect::OpenAi, "https://example.com"),
+            None,
+            &HeaderMap::new(),
+            &head,
+            false,
+            None,
+            &[],
+        );
+        assert_eq!(out.get("user-agent").unwrap().to_str().unwrap(), RECORDED);
     }
 
     #[test]

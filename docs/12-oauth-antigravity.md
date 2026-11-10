@@ -190,9 +190,11 @@ account. Two inputs do that classifying, and both must match the real IDE:
 
 1. The `User-Agent` on the call. The IDE sends
    `antigravity/ide/<version> darwin/arm64`; the platform token is pinned to the native desktop
-   fingerprint. Manarouter sends exactly the string its quota reader sends, built from
-   `IDE_FALLBACK_VERSION` in `crates/mr-core/src/quota/antigravity.rs`, so the login and the
-   metering paths present one client rather than two.
+   fingerprint. Manarouter sends exactly the string its quota reader sends, and both take
+   `<version>` from the release feed at runtime rather than from a literal (`ide_version()` in
+   `crates/mr-core/src/quota/antigravity.rs`), so the login and the metering paths present one
+   current client rather than two stale ones. The next subsection explains why the version cannot be
+   pinned.
 2. The host asked first: `daily-cloudcode-pa.googleapis.com`, then production, then the daily
    sandbox (OmniRoute's order). The host that answered `loadCodeAssist` is reused for
    `onboardUser` and the operation poll, so one login never straddles two backends.
@@ -307,7 +309,7 @@ required on every project-scoped call.
 | `Content-Type` | `application/json` |
 | `X-Goog-Api-Client` | `google-cloud-sdk vscode_cloudshelleditor/0.1` |
 | `Client-Metadata` | `{"ideType":"ANTIGRAVITY","platform":"WINDOWS","pluginType":"GEMINI"}` |
-| `User-Agent` | the Antigravity IDE string: `Mozilla/5.0 (…) Antigravity/<version> Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36` |
+| `User-Agent` | the Antigravity IDE string: `Mozilla/5.0 (…) Antigravity/<version> Chrome/142.0.7444.175 Electron/39.2.3 Safari/537.36`; the relay rewrites `<version>` from the release feed on every request |
 | `Accept` | `text/event-stream` on the streaming route |
 
 `Client-Metadata` is a JSON object sent as a header value, not a query parameter, and it is the one
@@ -332,6 +334,26 @@ The values matter for three reasons:
 gemini-cli comes from `google-auth-library` and is **UNCERTAIN**; the value above is the one the
 Antigravity IDE sends and is what the catalogue records. The two clients do not use the same string,
 and using the T1 string with a T2 login is a mismatch rather than an improvement.
+
+### The client version is resolved, not pinned
+
+The version in that `User-Agent` is load-bearing, and pinning it is unsafe. Cloud Code enforces a
+rolling minimum build and refuses anything below it with *"This version of Antigravity is no longer
+supported"*. The same client string is sent on inference, on quota reads and on login, so a stale
+literal puts all three behind the same check. That is not hypothetical — this project pinned
+`2.1.1`, the IDE moved to `2.6.0`, and inference began failing with exactly that message while the
+accounts were fine.
+
+So the version is resolved, not recorded. A background task fetches the IDE's public release feed
+(`https://antigravity-ide-auto-updater-974169037036.us-central1.run.app/releases`, the endpoint the
+IDE's own updater polls), takes the highest `version`, and caches it for six hours; a failed probe
+retries after five minutes and leaves the last known version in place. The CLI string resolves the
+same way from the latest `google-antigravity/antigravity-cli` GitHub release. The login path and the
+quota reader both read that cache. The relay additionally rewrites the `Antigravity/<version>` token
+of the `User-Agent` it sends upstream from the same cache, so a catalogue entry or a saved provider
+config written months ago cannot pin the client to an old build. The relay is the process that starts
+the refresher; a one-shot CLI command that never runs the relay uses the compiled-in fallback, which
+is the current release as of this writing rather than an old pin.
 
 ### The response envelope, and the translator trap
 

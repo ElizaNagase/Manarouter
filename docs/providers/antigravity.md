@@ -125,7 +125,7 @@ shared helper that normalised the two hosts would break one of the two registrat
 | Header | Note |
 |---|---|
 | `X-Goog-Api-Client` | The exact value gemini-cli sends. **UNCERTAIN** — recorded from research rather than from a published specification. |
-| `User-Agent` | **UNCERTAIN**, same provenance. |
+| `User-Agent` | The IDE's browser string, with its version token rewritten from the IDE release feed on every request so it cannot go stale. **UNCERTAIN**, same provenance. |
 | `Client-Metadata` | Carries `ideType: ANTIGRAVITY`. Required by the internal endpoint. |
 
 ## Refresh tokens

@@ -241,6 +241,10 @@ pub fn build_state(
 pub async fn serve(options: RelayOptions) -> Result<(), StartupError> {
     let config = load_config()?;
     let (state, addr) = build_state(&options, &config)?;
+    // The Antigravity client version is refused when it falls behind a rolling minimum, so resolve
+    // it from the release feed in the background instead of pinning a literal. The request path
+    // only reads the cache; a failed probe leaves the last known version (or the fallback) in place.
+    mr_core::quota::antigravity::spawn_version_refresher();
     server::serve(state, addr)
         .await
         .map_err(|e| StartupError::new(format!("the listener failed: {e}")))

@@ -39,6 +39,7 @@ use crate::openai::{
     to_pivot_request, AnthropicStreamState, PivotRequest,
 };
 use crate::sse;
+use crate::thought;
 use crate::{Result, TranslateCtx, TranslateError, TranslatedRequest};
 
 // ---------------------------------------------------------------------------------------------
@@ -225,7 +226,20 @@ fn function_call_part(tc: &Value) -> Option<Value> {
         }
     }
     // Arguments absent or empty: `args` is optional, and an absent one is the honest report.
-    Some(json!({"functionCall": call}))
+    //
+    // The signature is what makes a replayed call legal on Gemini 3 and later. It is resolved from
+    // the id we minted for it when that id comes back; when it cannot be — another process, another
+    // client's id, a client that rewrote it — the documented stand-in keeps the turn alive instead
+    // of failing it with a 400 the caller cannot act on.
+    let signature = tc
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(thought::signature)
+        .unwrap_or_else(|| thought::UNKNOWN_SIGNATURE.to_string());
+    Some(json!({
+        "functionCall": call,
+        "thoughtSignature": signature,
+    }))
 }
 
 /// One `role: "tool"` message as a user turn holding Gemini's `functionResponse`.
@@ -804,9 +818,9 @@ fn google_response_to_pivot(ctx: &TranslateCtx<'_>, v: &Value) -> Value {
             if let Some(call) = field(part, "functionCall", "function_call") {
                 if let Some(name) = field_str(call, "name", "name").filter(|n| !n.is_empty()) {
                     // Chat Completions keys calls by an id it then echoes on the tool result;
-                    // Gemini's functionCall has no id, so one is minted per response. The
-                    // request half resolves it back to a name by finding this very entry in
-                    // the assistant turn, so the pair round-trips.
+                    // Gemini's functionCall has no id of its own, so one is minted here. It is
+                    // unique across the process because the same id is the handle the request
+                    // half uses to hand the model its own thought signature back.
                     let arguments = match field(call, "args", "args") {
                         Some(a) if a.is_object() || a.is_array() => a.to_string(),
                         Some(_) => "{}".to_string(),
@@ -814,8 +828,13 @@ fn google_response_to_pivot(ctx: &TranslateCtx<'_>, v: &Value) -> Value {
                         // string, so it becomes the empty JSON object.
                         None => "{}".to_string(),
                     };
+                    let id = thought::mint_call_id();
+                    if let Some(signature) = field_str(part, "thoughtSignature", "thought_signature")
+                    {
+                        thought::remember(&id, signature);
+                    }
                     tool_calls.push(json!({
-                        "id": format!("call_{}", tool_calls.len()),
+                        "id": id,
                         "type": "function",
                         "function": {"name": name, "arguments": arguments},
                     }));
@@ -1061,12 +1080,17 @@ fn translate_stream_item(
                         // full arguments together — no argument splicing across frames.
                         _ => "{}".to_string(),
                     };
+                    let id = thought::mint_call_id();
+                    if let Some(signature) = field_str(part, "thoughtSignature", "thought_signature")
+                    {
+                        thought::remember(&id, signature);
+                    }
                     chunks.push(stream_chunk(
                         state,
                         json!({
                             "tool_calls": [{
                                 "index": index,
-                                "id": format!("call_{}", index),
+                                "id": id,
                                 "type": "function",
                                 "function": {"name": name, "arguments": arguments},
                             }]
@@ -1755,13 +1779,76 @@ mod tests {
         }));
         assert_eq!(out["choices"][0]["finish_reason"], "tool_calls");
         let call = &out["choices"][0]["message"]["tool_calls"][0];
-        assert_eq!(call["id"], "call_0");
+        assert!(
+            call["id"].as_str().unwrap().starts_with("call_"),
+            "the id is minted here so the client can echo it back with the call"
+        );
         assert_eq!(call["type"], "function");
         assert_eq!(call["function"]["name"], "f");
         // Chat Completions carries arguments as a JSON string, not an object.
         assert_eq!(
             serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap()).unwrap(),
             json!({"a": 1})
+        );
+    }
+
+    /// A signature the model sent comes back on the turn that replays the call.
+    ///
+    /// This is the whole point of the id store: Gemini 3 rejects a replayed `functionCall` that
+    /// lost its signature, and the pivot has no field to carry one through a client.
+    #[test]
+    fn a_replayed_call_carries_the_signature_the_model_sent() {
+        let first = response(json!({
+            "candidates": [{
+                "content": {"parts": [{
+                    "functionCall": {"name": "f", "args": {"a": 1}},
+                    "thoughtSignature": "sig-from-the-model"
+                }]},
+                "finishReason": "STOP"
+            }]
+        }));
+        let id = first["choices"][0]["message"]["tool_calls"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let out = build(json!({
+            "model": "x",
+            "messages": [
+                {"role": "user", "content": "do it"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": id, "type": "function",
+                     "function": {"name": "f", "arguments": "{\"a\":1}"}}
+                ]},
+                {"role": "tool", "tool_call_id": id, "content": "done"}
+            ]
+        }));
+        assert_eq!(
+            out["contents"][1]["parts"][0]["thoughtSignature"],
+            "sig-from-the-model"
+        );
+    }
+
+    /// An id this process never minted still produces a legal part.
+    ///
+    /// Losing the signature degrades the model's continuity; failing the request would lose the
+    /// turn. Google documents this stand-in for exactly that case.
+    #[test]
+    fn an_unknown_call_id_falls_back_to_the_documented_stand_in() {
+        let out = build(json!({
+            "model": "x",
+            "messages": [
+                {"role": "user", "content": "do it"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_from_another_process", "type": "function",
+                     "function": {"name": "f", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_from_another_process", "content": "done"}
+            ]
+        }));
+        assert_eq!(
+            out["contents"][1]["parts"][0]["thoughtSignature"],
+            "skip_thought_signature_validator"
         );
     }
 
@@ -1913,7 +2000,10 @@ mod tests {
         assert_eq!(one.len(), 2, "role chunk then tool chunk");
         let call = &chunk(&one[1])["choices"][0]["delta"]["tool_calls"][0];
         assert_eq!(call["index"], 0);
-        assert_eq!(call["id"], "call_0");
+        assert!(
+            call["id"].as_str().unwrap().starts_with("call_"),
+            "a streamed call needs a unique id too, so its signature can be resolved on replay"
+        );
         assert_eq!(call["function"]["name"], "f");
         assert_eq!(call["function"]["arguments"], "{\"a\":1}");
 

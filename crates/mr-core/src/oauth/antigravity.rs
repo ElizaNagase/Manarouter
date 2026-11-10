@@ -63,11 +63,12 @@ fn platform_name() -> &'static str {
 ///
 /// The quota reader has always sent this header (it is the fingerprint OmniRoute presents); the
 /// login path did not, which is why an account that already served requests through this instance
-/// could not be added back.
+/// could not be added back. The version is the IDE's current release rather than a pinned one:
+/// Cloud Code refuses outdated clients with an error about the app being unsupported.
 fn cloud_code_user_agent() -> String {
     format!(
         "antigravity/ide/{} darwin/arm64",
-        crate::quota::antigravity::IDE_FALLBACK_VERSION
+        crate::quota::antigravity::ide_version()
     )
 }
 
@@ -659,10 +660,9 @@ impl OAuthPlatform for Antigravity {
 
     fn fingerprint_headers(&self) -> &'static [(&'static str, &'static str)] {
         // Byte-identical to the catalogue's `[providers.headers]`. The `User-Agent` stays
-        // catalogue-only, and it now carries a literal version: it used to carry
-        // `${antigravity_version}`, which nothing substituted, so every inference request sent the
-        // template itself as part of the client fingerprint. `2.1.1` is the same version the quota
-        // reader pins, so the two paths present one client rather than two.
+        // catalogue-only, but its `Antigravity/<version>` token is rewritten per request from the
+        // release feed (see the dialect branch in the relay's `upstream_headers`), so the catalogue
+        // can record a literal without pinning an old build.
         // UNCERTAIN: the exact `X-Goog-Api-Client` spelling (`google-cloud-sdk
         // vscode_cloudshelleditor/0.1`) is reverse-engineered (docs/12); if it is wrong the
         // request may land in the wrong client's quota pool — a silent wrong-bucket, not an

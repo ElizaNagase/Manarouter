@@ -37,6 +37,9 @@ pub mod openai;
 pub mod responses;
 pub mod sse;
 
+/// Per-process storage for the Gemini thought signatures a client cannot carry itself.
+mod thought;
+
 /// Everything a translation needs that is not itself the body.
 ///
 /// Passed by reference and never stored, so translating a request allocates nothing beyond the
