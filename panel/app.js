@@ -9,7 +9,7 @@ import { api, ApiError, onUnauthorized } from './api.js';
 import { h, clear, errorBlock, spinner } from './dom.js';
 import { createPoller } from './poll.js';
 import { createToasts } from './toast.js';
-import { confirmDialog, secretKeyDialog } from './dialog.js';
+import { confirmDialog, promptDialog, secretKeyDialog } from './dialog.js';
 import {
   extractList, portsDirty, describePortChange, truncateMiddle, formatUptime,
 } from './format.js';
@@ -153,6 +153,7 @@ const ctx = {
   leaveGuard: null, // a view with unsaved work sets this to an async () => boolean
   toast,
   confirm: (opts) => confirmDialog(dialogRoot, opts),
+  prompt: (opts) => promptDialog(dialogRoot, opts),
   secretKey: (opts) => secretKeyDialog(dialogRoot, opts),
   // Programmatic navigation must ask the same unsaved-work guard the hash router asks, but before
   // the URL changes. Letting hashchange prompt after the fact meant a refused navigation had

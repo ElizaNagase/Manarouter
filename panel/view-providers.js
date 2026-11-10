@@ -1073,7 +1073,7 @@ export async function renderProviders(mount, ctx) {
     const accounts = Array.isArray(p.accounts) ? p.accounts : [];
     const accSection = h('section', {}, h('h3', {}, `Accounts (${accounts.length})`));
     if (accounts.length) {
-      const tb = h('tbody');
+      const accTb = h('tbody');
       for (const a of accounts) {
         const s = accountState(a);
         const quota = quotaCache.get(`${p.id}|${a.id}`);
@@ -1082,14 +1082,17 @@ export async function renderProviders(mount, ctx) {
           : null;
         const toggle = h('button', {
           class: 'btn btn-sm', type: 'button',
-          'aria-label': `${a.enabled === false ? 'Enable' : 'Disable'} account ${a.id}`,
+          'aria-label': `${a.enabled === false ? 'Enable' : 'Disable'} account ${a.id ?? ''}`,
         }, a.enabled === false ? 'Enable' : 'Disable');
         toggle.addEventListener('click', () => toggleAccount(p, a, toggle));
         const del = h('button', {
-          class: 'icon-btn danger', type: 'button', 'aria-label': `Delete account ${a.id}`,
+          class: 'icon-btn danger', type: 'button', 'aria-label': `Delete account ${a.id ?? ''}`,
         }, icon('trash'));
         del.addEventListener('click', () => deleteAccount(p, a));
-        tb.append(h('tr', {},
+
+
+
+        accTb.append(h('tr', {},
           h('td', { class: 'mono' }, a.id ?? ''),
           h('td', {}, a.label ?? a.identity ?? ''),
           h('td', {}, chip(s.label, s.cls, `state: ${s.key}`), quotaChip),
@@ -1103,24 +1106,111 @@ export async function renderProviders(mount, ctx) {
             h('th', { scope: 'col' }, 'ID'), h('th', { scope: 'col' }, 'Label'),
             h('th', { scope: 'col' }, 'State'), h('th', { scope: 'col' }, 'Pri'),
             h('th', { scope: 'col' }, 'Weight'), h('th', { scope: 'col' }, ''))),
-          tb)));
+          accTb)));
     } else {
       accSection.append(emptyState('No accounts.',
         p.auth?.type === 'oauth'
           ? 'Connect an account below to let this provider serve requests.'
           : 'Add an account to give this provider credentials.'));
     }
-    // A successful add has to leave the page showing the account it just created. Without a
-    // callback the old flow stopped at a disabled "Adding…" button, and the account only appeared
-    // after the drawer was closed and re-opened by hand.
     accSection.append(buildAccountForm(p, () => afterAccountConnected(p.id)));
     body.append(accSection);
 
     // --- models ---
     const models = Array.isArray(p.models) ? p.models : [];
-    const modelSection = h('section', {}, h('h3', {}, `Models (${models.length})`));
+    const testAllBtn = h('button', { class: 'btn btn-sm btn-test-all-models', type: 'button' }, 'Test all models');
+    const hideFailedToggle = toggle('Hide failed models', {
+      id: `provider-${p.id}-hide-failed`,
+      help: 'Automatically hide any model that fails the test from the relay listing.',
+    });
+    hideFailedToggle.row.classList.add('provider-models-hide-toggle');
+
+    const modelHead = h('div', { class: 'provider-models-head' },
+      h('h3', {}, `Models (${models.length})`),
+      models.length ? h('div', { class: 'provider-models-actions' }, hideFailedToggle.row, testAllBtn) : null,
+    );
+    const modelSection = h('section', {}, modelHead);
     if (models.length) {
-      const tb = h('tbody');
+      const modelTb = h('tbody');
+      let testingProviderModels = false;
+      testAllBtn.addEventListener('click', async () => {
+        if (testingProviderModels) {
+          testingProviderModels = false;
+          testAllBtn.textContent = 'Stopping…';
+          return;
+        }
+
+        const ok = await ctx.confirm({
+          title: `Test all ${models.length} models for ${p.label || p.id}?`,
+          message: `This will send test prompts to ${models.length} models and may consume quota. ${hideFailedToggle.input.checked ? 'Failed models will be automatically hidden.' : ''}`,
+          confirmLabel: 'Start testing',
+          cancelLabel: 'Cancel',
+          danger: false,
+        });
+        if (!ok) return;
+
+        testingProviderModels = true;
+        testAllBtn.classList.add('btn-danger');
+
+        let tested = 0;
+        let passed = 0;
+        let failed = 0;
+        let hidden = 0;
+
+        for (const m of models) {
+          if (!testingProviderModels) break;
+
+          testAllBtn.textContent = `Stop (${tested + 1}/${models.length} · ${passed} ok · ${failed} fail)`;
+
+          const rowBtn = modelTb.querySelector(`tr[data-model-id="${CSS.escape(m.id)}"] .btn-test`);
+          const label = rowBtn?.querySelector('span');
+          if (label) label.textContent = 'Testing…';
+
+          let success = false;
+          try {
+            await api.post('/api/models/test', {
+              provider: p.id,
+              model: m.id,
+              prompt: 'Reply with the single word OK.',
+            }, { skipAuthRedirect: true });
+            success = true;
+            passed += 1;
+            if (label) label.textContent = 'OK';
+          } catch {
+            success = false;
+            failed += 1;
+            if (label) label.textContent = 'failed';
+          }
+
+          if (!success && hideFailedToggle.input.checked && !m.hidden) {
+            try {
+              await api.post(`/api/providers/${encodeURIComponent(p.id)}/models`, { ...m, hidden: true });
+              m.hidden = true;
+              hidden += 1;
+              const toggleBtn = modelTb.querySelector(`tr[data-model-id="${CSS.escape(m.id)}"] button[aria-label*="model ${m.id}"]`);
+              if (toggleBtn) toggleBtn.textContent = 'Show';
+              const idCell = modelTb.querySelector(`tr[data-model-id="${CSS.escape(m.id)}"] td:first-child`);
+              if (idCell && !idCell.querySelector('.chip')) {
+                idCell.append(h('div', {}, chip('hidden')));
+              }
+            } catch {
+              // quiet
+            }
+          }
+
+          tested += 1;
+        }
+
+        testingProviderModels = false;
+        testAllBtn.classList.remove('btn-danger');
+        testAllBtn.textContent = 'Test all models';
+
+        ctx.toast.success(`Tested ${tested} models for ${p.id}: ${passed} passed, ${failed} failed${hidden ? ` (${hidden} hidden)` : ''}.`);
+        if (hidden > 0) {
+          await reload(true);
+        }
+      });
+
       for (const m of models) {
         const toggle = h('button', {
           class: 'btn btn-sm', type: 'button',
@@ -1131,8 +1221,6 @@ export async function renderProviders(mount, ctx) {
           class: 'icon-btn danger', type: 'button', 'aria-label': `Delete model ${m.id}`,
         }, icon('trash'));
         del.addEventListener('click', () => deleteModel(p, m));
-        // Labelled, not a bare triangle: this is the first thing an operator wants when a model
-        // stops answering, and an icon-only button in a dense table reads as decoration.
         const test = h('button', {
           class: 'btn btn-sm btn-test', type: 'button',
           'aria-label': `Test model ${m.id}`, title: 'Send one tiny completion through the router',
@@ -1147,17 +1235,14 @@ export async function renderProviders(mount, ctx) {
         }, 'Edit');
         edit.addEventListener('click', () => {
           const opening = editorRow.hidden;
-          for (const row of tb.querySelectorAll('.model-editor-row')) row.hidden = true;
-          for (const btn of tb.querySelectorAll('[data-model-edit]')) btn.setAttribute('aria-expanded', 'false');
+          for (const row of modelTb.querySelectorAll('.model-editor-row')) row.hidden = true;
+          for (const btn of modelTb.querySelectorAll('[data-model-edit]')) btn.setAttribute('aria-expanded', 'false');
           editorRow.hidden = !opening;
           edit.setAttribute('aria-expanded', opening ? 'true' : 'false');
           if (opening) editorRow.querySelector('input')?.focus();
         });
 
-        // One row per model, with the id and the few facts an operator scans for. The full
-        // editor opens underneath it: an eight-column table of always-live inputs made every
-        // row a form and every form a horizontal scroll.
-        tb.append(h('tr', {},
+        modelTb.append(h('tr', { dataset: { modelId: m.id } },
           h('td', {},
             h('span', { class: 'mono model-id' }, m.id, ' ', copyButton(m.id, { className: 'btn btn-sm icon-btn', title: 'Copy model ID' })),
             m.label ? h('div', { class: 'hint' }, m.label) : null,
@@ -1167,7 +1252,7 @@ export async function renderProviders(mount, ctx) {
           h('td', { class: 'num model-price' }, modelPriceShort(m)),
           h('td', {}, h('span', { class: 'mono' }, m.default_reasoning_level ?? 'inherit')),
           h('td', { class: 'actions' }, test, edit, toggle, del)));
-        tb.append(editorRow);
+        modelTb.append(editorRow);
       }
       modelSection.append(h('div', { class: 'table-scroll model-table-scroll' },
         h('table', { class: 'tbl model-table' },
@@ -1177,7 +1262,7 @@ export async function renderProviders(mount, ctx) {
             h('th', { scope: 'col', class: 'num' }, 'Price / Mtok'),
             h('th', { scope: 'col' }, 'Default level'),
             h('th', { scope: 'col' }, ''))),
-          tb)));
+          modelTb)));
     } else {
       modelSection.append(emptyState('No models yet.', 'Run “Sync models” or add one manually below.'));
     }

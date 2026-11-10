@@ -117,6 +117,57 @@ export function confirmDialog(root, {
   return done;
 }
 
+export function promptDialog(root, {
+  title,
+  message,
+  defaultValue = '',
+  placeholder = '',
+  confirmLabel = 'Confirm',
+  cancelLabel = 'Cancel',
+} = {}) {
+  const { done, close } = openDialog(root, (card, close) => {
+    const input = h('input', {
+      class: 'input mono',
+      type: 'text',
+      value: defaultValue,
+      placeholder,
+      'data-autofocus': '',
+      style: 'width: 100%; margin: 12px 0 16px;',
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const val = input.value.trim();
+        if (val) close(val);
+      }
+    });
+
+    const confirmBtn = h('button', {
+      class: 'btn btn-primary',
+      type: 'button',
+      onclick: () => {
+        const val = input.value.trim();
+        if (val) close(val);
+      },
+    }, confirmLabel);
+
+    card.append(
+      addTitle(card, title),
+      ...(message ? [h('p', { class: 'dialog-msg' }, message)] : []),
+      input,
+      h('div', { class: 'dialog-actions' },
+        h('button', {
+          class: 'btn',
+          type: 'button',
+          onclick: () => close(null),
+        }, cancelLabel),
+        confirmBtn,
+      ),
+    );
+  }, { dismissable: true });
+  return done;
+}
+
 /**
  * The one-time client-key reveal (POST /api/keys returns the plaintext exactly once).
  *

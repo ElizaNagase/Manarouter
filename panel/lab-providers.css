@@ -555,3 +555,28 @@ body.provider-dragging .providers-view .provider-table tr.row-draggable { cursor
   .providers-view .provider-tools .count { margin-right: auto; }
   .providers-view .provider-work { padding-left: 12px; }
 }
+
+/* Provider models test all & hide failed toggle */
+.provider-models-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.provider-models-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.provider-models-hide-toggle {
+  margin: 0;
+  gap: 5px;
+}
+.provider-models-hide-toggle label {
+  font-size: 11.5px;
+  color: var(--tx2);
+  cursor: pointer;
+  white-space: nowrap;
+}

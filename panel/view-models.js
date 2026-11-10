@@ -6,7 +6,7 @@
 import { api } from './api.js';
 import { h, chip, emptyState, errorBlock, field, toggle, copyButton, icon } from './dom.js';
 import {
-  formatCompact, formatAge, REASONING_LEVELS, providerLevels, declaredLevels, modelLevels,
+  formatCompact, formatAge, extractList, REASONING_LEVELS, providerLevels, declaredLevels, modelLevels,
 } from './format.js';
 
 const SOURCES = ['synced', 'manual', 'inferred'];
@@ -159,6 +159,14 @@ export async function renderModels(mount, ctx) {
 
   const count = h('span', { class: 'models-count', role: 'status', 'aria-live': 'polite' }, 'Loading…');
 
+  const testAllBtn = h('button', { class: 'btn models-test-all', type: 'button' }, 'Test all models');
+  const hideFailedToggle = toggle('Hide failed models', {
+    id: 'models-hide-failed',
+    help: 'Automatically hide any model that fails the test from the relay listing.',
+  });
+  hideFailedToggle.row.classList.add('models-hide-failed-toggle');
+  testAllBtn.disabled = true;
+
   const resyncAll = h('button', { class: 'btn', type: 'button' }, 'Resync all models');
   const deleteAll = h('button', { class: 'btn btn-danger', type: 'button' }, 'Delete all models');
   resyncAll.disabled = true;
@@ -169,7 +177,7 @@ export async function renderModels(mount, ctx) {
   const coverage = h('p', { class: 'models-coverage' }, 'Reading providers and their models.');
   const head = h('div', { class: 'models-head' },
     h('div', { class: 'models-head-copy' }, headline, coverage),
-    h('div', { class: 'models-bulk' }, resyncAll, deleteAll));
+    h('div', { class: 'models-bulk' }, hideFailedToggle.row, testAllBtn, resyncAll, deleteAll));
 
   const filters = h('div', { class: 'models-filters' }, provSel, sourceSel, hiddenFilter.row);
   hiddenFilter.row.classList.add('models-hidden-filter');
@@ -191,6 +199,235 @@ export async function renderModels(mount, ctx) {
   pageSizeSel.value = '100';
 
   mount.replaceChildren(head, controls, tableWrap, pager, note);
+
+  let combos = [];
+  async function refreshCombos() {
+    try {
+      combos = extractList(await api.get('/api/combos'), 'combos');
+    } catch {
+      combos = [];
+    }
+  }
+  void refreshCombos();
+
+  async function addModelToCombo(combo, p, m, btn = null) {
+    const textEl = btn ? btn.querySelector('.models-combo-btn-text') : null;
+    const originalText = textEl?.textContent;
+    if (btn) {
+      btn.disabled = true;
+      if (textEl) textEl.textContent = 'Adding…';
+    }
+
+    try {
+      const freshList = extractList(await api.get('/api/combos'), 'combos');
+      const target = freshList.find((c) => c.id === combo.id) ?? combo;
+      const steps = Array.isArray(target.steps) ? [...target.steps] : [];
+
+      steps.push({
+        enabled: true,
+        provider: p.id,
+        model: m.id,
+        weight: 0,
+      });
+
+      const payload = {
+        ...target,
+        steps,
+      };
+
+      await api.put('/api/combos/' + encodeURIComponent(target.id), payload);
+      ctx.toast.success(txt('Added ', p.id, '/', m.id, ' to combo ', target.name, '.'));
+      await refreshCombos();
+    } catch (err) {
+      ctx.toast.error(txt('Could not add to combo ', combo.name), err);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        if (textEl) textEl.textContent = originalText || 'Add to combo';
+      }
+    }
+  }
+
+  async function promptNewComboForModel(p, m) {
+    const rawTail = m.id.slice(m.id.lastIndexOf('/') + 1) || m.id;
+    const defaultName = rawTail.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase();
+
+    const name = await (ctx.prompt ? ctx.prompt({
+      title: 'New combo with this model',
+      message: txt('Create a new routing combo with step ', p.id, '/', m.id, ':'),
+      defaultValue: defaultName,
+      placeholder: 'combo-name',
+      confirmLabel: 'Create combo',
+      cancelLabel: 'Cancel',
+    }) : null);
+
+    if (!name || !name.trim()) return;
+
+    try {
+      const payload = {
+        name: name.trim(),
+        label: deriveDisplayName(name.trim()),
+        strategy: 'priority',
+        midstream_policy: 'restart',
+        max_retries: 1,
+        retry_delay_ms: 0,
+        affinity: true,
+        enabled: true,
+        steps: [{
+          enabled: true,
+          provider: p.id,
+          model: m.id,
+          weight: 0,
+        }],
+        hedge: {
+          enabled: false,
+          participants: [],
+          count: 3,
+          window_ms: 800,
+          winner_metric: 'first-response-byte',
+          on_winner_fail: { 'pick-highest-passed': null },
+          cancel_losers: true,
+          loser_grace_ms: 0,
+        },
+      };
+
+      const created = await api.post('/api/combos', payload);
+      ctx.toast.success(txt('Created combo ', payload.name, ' with step ', p.id, '/', m.id, '.'));
+      await refreshCombos();
+    } catch (err) {
+      ctx.toast.error('Could not create combo', err);
+    }
+  }
+
+  function buildAddToComboDropdown(p, m, { className = 'btn btn-sm' } = {}) {
+    const wrap = h('div', { class: 'models-combo-dropdown-wrap' });
+    const btn = h('button', {
+      class: className + ' models-combo-dropdown-btn',
+      type: 'button',
+      'aria-haspopup': 'menu',
+      'aria-expanded': 'false',
+      title: txt('Add ', m.id, ' to a routing combo'),
+    },
+      h('span', { class: 'models-combo-btn-text' }, 'Add to combo'),
+      h('span', { class: 'models-combo-caret', 'aria-hidden': 'true' }, ' ▾'));
+
+    const menu = h('div', {
+      class: 'models-combo-menu',
+      role: 'menu',
+      'aria-label': 'Select a combo to add this model to',
+      hidden: true,
+    });
+
+    let open = false;
+
+    function closeMenu() {
+      if (!open) return;
+      open = false;
+      menu.hidden = true;
+      btn.setAttribute('aria-expanded', 'false');
+      wrap.classList.remove('is-open');
+      document.removeEventListener('click', onDocClick);
+      document.removeEventListener('keydown', onDocKey);
+    }
+
+    function onDocClick(e) {
+      if (!wrap.contains(e.target)) closeMenu();
+    }
+
+    function onDocKey(e) {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        closeMenu();
+        btn.focus({ preventScroll: true });
+      }
+    }
+
+    async function toggleMenu(e) {
+      e?.stopPropagation();
+      if (open) {
+        closeMenu();
+        return;
+      }
+
+      document.querySelectorAll('.models-combo-dropdown-wrap.is-open').forEach((el) => {
+        el.querySelector('.models-combo-menu')?.setAttribute('hidden', '');
+        el.querySelector('.models-combo-dropdown-btn')?.setAttribute('aria-expanded', 'false');
+        el.classList.remove('is-open');
+      });
+
+      if (!combos.length) await refreshCombos();
+
+      renderMenuItems();
+      open = true;
+      menu.hidden = false;
+      btn.setAttribute('aria-expanded', 'true');
+      wrap.classList.add('is-open');
+
+      const rect = btn.getBoundingClientRect();
+      if (window.innerWidth - rect.left < 280) {
+        menu.classList.add('is-right');
+      } else {
+        menu.classList.remove('is-right');
+      }
+
+      setTimeout(() => {
+        document.addEventListener('click', onDocClick);
+        document.addEventListener('keydown', onDocKey);
+        const first = menu.querySelector('button');
+        if (first) first.focus({ preventScroll: true });
+      }, 0);
+    }
+
+    function renderMenuItems() {
+      menu.replaceChildren();
+      const head = h('div', { class: 'models-combo-menu-head' }, 'ADD TO COMBO');
+      menu.append(head);
+
+      if (!combos.length) {
+        menu.append(h('div', { class: 'models-combo-menu-empty hint' }, 'No combos configured yet'));
+      } else {
+        for (const c of combos) {
+          const stepCount = c.steps?.length ?? 0;
+          const isInCombo = c.steps?.some((s) => s.provider === p.id && s.model === m.id);
+          const item = h('button', {
+            class: 'models-combo-menu-item' + (isInCombo ? ' is-in-combo' : ''),
+            type: 'button',
+            role: 'menuitem',
+          },
+            h('span', { class: 'models-combo-item-name mono' }, c.name),
+            h('span', { class: 'models-combo-item-meta' },
+              txt(stepCount, ' step', stepCount === 1 ? '' : 's'),
+              isInCombo ? chip('added', 'chip-neutral models-combo-tag') : null));
+
+          item.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            closeMenu();
+            await addModelToCombo(c, p, m, btn);
+          });
+          menu.append(item);
+        }
+      }
+
+      const div = h('div', { class: 'models-combo-menu-divider' });
+      const newItem = h('button', {
+        class: 'models-combo-menu-item models-combo-menu-new',
+        type: 'button',
+        role: 'menuitem',
+      }, '+ New combo with this model…');
+
+      newItem.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        closeMenu();
+        await promptNewComboForModel(p, m);
+      });
+
+      menu.append(div, newItem);
+    }
+
+    btn.addEventListener('click', toggleMenu);
+    wrap.append(btn, menu);
+    return wrap;
+  }
 
   let selectedKey = null;
   let drawer = null;
@@ -324,6 +561,8 @@ export async function renderModels(mount, ctx) {
       h('h3', {}, 'Metadata overrides'),
       modelMetadataEditor(p, m));
 
+    const addToCombo = buildAddToComboDropdown(p, m, { className: 'btn btn-primary btn-sm' });
+
     const test = h('button', {
       class: 'btn btn-primary btn-sm',
       type: 'button',
@@ -347,11 +586,11 @@ export async function renderModels(mount, ctx) {
 
     const actions = h('section', { class: 'models-detail-section models-detail-actions' },
       h('h3', {}, 'Actions'),
-      h('div', { class: 'models-action-row' }, test, del),
+      h('div', { class: 'models-action-row' }, addToCombo, test, del),
       hide.row,
       h('p', { class: 'hint' }, 'Testing sends a fixed prompt and may consume provider quota. Deleting removes the model from this panel; a later sync may re-add it.'));
 
-    drawerBody.replaceChildren(identity, capabilities, reasoning, metadata, actions);
+    drawerBody.replaceChildren(identity, actions, capabilities, reasoning, metadata);
     if (focus || hadFocus) drawerClose.focus({ preventScroll: true });
   }
 
@@ -464,6 +703,7 @@ export async function renderModels(mount, ctx) {
 
     resyncAll.disabled = bulkBusy.value || providers.length === 0;
     deleteAll.disabled = bulkBusy.value || total === 0;
+    testAllBtn.disabled = bulkBusy.value || total === 0;
 
     if (!providers.length) {
       headline.textContent = 'No providers configured';
@@ -667,6 +907,8 @@ export async function renderModels(mount, ctx) {
           ? h('span', { class: 'models-derived-name' }, derived)
           : h('span', { class: 'models-muted' }, 'No label'));
 
+      const rowAddToCombo = buildAddToComboDropdown(p, m, { className: 'btn btn-sm' });
+
       const test = h('button', {
         class: 'btn btn-primary btn-sm',
         type: 'button',
@@ -729,7 +971,7 @@ export async function renderModels(mount, ctx) {
             'input: ' + inputs.join(', '))
           : !levels.length && !inputs.length ? h('span', { class: 'sr-only' }, 'Not reported') : null) : null,
       h('td', { class: 'actions models-actions-cell' },
-        h('div', { class: 'models-actions-inner' }, test, visibility.row, del)));
+        h('div', { class: 'models-actions-inner' }, rowAddToCombo, test, visibility.row, del)));
 
       row.classList.toggle('is-hidden', Boolean(m.hidden));
       row.addEventListener('click', (event) => {
