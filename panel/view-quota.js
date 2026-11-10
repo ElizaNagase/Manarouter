@@ -163,7 +163,7 @@ export async function renderQuota(mount, ctx) {
       const groups = groupAccountRows(accountRows);
       accountRows = groups.flatMap((group) => group.rows);
       children.push(renderGlance(groups));
-      groups.forEach((group, index) => children.push(renderProviderGroup(group, index, groups.length)));
+      groups.forEach((group) => children.push(renderProviderGroup(group)));
     }
     children.push(renderUsage());
     mount.replaceChildren(...children);
@@ -287,8 +287,8 @@ export async function renderQuota(mount, ctx) {
   }
 
   /// One provider, its heading, and the account cards inside it. The whole block is a drag target;
-  /// the heading's grip and arrows are the keyboard and discoverable equivalent.
-  function renderProviderGroup(group, index, total) {
+  /// the heading's grip makes that discoverable.
+  function renderProviderGroup(group) {
     const { provider, rows } = group;
     const head = h('div', {
       class: 'quota-provider-head',
@@ -297,19 +297,7 @@ export async function renderQuota(mount, ctx) {
       'data-quota-provider': provider.id,
     });
     const grip = h('span', { class: 'icon-btn quota-grip', 'aria-hidden': 'true' }, icon('grip'));
-    const up = h('button', {
-      class: 'icon-btn quota-provider-move', type: 'button',
-      disabled: index === 0,
-      'aria-label': 'Move ' + provider.id + ' block up', title: 'Move provider up',
-    }, icon('up'));
-    const down = h('button', {
-      class: 'icon-btn quota-provider-move', type: 'button',
-      disabled: index === total - 1,
-      'aria-label': 'Move ' + provider.id + ' block down', title: 'Move provider down',
-    }, icon('down'));
-    up.addEventListener('click', (e) => { e.stopPropagation(); moveProviderBlock(provider.id, -1); });
-    down.addEventListener('click', (e) => { e.stopPropagation(); moveProviderBlock(provider.id, 1); });
-    head.append(grip, up, down,
+    head.append(grip,
       h('h2', {}, provider.id),
       provider.label && provider.label !== provider.id
         ? h('span', { class: 'quota-provider-label', title: provider.label }, provider.label) : '',
@@ -365,7 +353,6 @@ export async function renderQuota(mount, ctx) {
   function renderAccount(row, group) {
     const { provider, key } = row;
     const index = accountRows.indexOf(row);
-    const position = group.rows.indexOf(row);
     const record = records.get(key);
     const label = accountLabel(row);
     // Only windows the provider quantified are drawn — one row if it reports one. An account that
@@ -388,19 +375,7 @@ export async function renderQuota(mount, ctx) {
       class: 'icon-btn quota-grip', 'aria-hidden': 'true',
       title: 'Drag to reorder this quota inside ' + provider.id,
     }, icon('grip'));
-    const up = h('button', {
-      class: 'icon-btn quota-account-move', type: 'button',
-      disabled: position === 0,
-      'aria-label': 'Move ' + label + ' up', title: 'Move quota up',
-    }, icon('up'));
-    const down = h('button', {
-      class: 'icon-btn quota-account-move', type: 'button',
-      disabled: position === group.rows.length - 1,
-      'aria-label': 'Move ' + label + ' down', title: 'Move quota down',
-    }, icon('down'));
-    up.addEventListener('click', (e) => { e.stopPropagation(); moveAccountRow(row, -1); });
-    down.addEventListener('click', (e) => { e.stopPropagation(); moveAccountRow(row, 1); });
-    const titleWrap = h('div', { class: 'quota-account-title' }, grip, up, down, h('h2', { title: `${provider.id} · ${label}` }, label));
+    const titleWrap = h('div', { class: 'quota-account-title' }, grip, h('h2', { title: `${provider.id} · ${label}` }, label));
     const header = h('div', { class: 'toolbar quota-account-head' }, titleWrap);
     const refreshButton = h('button', {
       class: 'btn',
@@ -623,27 +598,6 @@ export async function renderQuota(mount, ctx) {
     render();
   }
 
-  function focusProviderBlock(id) {
-    mount.querySelector(`[data-quota-provider="${CSS.escape(id)}"] .quota-provider-move:not(:disabled)`)?.focus();
-  }
-
-  function focusAccountRow(row) {
-    const index = accountRows.findIndex((candidate) => candidate.key === row.key);
-    if (index >= 0) {
-      mount.querySelector(`#${accountCardId(index)} .quota-account-move:not(:disabled)`)?.focus();
-    }
-  }
-
-  function moveProviderBlock(id, delta) {
-    const groups = groupAccountRows(accountRows);
-    const from = groups.findIndex((group) => group.provider.id === id);
-    const to = from + delta;
-    if (from < 0 || to < 0 || to >= groups.length) return;
-    [groups[from], groups[to]] = [groups[to], groups[from]];
-    commitProviderGroups(groups);
-    focusProviderBlock(id);
-  }
-
   function reorderProviderBlock(sourceId, targetId) {
     if (sourceId === targetId) return;
     const groups = groupAccountRows(accountRows);
@@ -653,18 +607,6 @@ export async function renderQuota(mount, ctx) {
     const insertAt = groups.findIndex((group) => group.provider.id === targetId);
     groups.splice(insertAt < 0 ? groups.length : insertAt, 0, moved);
     commitProviderGroups(groups);
-  }
-
-  function moveAccountRow(row, delta) {
-    const groups = groupAccountRows(accountRows);
-    const group = groups.find((candidate) => candidate.provider.id === row.provider.id);
-    if (!group) return;
-    const from = group.rows.findIndex((candidate) => candidate.key === row.key);
-    const to = from + delta;
-    if (from < 0 || to < 0 || to >= group.rows.length) return;
-    [group.rows[from], group.rows[to]] = [group.rows[to], group.rows[from]];
-    commitAccountGroup(groups, row.provider.id);
-    focusAccountRow(row);
   }
 
   function reorderAccountRow(source, target) {

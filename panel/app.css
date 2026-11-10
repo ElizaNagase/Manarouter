@@ -930,7 +930,6 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
 .quota-grip { flex: 0 0 auto; cursor: grab; color: var(--tx3); opacity: .7; }
 .quota-account:hover .quota-grip,
 .quota-provider-head:hover .quota-grip { opacity: 1; }
-.quota-account-move, .quota-provider-move { width: 18px; height: 18px; padding: 1px; flex: 0 0 auto; }
 
 /* The account name can contain an e-mail address; a flex item's automatic minimum width would
  * otherwise push the refresh button out of a narrow card instead of wrapping the address. */
@@ -1301,9 +1300,6 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 .provider-grip { width: 14px; height: 16px; padding: 0; color: var(--tx3); cursor: grab; opacity: .65; }
 .provider-grip:active { cursor: grabbing; }
 .tbl tr:hover .provider-grip { opacity: 1; }
-.provider-move { width: 18px; height: 16px; padding: 0; margin-left: 1px; color: var(--tx3); }
-.provider-move:hover:not(:disabled) { color: var(--pink); }
-.provider-move:disabled { opacity: 0.25; cursor: default; }
 .tbl tr.row-draggable { cursor: grab; }
 .tbl tr.row-draggable.dragging { opacity: 0.45; }
 .tbl tr.row-draggable.drag-over td { box-shadow: inset 0 2px 0 var(--pink); }

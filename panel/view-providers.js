@@ -384,23 +384,6 @@ export async function renderProviders(mount, ctx) {
     renderTable();
   }
 
-  /// Move one provider by a small delta for keyboard users. A row never crosses the pin boundary:
-  /// pinned and unpinned are separate groups in every sort mode, so a cross-group move would look
-  /// like a no-op and then be undone by the next render.
-  function moveProvider(id, delta) {
-    const list = orderedProviders();
-    const from = list.findIndex((p) => p.id === id);
-    const to = from + delta;
-    if (from < 0 || to < 0 || to >= list.length) return;
-    if (pinned.has(list[from].id) !== pinned.has(list[to].id)) return;
-    [list[from], list[to]] = [list[to], list[from]];
-    saveManualOrder(list.map((p) => p.id));
-    saveSort('manual');
-    renderTable();
-    const row = tableWrap.querySelector('tr[data-provider-id="' + CSS.escape(id) + '"]');
-    row?.querySelector('.provider-move')?.focus();
-  }
-
   function reorderProvider(sourceId, targetId) {
     if (sourceId === targetId) return;
     if (pinned.has(sourceId) !== pinned.has(targetId)) return;
@@ -523,27 +506,14 @@ export async function renderProviders(mount, ctx) {
       }, icon('pin'));
       pinBtn.addEventListener('click', (e) => { e.stopPropagation(); togglePin(p.id); });
 
-      // Reordering is always available, not only in Manual order: an arrow or a drag freezes the
-      // list as it is and switches the select to Manual. A move never crosses the pin boundary.
+      // Reordering is always available, not only in Manual order: a drag freezes the list as it
+      // is and switches the select to Manual. A move never crosses the pin boundary.
       const grip = h('span', {
         class: 'icon-btn provider-grip',
         'aria-hidden': 'true',
-        title: 'Drag to reorder, or use the arrows',
+        title: 'Drag to reorder',
       }, icon('grip'));
-      const up = h('button', {
-        class: 'icon-btn provider-move', type: 'button',
-        disabled: index === 0 || (pinned.has(ordered[index - 1]?.id) !== isPinned),
-        'aria-label': 'Move ' + p.id + ' up', title: 'Move up',
-      }, icon('up'));
-      const down = h('button', {
-        class: 'icon-btn provider-move', type: 'button',
-        disabled: index === ordered.length - 1
-          || (pinned.has(ordered[index + 1]?.id) !== isPinned),
-        'aria-label': 'Move ' + p.id + ' down', title: 'Move down',
-      }, icon('down'));
-      up.addEventListener('click', (e) => { e.stopPropagation(); moveProvider(p.id, -1); });
-      down.addEventListener('click', (e) => { e.stopPropagation(); moveProvider(p.id, 1); });
-      const pinCell = h('td', { class: 'pin-col' }, grip, pinBtn, up, down);
+      const pinCell = h('td', { class: 'pin-col' }, grip, pinBtn);
 
       const tr = h('tr', {
         class: 'row-click row-draggable' + (isPinned ? ' pinned-row' : ''),

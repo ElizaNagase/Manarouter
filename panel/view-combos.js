@@ -398,7 +398,7 @@ export async function renderCombos(mount, ctx, selectedId) {
       h('strong', {}, 'This order is your priority order. '),
       'The panel and the router never sort, re-weight or second-guess it: step 1 is tried first, ',
       'and in a hedged race the winner is the highest-priority participant that replied within the window. ',
-      'Reorder by dragging a row (or the arrow buttons) — the number on the left is the rank.');
+      'Reorder by dragging a row — the number on the left is the rank.');
 
     // Three pickers, one row. A step is either provider/model or a route to another combo; the
     // small selector swaps which ones are visible so the common case keeps two fields.
@@ -752,13 +752,6 @@ export async function renderCombos(mount, ctx, selectedId) {
         on.checked = step.enabled !== false;
         on.addEventListener('change', () => { draft.steps[i].enabled = on.checked; markDirty(); });
 
-        const up = h('button', { class: 'icon-btn', type: 'button', 'aria-label': `Move step ${i + 1} up` }, icon('up'));
-        const down = h('button', { class: 'icon-btn', type: 'button', 'aria-label': `Move step ${i + 1} down` }, icon('down'));
-        up.disabled = i === 0;
-        down.disabled = i === draft.steps.length - 1;
-        up.addEventListener('click', () => doMove(i, i - 1));
-        down.addEventListener('click', () => doMove(i, i + 1));
-
         // A model step may run at its own tier. A combo target has no model to pin a level on:
         // the nested combo supplies its own steps' levels, so there is no selector to offer.
         let levelSelect = null;
@@ -818,12 +811,12 @@ export async function renderCombos(mount, ctx, selectedId) {
 
         const li = h('li', { class: 'step-row', draggable: 'true', 'data-idx': String(i), tabindex: '-1' },
           pos,
-          h('span', { class: 'icon-btn', 'aria-hidden': 'true', title: 'Drag to reorder (or use the arrows)' }, icon('grip')),
+          h('span', { class: 'icon-btn', 'aria-hidden': 'true', title: 'Drag to reorder' }, icon('grip')),
           ref,
           levelSelect,
           h('label', { class: 'step-flag' }, race, 'race'),
           h('label', { class: 'step-flag' }, on, 'on'),
-          up, down, edit, del);
+          edit, del);
 
         li.addEventListener('dragstart', (e) => {
           e.dataTransfer.setData('text/plain', String(i));
