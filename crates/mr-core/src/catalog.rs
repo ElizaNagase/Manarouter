@@ -48,8 +48,8 @@
 //!
 //! ## Conventions the data file follows
 //!
-//! * `dialect` uses the kebab-case serde spelling: `open-ai`, `anthropic`, `google`, `codex`,
-//!   `copilot`, `antigravity`, `command-code-go`.
+//! * `dialect` uses the kebab-case serde spelling: `open-ai`, `anthropic`, `google`,
+//!   `google-ai-studio`, `codex`, `copilot`, `antigravity`, `command-code-go`.
 //! * `auth` is [`AuthKind`]'s own internally-tagged serde shape, so it is always an inline table:
 //!   `{ type = "bearer" }`, `{ type = "api-key-header", header = "x-api-key" }`,
 //!   `{ type = "query-param", param = "key" }` or `{ type = "oauth", platform = "openai-codex" }`.

@@ -21,21 +21,25 @@ The set is closed and small — seven members (`dialect.rs:17-45`, and `Dialect:
 |---|---|---|---|
 | `OpenAi` | `openai` | `open-ai` | 49 |
 | `Anthropic` | `anthropic` | `anthropic` | 1 |
-| `Google` | `google` | `google` | 1 |
+| `Google` | `google` | `google` | 0 |
+| `GoogleAiStudio` | `google-ai-studio` | `google-ai-studio` | 1 |
 | `Codex` | `codex` | `codex` | 1 |
 | `Copilot` | `copilot` | `copilot` | 1 |
 | `Antigravity` | `antigravity` | `antigravity` | 1 |
 | `CommandCodeGo` | `command-code-go` | `command-code-go` | 1 |
 
-Two spellings exist for a reason, and they differ for only one member. `as_str` is the permissive,
+Two spellings exist for a reason, and they differ for one member. `as_str` is the permissive,
 human-facing id; `serde`'s `kebab-case` rename is the strict wire form, and the two differ exactly
-once — serde produces `open-ai` where `as_str` returns `openai` (`dialect.rs:69-77`). The panel's
-list is pinned to the serde form by a cross-language test so the stricter of the two cannot be
-forgotten.
+once — serde produces `open-ai` where `as_str` returns `openai` (`dialect.rs:69-77`). `GoogleAiStudio`
+is the case where the two agree, and it is also why the dialect exists: `google` names the envelope
+shape, `google-ai-studio` names the public API whose thinking rules differ. The panel's list is
+pinned to the serde form by a cross-language test so the stricter of the two cannot be forgotten.
 
 `Dialect::parse` (`dialect.rs:97-111`) is the permissive parser used for hand-written config and for
 migrated OmniRoute data: `openai`, `openai-compatible`, `oa` and `compatible` all mean `OpenAi`;
-`claude` and `messages` mean `Anthropic`; `gemini` means `Google`; `chatgpt` means `Codex`;
+`claude` and `messages` mean `Anthropic`; `gemini`, `google-ai-studio`, `googleaistudio`,
+`ai-studio` and `aistudio` mean `GoogleAiStudio`, while `google` and `generativelanguage` mean the
+`Google` envelope shape; `chatgpt` means `Codex`;
 `agy` and `cloudcode` mean `Antigravity`. `CommandCodeGo` is the deliberate exception: it accepts
 exactly `command-code-go` and `cmdgo`. The pre-rename spellings (`commandcode`, `command-code`,
 `cmd`) are **not** aliases, because accepting them would defeat the rename and hide stale
@@ -82,22 +86,23 @@ upstream response straight back.
 
 ---
 
-## The seven dialects at a glance
+## The eight dialects at a glance
 
 | Dialect | Upstream path | Body passthrough possible | Always answers as SSE | Upstream shape |
 |---|---|---|---|---|
 | `open-ai` | `/v1/chat/completions` | yes, from an OpenAI client | no | OpenAI Chat Completions |
 | `anthropic` | `/v1/messages` | yes, from an Anthropic client | no | Anthropic Messages |
 | `google` | `models/{model}:generateContent` | no | no | Gemini `generateContent` |
+| `google-ai-studio` | `models/{model}:generateContent` | no | no | the same body on the public `generativelanguage` surface, which states its own thinking rules |
 | `codex` | `/responses` | no | yes | OpenAI Responses |
 | `copilot` | `/chat/completions` | yes, from an OpenAI client | no | OpenAI Chat Completions, behind a Copilot bearer |
 | `antigravity` | `v1internal:generateContent` | no | effectively yes | Gemini `generateContent` inside a Cloud Code envelope |
 | `command-code-go` | `alpha/generate` | no | yes | Command Code CLI envelope and private event stream |
 
 The path column is the path a request ends up at: the **dialect default** for the client's route,
-unless the provider's `route_overrides` names one or a translator supplies one. Google and
-Antigravity are always translator-named, because their path carries the model id or the Cloud Code
-method. Two things about the defaults need care.
+unless the provider's `route_overrides` names one or a translator supplies one. The two Gemini
+dialects and Antigravity are always translator-named, because their path carries the model id or the
+Cloud Code method. Two things about the defaults need care.
 
 ### How the upstream path is chosen
 
@@ -161,9 +166,9 @@ the endpoint that belongs to it:
 
 The Anthropic dialect has two: `/v1/messages` for the Messages route and
 `/v1/messages/count_tokens` for the token-counting route. The other dialects have one each
-(`/v1beta/models:generateContent`, `/v1internal:generateContent`, `/responses`, `/chat/completions`,
-`/alpha/generate`), and Google and Antigravity are always translator-named, because their path
-carries the model id or the Cloud Code method.
+(`/v1beta/models:generateContent` for both Gemini dialects, `/v1internal:generateContent`,
+`/responses`, `/chat/completions`, `/alpha/generate`), and the Gemini dialects and Antigravity are
+always translator-named, because their path carries the model id or the Cloud Code method.
 
 A provider that serves a route the convention does not name still has to say so in its
 `route_overrides` — for example an OpenAI-compatible service whose responses endpoint is not
@@ -184,7 +189,7 @@ match (`crates/mr-dialects/src/google.rs:67-93`).
 
 **On the wire.** OpenAI's public API surface: `/v1/chat/completions`, `/v1/responses`,
 `/v1/embeddings`, `/v1/audio/*`, `/v1/images/generations`, `/v1/models` (`dialect.rs:18-22`). This is
-the baseline — by far the largest group of providers speak it, and 49 of the 55 shipped templates
+the baseline — by far the largest group of providers speak it, and 195 of the 206 shipped templates
 use it.
 
 **Who can reach it.** Every client route. The OpenAI dialect is the client dialect of every route
@@ -300,15 +305,61 @@ the usual terminator, even when no terminal frame was seen. Both the `google` di
 does not synthesize completion after a broken body (`crates/manarouter-relay/src/server.rs`,
 `flush_stream_chunk`).
 
-**A caveat about the shipped template.** The only `google` template is `gemini`, and it authenticates
-with `?key=…` (`catalog/providers.toml`). The relay explicitly does not apply query-parameter
-authentication: it logs "query-parameter authentication is not applied; the credential will be
-missing" and sends nothing (`crates/manarouter-relay/src/server.rs`, `apply_auth`). The same
-catalogue note records that the key may also be sent as `x-goog-api-key`, which is the shape the
-relay can send.
+**No shipped template uses this dialect.** The one Gemini host the catalogue ships, `gemini`, is the
+vendor's public API and is therefore `google-ai-studio` (next section). `google` stays the envelope
+shape the Cloud Code surface speaks: a provider whose `base_url` already reaches a
+`generativelanguage` gateway through an envelope should name this dialect deliberately.
 
 **Read next.** [The Antigravity guide](providers/antigravity.md) for the Cloud Code envelope that
 wraps this shape, and [OAuth: Antigravity](12-oauth-antigravity.md) for the login.
+
+---
+
+## `google-ai-studio` — the same body on the public API
+
+**On the wire.** The same `generativelanguage` request and response shapes as `google`: one
+translator serves both (`crates/mr-dialects/src/google.rs`), and the path, the version segment and
+the streaming form are identical. What differs is **which surface the request lands on**, and that
+surface states thinking rules of its own — which is why this is a dialect and not a flag.
+
+**Who can reach it.** Both client dialects, through the same two arms as `google`
+(`crates/mr-dialects/src/lib.rs`, the `(OpenAi|Anthropic, GoogleAiStudio)` arms).
+
+**What the relay does differently.** Only the reasoning fragment. The `google` fragment states a
+`thinkingLevel` *and* a `thinkingBudget`; this dialect's fragment states the level alone
+(`crates/mr-core/src/snapshot.rs`, `dialect_reasoning_fragment`).
+
+**Quirks.** Three rules, measured against the public API on 2026-11-11 and recorded next to the
+fragment that obeys them:
+
+- **The two thinking controls are mutually exclusive.** A body carrying both `thinkingLevel` and
+  `thinkingBudget` is refused with `400 … "You can only set only one of thinking budget and thinking
+  level."` The `google` fragment sends both, which is why every Gemini 3.x request built from it was
+  rejected regardless of the numbers in it.
+- **The budget range belongs to the surface, not the model:** `thinking_budget must be in the range
+  [-1, 65535]`, so `131072` — the figure the `google` fragment uses — is a `400` here.
+  `dialect_budget_ceiling` therefore answers `65535` for this dialect and `None` for every other,
+  and `fit_thinking_budget` takes the tighter of that bound and the model's own output allowance
+  (`crates/mr-core/src/snapshot.rs`).
+- **`minimal` is not a level this surface accepts for these models** ("Thinking level MINIMAL is not
+  supported for this model"), and an unknown level is a `400` naming the field. The fragment
+  therefore only ever writes `low` or `high`.
+
+Because the fragment names no budget, a request that states no output cap is sent no ceiling either:
+`maxOutputTokens` travels with a budget, and stating a cap the fragment is not measured against
+would be inventing one (`crates/manarouter-relay/src/server.rs`, `apply_reasoning_level` and
+`stated_output_cap`). An operator who hand-writes a `reasoning_wire` fragment carrying a budget gets
+it fitted to both bounds, and the ceiling it was fitted against is then sent with it.
+
+**The shipped template.** `gemini` uses this dialect and authenticates with `x-goog-api-key`
+(`auth = { type = "api-key-header", header = "x-goog-api-key" }`), the key coming from
+[AI Studio](https://aistudio.google.com/apikey). The relay never puts a credential in a URL —
+`?key=…` is unsupported, and a provider configured with `query-param` auth logs "query-parameter
+authentication is not applied; the credential will be missing" and sends nothing
+(`crates/manarouter-relay/src/server.rs`, `apply_auth`).
+
+**Read next.** [The catalogue](providers/catalog.md) for the `gemini` template, and `google` above
+for the body-level quirks the two dialects share.
 
 ---
 
@@ -560,6 +611,7 @@ The route list is the one in the [API reference](18-api-reference.md); `RouteKin
 | `open-ai` | **Passthrough** — body forwarded verbatim | **Translated** — direct Anthropic→OpenAI pair |
 | `anthropic` | **Translated** — direct OpenAI→Anthropic pair | **Passthrough** — body forwarded verbatim |
 | `google` | **Translated** — pivot → Gemini | **Translated** — pivot → Gemini (two hops) |
+| `google-ai-studio` | **Translated** — pivot → Gemini | **Translated** — pivot → Gemini (two hops) |
 | `codex` | **Translated** — pivot → Responses | **Translated** — pivot → Responses (two hops) |
 | `copilot` | **Passthrough** — Copilot is OpenAI-shaped | **Translated** — direct Anthropic→OpenAI pair |
 | `antigravity` | **Translated** — pivot → Gemini + Cloud Code envelope | **Translated** — pivot → Gemini + envelope (two hops) |
@@ -650,6 +702,7 @@ Gemini gets `generationConfig.thinkingConfig`, not a field Gemini never reads
 | `codex` | `{"reasoning": {"effort": "<effort>", "summary": "auto"}}` |
 | `anthropic` | `{"thinking": {"type": "enabled", "budget_tokens": <n>}}` |
 | `google` | `{"generationConfig": {"thinkingConfig": {"thinkingLevel": "low"\|"high", "thinkingBudget": <n>}}}` — `thinkingLevel` is `high` from `medium` upward, and `<n>` starts from the Anthropic table |
+| `google-ai-studio` | the same object with `thinkingLevel` **alone**: this surface refuses both controls at once, and any budget it is handed is clamped to 65535 |
 | `antigravity` | the same object nested under `request`, because Antigravity's body is an envelope (`{project, model, request, userAgent}`). At the envelope's top level the upstream answers `400 Unknown name "generationConfig"` |
 
 Level `none` emits **no reasoning field at all, on every dialect**: sending
@@ -683,8 +736,8 @@ knows yet — [Images, audio and video](user/07-images-audio-video.md) lists the
 A dialect decides where the model id lives, and this is the single most common integration mistake:
 
 - `open-ai`, `anthropic`, `codex` carry it in the body, in a `model` field.
-- `google` carries it in the **URL** — `models/{model}:generateContent` — and the body carries no
-  `model` field at all (`google.rs:48-55`).
+- `google` and `google-ai-studio` carry it in the **URL** — `models/{model}:generateContent` — and
+  the body carries no `model` field at all (`google.rs:48-55`).
 - `antigravity` carries it in the **envelope**, alongside the request (`google.rs:70-74`).
 - `command-code-go` carries it in the envelope's `params.model`.
 

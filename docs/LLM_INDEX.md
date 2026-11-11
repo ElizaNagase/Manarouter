@@ -212,7 +212,15 @@ Exhaustive lists. With the one exception noted under `RouteKind`, these are the 
 accepted in configuration and returned by the API. Anything not listed is a validation error.
 
 ### `Dialect` — how a provider speaks
-`open-ai` · `anthropic` · `google` · `codex` · `copilot` · `antigravity` · `command-code-go`
+`open-ai` · `anthropic` · `google` · `google-ai-studio` · `codex` · `copilot` · `antigravity` ·
+`command-code-go`
+
+`google` and `google-ai-studio` are the same request and response body on two different surfaces:
+the Cloud Code envelope and the public API. The public API rejects the `thinkingLevel` +
+`thinkingBudget` pair and clamps a budget to 65535, so a provider host there must name
+`google-ai-studio` — the shipped `gemini` template does. The permissive `Dialect::parse` accepts
+`gemini`, `googleaistudio`, `ai-studio` and `aistudio` as `google-ai-studio`, and `google` or
+`generativelanguage` as `google`.
 
 Passthrough pairs include `open-ai → open-ai`, `anthropic → anthropic`, and OpenAI chat to Copilot's OpenAI-shaped surface. OpenAI chat to Antigravity is **not** a body passthrough: it uses the Google/Antigravity translator and still lacks OAuth/project-context completion.
 

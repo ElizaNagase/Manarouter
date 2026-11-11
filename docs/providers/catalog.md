@@ -125,7 +125,7 @@ many of OmniRoute's credentialed providers could be carried across.
 | `g4f-ollama` ⚠ | g4f.space — Ollama | `open-ai` | `https://g4f.space/api/ollama/v1` | `bearer` | chat, models, tool-calling |
 | `g4f-pollinations` ⚠ | g4f.space — Pollinations | `open-ai` | `https://g4f.space/api/pollinations/v1` | `bearer` | chat, models, tool-calling |
 | `galadriel` ⚠ | Galadriel | `open-ai` | `https://api.galadriel.ai/v1` | `bearer` | chat, models, tool-calling |
-| `gemini` | Google Gemini (AI Studio) | `google` | `https://generativelanguage.googleapis.com/v1beta` | `api-key-header` (x-goog-api-key) | chat, embeddings, models, tool-calling, reasoning, vision |
+| `gemini` | Google Gemini (AI Studio) | `google-ai-studio` | `https://generativelanguage.googleapis.com/v1beta` | `api-key-header` (x-goog-api-key) | chat, embeddings, models, tool-calling, reasoning, vision |
 | `gigachat` ⚠ | GigaChat (Sber) | `open-ai` | `https://gigachat.devices.sberbank.ru/api/v1` | `bearer` | chat, models, tool-calling |
 | `glm` | Z.ai GLM Coding | `open-ai` | `https://api.z.ai/api/coding/paas/v4` | `bearer` | chat, models, tool-calling, reasoning |
 | `glm-cn` ⚠ | GLM Coding (China) | `open-ai` | `https://open.bigmodel.cn/api/coding/paas/v4` | `bearer` | chat, models, tool-calling |

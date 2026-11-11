@@ -48,9 +48,13 @@ OAuth entries add `oauth_platform`, `oauth_*_url`, `oauth_scopes`, `oauth_redire
 `oauth_pkce`, and for the Copilot family `copilot_*` fields. See
 [OAuth overview](../10-oauth-overview.md).
 
-### The seven dialects
+### The eight dialects
 
-`open-ai`, `anthropic`, `google`, `codex`, `copilot`, `antigravity`, `command-code-go`.
+`open-ai`, `anthropic`, `google`, `google-ai-studio`, `codex`, `copilot`, `antigravity`,
+`command-code-go`. The two Gemini entries are different surfaces of the same body: `google` is the
+Cloud Code envelope shape and `google-ai-studio` is the public `generativelanguage` API, whose
+thinking rules are its own — see
+[the dialects guide](../24-provider-dialects.md#google-ai-studio--the-same-body-on-the-public-api).
 
 A dialect must be one of those. There is no "custom" dialect, and that is deliberate: a provider whose
 requests cannot be described by one of these is a provider the router cannot route to, and pretending

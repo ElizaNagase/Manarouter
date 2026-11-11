@@ -581,13 +581,13 @@ fn apply_reasoning_level(
         // The compiled budget is already fitted to the model's own ceiling. This fits it to the
         // ceiling *this* request states, because Anthropic rejects `budget_tokens` at or above
         // `max_tokens` outright, and a budget that eats the whole allowance is how a Gemini answer
-        // arrives with nothing in `content` but thoughts.
-        if let Some(cap) = output_cap {
-            if !mr_core::snapshot::fit_thinking_budget(&mut fragment, Some(cap)) {
-                // No room left to both think and answer: send no level rather than one the
-                // upstream will refuse.
-                fragment = serde_json::Value::Object(serde_json::Map::new());
-            }
+        // arrives with nothing in `content` but thoughts. The dialect's own range is applied here
+        // too: a client cannot raise a budget past what the surface accepts by stating a larger
+        // `max_tokens`.
+        if !mr_core::snapshot::fit_thinking_budget(step.dialect, &mut fragment, output_cap) {
+            // No room left to both think and answer: send no level rather than one the upstream
+            // will refuse.
+            fragment = serde_json::Value::Object(serde_json::Map::new());
         }
         if merge_reasoning(object, &fragment) {
             changed = true;
@@ -3122,6 +3122,7 @@ fn dialect_version(dialect: Dialect) -> Option<&'static str> {
         Dialect::OpenAi => Some("v1"),
         Dialect::Anthropic => Some("v1"),
         Dialect::Google => Some("v1beta"),
+        Dialect::GoogleAiStudio => Some("v1beta"),
         Dialect::Antigravity => Some("v1internal"),
         Dialect::Codex => None,
         Dialect::Copilot => None,
@@ -3265,6 +3266,7 @@ fn default_path(dialect: Dialect, route: RouteKind) -> &'static str {
             _ => "/v1/messages",
         },
         Dialect::Google => "/v1beta/models:generateContent",
+        Dialect::GoogleAiStudio => "/v1beta/models:generateContent",
         Dialect::Antigravity => "/v1internal:generateContent",
         Dialect::Codex => "/responses",
         Dialect::Copilot => "/chat/completions",
@@ -3716,8 +3718,10 @@ fn flush_stream_chunk(
     // finishing. A clean end of body is still the end of the answer, and a strict Chat client
     // rejects an unterminated stream even when every token arrived. A broken body is different:
     // it ends without a synthesized completion.
-    if matches!(ctx.upstream_dialect, Dialect::Google | Dialect::Antigravity)
-        && !ctx.is_passthrough()
+    if matches!(
+        ctx.upstream_dialect,
+        Dialect::Google | Dialect::Antigravity | Dialect::GoogleAiStudio
+    ) && !ctx.is_passthrough()
         && !upstream_failed
     {
         match mr_dialects::google::finish_stream(ctx) {
@@ -4124,6 +4128,65 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a clamp to nothing must leave the body byte-for-byte alone"
+        );
+    }
+
+    #[test]
+    fn an_ai_studio_step_is_sent_a_thinking_level_and_never_a_budget_with_it() {
+        // The failure this pins, reproduced against the public API on 2026-11-11: a compiled
+        // Google fragment states a level *and* a budget, and the AI Studio surface answers 400 to
+        // that pair — "You can only set only one of thinking budget and thinking level." — and to
+        // any budget above 65535 ("thinking_budget must be in the range [-1, 65535]"). So the
+        // dialect's own fragment must arrive here carrying the level alone, whatever the client
+        // sent. The step is compiled from a configuration rather than hand-written so the dialect
+        // default is what is under test, not a literal repeated in the test.
+        let body = br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+        let rewritten = |dialect: Dialect| {
+            let step = snapshot_with(
+                dialect,
+                "gemini-3.6-flash",
+                &[ReasoningLevel::High],
+                &[],
+                &[],
+            )
+            .providers()[0]
+                .steps[0]
+                .clone();
+            let rewritten = apply_reasoning_level(body, &step, false, None)
+                .unwrap()
+                .expect("a level was compiled, so the body has to change");
+            let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+            (step, value)
+        };
+
+        let (step, value) = rewritten(Dialect::GoogleAiStudio);
+        assert_eq!(
+            value["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+        assert_eq!(
+            value["generationConfig"]["thinkingConfig"].get("thinkingBudget"),
+            None,
+            "the two thinking controls are mutually exclusive on this surface"
+        );
+        // The request is still retargeted and otherwise untouched: dropping the budget must not
+        // quietly turn the rewrite into a no-op for the other fields.
+        assert_eq!(value["model"], "gemini-3.6-flash");
+        assert_eq!(value["messages"][0]["content"], "hi");
+        assert_eq!(step.dialect, Dialect::GoogleAiStudio);
+
+        // The control: the Cloud Code shape is a different surface and keeps both fields, which is
+        // why this is a dialect rather than a change to Google's fragment.
+        let (_, cloud_code) = rewritten(Dialect::Google);
+        assert_eq!(
+            cloud_code["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+        assert!(
+            cloud_code["generationConfig"]["thinkingConfig"]
+                .get("thinkingBudget")
+                .is_some(),
+            "Cloud Code tolerates the pair, so its fragment must be left alone"
         );
     }
 
@@ -4586,16 +4649,10 @@ mod tests {
     #[test]
     fn every_dialect_has_a_default_upstream_path() {
         // A dialect with no path would build a URL ending at the base and send the request to the
-        // host root, which fails as a provider 404 and reads as a wrong base URL.
-        for d in [
-            Dialect::OpenAi,
-            Dialect::Anthropic,
-            Dialect::Google,
-            Dialect::Codex,
-            Dialect::Copilot,
-            Dialect::Antigravity,
-            Dialect::CommandCodeGo,
-        ] {
+        // host root, which fails as a provider 404 and reads as a wrong base URL. `Dialect::ALL` is
+        // the source of truth rather than a list written out here, so a new dialect is covered the
+        // moment it exists.
+        for d in Dialect::ALL {
             let p = default_path(d, RouteKind::ChatCompletions);
             assert!(p.starts_with('/'), "{d:?} must have an absolute path");
             assert!(p.len() > 1, "{d:?} must not be the root");
@@ -5038,7 +5095,11 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
     /// End of body is the end of the answer, so it gets a terminal chunk and `[DONE]`.
     #[test]
     fn a_gemini_stream_without_a_finish_reason_is_closed_at_end_of_body() {
-        for upstream_dialect in [Dialect::Google, Dialect::Antigravity] {
+        for upstream_dialect in [
+            Dialect::Google,
+            Dialect::Antigravity,
+            Dialect::GoogleAiStudio,
+        ] {
             let ctx = TranslateCtx {
                 route: RouteKind::ChatCompletions,
                 client_dialect: Dialect::OpenAi,
@@ -5445,6 +5506,15 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
                 PathSource::Translator("models/gemini-2.5-pro:generateContent"),
                 "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
             ),
+            // The AI Studio dialect is the plain Gemini shape, so a base that already carries
+            // `v1beta` keeps it and the translator's model-bearing path is appended once.
+            (
+                Dialect::GoogleAiStudio,
+                RouteKind::ChatCompletions,
+                "https://generativelanguage.googleapis.com/v1beta",
+                PathSource::Translator("models/gemini-2.5-pro:generateContent"),
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
+            ),
             // Antigravity's version and its action share one segment, so the segment is left
             // alone rather than being taken for a version to strip or to add.
             (
@@ -5657,6 +5727,7 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         // These dialects serve one route each; the translator always names their path.
         let cases = [
             (Dialect::Google, "/v1beta/models:generateContent"),
+            (Dialect::GoogleAiStudio, "/v1beta/models:generateContent"),
             (Dialect::Antigravity, "/v1internal:generateContent"),
             (Dialect::Codex, "/responses"),
             (Dialect::Copilot, "/chat/completions"),

@@ -193,11 +193,11 @@ reset_only = true
 [[providers]]
 id = "gemini"
 label = "Google Gemini (AI Studio)"
-dialect = "google"
+dialect = "google-ai-studio"
 base_url = "https://generativelanguage.googleapis.com/v1beta"
 auth = { type = "api-key-header", header = "x-goog-api-key" }
 capabilities = ["chat", "embeddings", "models", "tool-calling", "reasoning", "vision"]
-note = "API-key access to the generativelanguage surface (models/{model}:generateContent). Vertex and service-account access is a different endpoint and is not shipped here. The key is sent as the x-goog-api-key header; the relay never puts a credential in a URL, so the ?key= query form is not supported."
+note = "API-key access to the generativelanguage surface (models/{model}:generateContent). Vertex and service-account access is a different endpoint and is not shipped here. The key is sent as the x-goog-api-key header; the relay never puts a credential in a URL, so the ?key= query form is not supported. The dialect is the public API's own: this surface accepts either thinkingBudget or thinkingLevel but not both, and caps the budget at 65535, so the thinking fragment it is sent names a level only."
 
 [[providers]]
 id = "openrouter"

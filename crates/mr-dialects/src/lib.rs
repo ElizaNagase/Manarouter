@@ -202,13 +202,18 @@ pub fn translate_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Option<T
             openai::from_anthropic_request(ctx, body).map(Some)
         }
 
-        // Plain Gemini and Cloud Code are the same inference shape. `google::from_pivot_request`
-        // picks `models/{model}:generateContent` or the `v1internal:` envelope off the upstream
-        // dialect, so both pairings land on the same translator.
+        // Plain Gemini, Cloud Code and the AI Studio surface are the same inference shape.
+        // `google::from_pivot_request` picks `models/{model}:generateContent` or the `v1internal:`
+        // envelope off the upstream dialect, so all three pairings land on the same translator.
         (Dialect::OpenAi, Dialect::Google)
         | (Dialect::Anthropic, Dialect::Google)
         | (Dialect::OpenAi, Dialect::Antigravity)
-        | (Dialect::Anthropic, Dialect::Antigravity) => {
+        | (Dialect::Anthropic, Dialect::Antigravity)
+        // The AI Studio surface is the same shape again — same path, same body, same
+        // `x-goog-api-key` header. What differs is its `thinkingConfig` rules, and those live in
+        // the reasoning fragment (`mr_core::snapshot`), not in the translation.
+        | (Dialect::OpenAi, Dialect::GoogleAiStudio)
+        | (Dialect::Anthropic, Dialect::GoogleAiStudio) => {
             google::from_pivot_request(ctx, body).map(Some)
         }
 
@@ -245,11 +250,13 @@ pub fn translate_response_body(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<By
         (Dialect::OpenAi, Dialect::Copilot) => Ok(Bytes::copy_from_slice(body)),
         (Dialect::Anthropic, Dialect::Copilot) => openai::to_anthropic_response(ctx, body),
         // `google::to_pivot_response` unwraps the Cloud Code `{response: {...}, traceId}`
-        // envelope when the upstream is Antigravity, so both Gemini pairings answer here.
+        // envelope when the upstream is Antigravity, so every Gemini pairing answers here.
         (Dialect::OpenAi, Dialect::Google)
         | (Dialect::Anthropic, Dialect::Google)
         | (Dialect::OpenAi, Dialect::Antigravity)
-        | (Dialect::Anthropic, Dialect::Antigravity) => google::to_pivot_response(ctx, body),
+        | (Dialect::Anthropic, Dialect::Antigravity)
+        | (Dialect::OpenAi, Dialect::GoogleAiStudio)
+        | (Dialect::Anthropic, Dialect::GoogleAiStudio) => google::to_pivot_response(ctx, body),
         (Dialect::OpenAi, Dialect::CommandCodeGo)
         | (Dialect::Anthropic, Dialect::CommandCodeGo) => commandcode::to_pivot_response(ctx, body),
         (Dialect::OpenAi, Dialect::Codex) | (Dialect::Anthropic, Dialect::Codex) => {
@@ -293,7 +300,9 @@ pub fn translate_sse_data(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<Stri
         (Dialect::OpenAi, Dialect::Google)
         | (Dialect::Anthropic, Dialect::Google)
         | (Dialect::OpenAi, Dialect::Antigravity)
-        | (Dialect::Anthropic, Dialect::Antigravity) => google::sse_to_pivot(ctx, data),
+        | (Dialect::Anthropic, Dialect::Antigravity)
+        | (Dialect::OpenAi, Dialect::GoogleAiStudio)
+        | (Dialect::Anthropic, Dialect::GoogleAiStudio) => google::sse_to_pivot(ctx, data),
         (Dialect::OpenAi, Dialect::Codex) | (Dialect::Anthropic, Dialect::Codex) => {
             responses::sse_to_pivot(ctx, data)
         }
@@ -447,6 +456,65 @@ mod tests {
         // The Anthropic-client pairing had no arm at all before: Unsupported outright.
         let anthropic_ctx =
             TranslateCtx::new(RouteKind::Messages, Dialect::Antigravity, "gemini-2.5-pro");
+        assert!(translate_request(
+            &anthropic_ctx,
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn ai_studio_upstreams_reach_the_plain_gemini_translator_on_every_half() {
+        // Reachability, not correctness — the same defect class as the two tests above. The
+        // AI Studio dialect is the public generativelanguage surface: the same host, the same
+        // `x-goog-api-key` header and the same `models/{model}:generateContent` body as
+        // `Dialect::Google`, with stricter `thinkingConfig` rules that are applied in the
+        // snapshot, never here. A missing dispatcher arm would be a runtime 400 (the catch-all
+        // reports Unsupported) rather than a compile error, so the arms are asserted.
+        let ctx = TranslateCtx::new(
+            RouteKind::ChatCompletions,
+            Dialect::GoogleAiStudio,
+            "gemini-3.6-flash",
+        );
+
+        let req = translate_request(
+            &ctx,
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .expect("an OpenAI client must reach the translator for an AI Studio upstream")
+        .expect("byte-forwarding would hand a Gemini endpoint an OpenAI body");
+        let doc: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(doc["contents"][0]["parts"][0]["text"], "hi");
+        assert!(
+            !doc.get("request").is_some(),
+            "the AI Studio surface is not the Cloud Code envelope"
+        );
+        assert_eq!(
+            req.path_override.as_deref(),
+            Some("models/gemini-3.6-flash:generateContent"),
+            "the public surface names its models, unlike v1internal"
+        );
+
+        let resp = translate_response_body(
+            &ctx,
+            br#"{"candidates":[{"content":{"parts":[{"text":"hey"}]},"finishReason":"STOP"}]}"#,
+        )
+        .expect("the response half must route to the Gemini translator as well");
+        let resp: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(resp["choices"][0]["message"]["content"], "hey");
+
+        let frames = translate_sse_data(
+            &ctx,
+            r#"{"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"STOP"}]}"#,
+        )
+        .expect("the SSE half must route to the Gemini translator as well");
+        assert!(frames.iter().any(|f| f.contains("[DONE]")));
+
+        let anthropic_ctx = TranslateCtx::new(
+            RouteKind::Messages,
+            Dialect::GoogleAiStudio,
+            "gemini-3.6-flash",
+        );
         assert!(translate_request(
             &anthropic_ctx,
             br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#

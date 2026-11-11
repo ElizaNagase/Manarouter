@@ -23,7 +23,13 @@ pub enum Dialect {
     /// Anthropic's Messages API: `/v1/messages`, `/v1/messages/count_tokens`.
     Anthropic = 1,
     /// Google's `generativelanguage` API: `models/{model}:generateContent` and
-    /// `:streamGenerateContent?alt=sse`. Used by plain Gemini API-key access.
+    /// `:streamGenerateContent?alt=sse`, with the permissive `thinkingConfig` the Cloud Code
+    /// surface accepts — a level and a budget together, and a budget up to `131_072`.
+    ///
+    /// That permissiveness is why the public API-key surface has its own dialect rather than a
+    /// note here: [`Dialect::GoogleAiStudio`] is the same shape with the stricter thinking rules
+    /// `generativelanguage.googleapis.com/v1beta` actually enforces. Pick this one only for a
+    /// surface known to accept both fields at once (Cloud Code without the `v1internal` envelope).
     Google = 2,
     /// OpenAI Codex on a ChatGPT subscription: the Responses API at
     /// `chatgpt.com/backend-api/codex/responses`, SSE-first, `store` must be `false`.
@@ -42,6 +48,30 @@ pub enum Dialect {
     /// migration that rewrites such files is a separate, explicit step. Failing loudly here is
     /// what keeps a stale file from silently selecting this dialect.
     CommandCodeGo = 6,
+    /// The Gemini API as Google AI Studio serves it to an API key: the same
+    /// `generativelanguage.googleapis.com` body, path and `x-goog-api-key` auth as
+    /// [`Dialect::Google`], with the public surface's stricter `thinkingConfig`.
+    ///
+    /// The body shape is shared; only the thinking control differs, and it differs in both
+    /// directions at once:
+    ///
+    /// - `thinkingConfig` takes a `thinkingLevel` **or** a `thinkingBudget`, never both. Sending
+    ///   both is a `400`: "You can only set only one of thinking budget and thinking level."
+    /// - `thinkingBudget` must lie within `[-1, 65535]`. The `131_072` ceiling Cloud Code accepts
+    ///   is refused: "thinking_budget must be in the range [-1, 65535]".
+    /// - `thinkingLevel` is `low` or `high` on the Gemini 3 models this surface serves; those
+    ///   models refuse `minimal`.
+    ///
+    /// Since the budget a model will accept cannot be read from this install's model metadata
+    /// (a synced AI Studio model carries neither `levels` nor `max_output_tokens`), this dialect
+    /// puts a *level* on the wire and never a budget: a dimensionless value cannot fall outside a
+    /// range, and a level sent alone cannot collide with the mutual-exclusion rule. The exact
+    /// fragments are built in [`crate::snapshot`].
+    ///
+    /// Measured against `v1beta` with an AI Studio key on 2026-11-11; the three sentences quoted
+    /// above are the upstream's own. `Dialect::Google`'s permissive pair is what produced
+    /// "thinking_budget must be in the range [-1, 65535]" for `gemini/gemini-3.8-flash`.
+    GoogleAiStudio = 7,
 }
 
 impl Dialect {
@@ -62,6 +92,7 @@ impl Dialect {
             4 => Self::Copilot,
             5 => Self::Antigravity,
             6 => Self::CommandCodeGo,
+            7 => Self::GoogleAiStudio,
             _ => return None,
         })
     }
@@ -84,11 +115,19 @@ impl Dialect {
             Self::Copilot => "copilot",
             Self::Antigravity => "antigravity",
             Self::CommandCodeGo => "command-code-go",
+            Self::GoogleAiStudio => "google-ai-studio",
         }
     }
 
     /// Parse the config identifier. Case-insensitive, and accepts common aliases so that both
     /// hand-written config and migrated OmniRoute data load.
+    ///
+    /// The two Gemini shapes are separated by *what the alias names*. `google` and
+    /// `generativelanguage` name the protocol shape and keep [`Dialect::Google`]; `gemini`,
+    /// `google-ai-studio`, `ai-studio` and `aistudio` name the vendor's public API-key surface and
+    /// select [`Dialect::GoogleAiStudio`], whose thinking rules are the ones such a key is actually
+    /// held to. `gemini` is the alias OmniRoute data carries, so migrated data picks up the
+    /// stricter — and correct — control instead of keeping a fragment the surface rejects.
     ///
     /// [`Dialect::CommandCodeGo`] is the deliberate exception: it accepts exactly
     /// `command-code-go` and the short alias `cmdgo`, and nothing else. The pre-rename spellings
@@ -101,7 +140,10 @@ impl Dialect {
                 Self::OpenAi
             }
             "anthropic" | "anthropic-compatible" | "claude" | "messages" => Self::Anthropic,
-            "google" | "gemini" | "generativelanguage" => Self::Google,
+            "google" | "generativelanguage" => Self::Google,
+            "gemini" | "google-ai-studio" | "googleaistudio" | "ai-studio" | "aistudio" => {
+                Self::GoogleAiStudio
+            }
             "codex" | "chatgpt" | "chatgpt-codex" => Self::Codex,
             "copilot" | "github-copilot" | "githubcopilot" => Self::Copilot,
             "antigravity" | "agy" | "gemini-code-assist" | "cloudcode" => Self::Antigravity,
@@ -134,7 +176,7 @@ impl Dialect {
     }
 
     /// Every dialect, in snapshot order. Useful for exhaustive tests.
-    pub const ALL: [Dialect; 7] = [
+    pub const ALL: [Dialect; 8] = [
         Self::OpenAi,
         Self::Anthropic,
         Self::Google,
@@ -142,6 +184,7 @@ impl Dialect {
         Self::Copilot,
         Self::Antigravity,
         Self::CommandCodeGo,
+        Self::GoogleAiStudio,
     ];
 
     /// The reasoning levels this dialect can put on the wire as *themselves*, ascending.
@@ -167,7 +210,12 @@ impl Dialect {
             Self::OpenAi | Self::Copilot | Self::CommandCodeGo | Self::Codex => {
                 &NAMED_EFFORT_LEVELS
             }
-            Self::Anthropic | Self::Google | Self::Antigravity => &ReasoningLevel::ALL,
+            // The AI Studio surface has no budget to range-check: a level goes out as a level, so
+            // every tier is expressible for the same reason it is on the budget dialects — the
+            // upper tiers share the surface's `high`.
+            Self::Anthropic | Self::Google | Self::Antigravity | Self::GoogleAiStudio => {
+                &ReasoningLevel::ALL
+            }
         }
     }
 
@@ -1119,7 +1167,7 @@ mod tests {
         }
         // Unknown values must be rejected rather than silently mapping onto a dialect, because a
         // misread snapshot byte would otherwise route traffic to an unrelated provider.
-        assert_eq!(Dialect::from_u8(7), None);
+        assert_eq!(Dialect::from_u8(8), None);
         assert_eq!(Dialect::from_u8(255), None);
     }
 
@@ -1335,12 +1383,33 @@ mod tests {
             (Dialect::Copilot, "copilot"),
             (Dialect::Antigravity, "antigravity"),
             (Dialect::CommandCodeGo, "command-code-go"),
+            (Dialect::GoogleAiStudio, "google-ai-studio"),
         ];
         assert_eq!(expected.len(), Dialect::ALL.len());
         for (dialect, id) in expected {
             assert_eq!(dialect.as_str(), id, "{dialect:?}");
             assert_eq!(Dialect::parse(id), Some(dialect), "{id}");
         }
+    }
+
+    /// The two Gemini shapes are selected by *what the alias names*, and `google` keeps the
+    /// permissive protocol shape.
+    #[test]
+    fn the_gemini_aliases_select_the_public_surface_not_the_protocol_shape() {
+        assert_eq!(Dialect::parse("gemini"), Some(Dialect::GoogleAiStudio));
+        assert_eq!(Dialect::parse("ai-studio"), Some(Dialect::GoogleAiStudio));
+        assert_eq!(Dialect::parse("aistudio"), Some(Dialect::GoogleAiStudio));
+        assert_eq!(
+            Dialect::parse("AI Studio"),
+            None,
+            "aliases are exact, not fuzzy"
+        );
+        assert_eq!(Dialect::parse("google"), Some(Dialect::Google));
+        assert_eq!(
+            Dialect::parse("generativelanguage"),
+            Some(Dialect::Google),
+            "the host name names the protocol shape"
+        );
     }
 
     #[test]

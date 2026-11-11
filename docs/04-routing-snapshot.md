@@ -213,9 +213,10 @@ reaches none of the three has `levels == 0` and its name gets no `-<level>` suff
 
 The vocabulary comes from `Dialect::expressible_reasoning_levels`, one authoritative list per
 dialect: named-effort dialects (`openai`, `codex`, `copilot`, `command-code-go`) send
-`reasoning_effort` and can name `none, minimal, low, medium, high, xhigh`; budget dialects
-(`anthropic`, `google`, `antigravity`) send a thinking budget and can express every tier, including
-`ultra` and `max`. Whatever the source — declared, catalogue or vocabulary — the result is filtered
+`reasoning_effort` and can name `none, minimal, low, medium, high, xhigh`; the thinking dialects
+(`anthropic`, `google`, `google-ai-studio`, `antigravity`) can express every tier, including `ultra`
+and `max`, because the tiers above them share the field's top value — `google-ai-studio` sends a
+level and never a budget, which is why the list is not restricted to budgets. Whatever the source — declared, catalogue or vocabulary — the result is filtered
 through that same list, so the compiler never offers a tier its dialect would rewrite or drop. A
 declared `max` on an `openai` model is therefore an error from `Provider::validate` (quoting the
 levels the dialect can send), not a level that quietly runs as `xhigh`.

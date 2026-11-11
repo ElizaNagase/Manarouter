@@ -1922,7 +1922,7 @@ fn reasoning_fragments(dialect: Dialect, model: &ModelEntry, levels: u32) -> [Op
         // `max_output_tokens` is the only honest ceiling, and clamping only lowers a number, so an
         // authored `reasoning_wire` is fitted by the same rule instead of being trusted blindly.
         if let Some(value) = fragment.as_mut() {
-            if !fit_thinking_budget(value, model.max_output_tokens) {
+            if !fit_thinking_budget(dialect, value, model.max_output_tokens) {
                 fragment = None;
             } else {
                 state_thinking_output_cap(dialect, value, model);
@@ -1941,7 +1941,7 @@ fn reasoning_fragments(dialect: Dialect, model: &ModelEntry, levels: u32) -> [Op
 /// budget arrives, as antigravity bodies do, without the `maxOutputTokens` it is measured against —
 /// the model then reasons under a ceiling it was never told about.
 ///
-/// So the ceiling travels with the budget, and only for the two dialects that carry thinking inside
+/// So the ceiling travels with the budget, and only for the dialects that carry thinking inside
 /// `generationConfig`: Anthropic is handed `max_tokens` by its own translator, and the
 /// `reasoning_effort` dialects have no budget to pair. The relay still lets a client's stated cap
 /// win, because it refits the budget to that cap before merging and never overwrites a field the
@@ -1951,7 +1951,10 @@ fn state_thinking_output_cap(
     fragment: &mut serde_json::Value,
     model: &ModelEntry,
 ) {
-    if !matches!(dialect, Dialect::Google | Dialect::Antigravity) {
+    if !matches!(
+        dialect,
+        Dialect::Google | Dialect::Antigravity | Dialect::GoogleAiStudio
+    ) {
         return;
     }
     let Some(ceiling) = model.max_output_tokens else {
@@ -1979,9 +1982,9 @@ fn state_thinking_output_cap(
 /// The level→fragment table for one dialect.
 ///
 /// These are the documented defaults from `plan.md` §4.5. The relay merges the selected fragment
-/// into the upstream body; a dialect with no table (Google and Antigravity, whose thinking config
-/// is a nested `generationConfig` the translator writes) contributes nothing here and is handled
-/// where that body is built.
+/// into the upstream body; Google, Antigravity and Google AI Studio take thinking inside a nested
+/// `generationConfig`, so their fragments are shaped to reach that field and are fitted to the
+/// budget range the surface accepts.
 fn dialect_reasoning_fragment(
     dialect: Dialect,
     level: ReasoningLevel,
@@ -2002,6 +2005,20 @@ fn dialect_reasoning_fragment(
         }
         Dialect::Anthropic => serde_json::json!({
             "thinking": { "type": "enabled", "budget_tokens": thinking_budget(level) }
+        }),
+        // The AI Studio surface takes a level **or** a budget and refuses a body carrying both —
+        // "You can only set only one of thinking budget and thinking level." — and its budget is
+        // capped at 65535 where Cloud Code takes 131072. So this dialect is sent the level alone:
+        // a dimensionless switch is the only thinking control that cannot fall outside a range,
+        // and sending one field cannot collide with a rule about sending two. Everything from
+        // `medium` up is the surface's `high`, exactly as on the dialects above, because that is
+        // the vocabulary the Gemini 3 models publish (`low`, `high`; not `minimal`).
+        Dialect::GoogleAiStudio => serde_json::json!({
+            "generationConfig": {
+                "thinkingConfig": {
+                    "thinkingLevel": if level.rank() >= ReasoningLevel::High.rank() { "high" } else { "low" },
+                }
+            }
         }),
         // Google and Antigravity take thinking inside `generationConfig`. The relay's merge is
         // recursive, so the fragment is shaped exactly as deep as the field it has to reach.
@@ -2136,24 +2153,50 @@ fn lower_thinking_budgets(value: &mut serde_json::Value, cap: u32) {
     }
 }
 
+/// The thinking-budget range a dialect accepts, when the dialect publishes one.
+///
+/// Only the AI Studio surface states a numeric range for the budget — and it states it as an
+/// error, "thinking_budget must be in the range [-1, 65535]", which is a bound a request has to
+/// respect just as much as a schema would be. Cloud Code and Anthropic publish no such range: for
+/// them the honest bound is the model's own output allowance, which is what a ceiling is for.
+///
+/// `-1` is inside the range and means "let the model decide", so the lower bound needs no code:
+/// it is not a budget this module writes, and [`lower_thinking_budgets`] only lowers a number.
+pub const fn dialect_budget_ceiling(dialect: Dialect) -> Option<u32> {
+    match dialect {
+        Dialect::GoogleAiStudio => Some(65_535),
+        _ => None,
+    }
+}
+
 /// Fit the thinking budget in `fragment` under `ceiling` output tokens, in place.
 ///
 /// Returns whether the fragment still says anything worth sending. `false` means the ceiling leaves
 /// no room to both think and answer, and the caller must drop the fragment rather than send a
 /// thinking level the model cannot honour.
 ///
-/// A `None` ceiling leaves a fragment that names a budget untouched: a model that declares no
-/// output limit has said nothing to fit against, and inventing one would be inventing a capability.
-/// Clamping only ever lowers a number, so it is safe to apply to a fragment the operator authored
-/// as well as to a dialect default.
-pub fn fit_thinking_budget(fragment: &mut serde_json::Value, ceiling: Option<u32>) -> bool {
+/// Two bounds can apply and the tighter one wins: the model's output allowance, which the budget is
+/// carved out of, and the dialect's own accepted range. A fragment that names no budget is left
+/// untouched, and so is one whose bounds are both unknown — a model that declares no output limit
+/// and a dialect that states no range have said nothing to fit against, and inventing a limit would
+/// be inventing a capability. Clamping only ever lowers a number, so it is safe to apply to a
+/// fragment the operator authored as well as to a dialect default.
+pub fn fit_thinking_budget(
+    dialect: Dialect,
+    fragment: &mut serde_json::Value,
+    ceiling: Option<u32>,
+) -> bool {
     if !mentions_thinking_budget(fragment) {
         return true;
     }
-    let Some(ceiling) = ceiling else {
+    let model_cap = ceiling.map(|ceiling| ceiling.saturating_sub(THINKING_HEADROOM_TOKENS));
+    let Some(cap) = model_cap
+        .into_iter()
+        .chain(dialect_budget_ceiling(dialect))
+        .min()
+    else {
         return true;
     };
-    let cap = ceiling.saturating_sub(THINKING_HEADROOM_TOKENS);
     if cap < MIN_THINKING_BUDGET {
         return false;
     }
@@ -4982,8 +5025,8 @@ mod tests {
 
         // Anthropic refuses `budget_tokens` at or above `max_tokens`, so a budget at the model's
         // own ceiling makes every request a 400. The answer needs room too, hence the headroom.
-        // Unlike the two Gemini-shaped dialects below, the fragment states no ceiling of its own:
-        // the Anthropic translator always writes `max_tokens`, so a second opinion here would be a
+        // Unlike the Gemini-shaped dialects below, the fragment states no ceiling of its own: the
+        // Anthropic translator always writes `max_tokens`, so a second opinion here would be a
         // number with nothing to override.
         assert_eq!(
             fragment_for(Dialect::Anthropic, Some(64_000)),
@@ -5019,6 +5062,18 @@ mod tests {
         // 1024 budget under a 4096 ceiling is a request that cannot produce an answer at all.
         assert_eq!(fragment_for(Dialect::Anthropic, Some(4_096)), None);
 
+        // The AI Studio default has no budget to fit — it is sent a level alone — so no ceiling
+        // applies to it here. What happens to a fragment that does name one, on either surface,
+        // is the next test's subject.
+        assert_eq!(
+            fragment_for(Dialect::GoogleAiStudio, Some(4_096)),
+            Some(serde_json::json!({
+                "generationConfig": { "thinkingConfig": { "thinkingLevel": "high" } }
+            })),
+            "no budget, no clamp, and the level is not dropped: this dialect's fragment cannot \
+             spend the answer's allowance"
+        );
+
         // A model that declares no ceiling keeps the table's budget — there is nothing to fit to,
         // and inventing a ceiling would be inventing a capability.
         assert_eq!(
@@ -5028,6 +5083,87 @@ mod tests {
             }))
         );
     }
+    #[test]
+    fn the_ai_studio_surface_is_fitted_to_its_own_budget_range_not_only_the_models_ceiling() {
+        // Measured against the public API on 2026-11-11 with an AI Studio key: a body carrying
+        // `thinkingBudget: 131072` is refused with `thinking_budget must be in the range
+        // [-1, 65535]`, and one carrying both a budget and a level is refused with "You can only
+        // set only one of thinking budget and thinking level." The dialect default therefore
+        // states a level, and the range bound is the second opinion applied to any fragment that
+        // does state a budget — including one an operator authored, which is the only way this
+        // dialect's fragment grows one.
+        let fragment_for = |wire: Option<serde_json::Value>, ceiling: Option<u32>| {
+            let mut config = Config::default();
+            let mut p = level_provider("p1", vec![with_levels("m1", &[ReasoningLevel::High])]);
+            p.dialect = Dialect::GoogleAiStudio;
+            p.models[0].max_output_tokens = ceiling;
+            p.models[0].reasoning_wire =
+                wire.map(|fragment| [(ReasoningLevel::High, fragment)].into_iter().collect());
+            config.providers = vec![p];
+            RoutingSnapshot::compile(&config).unwrap().providers()[0].steps[0].reasoning_json
+                [ReasoningLevel::High.rank() as usize]
+                .as_deref()
+                .map(|text| serde_json::from_str::<serde_json::Value>(text).unwrap())
+        };
+
+        // The default: a level, and nothing else. A model that declares a ceiling changes
+        // nothing, because there is no budget for that ceiling to bound — `maxOutputTokens`
+        // travels with a budget, and stating it here would be stating a cap the fragment is not
+        // measured against.
+        assert_eq!(
+            fragment_for(None, Some(65_536)),
+            Some(serde_json::json!({
+                "generationConfig": { "thinkingConfig": { "thinkingLevel": "high" } }
+            }))
+        );
+
+        // A budget larger than the surface accepts is lowered to the surface's own ceiling, not
+        // to the model's: `131072` is a number this API answers 400 for, whatever the model's
+        // output allowance happens to be. The ceiling is then stated, as on the Gemini dialects
+        // above, because the budget is carved out of it.
+        assert_eq!(
+            fragment_for(
+                Some(
+                    serde_json::json!({"generationConfig":{"thinkingConfig":{"thinkingBudget":131_072}}})
+                ),
+                None,
+            ),
+            Some(serde_json::json!({
+                "generationConfig": { "thinkingConfig": { "thinkingBudget": 65_535 } }
+            }))
+        );
+
+        // Both bounds at once: the model's allowance minus headroom is the tighter of the two, so
+        // the budget is fitted to that and the ceiling it was fitted against is sent with it.
+        assert_eq!(
+            fragment_for(
+                Some(
+                    serde_json::json!({"generationConfig":{"thinkingConfig":{"thinkingBudget":131_072}}})
+                ),
+                Some(65_536),
+            ),
+            Some(serde_json::json!({
+                "generationConfig": {
+                    "maxOutputTokens": 65_536,
+                    "thinkingConfig": { "thinkingBudget": 61_440 }
+                }
+            }))
+        );
+
+        // And a ceiling with no room left to both think and answer drops a budgeted fragment
+        // entirely, exactly as it does for Anthropic: this API accepts no budget below 1024, so a
+        // clamped 1024 under a 4096 allowance is a request that cannot produce an answer.
+        assert_eq!(
+            fragment_for(
+                Some(
+                    serde_json::json!({"generationConfig":{"thinkingConfig":{"thinkingBudget":32_768}}})
+                ),
+                Some(4_096),
+            ),
+            None
+        );
+    }
+
     #[test]
     fn each_dialect_maps_a_level_onto_the_field_it_actually_understands() {
         let fragments = |dialect: Dialect| {
@@ -5085,6 +5221,20 @@ mod tests {
             Some(
                 r#"{"generationConfig":{"thinkingConfig":{"thinkingLevel":"high","thinkingBudget":131072}}}"#
             )
+        );
+
+        // The AI Studio surface refuses a body carrying both a level and a budget ("You can only
+        // set only one of thinking budget and thinking level."), so it is sent the level alone —
+        // the only control here that cannot be out of range. Its vocabulary is `low`/`high`, so
+        // the two tiers below `high` are both `low`.
+        let ai_studio = fragments(Dialect::GoogleAiStudio);
+        assert_eq!(
+            ai_studio[ReasoningLevel::Low.rank() as usize].as_deref(),
+            Some(r#"{"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}}"#)
+        );
+        assert_eq!(
+            ai_studio[ReasoningLevel::High.rank() as usize].as_deref(),
+            Some(r#"{"generationConfig":{"thinkingConfig":{"thinkingLevel":"high"}}}"#)
         );
 
         // Antigravity sends the same field one level deeper: its body is an envelope, and a

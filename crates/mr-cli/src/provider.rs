@@ -909,7 +909,7 @@ enum ProbeKind {
 fn probe_kind(d: Dialect) -> ProbeKind {
     match d {
         Dialect::Anthropic => ProbeKind::Messages,
-        Dialect::Google => ProbeKind::Google,
+        Dialect::Google | Dialect::GoogleAiStudio => ProbeKind::Google,
         Dialect::Codex => ProbeKind::Responses,
         _ => ProbeKind::Chat,
     }

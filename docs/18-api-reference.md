@@ -163,8 +163,9 @@ name gets no `-<level>` suffix, and it runs at `none`, which emits no reasoning 
 
 The vocabulary is per dialect, and it is the same list validation accepts: named-effort dialects
 (`openai`, `codex`, `copilot`, `command-code-go`) can send `none, minimal, low, medium, high, xhigh`,
-while budget dialects (`anthropic`, `google`, `antigravity`) express every tier, `ultra` and `max`
-included. Any source — declared, catalogue or vocabulary — is filtered through that list, so the
+while the level-and-budget dialects (`anthropic`, `google`, `google-ai-studio`,
+`antigravity`) express every tier, `ultra` and `max` included — on `google-ai-studio` the level
+alone is what goes out, and its upper tiers share that surface's `high`. Any source — declared, catalogue or vocabulary — is filtered through that list, so the
 listing never offers a tier the dialect would rewrite or drop. A configured level outside the list
 is refused by the configuration validator with its name and the vocabulary quoted, so the panel
 cannot save it and startup will not publish it; it is never silently lowered.
@@ -199,6 +200,7 @@ recognise the value is a 400, and omitting the field is how every provider expre
 | codex (Responses) | `{"reasoning":{"effort":"<level>","summary":"auto"}}` — `xhigh` as `xhigh`; `ultra` and `max` normalised to `xhigh` |
 | anthropic | `{"thinking":{"type":"enabled","budget_tokens":N}}` with `N` = 1024 for `minimal`/`low`, 10240 for `medium`, 131072 for `high` and above, then fitted (below) |
 | google, antigravity | `{"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"\|"high","thinkingBudget":N}}}`, where `thinkingLevel` is `high` from `medium` upward and `low` below it, and `N` is the budget above |
+| google-ai-studio | `{"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"\|"high"}}}` — the level alone, because the public API refuses `thinkingLevel` and `thinkingBudget` together and caps a budget at 65535 |
 
 A per-model `reasoning_wire` map in the configuration **replaces the dialect default wholesale** for
 the levels it names — a fragment has to be internally consistent, so merging one field-by-field is not

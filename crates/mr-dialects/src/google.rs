@@ -829,7 +829,8 @@ fn google_response_to_pivot(ctx: &TranslateCtx<'_>, v: &Value) -> Value {
                         None => "{}".to_string(),
                     };
                     let id = thought::mint_call_id();
-                    if let Some(signature) = field_str(part, "thoughtSignature", "thought_signature")
+                    if let Some(signature) =
+                        field_str(part, "thoughtSignature", "thought_signature")
                     {
                         thought::remember(&id, signature);
                     }
@@ -1081,7 +1082,8 @@ fn translate_stream_item(
                         _ => "{}".to_string(),
                     };
                     let id = thought::mint_call_id();
-                    if let Some(signature) = field_str(part, "thoughtSignature", "thought_signature")
+                    if let Some(signature) =
+                        field_str(part, "thoughtSignature", "thought_signature")
                     {
                         thought::remember(&id, signature);
                     }

@@ -86,7 +86,11 @@ pub(crate) fn remember(id: &str, signature: &str) {
         // downgrades the next replay to the stand-in; failing the request would be worse.
         return;
     };
-    if store.by_id.insert(id.to_string(), signature.to_string()).is_none() {
+    if store
+        .by_id
+        .insert(id.to_string(), signature.to_string())
+        .is_none()
+    {
         store.order.push_back(id.to_string());
     }
     while store.by_id.len() > CAPACITY {
@@ -140,6 +144,10 @@ mod tests {
             let id = mint_call_id();
             remember(&id, "filler");
         }
-        assert_eq!(signature(&first), None, "the oldest entry should be evicted");
+        assert_eq!(
+            signature(&first),
+            None,
+            "the oldest entry should be evicted"
+        );
     }
 }

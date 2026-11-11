@@ -148,7 +148,7 @@ export function buildRedirectPaste(p, ctx, session) {
 // `open-ai`, `parse` wants `openai`. A value here that the backend rejects turns "Add provider"
 // into a save-time error, which is how the pre-rename `command-code` spelling was caught. The Rust
 // test `the_panel_offers_only_dialects_this_binary_deserialises` pins this list.
-const DIALECTS = ['open-ai', 'anthropic', 'google', 'codex', 'copilot', 'antigravity', 'command-code-go'];
+const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go'];
 const KEY_STRATEGIES = ['priority', 'round-robin', 'random', 'least-used'];
 // What a refusal parks: the credential (every model), that model on the credential, or that model
 // on every credential of the provider. Widening past `account` is only right when the upstream
@@ -265,7 +265,7 @@ const PROVIDER_PRESETS = {
     { name: 'Perplexity', dialect: 'open-ai', baseUrl: 'https://api.perplexity.ai', auth: 'bearer', hint: 'perplexity.ai. Add your Perplexity API key as an account secret after saving.' },
     { name: 'Cohere', dialect: 'open-ai', baseUrl: 'https://api.cohere.com/compatibility/v1', auth: 'bearer', hint: 'cohere.com, OpenAI-compatibility surface. Add your Cohere API key as an account secret after saving.' },
     { name: 'Anthropic', dialect: 'anthropic', baseUrl: 'https://api.anthropic.com/v1', auth: 'bearer', hint: 'api.anthropic.com. Add your Anthropic API key as an account secret after saving.' },
-    { name: 'Google Gemini', dialect: 'google', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', auth: 'bearer', hint: 'generativelanguage.googleapis.com. Add your Google API key as an account secret after saving.' },
+    { name: 'Google Gemini', dialect: 'google-ai-studio', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', auth: 'api-key-header', authHeader: 'x-goog-api-key', hint: 'The public Gemini API at generativelanguage.googleapis.com, reached with an AI Studio API key. Add the key as an account secret after saving; this endpoint wants it in the x-goog-api-key header.' },
   ],
   // Developer platforms and enterprise endpoints — OAuth or dedicated infrastructure,
   // visually separated from the standard LLM APIs above.
@@ -281,6 +281,9 @@ const PROVIDER_PRESETS = {
 };
 
 const DIALECT_BASE_URLS = {
+  // Both Gemini dialects are the same host; they differ in their thinking rules, not their URL.
+  'google-ai-studio': 'https://generativelanguage.googleapis.com/v1beta',
+  google: 'https://generativelanguage.googleapis.com/v1beta',
   codex: 'https://chatgpt.com/backend-api/codex',
   antigravity: 'https://cloudcode-pa.googleapis.com',
   'command-code-go': 'https://api.commandcode.ai',
@@ -2566,7 +2569,10 @@ export async function renderProviders(mount, ctx) {
     }
     renderAuthParams();
 
-    // Preset behavior: applying a preset sets dialect, base URL, and auth kind.
+    // Preset behavior: applying a preset sets dialect, base URL, and auth kind. A preset that
+    // names `authHeader` also sets the header, because an auth kind alone is not enough to be
+    // usable: `api-key-header` defaults to `x-api-key`, and Gemini wants `x-goog-api-key`, so a
+    // preset that only picked the kind would fill the form in with a header that is refused.
     presetSel.addEventListener('change', () => {
       const preset = [
         ...PROVIDER_PRESETS.providers,
@@ -2577,6 +2583,7 @@ export async function renderProviders(mount, ctx) {
         dialectIn.value = preset.dialect;
         baseUrl.value = preset.baseUrl;
         authSel.value = preset.auth;
+        if (preset.authHeader) authHeader.value = preset.authHeader;
         renderAuthParams();
       }
       presetHint.textContent = preset.hint;
