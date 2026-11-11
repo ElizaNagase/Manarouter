@@ -245,6 +245,21 @@ fn message_into_items(
             // `store: false` the only copy of it is what the client round-trips, so dropping it here
             // means every turn of a tool loop arrives without the thinking that justified the tool
             // calls it made.
+            //
+            // The text rides in `summary`, and the item carries no `content` at all. Both are the
+            // upstream's rules for a reasoning item arriving in `input`, and both were measured
+            // against the live endpoint rather than assumed — an item shaped any other way is a 400:
+            //
+            // * `summary` is required. Omitting it answers `missing_required_parameter` naming
+            //   `input[N].summary`, which is the error a chat client's round-tripped reasoning used
+            //   to fail with on the last turn of a long conversation.
+            // * `content` must be empty on the way in. One `reasoning_text` part answers
+            //   `array_above_max_length`: "Expected an array with maximum length 0".
+            //
+            // So a summary part is the only place pivot text can go, and an empty `summary` would
+            // say nothing while still paying for the item. The pivot's `reasoning_content` is
+            // already the visible account of the thinking — it is what this dialect's stream puts in
+            // that field — so it is that account, not the hidden trace, that is handed back.
             if let Some(text) = message
                 .get("reasoning_content")
                 .and_then(Value::as_str)
@@ -252,7 +267,7 @@ fn message_into_items(
             {
                 out.push(json!({
                     "type": "reasoning",
-                    "content": [{"type": "reasoning_text", "text": text}],
+                    "summary": [{"type": "summary_text", "text": text}],
                 }));
             }
             if let Some(parts) = content_parts("assistant", content) {
@@ -1244,6 +1259,22 @@ pub fn sse_to_pivot(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<String>> {
     RESPONSE_STREAM_STATE.with(|cell| translate_event(&mut cell.borrow_mut(), ctx, data))
 }
 
+/// Whether a Responses event closes the answer.
+///
+/// This face has no `[DONE]`; a stream ends on one of these events, and `response.completed` is the
+/// one an answer that ran to the end arrives with. `response.failed` and a bare `error` end it too:
+/// the client stops reading either way, so the relay must not treat the silence after them as an
+/// upstream that died mid-answer.
+fn is_terminal_event(data: &str) -> bool {
+    let Ok(event) = serde_json::from_str::<Value>(data) else {
+        return false;
+    };
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("response.completed" | "response.incomplete" | "response.failed" | "error")
+    )
+}
+
 /// Translate one upstream event against a caller-owned stream state.
 ///
 /// This is the whole stream machine: [`Translator::translate`] hands in the state it owns and
@@ -1263,6 +1294,15 @@ fn translate_event(
     if ctx.route == RouteKind::Responses {
         if candidate == SSE_DONE {
             return Ok(Vec::new());
+        }
+        // The frames are the upstream's own, so there is nothing to translate — but the stream still
+        // has to remember that the answer closed. Without that, `Translator::finish` finds no state
+        // and reports a truncation against a stream that ended exactly the way it should, which is
+        // what a Responses client used to receive right after `response.completed`: a spurious
+        // `stream_truncated` error on every successful answer.
+        if !slot.as_ref().map(|state| state.done).unwrap_or(false) && is_terminal_event(candidate) {
+            slot.get_or_insert_with(|| ResponseStreamState::new(ctx))
+                .done = true;
         }
         return Ok(vec![candidate.to_owned()]);
     }
@@ -1691,6 +1731,11 @@ mod tests {
     /// `store: false` keeps nothing upstream, so the only copy of the model's thinking is what the
     /// client round-trips. Dropping it makes every turn of a tool loop arrive without the reasoning
     /// that justified the tool calls, and the model re-plans what it already decided.
+    ///
+    /// The item is shaped the way the endpoint accepts one, which is not the way it was first
+    /// written here: the thinking goes in `summary`, and `content` is absent because the upstream
+    /// allows it zero parts on the way in. Both halves of that are the bug a chat client hit — a
+    /// `content`-bearing item without `summary` is refused before the model ever sees it.
     #[test]
     fn the_reasoning_a_model_produced_comes_back_as_an_input_item() {
         let ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Codex, "gpt-5-codex");
@@ -1720,8 +1765,12 @@ mod tests {
             .find(|item| item["type"] == json!("reasoning"))
             .expect("the reasoning is part of the transcript");
         assert_eq!(
-            reasoning["content"],
-            json!([{"type": "reasoning_text", "text": "I should call the listing tool."}])
+            reasoning["summary"],
+            json!([{"type": "summary_text", "text": "I should call the listing tool."}])
+        );
+        assert!(
+            reasoning.get("content").is_none(),
+            "the upstream accepts no content parts on a reasoning input item: {reasoning:?}"
         );
         // It stands before the call it justified, so the model reads its own plan first.
         let reasoning_at = input
@@ -1784,5 +1833,49 @@ mod tests {
             .expect("the terminal event translates");
         assert!(translator.is_finished());
         assert!(translator.finish(&ctx).is_empty());
+    }
+
+    /// A Responses client's own frames still have to close the answer.
+    ///
+    /// Nothing is translated on this route — the frames ride through as the upstream sent them — so
+    /// the state behind them is easy to forget. Forgetting it makes `finish` believe the stream died
+    /// mid-answer and append a `stream_truncated` error to every *successful* answer: the client is
+    /// handed `response.completed` and then an error frame after it.
+    #[test]
+    fn a_responses_client_stream_that_completed_is_not_called_truncated() {
+        let ctx = TranslateCtx::new(RouteKind::Responses, Dialect::Codex, "gpt-5-codex");
+        let mut translator = Translator::new();
+        translator
+            .translate(
+                &ctx,
+                r#"{"type":"response.output_text.delta","delta":"hello"}"#,
+            )
+            .expect("a delta rides through");
+        assert!(!translator.is_finished(), "the answer is still open");
+        translator
+            .translate(
+                &ctx,
+                r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-5-codex"}}"#,
+            )
+            .expect("the terminal event rides through");
+        assert!(translator.is_finished(), "the answer has closed");
+        assert!(
+            translator.finish(&ctx).is_empty(),
+            "a finished answer owes the client nothing, least of all an error"
+        );
+    }
+
+    /// A Responses client's stream that really did stop early is still reported.
+    #[test]
+    fn a_responses_client_stream_that_stopped_early_is_still_reported() {
+        let ctx = TranslateCtx::new(RouteKind::Responses, Dialect::Codex, "gpt-5-codex");
+        let mut translator = Translator::new();
+        translator
+            .translate(
+                &ctx,
+                r#"{"type":"response.output_text.delta","delta":"hello"}"#,
+            )
+            .expect("a delta rides through");
+        assert!(!translator.finish(&ctx).is_empty());
     }
 }

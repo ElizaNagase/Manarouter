@@ -418,9 +418,22 @@ streams an answer regardless and rejects `store: true` (`responses.rs:71-76`).
   `Translator::finish` with an `error` frame (`code: stream_truncated`) and the `[DONE]` sentinel —
   never with a synthesized `finish_reason: "stop"`, which would claim the answer finished. The last
   line in the buffer is flushed first, because a cut body ends without a trailing newline
-  (`responses.rs:852-864`, and `flush_stream_chunk` in `crates/manarouter-relay/src/server.rs`).
-  Google is the deliberate exception for a *clean* end of body: Gemini may omit `finishReason`, so
-  that case synthesizes `STOP`; a Google body error still ends without a completion.
+  (`responses.rs`, `Translator::finish`, and `flush_stream_chunk` in
+  `crates/manarouter-relay/src/server.rs`). Google is the deliberate exception for a *clean* end of
+  body: Gemini may omit `finishReason`, so that case synthesizes `STOP`; a Google body error still
+  ends without a completion. A Responses route needs the same knowledge even though none of its
+  frames are translated: its terminal event is still noted as it passes, because otherwise a
+  Responses client would be handed `response.completed` and then an error frame calling that same
+  answer truncated.
+- **A reasoning item in `input` is a `summary`, and carries no `content`.** Both are the endpoint's
+  own rules for an item arriving in `input`, measured against the live backend rather than assumed:
+  omitting `summary` answers `missing_required_parameter` naming `input[N].summary`, and a `content`
+  array with even one `reasoning_text` part answers `array_above_max_length` — "Expected an array
+  with maximum length 0". So a Chat Completions client's round-tripped `reasoning_content` is
+  written as `[{"type": "summary_text", "text": ...}]` with no `content` key at all
+  (`message_into_items` in `responses.rs`). A Responses-native client's items are forwarded
+  untouched: they are the upstream's own output, and repairing a body the router did not build
+  would change a transcript it cannot read.
 - The terminator is where the two client shapes diverge: a Chat Completions client needs a final
   `finish_reason` chunk and `data: [DONE]`, while a Responses client terminates on
   `response.completed` and treats `[DONE]` as protocol noise — so `[DONE]` is suppressed for
