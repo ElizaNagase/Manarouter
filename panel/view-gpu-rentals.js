@@ -779,7 +779,10 @@ async function renderInventory(mount, ctx) {
   function laneAccountRow(acc) {
     const label = asString(pick(acc, 'account', 'label')).trim() || '(unnamed)';
     const host = asString(pick(acc, 'host')).trim();
-    const project = asString(pick(acc, 'project')).trim();
+    // Cerebrium's own view names these `project_id` and `app_name`; a row that showed neither
+    // would leave two accounts on the same project indistinguishable.
+    const project = asString(pick(acc, 'project', 'project_id')).trim();
+    const app = asString(pick(acc, 'app', 'app_name')).trim();
     const health = asString(pick(acc, 'health')).trim();
     const warm = pick(acc, 'warm', 'is_warm');
     const minutesLeft = asNumber(pick(acc, 'minutes_left'));
@@ -789,6 +792,7 @@ async function renderInventory(mount, ctx) {
     const parts = [h('span', { class: 'mono' }, label)];
     if (host) parts.push(h('span', { class: 'hint' }, ` · ${host}`));
     if (project) parts.push(h('span', { class: 'hint' }, ` · project: ${project}`));
+    if (app) parts.push(h('span', { class: 'hint' }, ` · app: ${app}`));
     if (health) parts.push(h('span', { class: 'hint' }, ` · ${health}`));
     // `warm` is a boolean on three lanes. Printing `String(false)` would put the word "false" on a
     // card as if it were a status, so the boolean is said in words and any other value is quoted.

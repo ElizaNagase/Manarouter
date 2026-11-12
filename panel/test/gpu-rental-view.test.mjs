@@ -550,7 +550,13 @@ const laneStatuses = () => ({
     status: 'ok',
     ready: true,
     detail: null,
-    accounts: [{ account: 'cerebrium-main', app: 'manarouter-a1b2', project: 'proj-1', health: 'healthy', warm: false }],
+    accounts: [{
+      account: 'cerebrium-main',
+      app_name: 'manarouter-a1b2',
+      project_id: 'proj-1',
+      health: 'healthy',
+      warm: false,
+    }],
   },
 });
 
@@ -1155,6 +1161,10 @@ test('a lane whose status route fails is named, and the other lanes still render
   assert.match(text, /molab-main/, 'the lane that answered is still on screen');
   assert.match(text, /saturn-work/);
   assert.match(text, /cerebrium-main/);
+  assert.match(text, /project: proj-1/,
+    'Cerebrium names the field project_id; the row still has to say which project it belongs to');
+  assert.match(text, /app: manarouter-a1b2/,
+    'Cerebrium names the field app_name; without it two apps in one project look identical');
 });
 
 test('a Saturn budget that was never recorded reads as unrecorded, not as full allowance', async () => {
