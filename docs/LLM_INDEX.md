@@ -64,7 +64,7 @@ measured baseline of an existing Javascript router on the development machine �
 | Change combo behaviour | `docs/06-combos.md`, `docs/07-hedged-race.md`, `crates/mr-core/src/model.rs` |
 | Work on the hedged race | `docs/07-hedged-race.md` — read all of it; the semantics are counterintuitive |
 | Change account/key selection | `docs/05-key-selection.md`, `crates/mr-core/src/dialect.rs` (`KeyStrategy`) |
-| Work on quota | `docs/08-quota-tracking.md`, `docs/09-reset-aware-priority.md` |
+| Work on quota | `docs/08-quota-tracking.md`, `docs/09-reset-aware-priority.md`, `crates/mr-core/src/quota/` (`openai_compat.rs` reader, `probe.rs` candidate-endpoint walk) |
 | Add an OAuth platform | `docs/14-oauth-adding-a-platform.md`, `docs/omniroute-reference.md` |
 | Touch credentials or secrets | `docs/21-security.md` — read before writing any code |
 | Change the configuration schema | `docs/03-configuration.md` §1 first — unknown-key preservation is mandatory |

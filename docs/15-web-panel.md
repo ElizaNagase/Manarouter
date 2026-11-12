@@ -35,8 +35,8 @@ The two processes share state through files, not through IPC: the conductor writ
 | **Combos** | Every combo with its steps **in priority order**, each model step's optional pinned reasoning level, and a **Live health** panel | Create, edit, reorder steps, enable/disable, remove, pin a model step's reasoning level, and **check** the steps: one tiny completion per enabled model step through the relay probe, in priority order, so the panel shows which step answers right now and which one failed and why. A step may instead route to another combo; it has no provider, model or level of its own, is shown as a nested combo, and is checked in that combo rather than probed here. Provider, model and combo pickers are searchable. A cycle between nested combos is refused with the chain that closes it |
 | **Keys** | Client keys by label and prefix | Create (plaintext shown once), edit the policy, rotate the secret in place (new plaintext shown once, old secret invalidated after commit), enable/disable, delete |
 | **Aliases** | Alias to target mappings | Add, remove |
-| **Quota** | Allowances first, grouped by provider: each provider block has a heading, a strip of its accounts' window chips, and one card per account, laid out so several accounts share a wide page and a phone gets one full-width card, with one row per window the provider actually reported — then the recent request ledger underneath. Provider blocks and the account cards inside them can be dragged; that changes only this page. A provider that quantifies a single window gets a single row, never padding for the families it did not mention; an account with nothing quantified (never fetched, or no reported fraction) is left off the page rather than shown as an empty shell. An account whose refresh *failed* keeps its last-good card and the error when an earlier fetch left a quantified window to show; a failure with no window (including before the first snapshot) stays off the page too | Refresh an account's windows from the provider (key *and* OAuth accounts: the conductor mints the same short-lived token the relay would); reorder provider blocks and accounts for display |
-| **Settings** | Listen ports, client-key access, upstream proxies, the relay connection pool (including a low-resource profile), quota display, pricing data, the panel password, and the raw configuration | Edit; **ports apply on next restart** |
+| **Quota** | Allowances first, grouped by provider: each provider block has a heading, a strip of its accounts' window chips, and one card per account, laid out so several accounts share a wide page and a phone gets one full-width card, with one row per window the provider actually reported — then the recent request ledger underneath. Provider blocks and the account cards inside them can be dragged; that changes only this page. A provider that quantifies a single window gets a single row, never padding for the families it did not mention; an account with nothing quantified (never fetched, or no reported fraction) is left off the page rather than shown as an empty shell. An account whose refresh *failed* keeps its last-good card and the error when an earlier fetch left a quantified window to show; a failure with no window (including before the first snapshot) stays off the page too. A provider with no dedicated reader is asked through its candidate list, and such a card's footer names the candidate that answered | Refresh an account's windows from the provider (key *and* OAuth accounts: the conductor mints the same short-lived token the relay would); reorder provider blocks and accounts for display |
+| **Settings** | Listen ports, client-key access, upstream proxies, the relay connection pool (including a low-resource profile), quota display, quota probing (the candidate endpoints a generic provider is asked for an allowance), pricing data, the panel password, and the raw configuration | Edit; **ports apply on next restart** |
 | **Documentation** | The top-level files in `docs/`, rendered from markdown | Nothing |
 
 The **Models** view distinguishes discovered from hand-entered metadata explicitly, because a sync
@@ -97,7 +97,27 @@ grey when a window is unlimited. The colour is always a second copy of a number 
 words — it never carries the meaning alone, and a window that arrives without a fraction is not
 drawn at all rather than painted red or green. The page does not print the snapshot's `source` URL
 or its per-window `details`; both stay in `/api/quota` for diagnosis, because beside the percentage
-they buried the number the page exists to show.
+they buried the number the page exists to show. The one exception is the card's own provenance line:
+when a reading came from a generic provider's candidate walk, the source is the single fact that says
+*which* endpoint answered, so the footer reads `2 min ago · read from /api/v1/key` — and nothing at all
+for a provider with a dedicated reader, where the source is the reader's own name and adds nothing.
+
+## Quota probing
+
+A provider nobody wrote a reader for usually still publishes its allowance somewhere, and the places
+are a short, well-worn list (`docs/08-quota-tracking.md` § *Candidate quota endpoints*). Settings →
+**Quota probing** edits that list: each candidate is a row that can be reordered, removed, and added
+to; the card shows the built-in nine when no list has been saved, and offers **Reset to the built-in
+list** to get back to them. Alongside the list are the walk switch and the last-resort one-token
+`POST /v1/chat/completions` with the model id it names.
+
+Two things the card is careful about. A candidate is a **path on the account's own base URL, never a
+URL** — every request carries that account's credential — so a host in an entry is refused while it is
+typed, with the same rule the router applies before each request (a leading `//`, no leading `/`, a
+fragment, a space or a control character are refused the same way). And an empty list is a decision,
+not a mistake: it means *probe nothing*, and it is saved as such rather than being quietly replaced by
+the defaults. The card saves through the same validated `PUT /api/config` as every other settings
+card, so a list the router would refuse never reaches the file.
 
 ## The live combo block
 

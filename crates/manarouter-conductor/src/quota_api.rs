@@ -302,7 +302,7 @@ async fn get_quota(State(state): State<AppState>) -> ApiResult<Json<Value>> {
             // made-up `0/0` window reads as "exhausted" and sends the operator chasing a number
             // nobody measured. It stays hidden until it either gains a real fetcher or produces a
             // cached row.
-            if entry.is_none() && !reports_quota(provider, account) {
+            if entry.is_none() && !reports_quota(provider, account, &config.quota_probe) {
                 continue;
             }
             rows.push(account_row(provider, account, entry, None));
@@ -325,7 +325,7 @@ async fn refresh_all(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         .flat_map(|p| {
             p.accounts
                 .iter()
-                .filter(|a| a.enabled && reports_quota(p, a))
+                .filter(|a| a.enabled && reports_quota(p, a, &config.quota_probe))
                 .map(move |a| (p.clone(), a.clone()))
         })
         .collect();
@@ -380,16 +380,25 @@ async fn refresh_account(state: &AppState, provider: &Provider, account: &Accoun
 /// Whether this provider/account pair has a quota fetcher that can actually report an allowance.
 ///
 /// The generic OpenAI-compatible reader sits in the fallback tier and claims everything, but it can
-/// only answer when the account declares a `quotaEndpoint`. Everything else it claims has no
-/// endpoint to read, which is exactly the "this service does not report quota" case — and the
-/// panel must not invent a window for it.
+/// only answer when it has something to read: either the account declares a `quotaEndpoint`, or the
+/// `quotaProbe` walk has a candidate list to try on the account's own origin. Everything else it
+/// claims has no endpoint to read, which is exactly the "this service does not report quota" case —
+/// and the panel must not invent a window for it.
 ///
 /// The provider's base URL has to go into the look-up, not just its id and dialect: those two are
 /// operator-chosen, and a vendor is recognised by the host its traffic goes to. A provider called
 /// `commandcode` on the generic `open-ai` dialect matched no fetcher until the host claim existed, so
 /// this function said "no quota here" about a service that reports one and the account never
 /// appeared on the page.
-fn reports_quota(provider: &Provider, account: &Account) -> bool {
+///
+/// The walk is asked rather than assumed: [`mr_core::quota::probe::walk_configured`] answers for the
+/// account's own declaration, so an account that switches the walk off, or empties the list, stays
+/// off this page exactly as it was before the walk existed.
+fn reports_quota(
+    provider: &Provider,
+    account: &Account,
+    probe: &mr_core::quota::probe::QuotaProbeConfig,
+) -> bool {
     let quota_account = mr_core::quota::registry::QuotaAccount::from_account(account);
     let Some(fetcher) = default_registry().lookup(
         provider.dialect,
@@ -412,6 +421,7 @@ fn reports_quota(provider: &Provider, account: &Account) -> bool {
         .extra
         .get(mr_core::quota::registry::QUOTA_ENDPOINT_KEY)
         .is_some_and(|value| !value.is_null())
+        || mr_core::quota::probe::walk_configured(Some(probe), &account.extra)
 }
 
 async fn fetch_and_store(
@@ -441,7 +451,10 @@ async fn fetch_and_store(
     }
     let mut context = QuotaFetchContext::new(provider.id.as_str(), provider.dialect, http)
         .with_account(quota_account)
-        .with_base_url(provider.base_url.clone());
+        .with_base_url(provider.base_url.clone())
+        // The candidate list is configuration, and it is read here rather than captured when the
+        // refresh was queued: a refresh is the operator's way of testing a list they just saved.
+        .with_quota_probe(state.current_config().await.quota_probe.clone());
     if let Some(secret) = credential {
         context = context.with_credential(secret);
     }
@@ -769,6 +782,7 @@ mod tests {
     #[test]
     fn a_provider_recognised_by_its_host_reports_quota_and_the_rest_do_not() {
         let account = Account::new("work");
+        let walk = mr_core::quota::probe::QuotaProbeConfig::default();
 
         // Command Code, on the exact base URL the operator's config carries.
         let command_code = Provider::new(
@@ -776,25 +790,63 @@ mod tests {
             mr_core::Dialect::OpenAi,
             "https://api.commandcode.ai/provider/v1",
         );
-        assert!(reports_quota(&command_code, &account));
+        assert!(reports_quota(&command_code, &account, &walk));
 
-        // A made-up id on somebody else's host is still a service with no reader and no declared
-        // endpoint: the page must not be given an invented window for it.
+        // A made-up id on somebody else's host is a service with no dedicated reader. What decides
+        // whether the page offers it is whether the walk has anything to try there.
         let unknown = Provider::new(
             "some-openai-clone",
             mr_core::Dialect::OpenAi,
             "https://api.openai.com/v1",
         );
-        assert!(!reports_quota(&unknown, &account));
+        assert!(reports_quota(&unknown, &account, &walk));
 
-        // That is the pre-existing escape hatch, and it still works: declare where the quota lives
-        // and the generic reader can answer.
+        // Switch the walk off, or empty its list, and nothing is offered: byte for byte the
+        // behaviour the panel had before the walk existed.
+        let off = mr_core::quota::probe::QuotaProbeConfig {
+            enabled: false,
+            ..mr_core::quota::probe::QuotaProbeConfig::default()
+        };
+        assert!(!reports_quota(&unknown, &account, &off));
+        let empty = mr_core::quota::probe::QuotaProbeConfig {
+            paths: Vec::new(),
+            ..mr_core::quota::probe::QuotaProbeConfig::default()
+        };
+        assert!(!reports_quota(&unknown, &account, &empty));
+
+        // The pre-existing escape hatch still works, and it does not need the walk: a declared
+        // endpoint is read even with the section switched off.
         let mut declared = Account::new("work");
         declared.extra.insert(
             mr_core::quota::registry::QUOTA_ENDPOINT_KEY.to_owned(),
             json!("https://api.openai.com/v1/credits"),
         );
-        assert!(reports_quota(&unknown, &declared));
+        assert!(reports_quota(&unknown, &declared, &off));
+
+        // An account that declares its own list is walked with the section off only if it also
+        // switches the walk on for itself: a bare list inherits `enabled`, which is how the
+        // documented overlay works.
+        let mut inherited = Account::new("work");
+        inherited.extra.insert(
+            mr_core::quota::probe::QUOTA_PROBE_KEY.to_owned(),
+            json!(["/v1/balance"]),
+        );
+        assert!(!reports_quota(&unknown, &inherited, &off));
+        let mut own = Account::new("work");
+        own.extra.insert(
+            mr_core::quota::probe::QUOTA_PROBE_KEY.to_owned(),
+            json!({ "enabled": true, "paths": ["/v1/balance"] }),
+        );
+        assert!(reports_quota(&unknown, &own, &off));
+
+        // A declaration that cannot be read is offered anyway, so the refresh reports the mistake
+        // instead of the page silently dropping the account.
+        let mut broken = Account::new("work");
+        broken.extra.insert(
+            mr_core::quota::probe::QUOTA_PROBE_KEY.to_owned(),
+            json!("https://api.openai.com/v1/balance"),
+        );
+        assert!(reports_quota(&unknown, &broken, &off));
     }
 
     /// The label on the one window an undeclared quota produces.

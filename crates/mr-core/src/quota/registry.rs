@@ -185,6 +185,13 @@ pub struct QuotaFetchContext {
     pub base_url: Option<String>,
     /// The account's credential, when there is one. Required by some upstreams, unused by others.
     pub credential: Option<QuotaCredential>,
+    /// The operator's candidate list for the fallback walk
+    /// ([`crate::quota::probe`]), when the caller has one to pass down.
+    ///
+    /// `None` is not "no probing": it means the built-in default list is used, which is what every
+    /// caller that predates this field gets. The account's own `quotaProbe` extras are read by the
+    /// walk and win over this, exactly as they do for `quotaEndpoint`.
+    pub quota_probe: Option<crate::quota::probe::QuotaProbeConfig>,
     /// The transport. A test injects a fake here and no socket is touched.
     pub http: Arc<dyn QuotaHttp>,
 }
@@ -198,6 +205,7 @@ impl QuotaFetchContext {
             account: QuotaAccount::new(),
             base_url: None,
             credential: None,
+            quota_probe: None,
             http,
         }
     }
@@ -219,6 +227,16 @@ impl QuotaFetchContext {
         self.credential = Some(credential.into());
         self
     }
+
+    /// Set the operator's candidate list for the fallback walk.
+    ///
+    /// The control plane passes its `quotaProbe` config section here. Without this call the walk
+    /// uses [`crate::quota::probe::QuotaProbeConfig::default`], which is the same list a
+    /// configuration file gets when it does not mention the section at all.
+    pub fn with_quota_probe(mut self, quota_probe: crate::quota::probe::QuotaProbeConfig) -> Self {
+        self.quota_probe = Some(quota_probe);
+        self
+    }
 }
 
 impl std::fmt::Debug for QuotaFetchContext {
@@ -231,6 +249,15 @@ impl std::fmt::Debug for QuotaFetchContext {
             .field(
                 "credential",
                 &self.credential.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                // Only the shape: a candidate path may carry a token in its query string, and this
+                // `Debug` goes into logs and error contexts.
+                "quota_probe",
+                &self
+                    .quota_probe
+                    .as_ref()
+                    .map(|config| (config.enabled, config.paths.len())),
             )
             .field("http", &self.http)
             .finish()

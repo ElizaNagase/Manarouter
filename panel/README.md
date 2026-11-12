@@ -15,7 +15,7 @@ All requests are **relative** (`/api/…`); the panel talks only to the origin t
 | `app.js` | Entry point: session gate, hash router (`#/view/param`), health poller wiring, the persistent restart-pending banner, shared `ctx` passed to every view. |
 | `api.js` | Single fetch wrapper. Parses the `{ error: { code, message, details } }` envelope, centralises the 401 → login transition, offers `getRaw`/`putRaw` for the config file. |
 | `dom.js` | `h()` element builder — the only sanctioned DOM construction. **Exactly one deliberate `innerHTML`** — docs markdown in `view-docs.js`, escaped at the door by `markdown.js` — and server strings (provider labels, model ids, error messages, doc text) enter the DOM as text nodes or `textContent` only. Also: validation-problem → field mapping, error blocks, chips, form fields. |
-| `format.js` | Pure, DOM-free helpers (uptime/age, chip-class selection, problem grouping, port diffing, combo step moves, hedge-enum parsing). See “Testing”. The hedge-enum helpers (`parseWinnerFail` / `buildWinnerFail`) build the backend's internally tagged form; legacy externally tagged documents are still read. |
+| `format.js` | Pure, DOM-free helpers (uptime/age, chip-class selection, problem grouping, port diffing, combo step moves, hedge-enum parsing, quota-probe candidate validation and provenance). See “Testing”. The hedge-enum helpers (`parseWinnerFail` / `buildWinnerFail`) build the backend's internally tagged form; legacy externally tagged documents are still read. |
 | `poll.js` | Health poll scheduler. Chained `setTimeout` (never overlapping), **stops entirely while `document.visibilityState !== 'visible'`** — a background tab must not hammer a loopback socket — and fires one immediate tick on return. |
 | `combo-live.js` | The sidebar's live combo visualizer, under the Combos nav entry. Polls `GET /api/activity` (the control plane proxying the relay's `/control/activity`) every 1.5 s through `poll.js`. The block shows the combo and the route it is serving on two lines; when idle it shows the last decision, with its relative age in the tooltip and accessible label rather than a third line. `comboActivityView` is the pure decision — live, recent history, never run, control plane unreachable — so all four states are tested without a DOM. |
 | `toast.js` | Global notification area. Success/error/warning/info map onto the semantic colours; error toasts render the backend's full `details` list. |
@@ -27,8 +27,8 @@ All requests are **relative** (`/api/…`); the panel talks only to the origin t
 | `view-keys.js` | Client keys, allow-lists (one per line), create flow with the show-once plaintext dialog. |
 | `view-aliases.js` | Alias table editor (add + delete; the API has no alias PUT). |
 | `view-models.js` | All models across providers in one dense table. Label, context, pricing, reasoning and input columns appear only when the loaded rows report them; when unfiltered, rows that report more are listed first. Model ids stay primary and truncate rather than wrap. Search, provider/source/hidden filters, 50/100/250/500 paging, a keyboard-reachable detail drawer (metadata overrides, test, hide, delete), and confirmed bulk resync/delete. |
-| `view-quota.js` | Cached upstream quota windows, grouped by provider and account: chips for every quantified window, one card per account coloured by its most exhausted window, and display-only drag reordering for both levels. Refresh is explicit (or opt-in on load); the request ledger from `GET /api/usage` follows underneath. |
-| `view-settings.js` | Port editor with apply-on-restart warning, panel password, raw config editor with Validate/Save. |
+| `view-quota.js` | Cached upstream quota windows, grouped by provider and account: chips for every quantified window, one card per account coloured by its most exhausted window, and display-only drag reordering for both levels. Refresh is explicit (or opt-in on load); the request ledger from `GET /api/usage` follows underneath. A card read through a candidate walk names the candidate that answered, in its footer. |
+| `view-settings.js` | Settings cards: listener ports with the apply-on-restart warning, the relay connection pool, client-key access, upstream proxies, quota display, **quota probing** (the candidate endpoints a generic provider is asked for an allowance — reorderable, with the one-token `POST` and its model), pricing data, the panel password, and the raw configuration with Validate/Save. |
 | `view-docs.js` | Documentation browser; renders doc text as markdown into `innerHTML`, through `markdown.js`, which escapes raw HTML (`&`/`<`/`>`/`"`/`'`) first, so a doc cannot inject DOM. |
 
 ## API contract as understood by this panel
@@ -107,9 +107,9 @@ For Firefox, use `npx playwright install firefox` then `BROWSER=firefox node pan
 
 The suite in `panel/test/*.test.mjs` covers the DOM-free helpers and the renderers that can run
 without a browser: API request envelopes, uptime/age formatting, provider presets, probe targets,
-reasoning levels, searchable selects, combo live-state selection, quota display ordering, model
-grouping and paging, markdown escaping, OAuth redirects and provider refresh decisions. Run it
-with:
+reasoning levels, searchable selects, combo live-state selection, quota display ordering,
+quota-probe candidate validation and provenance, model grouping and paging, markdown escaping,
+OAuth redirects and provider refresh decisions. Run it with:
 
 ```bash
 node --test panel/test/*.test.mjs
@@ -120,7 +120,7 @@ mock API in Playwright, without touching the configured conductor. Its setup is 
 
 ### Current verification
 
-At the time of writing, `node --test panel/test/*.test.mjs` runs 126 tests with no failures, and
+At the time of writing, `node --test panel/test/*.test.mjs` runs 350 tests with no failures, and
 the Rust workspace passes `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`
 and `cargo test --workspace`.
 

@@ -667,3 +667,87 @@ export function mergeQuotaRecord(previous, next) {
   }
   return next;
 }
+
+// ---------- quota probing ----------
+// A provider with no dedicated quota fetcher can still be asked: the router walks a list of
+// conventional balance/quota paths on the account's own base URL and reads the first one that
+// answers (see `crates/mr-core/src/quota/probe.rs`). The panel edits that list in Settings, and
+// shows which candidate answered on the Quota page.
+
+/** The fetcher id the walk stamps on a reading it produced, before the candidate path. */
+const PROBE_SOURCE_PREFIX = 'openai-compatible';
+
+/**
+ * The candidates a deployment walks until someone saves a list of their own.
+ *
+ * Mirrors `DEFAULT_QUOTA_PROBE_PATHS` in `crates/mr-core/src/quota/probe.rs`, which is also the
+ * table in `docs/08-quota-tracking.md`. Settings shows these so the card is never blank and an
+ * operator can see — and reset to — what a refresh would really try. The router's copy stays
+ * authoritative; a test in `panel/test/quota-probe.test.mjs` pins this one to the documented order.
+ */
+export const QUOTA_PROBE_DEFAULT_PATHS = [
+  '/v1/balance',
+  '/api/balance',
+  '/api/v1/key',
+  '/v1/key',
+  '/v1/user/info',
+  '/v1/dashboard/billing/subscription',
+  '/v1/credits',
+  '/v1/quota',
+  '/v1/usage',
+];
+
+/** The one candidate that is a POST, tried after every path (`CHAT_COMPLETIONS_PATH`). */
+export const QUOTA_PROBE_CHAT_PATH = '/v1/chat/completions';
+
+/**
+ * What is wrong with one candidate path, or `null` when nothing is.
+ *
+ * A candidate is a path on the account's own base URL, never a URL: the credential for that account
+ * may not be sent anywhere else, so a host in the list is refused rather than fetched. This mirrors
+ * `probe_path_problem` in `crates/mr-core/src/quota/probe.rs` so a typo is caught while it is typed
+ * instead of at the first refresh. The router refuses the same entries at runtime — it has to, since
+ * an account's own list never passes through config validation.
+ */
+export function probePathProblem(path) {
+  const value = typeof path === 'string' ? path : '';
+  if (!value.trim()) return 'is empty';
+  if (value.includes('://') || value.startsWith('//')) {
+    return 'names a host; a candidate is a path on the provider\'s own base URL, so it must start with a single "/"';
+  }
+  if (!value.startsWith('/')) return 'must start with "/" — a candidate is a path, not a URL';
+  if (value.includes('#')) return 'carries a fragment, which is never sent to a server';
+  // Exactly what the router refuses: a space, or a control character (`\u0000`–`\u001f`, `\u007f`).
+  if (/[\u0000-\u001f\u007f ]/.test(value)) {
+    return 'contains a space or control character';
+  }
+  return null;
+}
+
+/** The first problem in a candidate list, as `index` and reason; `null` when the list is usable. */
+export function probePathListProblem(paths) {
+  const list = Array.isArray(paths) ? paths : [];
+  for (let index = 0; index < list.length; index += 1) {
+    const problem = probePathProblem(list[index]);
+    if (problem) return { index, problem };
+  }
+  return null;
+}
+
+/**
+ * Where a reading came from, for the Quota page.
+ *
+ * `source` is the fetcher that produced the snapshot, and the walk appends the candidate that
+ * answered: `openai-compatible /v1/balance`, or `... /v1/balance (headers)` when the number came
+ * from response headers rather than the body. Anything else (a dedicated fetcher, or a reading
+ * taken before the walk existed) has no candidate to name and returns an empty string, so the page
+ * says nothing rather than guessing.
+ */
+export function probeSourceLabel(source) {
+  if (typeof source !== 'string') return '';
+  const match = new RegExp(`^${PROBE_SOURCE_PREFIX}\\s+(\\S+?)(\\s+\\(headers\\))?$`).exec(source.trim());
+  if (!match) return '';
+  const path = match[1];
+  if (!path.startsWith('/')) return '';
+  return match[2] ? `read from ${path} (response headers)` : `read from ${path}`;
+}

@@ -471,7 +471,11 @@ fn number_at(scope: &Value, keys: &[&str]) -> Option<f64> {
 
 /// B6's conventional reading: a bare URL declaration with no `quotas`, whose payload carries the
 /// usual key names either at the top level or under `data`.
-fn conventional_quota(body: &Value, provider_id: &str) -> Result<UsageQuota> {
+///
+/// `pub(crate)` because the fallback walk ([`crate::quota::probe`]) reads candidate endpoints with
+/// *this* extractor rather than a second one of its own: one place decides what a conventional quota
+/// payload looks like, including that a body with no limit is not one.
+pub(crate) fn conventional_quota(body: &Value, provider_id: &str) -> Result<UsageQuota> {
     // `data` is the conventional envelope; anything else is read from the top level.
     let scope = match body.get("data") {
         Some(data @ Value::Object(_)) => data,
@@ -517,11 +521,13 @@ impl QuotaFetcher for OpenAiCompat {
 
     async fn fetch(&self, ctx: &QuotaFetchContext) -> Result<UsageQuota> {
         let Some(spec) = EndpointSpec::from_extra(&ctx.account.extra)? else {
-            return Err(Error::NotFound(format!(
-                "provider {:?} has no dedicated quota fetcher and the account declares no \
-                 `{QUOTA_ENDPOINT_KEY}`",
-                ctx.provider_id
-            )));
+            // No declared endpoint. Rather than give up, walk the operator's candidate list
+            // ([`crate::quota::probe`]) — a handful of conventional paths on the account's own base
+            // URL, each read with [`conventional_quota`] above, stopping at the first that answers.
+            // The list is configured (`quotaProbe`), the account's own declaration wins over it, and
+            // the walk never leaves the account's host. When nothing answers this still returns the
+            // honest `NotFound` the fallback always returned.
+            return crate::quota::probe::walk(ctx).await;
         };
 
         let credential = ctx

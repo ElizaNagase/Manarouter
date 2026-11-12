@@ -33,6 +33,7 @@ use crate::rental::RentalAccount;
 use crate::dialect::{InputModality, ReasoningLevel};
 use crate::error::{Error, Result};
 use crate::model::{Alias, ClientKey, Combo, KeyLimit, Provider};
+use crate::quota::probe::{validate_probe_paths, QuotaProbeConfig};
 use crate::{
     CONFIG_FORMAT_VERSION, DEFAULT_CONTROL_HOST, DEFAULT_CONTROL_PORT, DEFAULT_RELAY_HOST,
     DEFAULT_RELAY_PORT,
@@ -97,6 +98,19 @@ pub struct Config {
 
     /// Quota-tracking behaviour.
     pub quota: QuotaConfig,
+
+    /// The candidate endpoints to try when no quota reader knows where a provider publishes one.
+    ///
+    /// A sibling of [`Self::quota`] rather than part of it: [`QuotaConfig`] says *whether* and how
+    /// often to read a quota, and this says *where to look* when the account declares no
+    /// `quotaEndpoint` and no reader was written for the provider. See
+    /// [`crate::quota::probe`] for the rules the walk keeps — the paths are relative, the walk stays
+    /// on the account's own host, and it stops at the first candidate that answers.
+    ///
+    /// Written as `quotaProbe` in the file, the same spelling an account uses to override it, and
+    /// read from `quota_probe` too so it matches the rest of this file's snake_case keys.
+    #[serde(rename = "quotaProbe", alias = "quota_probe")]
+    pub quota_probe: QuotaProbeConfig,
 
     /// Latency-tuning knobs, all with defaults that are right for a laptop.
     pub latency: LatencyConfig,
@@ -593,6 +607,7 @@ impl Default for Config {
             aliases: Vec::new(),
             client_keys: Vec::new(),
             quota: QuotaConfig::default(),
+            quota_probe: QuotaProbeConfig::default(),
             latency: LatencyConfig::default(),
             routing: RoutingConfig::default(),
             proxies: Vec::new(),
@@ -1144,10 +1159,22 @@ impl Config {
         }
 
         problems.extend(self.validate_routing());
+        problems.extend(self.validate_quota_probe());
         problems.extend(self.validate_proxies());
         problems.extend(self.validate_keyless());
 
         problems
+    }
+
+    /// Validate `quotaProbe`.
+    ///
+    /// The rule reported here is the one that keeps a probe on the host the credential belongs to: a
+    /// candidate is a path on an account's own base URL, so an entry carrying a scheme or a second
+    /// host is refused — naming the entry — rather than sent. The walk refuses the same inputs and
+    /// an account's own `quotaProbe` never passes through this function, so this is the early,
+    /// arrival-time half of one rule and not a second rule.
+    fn validate_quota_probe(&self) -> Vec<String> {
+        validate_probe_paths("quotaProbe.paths", &self.quota_probe.paths)
     }
 
     /// Validate `routing.defaults` and `quota.display`.
@@ -2545,6 +2572,82 @@ mod tests {
         assert_eq!(cfg.quota.display.chunks, DEFAULT_QUOTA_CHUNKS);
         assert_eq!(cfg.proxy_strategy, ProxyStrategy::Priority);
         assert!(cfg.proxies.is_empty());
+
+        // The candidate quota list is on by default and is the documented nine + `POST` set, so a
+        // provider nobody wrote a reader for is still probed without any configuration.
+        assert_eq!(cfg.quota_probe, QuotaProbeConfig::default());
+        assert!(cfg.quota_probe.enabled);
+        assert!(cfg.quota_probe.chat_completion_probe);
+        assert_eq!(
+            cfg.quota_probe.paths,
+            vec![
+                "/v1/balance",
+                "/api/balance",
+                "/api/v1/key",
+                "/v1/key",
+                "/v1/user/info",
+                "/v1/dashboard/billing/subscription",
+                "/v1/credits",
+                "/v1/quota",
+                "/v1/usage",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_quota_probe_section_round_trips_and_is_validated_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        let mut cfg = Config::default();
+        cfg.quota_probe.paths = vec!["/api/v1/key".to_string()];
+        cfg.quota_probe
+            .extra
+            .insert("model".to_string(), Value::from("m"));
+        cfg.save(&path).unwrap();
+
+        // The section is written, and comes back as it went in.
+        let document: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            document["quotaProbe"]["paths"],
+            Value::from(vec!["/api/v1/key"])
+        );
+        assert_eq!(document["quotaProbe"]["model"], Value::from("m"));
+        let back = Config::load(&path).unwrap();
+        assert_eq!(back, cfg);
+        assert_eq!(back.quota_probe.paths, vec!["/api/v1/key".to_string()]);
+
+        // A candidate that names a host is a configuration error that names the entry, so a typo is
+        // reported where it was typed instead of surfacing as a probe against somebody else's
+        // server.
+        cfg.quota_probe.paths = vec![
+            "/v1/balance".to_string(),
+            "https://evil.test/v1/credits".to_string(),
+            "api.example.test/v1/quota".to_string(),
+        ];
+        let problems = cfg.validate();
+        let probe_problems: Vec<&String> = problems
+            .iter()
+            .filter(|problem| problem.contains("quotaProbe.paths["))
+            .collect();
+        assert_eq!(probe_problems.len(), 2, "{problems:?}");
+        assert!(
+            probe_problems[0].contains("https://evil.test/v1/credits")
+                && probe_problems[0].starts_with("quotaProbe.paths[1]:"),
+            "{probe_problems:?}"
+        );
+        assert!(
+            probe_problems[1].contains("api.example.test/v1/quota")
+                && probe_problems[1].starts_with("quotaProbe.paths[2]:"),
+            "{probe_problems:?}"
+        );
+
+        // The default list is valid, so an untouched configuration has nothing to report here.
+        assert!(Config::default()
+            .validate()
+            .iter()
+            .all(|problem| !problem.contains("quotaProbe")));
     }
 
     #[test]
@@ -2559,6 +2662,11 @@ mod tests {
         cfg.routing.defaults.image = Some("acme/vision-1".to_string());
         cfg.quota.display.mode = QuotaDisplayMode::Percentage;
         cfg.quota.display.chunks = 7;
+        cfg.quota_probe.paths = vec!["/v1/credits".to_string(), "/v1/quota".to_string()];
+        cfg.quota_probe.chat_completion_probe = false;
+        cfg.quota_probe
+            .extra
+            .insert("model".to_string(), Value::from("the-model"));
         cfg.proxies.push(ProxyConfig {
             id: "eu".to_string(),
             label: Some("EU egress".to_string()),
@@ -2595,6 +2703,7 @@ mod tests {
         assert!(!cfg.no_key_required);
         assert!(cfg.proxies.is_empty());
         assert_eq!(cfg.quota.display.chunks, DEFAULT_QUOTA_CHUNKS);
+        assert_eq!(cfg.quota_probe, QuotaProbeConfig::default());
     }
 
     #[test]
@@ -2622,6 +2731,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_unknown_field_inside_the_quota_probe_section_is_preserved() {
+        // The section is `#[serde(flatten)] extra`, like every other one, so a key this binary does
+        // not know (a future knob, or an operator's own note) survives a load/save cycle.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"format_version":1,"quotaProbe":{"paths":["/v1/quota"],"future_probe":true}}"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(
+            cfg.quota_probe.extra.get("future_probe"),
+            Some(&Value::from(true))
+        );
+        assert_eq!(cfg.quota_probe.paths, vec!["/v1/quota".to_string()]);
+
+        cfg.save(&path).unwrap();
+        let document: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(document["quotaProbe"]["future_probe"], Value::from(true));
+    }
     #[test]
     fn is_loopback_handles_every_spelling_a_person_writes() {
         for host in [

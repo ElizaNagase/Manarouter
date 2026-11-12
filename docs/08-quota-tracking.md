@@ -45,6 +45,7 @@ rather than because the router guessed.
 | `x-ratelimit-limit-tokens`, `-remaining-tokens`, `-reset-tokens` | OpenAI-compatible | Absent on many providers. Its absence is normal, not an error. |
 | `anthropic-ratelimit-requests-*`, `-tokens-*`, `-input-tokens-*`, `-output-tokens-*` | Anthropic | Separate input and output token budgets, which most providers do not have. |
 | `reset_at` / `reset` inside a 429 body | Various | **Not standardised.** The field name and its unit differ per provider, so each is parsed per provider family rather than guessed at generically. |
+| `x-balance-*`, `x-credit-*` | Various reseller and gateway hosts | A balance in a header, read by the [candidate-endpoint walk](#candidate-quota-endpoints) and only when no body answered. Covers `x-balance`, `x-balance-limit`, `x-balance-total`, `x-balance-remaining`, `x-balance-available`, `x-credit-limit`, `x-credit-total`, `x-credit-remaining` and `x-credit-balance`; a limit with no consumption is a total, never a spent fraction. |
 
 ### When nothing is said
 
@@ -66,9 +67,30 @@ is driving it.
     "default_cooldown_secs": 60,
     "auth_failure_cooldown_secs": 900,
     "failures_before_dead": 3
+  },
+  "quotaProbe": {
+    "enabled": true,
+    "paths": [
+      "/v1/balance",
+      "/api/balance",
+      "/api/v1/key",
+      "/v1/key",
+      "/v1/user/info",
+      "/v1/dashboard/billing/subscription",
+      "/v1/credits",
+      "/v1/quota",
+      "/v1/usage"
+    ],
+    "chat_completion_probe": true
   }
 }
 ```
+
+`quota` says whether and how often a limit is tracked; `quotaProbe` says **where to look** for one on a
+provider nobody wrote a reader for. It is a sibling of `quota`, not a part of it, and it is described
+[below](#candidate-quota-endpoints). The panel edits the same section under Settings → **Quota
+probing**, where the list can be reordered and reset to the built-in one; the file remains the only
+place an individual account's own override is written.
 
 Per-account windows are declared on the account:
 
@@ -96,6 +118,115 @@ The distinction between `rolling` and `fixed` is not academic. With a 60-second 
 burst at the start of one minute and another burst 61 seconds later is legal. With a fixed
 per-minute window, the same two bursts may land in the same minute and be rejected. A router that
 assumes the wrong one will either under-use its quota or overrun it.
+
+### Candidate quota endpoints
+
+A provider nobody has written a reader for usually still publishes its allowance somewhere, and the
+places it is published are a short, well-worn list. `quotaProbe` is that list, and the generic
+OpenAI-compatible reader walks it in order, stopping at the first candidate that actually says
+something about a quota.
+
+| # | Candidate | Method |
+|---|---|---|
+| 1 | `/v1/balance` | `GET` |
+| 2 | `/api/balance` | `GET` |
+| 3 | `/api/v1/key` | `GET` |
+| 4 | `/v1/key` | `GET` |
+| 5 | `/v1/user/info` | `GET` |
+| 6 | `/v1/dashboard/billing/subscription` | `GET` |
+| 7 | `/v1/credits` | `GET` |
+| 8 | `/v1/quota` | `GET` |
+| 9 | `/v1/usage` | `GET` |
+| 10 | `/v1/chat/completions` | `POST`, one token, read for its headers only |
+
+The rules the walk keeps, and the reason each one exists:
+
+- **A candidate is a path, never a URL.** `http://`, `https://` and a leading `//` are refused, and
+  the error names the offending entry. Every request carries the account's credential, so a list that
+  could name a host would be a way to hand a working key to a third party by editing one line of a
+  configuration file. The check runs when the file is loaded and again as each request is built, and
+  the request is sent only if the resolved URL is still on the account's own base-URL host.
+- **`404` and `405` mean "not served here", and the walk goes on.** Those are the normal answers from
+  an upstream that publishes no such path; treating them as a failure would stop at the first
+  candidate on nearly every provider.
+- **Any other non-2xx stops the walk.** A `401` or `403` says the credential is wrong, a `429` says
+  the account is out until the reset, and a `5xx` says the upstream is unwell. Nine further requests
+  after one of those spend a real credential on an answer already known.
+- **A `2xx` only counts if a quota resolves from it.** The body goes through the same extractor the
+  declared-`quotaEndpoint` path uses, refusal included: a body that merely mentions a number is not a
+  quota, and a `remaining` on its own has no denominator to report a fraction against.
+- **Headers are the last resort, not a first reading.** `x-ratelimit-*` first, then `x-balance-*` and
+  `x-credit*`, are read only from a `2xx` whose body resolved nothing. A header fallback that
+  outranked a body would misreport an account whose body says exactly what is left.
+- **A limit with no consumption is not a consumed fraction.** A limit alone (say
+  `x-ratelimit-limit-requests: 500`) is recorded as a total with `fraction_reported: false`, exactly
+  as a `total` with no `used` is: turning it into `used = total` would paint a healthy account as
+  exhausted. A family with no positive limit, or with only a remaining figure, contributes nothing —
+  no row is ever `0/0`.
+- **The one-token `POST` needs a model and is tried last.** `POST /v1/chat/completions` is the one
+  endpoint an OpenAI-compatible upstream is certain to serve, so it is the last place a rate-limit
+  header can come from — but it is a real completion request, spending real quota, so it runs after
+  every path and only when a model is named:
+
+  ```json
+  { "quotaProbe": { "paths": ["/v1/balance"], "model": "your-model-id" } }
+  ```
+
+  No model id is invented when none is configured: a hard-coded one would aim probes at a model the
+  account may not have and spend its quota proving that. `chat_completion_probe: false` disables the
+  `POST` outright.
+- **A walk is bounded at 25 requests**, however long the list is. The list is operator-editable and
+  every entry spends the credential, so an unconsidered two-hundred entry list would be a denial of
+  service against the account itself. A too-long list is trimmed rather than rejected: the first
+  entries are the ones the operator meant.
+- **The walk runs only when quota tracking runs**, and never in the background. `quotaProbe.enabled`
+  switches the walk itself off, and a walk only ever happens inside a quota read that `quota.enabled`
+  has already allowed — there is no timer and no polling anywhere in this path, so nothing here
+  contacts an upstream on its own.
+
+An account overrides the list, because one account on a reseller host may need a different path from
+the next:
+
+```json
+{
+  "provider": "openai",
+  "label": "work",
+  "quotaProbe": ["/api/v1/key", "/v1/balance"]
+}
+```
+
+An array is a path list and inherits everything else from the configured section. An object may set
+any field, so an account that only wants a different model does not have to repeat the whole list:
+
+```json
+{
+  "provider": "openai",
+  "label": "work",
+  "quotaProbe": {
+    "enabled": true,
+    "paths": ["/api/v1/key"],
+    "chat_completion_probe": false,
+    "model": "the-model-this-account-uses"
+  }
+}
+```
+
+Anything else — a string, a number, or an object with a non-string path — is refused with a message
+saying what was expected, rather than walked with a guess.
+
+> **Status.** The walk is wired end to end. The conductor offers a generic account for a quota read
+> when it declares a `quotaEndpoint` **or** when a walk would really run for it — the `quotaProbe`
+> section enabled with at least one path (`walk_configured`, `crates/mr-core/src/quota/probe.rs`);
+> `refresh_all` uses the same test, and the configured section is placed into the fetch context, so
+> the list above — edited in the file, or under Settings → **Quota probing** in the panel — is what a
+> refresh walks rather than only the built-in one. The account's card names the candidate that
+> answered. An account-level override is still edited in the configuration file.
+>
+> Two consequences are worth stating plainly. A generic account that declares nothing is now fetched
+> on an operator-triggered refresh where it used to be skipped, and that refresh sends real requests
+> with that account's credential; `quotaProbe.enabled: false` or an empty `paths` list restores the
+> previous behaviour exactly, account by account. And because the walk is triggered by a refresh and
+> never by a timer, nothing here contacts an upstream on its own.
 
 ## Why quota is per account, not per provider
 
@@ -263,13 +394,30 @@ Two consequences:
 
 ## Credit balances
 
-Some providers expose a balance endpoint. Where one is known, the intended design is for the conductor
-to probe it **off the request path** on a long interval, with the panel showing the result — but no
-balance probe exists in either service today, so a balance is currently always shown as unknown.
+Some providers expose a balance endpoint, and neither they nor the router standardise its shape. Three
+ways to reach one are intended, in order of how much is known about the provider:
+
+1. a dedicated reader, for the hosts whose balance shape was read out of their own documentation — see
+   [which providers report a live allowance](user/06-quota.md#which-providers-report-a-live-allowance);
+2. an account-level `quotaEndpoint`, for a host whose operator knows the path;
+3. the [candidate-endpoint walk](#candidate-quota-endpoints), for everything else: the list of paths
+   is tried in order, and a body that resolves a total and a remaining figure — or a `x-balance-*` /
+   `x-credit-*` header on a body that resolved nothing — becomes the account's reported row on the
+   quota page. It arrives there as a **window**, carrying the source `openai-compatible` and the
+   display name `rate limit (credits)`, not as a separate "balance" field: the panel has one shape for
+   "how full is this allowance", and inventing a second one for money would mean the balance is the
+   only number that never appears in the view an operator actually looks at.
+
+What is **not** implemented is the probing *schedule*: the walk is a reader, so it runs inside a quota
+read — the panel's refresh — and not off the request path on a long interval. It also cannot run at all
+until the conductor asks for a quota read on an account that declares nothing, which it does not do
+yet (see the status note under [candidate quota endpoints](#candidate-quota-endpoints)).
 
 A balance that cannot be fetched is shown as **unknown**, never as zero. Displaying an unreadable
 balance as zero would suggest an account is empty when it may be perfectly full, and would send an
-operator hunting for a problem that does not exist.
+operator hunting for a problem that does not exist. The same rule holds for a balance that is only
+partly readable: a limit with no consumption is reported as a total with `fraction_reported: false`,
+so the panel shows the ceiling without claiming to know how much of it is gone.
 
 ## What is recorded per request
 
@@ -358,6 +506,10 @@ of its snapshot, because a quota figure without an age is a claim about now that
 Stated so they are not discovered later. Most of these describe the intended accounting; only what
 the provider actually reports reaches the ledger:
 
+- **The candidate-endpoint walk is not reached in a running deployment yet.** It is implemented and
+  tested in `mr-core`, but the conductor still fetches quota only for accounts that declare a
+  `quotaEndpoint` — and those are exactly the accounts that never need the walk. See the status note
+  under [candidate quota endpoints](#candidate-quota-endpoints).
 - **Usage a provider does not report is not counted.** Streamed responses frequently omit it.
 - **Requests that fail before reaching the provider are not counted against quota**, correctly — they
   did not consume any — but they do appear in the error rate.
@@ -369,6 +521,17 @@ the provider actually reports reaches the ledger:
   than both.
 - **Spend budgets and credit balances are not enforced.** The router can tell you a provider is
   returning 402; it cannot predict it.
+- **A candidate endpoint list is a guess about paths, not knowledge about a provider.** The nine
+  `GET` candidates and the one-token `POST` cover what resellers and gateways commonly serve; a host
+  that publishes its allowance somewhere else is not read until the operator adds the path, and one
+  that answers `200` with something that is not a quota is passed over rather than trusted.
+- **The walk spends the account's credential, once per candidate.** Nine `404`s is nine authenticated
+  requests against that account's rate limit — the reason the list is short, the reason a walk is
+  bounded, and the reason the only candidate that actually generates text is the one-token `POST` at
+  the end.
+- **A walked reading is as fresh as the last quota read.** The walk cannot refresh itself: there is no
+  background polling anywhere in this subsystem, so the number on the page is the number from the last
+  refresh the operator (or the panel) asked for.
 
 ## See also
 
@@ -377,4 +540,5 @@ the provider actually reports reaches the ledger:
 - [Configuration](03-configuration.md) — `QuotaConfig` and account windows in full.
 - [Hedged race](07-hedged-race.md) — the quota cost of racing.
 - [Web panel](15-web-panel.md) — how cooldowns and health are displayed.
+- [Quota and usage (operator guide)](user/06-quota.md) — which providers report a live allowance today.
 - [Migration](17-migrating-from-omniroute.md) — what happens to the reference router's quota data.

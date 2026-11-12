@@ -9,8 +9,8 @@ import { h, emptyState, errorBlock, icon, toggle } from './dom.js';
 import {
   QUOTA_STATUS_CRITICAL_AT_OR_BELOW, QUOTA_STATUS_HEALTHY_ABOVE,
   formatQuotaAge, formatQuotaUsage, formatPercent, formatResetInLabel,
-  mergeQuotaRecord, quotaAccountVisible, quotaFamilyLabel, quotaStatusLevel, quotaWindows,
-  worstQuotaStatus,
+  mergeQuotaRecord, probeSourceLabel, quotaAccountVisible, quotaFamilyLabel, quotaStatusLevel,
+  quotaWindows, worstQuotaStatus,
 } from './format.js';
 
 // Bars by default: a share of a window is a share, and twenty cells made an operator count them.
@@ -425,9 +425,15 @@ export async function renderQuota(mount, ctx) {
       reorderAccountRow(source, row);
     });
 
-    // Age only. The snapshot's source URL and its per-model `details` remain in the API for
-    // diagnostics; printed on every card they buried the number this page exists to show.
-    card.append(h('p', { class: 'hint' }, formatQuotaAge(record?.fetched_at)));
+    // Age, then where the number came from. The snapshot's per-model `details` stay in the API for
+    // diagnostics; printed on every card they buried the number this page exists to show. The
+    // provenance line is the exception, and only for a generic provider: there the router tried a
+    // list of candidates and named the one that answered, which is the single fact an operator
+    // needs to know whether the reading is the endpoint they meant (Settings → Quota probing).
+    const provenance = probeSourceLabel(record?.source);
+    card.append(h('p', { class: 'hint' }, provenance
+      ? `${formatQuotaAge(record?.fetched_at)} · ${provenance}`
+      : formatQuotaAge(record?.fetched_at)));
 
     const error = localErrors.get(key) || record?.error;
     if (error) card.append(errorBlock({ message: errorMessage(error) }));

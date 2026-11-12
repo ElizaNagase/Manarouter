@@ -3,7 +3,10 @@
 
 import { api } from './api.js';
 import { h, chip, field, toggle, errorBlock, applyFieldErrors, clearFieldErrors } from './dom.js';
-import { describePortChange } from './format.js';
+import {
+  describePortChange, moveStep, probePathListProblem, probePathProblem,
+  QUOTA_PROBE_CHAT_PATH, QUOTA_PROBE_DEFAULT_PATHS,
+} from './format.js';
 
 export async function renderSettings(mount, ctx) {
   const portsCard = h('div', { class: 'card wide' }, h('h2', {}, 'Listen ports'));
@@ -11,15 +14,18 @@ export async function renderSettings(mount, ctx) {
   const accessCard = h('div', { class: 'card' }, h('h2', {}, 'Client-key access'));
   const proxiesCard = h('div', { class: 'card wide' }, h('h2', {}, 'Upstream proxies'));
   const quotaDisplayCard = h('div', { class: 'card' }, h('h2', {}, 'Quota display'));
+  const quotaProbeCard = h('div', { class: 'card wide' }, h('h2', {}, 'Quota probing'));
   const pricingCard = h('div', { class: 'card' }, h('h2', {}, 'Pricing data'));
   const passwordCard = h('div', { class: 'card' }, h('h2', {}, 'Panel password'));
   const rawCard = h('div', { class: 'card wide' }, h('h2', {}, 'Raw configuration'));
   // Eight full-width cards made Settings a long single column with no reading rhythm. A two-up
   // grid keeps the wide forms (ports, proxies, raw JSON) full width and pairs the short ones.
+  // Quota probing joins them wide: a candidate list is a row of paths, each with its own label and
+  // reorder buttons, and pairing it with a narrow card would squeeze the paths into a column.
   mount.replaceChildren(h('div', { class: 'settings-grid' },
-    portsCard, latencyCard, accessCard, proxiesCard, quotaDisplayCard, pricingCard, passwordCard, rawCard));
+    portsCard, latencyCard, accessCard, proxiesCard, quotaDisplayCard, quotaProbeCard, pricingCard, passwordCard, rawCard));
 
-  await Promise.all([renderPorts(), renderPassword(), renderLatency(), renderAccess(), renderProxies(), renderQuotaDisplay(), renderPricing()]);
+  await Promise.all([renderPorts(), renderPassword(), renderLatency(), renderAccess(), renderProxies(), renderQuotaDisplay(), renderQuotaProbe(), renderPricing()]);
   renderRaw(); // sequential on purpose: the textarea is heavy and it can stream in last
 
   // ------------------------------------------------------------------ ports
@@ -487,6 +493,172 @@ export async function renderSettings(mount, ctx) {
       field('Global chunk count', chunks, { hint: '1–200 chunks per full allowance.' }),
       refreshOnLoad.row,
       h('div', { class: 'dialog-actions' }, save), status,
+    );
+  }
+
+  // ---------------------------------------------------------------- quota probing
+
+  async function renderQuotaProbe() {
+    let config;
+    try {
+      config = await readConfig();
+    } catch (err) {
+      quotaProbeCard.replaceChildren(h('h2', {}, 'Quota probing'), errorBlock(err));
+      return;
+    }
+
+    const section = config.quotaProbe && typeof config.quotaProbe === 'object' && !Array.isArray(config.quotaProbe)
+      ? config.quotaProbe
+      : {};
+    // A section that names no list at all walks the router's built-in candidates, so the editor
+    // opens on those. An explicit list is taken exactly as written — an empty one included, because
+    // deleting every candidate is how an operator says "probe nothing here".
+    const inherited = !Array.isArray(section.paths);
+    const paths = (inherited ? QUOTA_PROBE_DEFAULT_PATHS : section.paths).map((path) => String(path));
+
+    const walk = toggle('Walk the candidate list', {
+      checked: section.enabled !== false,
+      help: 'When this is off, an account whose provider has no dedicated quota reader and which declares no quota endpoint is left off the Quota view: nothing is requested from it and no allowance is shown. That is exactly the behaviour from before this section existed.',
+    });
+    const chatProbe = toggle(`Also try a one-token POST to ${QUOTA_PROBE_CHAT_PATH}`, {
+      checked: section.chat_completion_probe !== false && section.chatCompletionProbe !== false,
+      help: 'Tried only after every path above has answered nothing. It sends one short request and reads the rate-limit headers from the reply. That consumes a little of the account\'s allowance and is billed even when the reply carries no recognizable headers.',
+    });
+    // No `aria-label` here: the `field()` below gives this input a real `<label for>`, and a second
+    // name would be the one screen readers announced.
+    const model = h('input', {
+      class: 'input mono', type: 'text', placeholder: 'the model this account uses',
+      value: typeof section.model === 'string' ? section.model : '',
+    });
+    const list = h('div');
+    const status = h('div');
+    let inputs = [];
+
+    // The list is the operator's order and is never sorted: moving a candidate is one splice, and
+    // the number beside each row is the order requests are made in.
+    function syncPaths() {
+      inputs.forEach((input, index) => { if (index < paths.length) paths[index] = input.value; });
+    }
+
+    function checkInput(input, problem) {
+      const bad = probePathProblem(input.value);
+      problem.textContent = bad ? `This candidate ${bad}.` : '';
+      if (bad) input.setAttribute('aria-invalid', 'true'); else input.removeAttribute('aria-invalid');
+    }
+
+    function drawPaths() {
+      inputs = [];
+      list.replaceChildren();
+      if (!paths.length) {
+        list.append(h('p', { class: 'hint' }, 'No candidates: no account is probed by this list. Add a path, or switch the walk off above if that is what you mean to say.'));
+        return;
+      }
+      paths.forEach((path, index) => {
+        const input = h('input', {
+          class: 'input mono', type: 'text', value: path, placeholder: '/v1/balance',
+          'aria-label': `Candidate ${index + 1} path`,
+        });
+        const problem = h('p', { class: 'hint' });
+        problem.id = `probe-path-problem-${index}`;
+        input.setAttribute('aria-describedby', problem.id);
+        input.addEventListener('input', () => checkInput(input, problem));
+        checkInput(input, problem);
+
+        const up = h('button', {
+          class: 'btn btn-sm', type: 'button', title: 'Move earlier', disabled: index === 0,
+          'aria-label': `Move candidate ${index + 1} earlier`,
+        }, '\u2191');
+        const down = h('button', {
+          class: 'btn btn-sm', type: 'button', title: 'Move later', disabled: index === paths.length - 1,
+          'aria-label': `Move candidate ${index + 1} later`,
+        }, '\u2193');
+        up.addEventListener('click', () => { syncPaths(); reorder(index, index - 1); });
+        down.addEventListener('click', () => { syncPaths(); reorder(index, index + 1); });
+        const remove = h('button', { class: 'btn btn-sm', type: 'button', 'aria-label': `Remove candidate ${index + 1}` }, 'Remove');
+        remove.addEventListener('click', () => { syncPaths(); paths.splice(index, 1); drawPaths(); });
+
+        inputs.push(input);
+        list.append(h('div', { style: 'margin:8px 0;' },
+          h('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;' },
+            h('span', { class: 'hint mono', style: 'min-width:20px;text-align:right;' }, String(index + 1)),
+            input, up, down, remove),
+          problem));
+      });
+    }
+
+    function reorder(from, to) {
+      const next = moveStep(paths, from, to);
+      paths.length = 0;
+      paths.push(...next);
+      drawPaths();
+    }
+    drawPaths();
+
+    const addPath = h('button', { class: 'btn', type: 'button' }, 'Add candidate');
+    addPath.addEventListener('click', () => { syncPaths(); paths.push(''); drawPaths(); });
+    const resetPaths = h('button', { class: 'btn', type: 'button' }, 'Reset to the built-in list');
+    resetPaths.addEventListener('click', () => {
+      syncPaths();
+      paths.length = 0;
+      paths.push(...QUOTA_PROBE_DEFAULT_PATHS);
+      drawPaths();
+    });
+
+    const save = h('button', { class: 'btn btn-primary', type: 'button' }, 'Save quota probing');
+    save.addEventListener('click', async () => {
+      syncPaths();
+      // Caught here rather than at the first refresh: the router refuses the same entries, but it
+      // cannot name them when the list came from an account rather than from this file.
+      const problem = probePathListProblem(paths);
+      if (problem) {
+        status.replaceChildren(h('div', { class: 'form-errors', role: 'alert' },
+          h('strong', {}, `Candidate ${problem.index + 1} cannot be probed:`),
+          h('p', {}, `it ${problem.problem}.`)));
+        return;
+      }
+      const latest = await readConfig().catch((err) => {
+        status.replaceChildren(errorBlock(err));
+        return null;
+      });
+      if (!latest) return;
+      const existing = latest.quotaProbe && typeof latest.quotaProbe === 'object' && !Array.isArray(latest.quotaProbe)
+        ? latest.quotaProbe
+        : {};
+      // A key this card does not edit (an account-wide override of something else) survives the
+      // save; the three this card owns are written from the controls, always.
+      const next = {
+        ...existing,
+        enabled: walk.input.checked,
+        paths: [...paths],
+        chat_completion_probe: chatProbe.input.checked,
+      };
+      const named = model.value.trim();
+      if (named) next.model = named; else delete next.model;
+      latest.quotaProbe = next;
+      try {
+        await api.putRaw('/api/config/raw', JSON.stringify(latest, null, 2));
+        await renderValidation(status);
+        ctx.toast.success('Quota probing saved. Refresh an account on the Quota view to try the new list.');
+      } catch (err) {
+        status.replaceChildren(errorBlock(err));
+      }
+    });
+
+    quotaProbeCard.replaceChildren(
+      h('h2', {}, 'Quota probing'),
+      h('p', { class: 'hint', style: 'margin-bottom:10px;' },
+        'Some providers report no allowance through an endpoint this router knows. For those, the router walks the candidate paths below against the account\'s own base URL, in order, and reads the first candidate that answers. Every request is made as that account, so it can count against the account\'s rate limit; a refresh from the Quota view is what runs the walk, and the page then names the candidate that answered. A single account can override this list in the configuration file, under its own quotaProbe key.'),
+      walk.row,
+      h('p', { class: 'hint', style: 'margin-top:12px;' }, 'Candidates, in the order they are tried:'),
+      list,
+      h('p', { class: 'hint' }, inherited
+        ? 'This deployment names no candidate list, so the router is walking the built-in candidates shown here. Saving writes this list into the configuration file explicitly.'
+        : 'Each candidate is a path on the provider\'s own base URL: an account\'s credential is never sent to another host, so a full URL is refused rather than fetched.'),
+      h('div', { class: 'dialog-actions' }, addPath, resetPaths),
+      chatProbe.row,
+      field('Model the one-token probe names', model, { hint: 'The router does not guess a model id. Leave this empty to skip the POST candidate even while it is enabled above.' }),
+      h('div', { class: 'dialog-actions' }, save),
+      status,
     );
   }
 

@@ -43,4 +43,5 @@ pub mod moonshot;
 pub mod openai_compat;
 pub mod opencode;
 pub mod openrouter;
+pub mod probe;
 pub mod qwen;

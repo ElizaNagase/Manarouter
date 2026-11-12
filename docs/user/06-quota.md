@@ -21,9 +21,23 @@ allowance to read. These are the readers in this build:
 
 Modal has no assumed vendor endpoint: configure `modalQuotaEndpoint` in that account's provider-specific metadata. It accepts an HTTPS URL string or an object such as `{ "url": "https://your-controlled-endpoint.example/modal-quota", "auth": "bearer" }`; `auth` may be `bearer` (default), `x-api-key`, or `none`. The endpoint returns JSON with numeric non-negative `spend` and `remaining` at the root or under `data`; optional `limit` (or `total`) supplies the window total, otherwise it is derived as `spend + remaining`. Optional `currency`, `display_name`, and `reset_at` (or `resetAt`) are carried into the quota snapshot. This is an operator-owned endpoint contract, not a claimed Modal API shape. Store any credential only in the account's normal secret field; never embed it in the URL or metadata.
 
-Everything else falls to the generic OpenAI-compatible reader, which reports nothing unless the
-account declares a `quotaEndpoint`. An account with no reader and no declaration is left off the
-list rather than shown as empty: a row of zeros would claim a measurement nobody made.
+Everything else falls to the generic OpenAI-compatible reader, which reads a live allowance in two
+ways: from an endpoint the account declares with `quotaEndpoint`, or from the candidate list below.
+An account with no reader, no declaration and no list to walk is left off the list rather than shown
+as empty: a row of zeros would claim a measurement nobody made.
+
+The candidate list (`quotaProbe`) is a configurable list of quota endpoints for exactly that
+undeclared case — it walks `/v1/balance`, `/api/balance`, `/api/v1/key`, `/v1/key`, `/v1/user/info`,
+`/v1/dashboard/billing/subscription`, `/v1/credits`, `/v1/quota`, `/v1/usage`, and finally a
+one-token `POST /v1/chat/completions` read for its rate-limit or `x-balance-*` / `x-credit-*` headers,
+stopping at the first candidate that resolves a quota. Each candidate is a path on that account's own
+base URL and is requested with that account's credential, so a refresh spends a little of the
+account's own rate limit; a `404` or `405` means "not served here" and the walk goes on. Edit the
+list, the one-token `POST` and the model it names under **Settings → Quota probing** (the same values
+live in the `quotaProbe` section of the configuration file, where an individual account may override
+them). When a walk produces a reading, the account's card on the Quota page names the candidate that
+answered. See [candidate quota endpoints](../08-quota-tracking.md#candidate-quota-endpoints) for the
+rules and the reasoning behind each one.
 
 A plan that meters several windows at once (a five-hour, a weekly and a monthly allowance, for
 example) is reported as one row: the window closest to exhaustion is the row's own fraction, and

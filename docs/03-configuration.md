@@ -97,6 +97,12 @@ state and restart" is only safe when neither of those matters to you.
     "failures_before_dead": 3
   },
 
+  "quotaProbe": {                     // where to look for an allowance, on a provider with no reader
+    "enabled": true,
+    "paths": ["/v1/balance", "/v1/quota"],
+    "chat_completion_probe": true      // last-resort one-token POST, read for headers only
+  },
+
   "latency": {
     "prewarm": true,
     "pool_idle_secs": 90,
@@ -150,6 +156,22 @@ Both are carried in the schema so an existing file keeps loading, and both are *
 `SO_REUSEPORT` on it unconditionally. That flag is what lets a second *process* share the port; it does
 not fan a single process out across CPUs. `backlog` is never applied to the socket, so you get the
 operating system's default. Neither field is wrong to set, and neither does anything yet.
+
+### `quotaProbe`
+
+Where to look for an allowance on a provider nobody has written a quota reader for: `paths` is a list
+of **paths on that account's own base URL**, tried in order, and `chat_completion_probe` adds a
+last-resort one-token `POST /v1/chat/completions` read for its rate-limit, `x-balance-*` and
+`x-credit-*` headers. A path with a host in it (`https://…`, `//…`) is a configuration error that
+names the offending entry, and the same check runs again before each request: a candidate can only ever
+be aimed at the account's own host, because every request carries that account's credential.
+
+The key is spelled `quotaProbe` at the root and on an account (whose own list wins, and may also name
+a `model` for the probe); `quota_probe` is accepted as the snake_case spelling, and inner field names
+are snake_case. The full rules — `404`/`405` continuing, what counts as an answer, the header fallback,
+the bound on the walk, and when an account is fetched at all — are in
+[quota tracking](08-quota-tracking.md#candidate-quota-endpoints). Settings → **Quota probing** in the
+panel edits the same section, so the file is not the only way in.
 
 ---
 
@@ -456,6 +478,10 @@ valid. It checks:
 - a combo step naming an unknown provider;
 - an alias pointing at nothing resolvable;
 - a zero `hedge_width`, `hedge_max_requests` or `pool_max_idle_per_host`;
+- a `quotaProbe.paths` entry that is empty, is not a path (no leading `/`), or is an absolute URL —
+  reported as `quotaProbe.paths[i]` and quoting the offending entry. An account's own `quotaProbe` is
+  not part of this check (it lives in account metadata, not in the typed config) and is instead
+  refused where it is read, before any request is sent;
 - a `format_version` newer than the binary understands.
 
 Any `mr` command that would save an invalid configuration refuses to write it, prints every problem
