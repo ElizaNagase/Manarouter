@@ -138,6 +138,8 @@ pub enum DenialReason {
     /// that has been satisfied, and a gateway that quietly stops enforcing a budget the moment its
     /// database hiccups is not enforcing it.
     LedgerUnavailable,
+    /// A self-hosted provider cannot fit the request in its KV-token pool.
+    KvBudgetExceeded,
 }
 
 /// A refused request, with what the client should be told.

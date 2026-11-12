@@ -210,8 +210,27 @@ pub fn build_state(
     // The reloader needs its own handle, taken before `relay` is moved into the state.
     let reload_handle = Arc::clone(&relay);
 
+    let kv_usage = Arc::new(crate::kv_budget::AdmissionPool::new());
+
+    // The batch lane is built before the state and given no workers yet, because it needs the state
+    // (to resolve a model and dispatch an item) and the state needs the lane (to serve `/v1/batches`).
+    // Opening it first also recovers unfinished batches from disk here, synchronously, before the
+    // listener exists: a batch that was interrupted by the last restart is queued by the time the
+    // first client can ask about it, instead of appearing to hang until the next restart.
+    //
+    // The executor is a handle rather than a value so that it can be filled in afterwards; the lane
+    // holds it as a `dyn ItemExecutor` and never knows the difference.
+    let batch_executor = crate::server::ServerBatchExecutor::default();
+    let batch = crate::batch::BatchLane::open(
+        mr_core::config::state_dir().join("batches"),
+        Arc::clone(&kv_usage),
+        Arc::new(batch_executor.clone()),
+        0,
+    );
+
     let state = AppState {
         relay,
+        quota_store: Arc::clone(&oauth_store),
         no_key_required: config.no_key_required,
         health: Arc::new(Health::new()),
         vault,
@@ -220,7 +239,15 @@ pub fn build_state(
         oauth_store,
         sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
         activity: Arc::new(crate::activity::ActivityLog::new()),
+        kv_usage,
+        batch,
     };
+
+    // Now that the state exists, hand the executor the pieces it needs and let the workers drain
+    // whatever was recovered. Until this point the queue is populated and nothing consumes it, which
+    // is exactly the state a recovered-but-not-yet-started batch should be in.
+    batch_executor.install(state.clone());
+    state.batch.start_workers(crate::batch::DEFAULT_WORKERS);
 
     // Adopt routing changes written by the control plane, without a restart.
     //

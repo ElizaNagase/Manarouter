@@ -30,6 +30,12 @@
 //!   decisions that are most likely to be wrong can be tested without a network.
 //! * [`usage_tap`] — folds token counts and the first-to-last output window out of a response body
 //!   as it streams past, so usage is measured without buffering the stream it is measuring.
+//! * [`kv_budget`] — the KV-token admission pool shared by the request path and the batch lane, and
+//!   the GPU-second ledger every settled attempt writes a row to.
+//! * [`batch`] — the second lane: a submitted batch of prompts, run by a small fixed worker pool
+//!   against the same admission pool, with per-item results, resumability and a cost report in
+//!   dollars. Its route handlers are mounted by [`server`], which is the only thing that knows where
+//!   an item is dispatched to.
 //! * [`server`] — the route table and the accept loop.
 //!
 //! See `docs/01-architecture.md` for the intended shape and `docs/16-latency-engineering.md` for
@@ -44,8 +50,10 @@ use mimalloc::MiMalloc;
 static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
 pub mod activity;
+pub mod batch;
 pub mod count_tokens;
 pub mod egress;
+pub mod kv_budget;
 pub mod model_scan;
 pub mod proxy;
 pub mod quota;

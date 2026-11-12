@@ -195,6 +195,7 @@ mod tests {
             reasoning_json: Default::default(),
             input_modalities: 1,
             pricing: None,
+            context_length: None,
         }
     }
 
