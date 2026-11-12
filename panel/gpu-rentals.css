@@ -24,6 +24,16 @@
   margin-top: 10px;
 }
 
+/* The attach form sits inside a lane card, between its status and its actions. It is structure, so
+ * it is a grey rule and grey labels; the only pink on it is the Attach button, which is interaction. */
+.gpu-rentals .gpu-attach {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+.gpu-rentals .gpu-attach > h4 { margin: 0 0 8px; font-size: 13px; color: var(--tx2); }
+.gpu-rentals .gpu-attach .field { margin-bottom: 8px; }
+
 /* ---------- plan limits ---------- */
 
 .gpu-rentals .gpu-plan-note { margin-bottom: 8px; }

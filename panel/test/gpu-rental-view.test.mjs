@@ -379,14 +379,23 @@ const settle = async (rounds = 3) => {
 };
 
 /** Mount the real view with a stub API and a stub ctx, and record every request. */
-async function mountView({ param = null, handlers = {} } = {}) {
+async function mountView({ param = null, handlers = {}, onPost = null } = {}) {
   const calls = [];
+  const posts = [];
   const navigations = [];
   const originalGet = api.get;
+  const originalPost = api.post;
   api.get = async (path) => {
     calls.push(path);
     if (!Object.hasOwn(handlers, path)) throw new Error(`test did not expect GET ${path}`);
     const reply = handlers[path];
+    if (reply instanceof Error) throw reply;
+    return reply;
+  };
+  api.post = async (path, body) => {
+    posts.push({ path, body });
+    if (typeof onPost !== 'function') throw new Error(`test did not expect POST ${path}`);
+    const reply = await onPost(path, body);
     if (reply instanceof Error) throw reply;
     return reply;
   };
@@ -404,8 +413,9 @@ async function mountView({ param = null, handlers = {} } = {}) {
     await render(mount, ctx, param);
   } finally {
     api.get = originalGet;
+    api.post = originalPost;
   }
-  return { mount, calls, navigations, ctx };
+  return { mount, calls, posts, navigations, ctx };
 }
 
 function findButton(root, label) {
@@ -1186,3 +1196,50 @@ test('the plan preview posts the schedule and shows each wave with the deploymen
       assert.match(text, /does not start/i, 'the preview says it starts nothing');
     });
   });
+
+test('a lane account can be attached from its card, and a vault refusal is not swallowed', async () => {
+  const handlers = standardHandlers();
+  handlers['/api/gpu/lanes/molab/status'] = {
+    lane: 'molab',
+    warm_lanes: 0,
+    detail: '0 warm lanes, start one',
+    accounts: [],
+  };
+  const { mount, posts } = await mountView({
+    handlers,
+    onPost: () => ({
+      status: 'ok',
+      remembered: false,
+      remember_error: 'the vault is read-only',
+    }),
+  });
+  // mountView restores api.post once the first render is done; the click happens after that, so
+  // the stub has to outlive the render for this interaction test.
+  const originalPost = api.post;
+  api.post = async (path, body) => {
+    posts.push({ path, body });
+    return { status: 'ok', remembered: false, remember_error: 'the vault is read-only' };
+  };
+  try {
+
+  fire(findButton(mount, 'Attach account'), 'click');
+  const form = mount.querySelector('.gpu-attach');
+  assert.ok(form, 'the button opens the attach form on the card');
+  for (const [name, value] of [['account', 'molab-a'], ['url', 'https://molab.example/'], ['token', 's3cret']]) {
+    form.querySelector(`[data-lane-field="${name}"]`).value = value;
+  }
+  fire(findButton(form, 'Attach'), 'click');
+  await new Promise((resolve) => realSetTimeout(resolve, 10));
+
+  assert.deepEqual(posts, [{
+    path: '/api/gpu/lanes/molab/attach',
+    body: { account: 'molab-a', url: 'https://molab.example/', token: 's3cret' },
+  }], 'the form posts the route fields and nothing else');
+  assert.match(textOf(mount), /Attached for this process only — the vault did not keep it: the vault is read-only/,
+    'an attach the vault refused is reported, because it will not survive a restart');
+  assert.equal(form.querySelector('[data-lane-field="token"]').value, 's3cret',
+    'a failed attach keeps the token so the operator can retry without retyping it');
+  } finally {
+    api.post = originalPost;
+  }
+});

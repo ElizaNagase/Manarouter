@@ -904,18 +904,127 @@ async function renderInventory(mount, ctx) {
           + 'the credential.'));
       }
 
+      const actionsRow = h('div', { class: 'gpu-actions', style: 'margin-top:8px' },
+        ghostButton('Refresh', () => refreshSingleLane(platform),
+          `Re-fetch ${platform} lane status only`));
       const cardEl = h('section', { class: 'card gpu-section' },
         h('h2', {}, platform),
         statusLine, ...parts,
-        h('div', { class: 'gpu-actions', style: 'margin-top:8px' },
-          ghostButton('Refresh', () => refreshSingleLane(platform),
-            `Re-fetch ${platform} lane status only`)));
+        actionsRow);
+
+      if (LANE_ATTACH_FIELDS[platform]) {
+        actionsRow.append(ghostButton('Attach account', () => {
+          const open = cardEl.querySelector('.gpu-attach');
+          if (open) {
+            open.remove();
+            return;
+          }
+          const form = laneAttachForm(platform);
+          if (form) cardEl.append(form);
+        }, `POST /api/gpu/lanes/${platform}/attach`));
+      }
 
       cards.push(cardEl);
     }
     card.append(...cards);
     laneCardsBox.append(card);
   }
+
+
+/**
+ * The fields each lane's attach route takes. Kaggle is absent on purpose: it has no attach route —
+ * it runs through the `kaggle` CLI on the host — and a form here would invent one.
+ */
+const LANE_ATTACH_FIELDS = Object.freeze({
+  molab: Object.freeze([
+    Object.freeze({ name: 'account', label: 'Account label', placeholder: 'molab-main' }),
+    Object.freeze({ name: 'url', label: 'Notebook URL', placeholder: 'https://…' }),
+    Object.freeze({ name: 'token', label: 'Token', secret: true }),
+  ]),
+  saturn: Object.freeze([
+    Object.freeze({ name: 'account', label: 'Account label', placeholder: 'saturn-main' }),
+    Object.freeze({ name: 'host', label: 'Workspace host', placeholder: 'workspace-abc.saturncloud.io' }),
+    Object.freeze({ name: 'token', label: 'Token', secret: true }),
+  ]),
+  cerebrium: Object.freeze([
+    Object.freeze({ name: 'account', label: 'Account label', placeholder: 'cerebrium-main' }),
+    Object.freeze({ name: 'project_id', label: 'Project id', placeholder: 'project-…' }),
+    Object.freeze({ name: 'app_name', label: 'App name', placeholder: 'app-…' }),
+    Object.freeze({ name: 'token', label: 'Service-account token', secret: true }),
+  ]),
+});
+
+/**
+ * An inline form for POST /api/gpu/lanes/{platform}/attach.
+ *
+ * The token field is a password input, is never prefilled, and is cleared on success; the reply's
+ * `remembered` flag is reported verbatim, because an attach that the vault refused still happened
+ * and the operator has to know it will not survive a restart.
+ */
+function laneAttachForm(platform) {
+  const fields = LANE_ATTACH_FIELDS[platform];
+  if (!fields) return null;
+
+  const inputs = new Map();
+  const rows = fields.map((f) => {
+    const id = `lane-attach-${platform}-${f.name}`;
+    const input = h('input', {
+      id,
+      class: `input${f.secret ? '' : ' mono'}`,
+      type: f.secret ? 'password' : 'text',
+      placeholder: f.placeholder ?? null,
+      autocomplete: 'off',
+      spellcheck: 'false',
+      autocapitalize: 'off',
+      'data-lane-field': f.name,
+      'aria-label': f.label,
+    });
+    inputs.set(f.name, input);
+    return h('div', { class: 'field' },
+      h('label', { for: id }, f.label), input);
+  });
+
+  const note = h('p', { class: 'hint' });
+  const submit = button('Attach', async () => {
+    const body = {};
+    for (const f of fields) body[f.name] = String(inputs.get(f.name).value ?? '').trim();
+    const missing = fields.filter((f) => !body[f.name]).map((f) => f.label.toLowerCase());
+    if (missing.length) {
+      note.textContent = `Fill in ${missing.join(', ')} before attaching.`;
+      return;
+    }
+    setDisabled(submit, true);
+    note.textContent = 'Attaching…';
+    try {
+      const result = await api.post(`/api/gpu/lanes/${platform}/attach`, body);
+      const remembered = asBool(pick(result, 'remembered'));
+      if (remembered === false) {
+        // The attach happened; the vault write did not. Repainting the card now would throw this
+        // sentence away with the form, and a credential that will vanish at restart is exactly the
+        // thing the operator must not miss.
+        const why = asString(pick(result, 'remember_error')).trim();
+        note.textContent = `Attached for this process only — the vault did not keep it${why ? `: ${why}` : '.'}`;
+        return;
+      }
+      for (const input of inputs.values()) input.value = '';
+      note.textContent = 'Attached and kept in the vault.';
+      await refreshSingleLane(platform);
+    } catch (err) {
+      note.textContent = asString(pick(err, 'message')).trim() || 'The attach request failed.';
+    } finally {
+      setDisabled(submit, false);
+    }
+  });
+
+  const wrapper = h('div', { class: 'gpu-attach' },
+    h('h4', {}, 'Attach an account'),
+    ...rows,
+    h('div', { class: 'gpu-actions' },
+      submit,
+      ghostButton('Cancel', () => wrapper.remove())),
+    note);
+  return wrapper;
+}
 
   async function refreshSingleLane(platform) {
     try {
