@@ -895,6 +895,15 @@ pub(crate) fn auth_headers(p: &Provider, secret: &str) -> Result<Vec<(String, St
             vec![(name.clone(), format!("{prefix}{secret}"))]
         }
         AuthKind::QueryParam { .. } => Vec::new(),
+        AuthKind::Modal => {
+            let (key, token_secret) = secret.split_once('.').ok_or_else(|| {
+                CliError::validation("Modal credential must be the Token ID.Token Secret pair")
+            })?;
+            vec![
+                ("modal-key".to_owned(), key.to_owned()),
+                ("modal-secret".to_owned(), token_secret.to_owned()),
+            ]
+        }
     })
 }
 

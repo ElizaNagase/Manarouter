@@ -21,16 +21,27 @@
 //! The compiler lives in [`snapshot`] and is the only thing that bridges them. This is what lets
 //! combo logic be arbitrarily sophisticated while the request path stays a pointer load, a hash
 //! lookup and a couple of atomic operations.
+//!
+//! ## GPU rentals
+//!
+//! [`gpu`] holds the pure logic behind renting a GPU: the verified card catalog, the HuggingFace
+//! architecture reader, the KV-cache sizing maths and the re-quantisation recipe. It is deliberately
+//! free of I/O and of the clock, and [`rental`] holds the operator's authored rental accounts and
+//! deployments, so a sizing formula or a price can be checked in a test rather than against an
+//! invoice.
 
 pub mod catalog;
 pub mod config;
 pub mod dialect;
 pub mod error;
+pub mod gpu;
+pub mod lane;
 pub mod ids;
 pub mod model;
 pub mod oauth;
 pub mod published;
 pub mod quota;
+pub mod rental;
 pub mod secret;
 pub mod snapshot;
 pub mod store;
@@ -105,7 +116,9 @@ pub const SNAPSHOT_MAGIC: [u8; 8] = *b"MROUTES1";
 /// Version 7 adds each provider's **cooldown scope** to the compiled plan. A v6 frame has no such
 /// field, and its provider records are one byte shorter, so reading one would shift every following
 /// byte of the record — it must be rejected rather than reinterpreted.
-pub const SNAPSHOT_VERSION: u32 = 7;
+///
+/// Version 8 carries provider KV capacity, cost-per-second and cold-start timeout configuration.
+pub const SNAPSHOT_VERSION: u32 = 8;
 
 /// Current on-disk database schema version.
 ///
@@ -116,8 +129,6 @@ pub const SNAPSHOT_VERSION: u32 = 7;
 /// Version 3 added the `usage_tokens` side table (cached tokens, cache-write tokens, and the
 /// generation window that tokens-per-second divides by). Version 4 added the `key_usage_bytes`
 /// side table: the request and response byte counts the relay observes, which the panel process
-/// turns into a token estimate when the provider reported no counts of its own. The store
-/// currently has four migrations; per-key rolling admission is not yet implemented. Keep this
-/// version aligned with `MIGRATIONS` until the complete, tested admission migration is added. The
-/// compile-time assert in [`store`] enforces that invariant.
-pub const SCHEMA_VERSION: u32 = 4;
+/// turns into a token estimate when the provider reported no counts of its own. Version 5 adds
+/// `gpu_usage`, the append-only billing record for self-hosted provider GPU seconds.
+pub const SCHEMA_VERSION: u32 = 5;

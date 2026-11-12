@@ -185,6 +185,8 @@ pub fn translate_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Option<T
         // google translator below instead — see `docs/providers/antigravity.md` and the request
         // body in `docs/12-oauth-antigravity.md` §5.
         (Dialect::OpenAi, Dialect::Copilot) => Ok(None),
+        // Modal vLLM serves the OpenAI-compatible chat surface behind Modal-Key/Modal-Secret.
+        (Dialect::OpenAi, Dialect::ModalVllm) => Ok(None),
         // The Anthropic half of this pair had no arm on ANY of the three functions: Unsupported
         // before a byte moved. Copilot's shape says it belongs here — `docs/providers/copilot.md`
         // gives `/chat/completions` as "OpenAI Chat Completions", and `catalog/providers.toml`
@@ -192,6 +194,9 @@ pub fn translate_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Option<T
         // i.e. Claude Code sessions are meant to reach it. It takes the same direct
         // Anthropic-to-OpenAI pair `(Anthropic, OpenAi)` uses below, not a double pivot.
         (Dialect::Anthropic, Dialect::Copilot) => {
+            openai::from_anthropic_request(ctx, body).map(Some)
+        }
+        (Dialect::Anthropic, Dialect::ModalVllm) => {
             openai::from_anthropic_request(ctx, body).map(Some)
         }
 
@@ -249,6 +254,8 @@ pub fn translate_response_body(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<By
         // round trip failed with Unsupported at the response even though the request succeeded.
         (Dialect::OpenAi, Dialect::Copilot) => Ok(Bytes::copy_from_slice(body)),
         (Dialect::Anthropic, Dialect::Copilot) => openai::to_anthropic_response(ctx, body),
+        (Dialect::OpenAi, Dialect::ModalVllm) => Ok(Bytes::copy_from_slice(body)),
+        (Dialect::Anthropic, Dialect::ModalVllm) => openai::to_anthropic_response(ctx, body),
         // `google::to_pivot_response` unwraps the Cloud Code `{response: {...}, traceId}`
         // envelope when the upstream is Antigravity, so every Gemini pairing answers here.
         (Dialect::OpenAi, Dialect::Google)
@@ -293,6 +300,8 @@ pub fn translate_sse_data(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<Stri
         // the rest.
         (Dialect::OpenAi, Dialect::Copilot) => Ok(vec![data.to_owned()]),
         (Dialect::Anthropic, Dialect::Copilot) => openai::sse_to_anthropic(ctx, data),
+        (Dialect::OpenAi, Dialect::ModalVllm) => Ok(vec![data.to_owned()]),
+        (Dialect::Anthropic, Dialect::ModalVllm) => openai::sse_to_anthropic(ctx, data),
         (Dialect::OpenAi, Dialect::CommandCodeGo)
         | (Dialect::Anthropic, Dialect::CommandCodeGo) => commandcode::sse_to_pivot(ctx, data),
         // Cloud Code's stream frames carry the same `{"response": ...}` wrapper, unwrapped per
@@ -520,6 +529,21 @@ mod tests {
             br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#
         )
         .is_ok());
+    }
+
+    #[test]
+    fn modal_vllm_is_openai_compatible_with_direct_anthropic_translation() {
+        let openai_ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::ModalVllm, "qwen");
+        let anthropic_ctx = TranslateCtx::new(RouteKind::Messages, Dialect::ModalVllm, "qwen");
+        let body = br#"{"model":"qwen","messages":[{"role":"user","content":"hi"}]}"#;
+        assert!(translate_request(&openai_ctx, body).unwrap().is_none());
+        assert!(translate_request(&anthropic_ctx, br#"{"model":"qwen","max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#).unwrap().is_some());
+        let raw = br#"{"choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}"#;
+        assert_eq!(
+            translate_response_body(&openai_ctx, raw).unwrap().as_ref(),
+            &raw[..]
+        );
+        assert!(translate_response_body(&anthropic_ctx, raw).is_ok());
     }
 
     #[test]

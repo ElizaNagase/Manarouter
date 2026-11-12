@@ -72,6 +72,9 @@ pub enum Dialect {
     /// above are the upstream's own. `Dialect::Google`'s permissive pair is what produced
     /// "thinking_budget must be in the range [-1, 65535]" for `gemini/gemini-3.8-flash`.
     GoogleAiStudio = 7,
+    /// Modal-hosted vLLM endpoint: OpenAI-compatible, but with `Modal-Key` and `Modal-Secret`
+    /// headers.
+    ModalVllm = 8,
 }
 
 impl Dialect {
@@ -93,6 +96,7 @@ impl Dialect {
             5 => Self::Antigravity,
             6 => Self::CommandCodeGo,
             7 => Self::GoogleAiStudio,
+            8 => Self::ModalVllm,
             _ => return None,
         })
     }
@@ -116,6 +120,7 @@ impl Dialect {
             Self::Antigravity => "antigravity",
             Self::CommandCodeGo => "command-code-go",
             Self::GoogleAiStudio => "google-ai-studio",
+            Self::ModalVllm => "modal-vllm",
         }
     }
 
@@ -148,6 +153,7 @@ impl Dialect {
             "copilot" | "github-copilot" | "githubcopilot" => Self::Copilot,
             "antigravity" | "agy" | "gemini-code-assist" | "cloudcode" => Self::Antigravity,
             "command-code-go" | "cmdgo" => Self::CommandCodeGo,
+            "modal-vllm" | "modal" | "modalvllm" => Self::ModalVllm,
             _ => return None,
         })
     }
@@ -176,7 +182,7 @@ impl Dialect {
     }
 
     /// Every dialect, in snapshot order. Useful for exhaustive tests.
-    pub const ALL: [Dialect; 8] = [
+    pub const ALL: [Dialect; 9] = [
         Self::OpenAi,
         Self::Anthropic,
         Self::Google,
@@ -185,6 +191,7 @@ impl Dialect {
         Self::Antigravity,
         Self::CommandCodeGo,
         Self::GoogleAiStudio,
+        Self::ModalVllm,
     ];
 
     /// The reasoning levels this dialect can put on the wire as *themselves*, ascending.
@@ -207,12 +214,11 @@ impl Dialect {
     /// configuration validator cannot disagree about the vocabulary of a dialect.
     pub const fn expressible_reasoning_levels(self) -> &'static [ReasoningLevel] {
         match self {
-            Self::OpenAi | Self::Copilot | Self::CommandCodeGo | Self::Codex => {
+            Self::OpenAi | Self::Copilot | Self::CommandCodeGo | Self::Codex | Self::ModalVllm => {
                 &NAMED_EFFORT_LEVELS
             }
-            // The AI Studio surface has no budget to range-check: a level goes out as a level, so
-            // every tier is expressible for the same reason it is on the budget dialects — the
-            // upper tiers share the surface's `high`.
+            // The budget dialects and AI Studio take a level or budget into their own fields.
+            // Every tier is expressible for the same reason — the upper tiers share a ceiling.
             Self::Anthropic | Self::Google | Self::Antigravity | Self::GoogleAiStudio => {
                 &ReasoningLevel::ALL
             }
@@ -500,6 +506,8 @@ pub enum AuthKind {
         #[serde(default = "default_query_param")]
         param: String,
     },
+    /// Modal-style authentication, using `Modal-Key` and `Modal-Secret` headers.
+    Modal,
     /// The credential needs an OAuth platform to turn it into live request headers, and may need
     /// a short-lived session token minted from a long-lived one (Copilot).
     ///
@@ -1167,7 +1175,7 @@ mod tests {
         }
         // Unknown values must be rejected rather than silently mapping onto a dialect, because a
         // misread snapshot byte would otherwise route traffic to an unrelated provider.
-        assert_eq!(Dialect::from_u8(8), None);
+        assert_eq!(Dialect::from_u8(9), None);
         assert_eq!(Dialect::from_u8(255), None);
     }
 
@@ -1384,6 +1392,7 @@ mod tests {
             (Dialect::Antigravity, "antigravity"),
             (Dialect::CommandCodeGo, "command-code-go"),
             (Dialect::GoogleAiStudio, "google-ai-studio"),
+            (Dialect::ModalVllm, "modal-vllm"),
         ];
         assert_eq!(expected.len(), Dialect::ALL.len());
         for (dialect, id) in expected {

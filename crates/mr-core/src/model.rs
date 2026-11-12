@@ -533,6 +533,25 @@ pub struct Provider {
     /// Whether this provider prefers HTTP/2 when the host supports it.
     #[serde(default = "default_http2")]
     pub http2: Http2Preference,
+    /// KV-token budget configuration for self-hosted providers (e.g. Modal vLLM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_pool_tokens: Option<u64>,
+    /// Maximum declared context tokens; overrides discovered model metadata when provided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context: Option<u64>,
+    /// Maximum simultaneous requests accepted by the endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
+    /// Cost per second in USD. When set, GPU-second billing is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_per_second: Option<f64>,
+    /// A self-hosted Modal/vLLM endpoint reports 503 while scaling from cold; use a long TTFB
+    /// budget to allow one boot and prefill.
+    #[serde(
+        default = "default_cold_start_ttfb_timeout_ms",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cold_start_ttfb_timeout_ms: Option<u64>,
     /// Which configured proxy this provider's traffic goes through, by [`ProxyConfig::id`].
     ///
     /// `None` dials the upstream directly. An account may override this, which is the case the
@@ -614,6 +633,10 @@ fn default_ttfb_timeout_ms() -> u64 {
 fn default_idle_timeout_ms() -> u64 {
     120_000
 }
+
+fn default_cold_start_ttfb_timeout_ms() -> Option<u64> {
+    None
+}
 fn default_http2() -> Http2Preference {
     Http2Preference::Auto
 }
@@ -635,6 +658,7 @@ pub enum Http2Preference {
 impl Provider {
     /// A minimal provider with sensible defaults, used as the base when the panel creates one.
     pub fn new(id: impl Into<String>, dialect: Dialect, base_url: impl Into<String>) -> Self {
+        let modal_vllm = dialect == Dialect::ModalVllm;
         Self {
             id: ProviderId::from(id.into()),
             label: None,
@@ -651,12 +675,21 @@ impl Provider {
             enabled: true,
             headers: BTreeMap::new(),
             route_overrides: BTreeMap::new(),
-            connect_timeout_ms: default_connect_timeout_ms(),
+            connect_timeout_ms: if modal_vllm {
+                300_000
+            } else {
+                default_connect_timeout_ms()
+            },
             ttfb_timeout_ms: default_ttfb_timeout_ms(),
             idle_timeout_ms: default_idle_timeout_ms(),
             total_timeout_ms: 0,
             prewarm: false,
             http2: Http2Preference::Auto,
+            kv_pool_tokens: None,
+            max_context: None,
+            max_concurrent: None,
+            price_per_second: None,
+            cold_start_ttfb_timeout_ms: modal_vllm.then_some(300_000),
             proxy: None,
             note: None,
             extra: BTreeMap::new(),
@@ -882,6 +915,20 @@ impl Provider {
                     .into(),
             );
         }
+        if self.dialect == Dialect::ModalVllm {
+            if self
+                .price_per_second
+                .is_some_and(|price| !price.is_finite() || price <= 0.0)
+            {
+                problems.push("price_per_second must be a finite positive number".into());
+            }
+            if self
+                .cold_start_ttfb_timeout_ms
+                .is_some_and(|timeout| timeout == 0)
+            {
+                problems.push("cold_start_ttfb_timeout_ms must be greater than zero".into());
+            }
+        }
         for m in &self.models {
             if m.id.is_empty() {
                 problems.push("a model entry has an empty id".into());
@@ -928,6 +975,22 @@ impl Provider {
             }
             Dialect::CommandCodeGo if wants(Capability::Embeddings) => {
                 out.push("the Command Code dialect has no embeddings endpoint".to_string());
+            }
+            Dialect::ModalVllm => {
+                for c in [
+                    Capability::Responses,
+                    Capability::Embeddings,
+                    Capability::AudioTranscription,
+                    Capability::AudioSpeech,
+                    Capability::ImagesGenerations,
+                ] {
+                    if wants(c) {
+                        out.push(format!(
+                            "the Modal vLLM dialect only serves OpenAI-compatible chat completions, not {}",
+                            c.as_str()
+                        ));
+                    }
+                }
             }
             _ => {}
         }

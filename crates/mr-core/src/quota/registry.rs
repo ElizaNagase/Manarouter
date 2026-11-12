@@ -556,6 +556,7 @@ pub fn default_registry() -> QuotaRegistry {
     use crate::quota::glm::Glm;
     use crate::quota::grok::Grok;
     use crate::quota::minimax::MiniMax;
+    use crate::quota::modal::Modal;
     use crate::quota::moonshot::Moonshot;
     use crate::quota::openai_compat::OpenAiCompat;
     use crate::quota::opencode::OpenCodeGo;
@@ -575,6 +576,7 @@ pub fn default_registry() -> QuotaRegistry {
     registry.register_provider(Arc::new(Glm::new()));
     registry.register_provider(Arc::new(Grok::new()));
     registry.register_provider(Arc::new(MiniMax::new()));
+    registry.register_provider(Arc::new(Modal::new()));
     registry.register_provider(Arc::new(Moonshot::new()));
     registry.register_provider(Arc::new(OpenCodeGo::new()));
     registry.register_provider(Arc::new(OpenRouter::new()));
@@ -1312,7 +1314,7 @@ mod tests {
     /// The provider ids [`default_registry`] must contain: one per Phase C file that exports a
     /// fetcher. Written out rather than derived, so adding a fetcher forces this list to be
     /// updated and a failure names the missing or colliding id.
-    const EXPECTED_PROVIDER_IDS: [&str; 14] = [
+    const EXPECTED_PROVIDER_IDS: [&str; 15] = [
         "antigravity",
         "claude",
         "codex",
@@ -1322,6 +1324,7 @@ mod tests {
         "github",
         "glm",
         "minimax",
+        "modal",
         "moonshot",
         "opencode-go",
         "openrouter",

@@ -38,6 +38,7 @@ pub mod glm;
 pub mod grok;
 pub mod kimi;
 pub mod minimax;
+pub mod modal;
 pub mod moonshot;
 pub mod openai_compat;
 pub mod opencode;

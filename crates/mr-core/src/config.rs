@@ -28,6 +28,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::rental::RentalAccount;
+
 use crate::dialect::{InputModality, ReasoningLevel};
 use crate::error::{Error, Result};
 use crate::model::{Alias, ClientKey, Combo, KeyLimit, Provider};
@@ -123,6 +125,16 @@ pub struct Config {
 
     /// Cross-instance sync groundwork; inert unless enabled.
     pub sync: SyncConfig,
+
+    /// GPU-rental platform accounts, in operator-chosen order.
+    ///
+    /// Each entry pairs a platform credential with the plan the operator says it is on. Nothing
+    /// here is inferred: an account whose plan was never recorded reads as [`RentalPlan::Unknown`],
+    /// and [`crate::gpu::catalog`] carries the per-GPU free-plan facts separately, because the two
+    /// questions ("what does this account cost?" and "is this card free on that platform?") have
+    /// different answers and must not be collapsed into one flag.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rental_accounts: Vec<RentalAccount>,
 
     /// Fields this binary does not know about, preserved verbatim.
     #[serde(flatten)]
@@ -588,6 +600,7 @@ impl Default for Config {
             no_key_required: false,
             allow_remote_without_key: false,
             sync: SyncConfig::default(),
+            rental_accounts: Vec::new(),
             extra: Map::new(),
         }
     }
@@ -1383,6 +1396,11 @@ impl Config {
             // much as the strategy does: a change must invalidate the digest and recompile.
             p.cooldown_scope.hash(&mut hasher);
             p.proxy.hash(&mut hasher);
+            p.kv_pool_tokens.hash(&mut hasher);
+            p.max_context.hash(&mut hasher);
+            p.max_concurrent.hash(&mut hasher);
+            p.price_per_second.map(f64::to_bits).hash(&mut hasher);
+            p.cold_start_ttfb_timeout_ms.hash(&mut hasher);
             for (account_index, a) in p.accounts.iter().enumerate() {
                 account_index.hash(&mut hasher);
                 a.id.as_str().hash(&mut hasher);
@@ -1396,6 +1414,7 @@ impl Config {
             for m in &p.models {
                 m.id.hash(&mut hasher);
                 m.hidden.hash(&mut hasher);
+                m.context_length.hash(&mut hasher);
             }
         }
         for c in &self.combos {
@@ -1583,6 +1602,7 @@ pub fn is_advisory(problem: &str) -> bool {
 mod tests {
     use super::*;
     use crate::ids::{AccountId, ComboId};
+    use crate::rental::RentalPlan;
     use crate::model::{Account, ComboStep, ModelEntry, ModelSource};
 
     fn provider(id: &str) -> Provider {
@@ -1660,6 +1680,65 @@ mod tests {
         cfg.save(&p).unwrap();
         let back = Config::load(&p).unwrap();
         assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn rental_accounts_round_trip_and_default_to_empty() {
+        // A config written before this field existed must load with no accounts, not with an
+        // error: the field is additive, and `#[serde(default)]` is what makes that true.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        std::fs::write(&p, r#"{"format_version": 1}"#).unwrap();
+        assert!(Config::load(&p).unwrap().rental_accounts.is_empty());
+
+        let mut cfg = Config::default();
+        let mut acct = RentalAccount::new("modal-a");
+        acct.label = "Mana on Modal".to_string();
+        acct.plan = RentalPlan::Paid;
+        acct.secret_ref = Some("vault/modal".to_string());
+        acct.max_concurrent_containers = Some(10);
+        // An unknown member survives, exactly as it does at the top level.
+        acct.extra.insert("future_field".to_string(), Value::from(7));
+        cfg.rental_accounts.push(acct);
+        cfg.save(&p).unwrap();
+
+        let back = Config::load(&p).unwrap();
+        assert_eq!(back, cfg);
+        assert_eq!(back.rental_accounts.len(), 1);
+        assert_eq!(back.rental_accounts[0].plan, RentalPlan::Paid);
+        assert_eq!(
+            back.rental_accounts[0].extra.get("future_field"),
+            Some(&Value::from(7))
+        );
+
+        // The key is spelled on the wire as the operator would write it, and stays absent from
+        // `extra` — a field the binary knows must not be echoed twice.
+        let text = std::fs::read_to_string(&p).unwrap();
+        let mut raw: Value = serde_json::from_str(&text).unwrap();
+        assert!(raw.get("rental_accounts").is_some(), "{raw}");
+        assert!(raw.get("extra").is_none(), "{raw}");
+
+        // An empty list is omitted rather than written as `[]`, so a config that has never rented
+        // anything stays byte-identical to one from before the field existed.
+        let empty = serde_json::to_string(&Config::default()).unwrap();
+        assert!(!empty.contains("rental_accounts"), "{empty}");
+
+        // An unknown *sibling* still lands in `extra`: the added field has not disturbed the
+        // flatten that makes downgrade safe.
+        raw.as_object_mut()
+            .unwrap()
+            .insert("future_sibling".to_string(), serde_json::json!({"nested": true}));
+        std::fs::write(&p, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+        let sibling = Config::load(&p).unwrap();
+        assert_eq!(
+            sibling.extra.get("future_sibling"),
+            Some(&serde_json::json!({"nested": true}))
+        );
+        assert_eq!(sibling.rental_accounts.len(), 1);
+        assert_eq!(sibling.rental_accounts[0].id, "modal-a");
+        // And it survives a save/load cycle of the loaded config.
+        sibling.save(&p).unwrap();
+        assert_eq!(Config::load(&p).unwrap(), sibling);
     }
 
     #[test]
@@ -1998,6 +2077,36 @@ mod tests {
         let mut b = a.clone();
         b.combos.push(combo("slow", "p1"));
         assert_ne!(a.routing_digest(), b.routing_digest());
+    }
+
+    #[test]
+    fn the_routing_digest_changes_when_self_hosted_budget_settings_change() {
+        let mut base = Config::default();
+        let mut provider = provider("modal");
+        provider.dialect = crate::dialect::Dialect::ModalVllm;
+        base.providers.push(provider);
+        let digest = base.routing_digest();
+        let mut variants = Vec::new();
+        for (field, value) in [
+            ("kv_pool_tokens", 1),
+            ("max_context", 2),
+            ("max_concurrent", 3),
+            ("price_per_second", 4),
+            ("cold_start_ttfb_timeout_ms", 5),
+        ] {
+            let mut changed = base.clone();
+            let p = &mut changed.providers[0];
+            match field {
+                "kv_pool_tokens" => p.kv_pool_tokens = Some(value),
+                "max_context" => p.max_context = Some(value),
+                "max_concurrent" => p.max_concurrent = Some(value as u32),
+                "price_per_second" => p.price_per_second = Some(value as f64),
+                "cold_start_ttfb_timeout_ms" => p.cold_start_ttfb_timeout_ms = Some(value),
+                _ => unreachable!(),
+            }
+            variants.push(changed.routing_digest());
+        }
+        assert!(variants.into_iter().all(|variant| variant != digest));
     }
 
     #[test]

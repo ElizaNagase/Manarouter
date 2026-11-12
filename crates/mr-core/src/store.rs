@@ -84,7 +84,13 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// transaction as the migration it names, but if a future edit ever splits them, a re-run after a
 /// crash must not fail — a migration that errors on its second attempt bricks `open` for a
 /// database whose contents are actually fine.
-const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3, MIGRATION_V4];
+const MIGRATIONS: &[&str] = &[
+    MIGRATION_V1,
+    MIGRATION_V2,
+    MIGRATION_V3,
+    MIGRATION_V4,
+    MIGRATION_V5,
+];
 
 /// Schema v1: four tables, their indexes, and the revision/tombstone columns every row carries
 /// for v2 sync (see the module docs).
@@ -263,6 +269,21 @@ CREATE TABLE IF NOT EXISTS key_usage_bytes (
 );
 
 CREATE INDEX IF NOT EXISTS key_usage_bytes_by_usage ON key_usage_bytes(usage_id);
+"#;
+
+/// Schema v5: self-hosted GPU billing, stored beside a key usage row.
+const MIGRATION_V5: &str = r#"
+CREATE TABLE IF NOT EXISTS gpu_usage (
+    usage_id          TEXT PRIMARY KEY,
+    provider_id       TEXT NOT NULL,
+    model             TEXT NOT NULL,
+    duration_ms       INTEGER NOT NULL,
+    gpu_seconds       REAL NOT NULL,
+    cost_usd          REAL,
+    created_at        INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS gpu_usage_by_provider_time ON gpu_usage(provider_id, created_at);
 "#;
 
 /// Compile-time guarantee that every migration has a schema version and vice versa.
@@ -618,6 +639,26 @@ fn row_to_raw_usage(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawUsage> {
         revision: row.get(11)?,
         deleted_at: row.get(12)?,
     })
+}
+
+/// One self-hosted endpoint billing record, persisted independently of public token rates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpuUsageRecord {
+    pub usage_id: String,
+    pub provider_id: String,
+    pub model: String,
+    pub duration_ms: u64,
+    pub gpu_seconds: f64,
+    pub cost_usd: Option<f64>,
+    pub created_at: Millis,
+}
+
+/// A compact aggregate of self-hosted endpoint GPU billing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct GpuUsageAggregate {
+    pub requests: u64,
+    pub gpu_seconds: f64,
+    pub cost_usd: f64,
 }
 
 /// Aggregates over a time range, computed by SQLite in a single pass.
@@ -1517,6 +1558,45 @@ impl Store {
     /// Aggregate usage grouped by model over `[from, to)`.
     pub fn usage_by_model(&self, from: Millis, to: Millis) -> Result<Vec<UsageGroup>> {
         self.usage_grouped("model", from, to)
+    }
+
+    /// Append one self-hosted GPU billing row.
+    pub fn record_gpu_usage(&self, record: &GpuUsageRecord) -> Result<()> {
+        let guard = self.guard()?;
+        guard.execute(
+            "INSERT INTO gpu_usage (usage_id, provider_id, model, duration_ms, gpu_seconds, \
+             cost_usd, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(usage_id) DO NOTHING",
+            params![
+                record.usage_id,
+                record.provider_id,
+                record.model,
+                record.duration_ms,
+                record.gpu_seconds,
+                record.cost_usd,
+                record.created_at.as_millis(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Aggregate self-hosted GPU billing over `[from, to)`.
+    pub fn gpu_usage_totals(&self, from: Millis, to: Millis) -> Result<GpuUsageAggregate> {
+        let guard = self.guard()?;
+        guard
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(gpu_seconds), 0), \
+             COALESCE(SUM(cost_usd), 0) FROM gpu_usage WHERE created_at >= ?1 AND created_at < ?2",
+                params![from.as_millis(), to.as_millis()],
+                |row| {
+                    Ok(GpuUsageAggregate {
+                        requests: row.get(0)?,
+                        gpu_seconds: row.get(1)?,
+                        cost_usd: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
     }
 
     /// The usage rows that occurred in `[from, to)`, newest first, up to `limit`.

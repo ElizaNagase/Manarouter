@@ -1314,6 +1314,7 @@ mod tests {
             AuthKind::ApiKeyHeader { header } => format!("`api-key-header` ({header})"),
             AuthKind::Header { name, .. } => format!("`header` ({name})"),
             AuthKind::QueryParam { param } => format!("`query-param` ({param})"),
+            AuthKind::Modal => "`modal`".to_owned(),
             AuthKind::OAuth { platform } => format!("`oauth` ({platform})"),
         }
     }
