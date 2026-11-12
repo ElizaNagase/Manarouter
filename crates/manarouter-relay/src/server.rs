@@ -1690,6 +1690,95 @@ enum CredentialMiss {
     Unusable,
 }
 
+/// The result of looking an account's static credential up in the vault.
+enum StoredCredential {
+    /// A value is stored under the reference.
+    Found(String),
+    /// Nothing is stored under it, or the account names no reference at all.
+    Miss,
+}
+
+/// Look up one account's static credential, giving a miss a second look at the file.
+///
+/// The relay's vault is a snapshot taken when the process started, while the panel and `mr` write
+/// credentials into that same vault at any moment — so "nothing under this reference" can simply
+/// mean "nothing there when we started". Re-reading once turns a permanent-looking failure into a
+/// credential that works as soon as it is added, without waiting for a restart nobody knows to
+/// perform. A vault that cannot be read at all is reported as such rather than as a missing secret:
+/// that is a statement about the relay, not about this account.
+///
+/// A compiled static account always names a vault slot — `account_plan` resolves the conventional
+/// id for it — so an account with no reference at all has nothing to attach, which is the same
+/// problem as a reference with nothing stored under it.
+fn stored_credential(
+    app: &AppState,
+    account: &mr_core::snapshot::AccountPlan,
+) -> Result<StoredCredential, mr_core::error::Error> {
+    let Some(id) = account.secret_ref.as_deref() else {
+        return Ok(StoredCredential::Miss);
+    };
+    match app.vault.get(id) {
+        Ok(Some(value)) => Ok(StoredCredential::Found(value)),
+        Ok(None) => match app.vault.refreshed() {
+            Ok(fresh) => match fresh.get(id) {
+                Ok(Some(value)) => {
+                    tracing::info!(
+                        account = %account.id,
+                        "credential was stored after the relay started; using it"
+                    );
+                    Ok(StoredCredential::Found(value))
+                }
+                Ok(None) => Ok(StoredCredential::Miss),
+                // The file could not be re-read at all: that is a vault problem, not a missing
+                // secret, and it is reported as such.
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a step's auth kind can be attached to a request that carries **no** credential.
+///
+/// Only [`AuthKind::Bearer`] can, and it is the same exemption `Provider::validate` makes when it
+/// allows an account with nothing attached: a local llama.cpp or Ollama server accepts requests with
+/// no credential at all, and a provider pointed at one is configured with an account that has no
+/// secret. Every other auth kind names a header, a query parameter or a platform that exists to
+/// *carry* a value, so a request without one would be rejected upstream as a malformed request; for
+/// those, an account with nothing attached stays the refusal it is today. This is deliberately a
+/// property of the auth kind alone — no provider id, host or base URL is consulted, so it holds for
+/// any provider configured this way.
+fn auth_tolerates_no_credential(auth: &AuthKind) -> bool {
+    matches!(auth, AuthKind::Bearer)
+}
+
+/// Whether this account was configured with no credential of its own at all.
+///
+/// `Provider::validate` treats "an account with no credential" as a choice an operator is allowed to
+/// make for a bearer-token provider, and on that side of the line the test is easy: the account has
+/// neither a `secret_ref` nor an `oauth_ref` in the configuration. The relay only ever sees the
+/// compiled plan, where the compiler has already resolved a missing `secret_ref` to the
+/// conventional [`mr_core::secret::account_secret_id`] slot — the same path `mr account add` writes
+/// to. So the configuration's `None` has to be recognised indirectly: an account whose reference is
+/// *nothing but* that conventional fallback was never given a credential of its own, while one that
+/// names a slot of its own was.
+///
+/// This is why the distinction matters rather than being pedantic. An account that names its own
+/// slot and has nothing stored under it is an account someone is still going to fill in — the step
+/// must step over it and go on to a sibling that does have a credential, which is what the
+/// `provider/{id}/account/{label}-credential` tests pin. An account that was never given a
+/// reference at all is the local-server case, and it is the only one of the two that may run with no
+/// credential.
+///
+/// No provider id, host, base URL or model is consulted — only whether the reference is the
+/// compiler's own fallback for this account, so nothing here is specific to any upstream.
+fn account_names_no_own_slot(step: &StepPlan, account: &mr_core::snapshot::AccountPlan) -> bool {
+    let conventional =
+        mr_core::secret::account_secret_id(step.provider_id.as_str(), account.id.as_str());
+    account.secret_ref.as_deref() == Some(conventional.as_str())
+}
+
 /// Resolve one account's credential, without treating a missing one as an error.
 ///
 /// Separate from [`attempt_step`] so each per-account case — a missing secret, an OAuth reference
@@ -1700,48 +1789,39 @@ async fn account_credential(
     account: &mr_core::snapshot::AccountPlan,
 ) -> AccountCredential {
     let Some(oauth_ref) = account.oauth_ref.as_deref() else {
-        return match account.secret_ref.as_deref() {
-            Some(id) => match app.vault.get(id) {
-                Ok(Some(value)) => AccountCredential::Usable {
-                    credential: Some(value),
-                    oauth_headers: Vec::new(),
-                    oauth_tokens: None,
-                },
-                // A miss deserves a second look at the file. The relay's vault is a snapshot taken
-                // when the process started, while the panel and `mr` write credentials into that
-                // same vault at any moment — so "nothing under this reference" can simply mean
-                // "nothing there when we started". Re-reading once turns a permanent-looking
-                // failure into a credential that works as soon as it is added, without waiting for
-                // a restart nobody knows to perform.
-                Ok(None) => match app.vault.refreshed() {
-                    Ok(fresh) => match fresh.get(id) {
-                        Ok(Some(value)) => {
-                            tracing::info!(
-                                account = %account.id,
-                                "credential was stored after the relay started; using it"
-                            );
-                            AccountCredential::Usable {
-                                credential: Some(value),
-                                oauth_headers: Vec::new(),
-                                oauth_tokens: None,
-                            }
-                        }
-                        Ok(None) => {
-                            tracing::warn!(account = %account.id, "no credential in the vault for this account");
-                            AccountCredential::Unusable(CredentialMiss::Missing)
-                        }
-                        Err(e) => AccountCredential::VaultUnreadable(e),
-                    },
-                    // The file could not be re-read at all: that is a vault problem, not a missing
-                    // secret, and it is reported as such.
-                    Err(e) => AccountCredential::VaultUnreadable(e),
-                },
-                Err(e) => AccountCredential::VaultUnreadable(e),
+        // Both halves are required: the step's auth kind has to be one that a credential-less
+        // request is valid for, *and* the account has to be one that was configured with no
+        // credential. Either alone would take the `Authorization` header away from requests that
+        // are supposed to keep it.
+        let usable_without_credential =
+            auth_tolerates_no_credential(&step.auth) && account_names_no_own_slot(step, account);
+        let stored = match stored_credential(app, account) {
+            Ok(stored) => stored,
+            Err(e) => return AccountCredential::VaultUnreadable(e),
+        };
+        return match stored {
+            StoredCredential::Found(value) => AccountCredential::Usable {
+                credential: Some(value),
+                oauth_headers: Vec::new(),
+                oauth_tokens: None,
             },
-            // A compiled static account always names a vault slot — `account_plan` resolves the
-            // conventional id for it — so an account with no reference at all has nothing to
-            // attach, which is the same problem as a reference with nothing stored under it.
-            None => AccountCredential::Unusable(CredentialMiss::Missing),
+            // A provider whose account needs no credential serves this account with no credential
+            // at all, and the request goes upstream with no `Authorization` header — `apply_auth`
+            // attaches nothing for a `None` credential rather than sending an empty header, which
+            // the upstream would reject as malformed. Nothing is logged as a warning either, because
+            // for such a provider this is the configured, intended state and not a fault to fix.
+            StoredCredential::Miss if usable_without_credential => AccountCredential::Usable {
+                credential: None,
+                oauth_headers: Vec::new(),
+                oauth_tokens: None,
+            },
+            // Nothing stored, and an account that has a vault slot of its own to be filled: the
+            // operator has an account that cannot serve yet. Naming it is what sends them to the
+            // account that needs a key.
+            StoredCredential::Miss => {
+                tracing::warn!(account = %account.id, "no credential in the vault for this account");
+                AccountCredential::Unusable(CredentialMiss::Missing)
+            }
         };
     };
 
@@ -10324,6 +10404,297 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
 
         // The suggestion names the provider, so it is actionable without reading the config.
         assert!(many.contains("mr account add p --secret-stdin"), "{many}");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // A provider that needs no credential
+    // -----------------------------------------------------------------------------------------
+
+    /// A state with an open vault and no routes: enough to resolve one account's credential.
+    fn credential_state() -> AppState {
+        let dir = tempfile::tempdir().unwrap();
+        // The vault is empty on purpose: this is the provider that needs no credential, and a
+        // credential that happens to be stored would hide exactly the case under test.
+        let vault = Arc::new(mr_core::secret::Vault::open(dir.path()).unwrap());
+
+        let config = mr_core::config::Config::default();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            mr_core::snapshot::RoutingSnapshot::default(),
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        }
+    }
+
+    /// A compiled account with no OAuth reference and (when asked) no vault reference at all.
+    ///
+    /// Compiled through the snapshot so the plan under test has the shape the relay actually sees,
+    /// rather than a hand-built literal that could drift from it.
+    fn compiled_account(secret_ref: Option<&str>) -> mr_core::snapshot::AccountPlan {
+        let mut provider =
+            mr_core::model::Provider::new("local", Dialect::OpenAi, "http://127.0.0.1:11434/v1");
+        let mut account = mr_core::model::Account::new("local");
+        // `Account::new` leaves `secret_ref` as `None`, which is how "this provider needs no
+        // credential" is expressed; the compiler then resolves the conventional vault slot for it.
+        if let Some(id) = secret_ref {
+            account.secret_ref = Some(id.to_owned());
+        }
+        provider.accounts = vec![account];
+
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        snapshot.providers()[0].accounts[0].clone()
+    }
+
+    /// One step over the keyless local provider, differing only in how it attaches a credential.
+    fn compiled_step(auth: AuthKind) -> StepPlan {
+        let mut provider =
+            mr_core::model::Provider::new("local", Dialect::OpenAi, "http://127.0.0.1:11434/v1");
+        provider.auth = auth;
+        let mut entry = dm();
+        entry.id = "m".into();
+        entry.input_modalities = vec![InputModality::Text];
+        provider.models = vec![entry];
+
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        snapshot.providers()[0].steps[0].clone()
+    }
+
+    /// A keyless account on a Bearer provider is usable, and the request carries no credential.
+    ///
+    /// This is the local llama.cpp / Ollama case: the provider was deliberately configured with an
+    /// account that has no secret, because the upstream wants no credential. It used to fail with
+    /// `429 no_usable_accounts ... 1 account has no credential in the vault`, which told the
+    /// operator to attach a key to a provider that must not have one.
+    #[tokio::test]
+    async fn a_bearer_step_serves_an_account_with_no_credential_at_all() {
+        let app = credential_state();
+        let step = compiled_step(AuthKind::Bearer);
+        // No reference in the configuration at all, which the compiler resolves to the conventional
+        // slot; nothing is stored under it and nothing is expected to be.
+        let account = compiled_account(None);
+        let conventional = format!("provider/local/account/{}", account.id);
+        assert_eq!(
+            account.secret_ref.as_deref(),
+            Some(conventional.as_str()),
+            "the compiler must resolve the conventional slot for this to be the case under test"
+        );
+
+        match account_credential(&app, &step, &account).await {
+            AccountCredential::Usable {
+                credential,
+                oauth_headers,
+                oauth_tokens,
+            } => {
+                assert!(
+                    credential.is_none(),
+                    "a keyless account must send no credential, not an empty one"
+                );
+                assert!(oauth_headers.is_empty());
+                assert!(oauth_tokens.is_none());
+            }
+            _ => panic!("a keyless account on a Bearer provider must be usable"),
+        }
+    }
+
+    /// An account with a vault slot of its own is not keyless, even when the step is a Bearer one.
+    ///
+    /// This is the other half of the rule, and the half the bug report's provider does not have: an
+    /// account that names its own slot is one somebody is still going to fill in, so the step must
+    /// step over it rather than send a credential-less request in its name.
+    #[tokio::test]
+    async fn a_bearer_step_does_not_serve_an_account_that_names_its_own_empty_slot() {
+        let app = credential_state();
+        let step = compiled_step(AuthKind::Bearer);
+        let account = compiled_account(Some("second-credential"));
+
+        assert!(
+            matches!(
+                account_credential(&app, &step, &account).await,
+                AccountCredential::Unusable(CredentialMiss::Missing)
+            ),
+            "an account with its own empty slot must still be reported as missing"
+        );
+    }
+
+    /// Every other auth kind still refuses an account with nothing attached.
+    ///
+    /// Those kinds exist to carry a value — a header, a query parameter, a Modal pair, an OAuth
+    /// platform — so an account with no credential is a configuration error rather than a choice,
+    /// and the refusal has to stay so the operator is still sent to the account that needs a key.
+    /// The accounts here are the keyless ones, so **only** the auth kind can be doing the refusing.
+    #[tokio::test]
+    async fn only_bearer_serves_an_account_with_no_credential() {
+        let app = credential_state();
+        let kinds = [
+            AuthKind::ApiKeyHeader {
+                header: "x-api-key".into(),
+            },
+            AuthKind::Header {
+                name: "x-goog-api-key".into(),
+                prefix: String::new(),
+            },
+            AuthKind::QueryParam {
+                param: "key".into(),
+            },
+            AuthKind::Modal,
+        ];
+        for auth in kinds {
+            let step = compiled_step(auth.clone());
+            assert!(
+                matches!(
+                    account_credential(&app, &step, &compiled_account(None)).await,
+                    AccountCredential::Unusable(CredentialMiss::Missing)
+                ),
+                "{auth:?} accepted an account with no credential attached"
+            );
+        }
+        assert!(auth_tolerates_no_credential(&AuthKind::Bearer));
+        assert!(!auth_tolerates_no_credential(&AuthKind::ApiKeyHeader {
+            header: "x-api-key".into(),
+        }));
+    }
+
+    /// A keyless local provider serving model `m`, with an empty vault.
+    ///
+    /// The account is left without a `secret_ref`, which is how "this provider needs no credential"
+    /// is written in a configuration, and the model is named so a request can route to it.
+    fn keyless_provider() -> mr_core::model::Provider {
+        let mut provider =
+            mr_core::model::Provider::new("local", Dialect::OpenAi, "http://127.0.0.1:1");
+        provider.accounts = vec![mr_core::model::Account::new("local")];
+        let mut entry = dm();
+        entry.id = "m".into();
+        entry.input_modalities = vec![InputModality::Text];
+        provider.models = vec![entry];
+        provider
+    }
+
+    /// A relay whose only route is one keyless account, over `upstream_recording_auth`.
+    ///
+    /// That upstream records the `Authorization` header each request carried (empty when it carried
+    /// none), so a test can check the wire and not only the status code. A non-empty `base_url`
+    /// points the same provider somewhere nothing listens, for the test that expects a refusal.
+    async fn keyless_state(
+        auth: AuthKind,
+        base_url: Option<&str>,
+    ) -> (AppState, Arc<std::sync::Mutex<Vec<String>>>) {
+        let (url, seen) = upstream_recording_auth().await;
+        let mut provider = keyless_provider();
+        provider.auth = auth;
+        provider.base_url = base_url.map(str::to_owned).unwrap_or(url);
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let compiled = snapshot.providers()[0].accounts[0]
+            .secret_ref
+            .clone()
+            .unwrap_or_default();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        // Deliberately empty, and checked empty: the conventional slot exists in the compiled plan
+        // but nothing is stored under it, which is the state the operator reported as unusable.
+        let vault = Arc::new(mr_core::secret::Vault::open(dir.path()).unwrap());
+        assert!(
+            vault.get(&compiled).unwrap().is_none(),
+            "this fixture is only meaningful with nothing stored for the keyless account"
+        );
+
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+        (state, seen)
+    }
+
+    /// The whole request path serves a keyless Bearer account instead of returning 429.
+    ///
+    /// The unit tests above pin the resolution; this one pins the consequence the operator saw, so a
+    /// later change that reintroduced the refusal anywhere between the vault and the upstream fails
+    /// here rather than in the field. It also checks the wire: the request must arrive with no
+    /// `Authorization` header at all, rather than with an empty one.
+    #[tokio::test]
+    async fn a_request_to_a_keyless_bearer_provider_reaches_the_upstream() {
+        let (state, seen) = keyless_state(AuthKind::Bearer, None).await;
+        let response = chat(state, "local/m").await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a keyless Bearer account was refused: {}",
+            body_text(response).await
+        );
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "the request never reached the upstream");
+        assert!(
+            sent[0].is_empty(),
+            "the upstream was sent an Authorization header: {:?}",
+            sent[0]
+        );
+    }
+
+    /// The same request against an account-keyed auth kind still reports the honest 429.
+    ///
+    /// Without this the test above would pass on the strength of the 429 having been deleted
+    /// everywhere rather than only where it was wrong. The provider is otherwise identical, so the
+    /// auth kind is the only difference between the two outcomes.
+    #[tokio::test]
+    async fn a_request_to_a_keyless_header_provider_still_reports_no_usable_accounts() {
+        let (state, seen) = keyless_state(
+            AuthKind::ApiKeyHeader {
+                header: "x-api-key".into(),
+            },
+            Some("http://127.0.0.1:1"),
+        )
+        .await;
+
+        let response = chat(state, "local/m").await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = body_text(response).await;
+        assert!(body.contains("no_usable_accounts"), "{body}");
+        assert!(body.contains("no credential"), "{body}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing should go upstream"
+        );
     }
 
     /// A tracing writer that keeps what it is given, so a test can read the log.
