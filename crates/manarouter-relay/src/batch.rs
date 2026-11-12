@@ -445,6 +445,18 @@ impl BatchUsage {
             (Some(boot), Some(cost)) if cost > 0.0 => Some(boot / cost),
             _ => None,
         };
+        // The number a batch operator compares cards on. Both halves are measured, so this is
+        // arithmetic over the bill rather than a throughput prediction; `billable` excludes the boot
+        // fee because a card's steady-state cost per token is what the boot fee distorts.
+        let per_million = |dollars: Option<f64>| match (dollars, self.completion_tokens) {
+            (Some(dollars), tokens) if tokens > 0 => Some(dollars / tokens as f64 * 1_000_000.0),
+            _ => None,
+        };
+        let all_in_per_million = per_million(self.cost_usd);
+        let serving_per_million = per_million(match (self.cost_usd, self.boot_cost_usd) {
+            (Some(cost), Some(boot)) => Some((cost - boot).max(0.0)),
+            _ => None,
+        });
         let verdict = match share {
             Some(share) if share > BOOT_DOMINANT_SHARE => "boot_dominates",
             Some(_) => "work_dominates",
@@ -463,6 +475,15 @@ impl BatchUsage {
             // The answer to "was that batch too small to be worth a cold start", in the only form this
             // module can support: measured dollars, not a predicted token count.
             "boot_share_pct": share.map(|share| round_to(share * 100.0, 100.0)),
+            // What a million output tokens cost, all in. Includes the boot fee, which is the point:
+            // a batch that produced 120K tokens and spent as long booting as generating must not
+            // look cheap because its serving rate was good.
+            "usd_per_million_output_tokens": all_in_per_million
+                .map(|value| round_to(value, 1_000_000.0)),
+            // The same figure with the boot fee removed, which is what a card-to-card comparison
+            // needs. `null` when either half is unpriced, never a guess.
+            "serving_usd_per_million_output_tokens": serving_per_million
+                .map(|value| round_to(value, 1_000_000.0)),
             "cold_start_verdict": verdict,
             "provider": self.provider,
             "model": self.model,
@@ -2928,6 +2949,59 @@ mod tests {
         assert_eq!(usage.provider.as_deref(), Some("local"));
         assert_eq!(usage.model.as_deref(), Some("m"));
         assert_eq!(usage.cold_starts, 1);
+    }
+
+    #[test]
+    fn the_cost_per_million_output_tokens_is_derived_and_never_guessed() {
+        let price = 3.03 / 3600.0;
+        let usage = summarize(&[
+            settled(0, "m", 200.0, 1, Some(price), Some(10), Some(2)),
+            settled(1, "m", 100.0, 0, Some(price), Some(30), Some(4)),
+        ])
+        .expect("two settled items have a report")
+        .view();
+        let cost = 300.0 * price;
+        let boot = 180.0 * price;
+        // 6 output tokens over 300 s of card time: both figures are the measured bill divided by the
+        // measured token count, so they must agree with that division exactly, not approximately.
+        let all_in = usage["usd_per_million_output_tokens"]
+            .as_f64()
+            .expect("a priced batch with output tokens has a figure");
+        assert!((all_in - cost / 6.0 * 1_000_000.0).abs() < 1e-6);
+        let serving = usage["serving_usd_per_million_output_tokens"]
+            .as_f64()
+            .expect("a priced batch with a measured boot fee has a figure");
+        assert!((serving - (cost - boot) / 6.0 * 1_000_000.0).abs() < 1e-6);
+        assert!(
+            all_in > serving,
+            "the boot fee is part of the all-in figure and not of the serving one"
+        );
+
+        // No output tokens: there is no denominator, and a division by zero would be infinity rather
+        // than an answer. Both figures are absent, not zero.
+        let silent = summarize(&[settled(0, "m", 200.0, 1, Some(price), Some(10), Some(0))])
+            .expect("one settled item has a report")
+            .view();
+        assert!(silent["usd_per_million_output_tokens"].is_null());
+        assert!(silent["serving_usd_per_million_output_tokens"].is_null());
+
+        // No declared price: nothing to divide, so nothing is stated.
+        let unpriced = summarize(&[settled(0, "m", 200.0, 1, None, Some(10), Some(2))])
+            .expect("one settled item has a report")
+            .view();
+        assert!(unpriced["usd_per_million_output_tokens"].is_null());
+        assert!(unpriced["serving_usd_per_million_output_tokens"].is_null());
+
+        // A genuinely free endpoint costs zero per million, which is a known zero rather than unknown.
+        // The serving figure stays unknown even here: a price of zero matches no measured card, so
+        // the boot fee is not known to subtract, and the report says so instead of assuming the boot
+        // was free too.
+        let free = summarize(&[settled(0, "m", 200.0, 1, Some(0.0), Some(10), Some(2))])
+            .expect("one settled item has a report")
+            .view();
+        assert_eq!(free["usd_per_million_output_tokens"], 0.0);
+        assert!(free["boot_cost_usd"].is_null());
+        assert!(free["serving_usd_per_million_output_tokens"].is_null());
     }
 
     #[test]

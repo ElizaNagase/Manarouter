@@ -280,7 +280,12 @@ cost in dollars with the boot fee on its own line. What the issue asks beyond th
 question — *is this batch too small to be worth a cold start* — and the answer is now reported from
 measured dollars rather than a predicted token count: the usage block carries `boot_share_pct` and
 `cold_start_verdict` (`boot_dominates` above half the bill, `work_dominates` below, `unknown` when
-there is no price to divide). A pre-flight hold would need a throughput figure this build does not
+there is no price to divide). It also carries the figure the issue's own table compares cards on,
+`usd_per_million_output_tokens` (the whole bill, boot included, over the output tokens the provider
+counted) and `serving_usd_per_million_output_tokens` (the same figure with the boot fee removed, which
+is what a card-to-card comparison needs). Both are divisions of two measured numbers and both are
+`null` when either is missing — a batch that produced no output tokens has no denominator, and a price
+of zero matches no measured boot time, so neither figure is invented to fill the gap. A pre-flight hold would need a throughput figure this build does not
 have for any card; inventing one is the guess the module refuses to make.
 
 Still not verified: no batch has been submitted to a real GPU and observed to complete, so every
