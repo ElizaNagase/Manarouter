@@ -1124,6 +1124,9 @@ async fn dispatch_routed(
     let quota = app.relay.quota_config();
     // The model the request should be retried against when no step can carry its modality.
     let mut fallback_target: Option<String> = None;
+    // Why the steps were skipped, so a refusal that tried nothing can name the reason instead of
+    // assuming a cooldown. Bounded by the number of distinct causes.
+    let mut skip_causes: Vec<SkipCause> = Vec::new();
 
     // What this request is filed under, when it is combo activity at all: the combo it resolved to
     // and the name the client actually sent. A direct model is `None`, so the recording helpers
@@ -1297,10 +1300,12 @@ async fn dispatch_routed(
             Attempt::Skip {
                 sticky_cleared,
                 fallback_target: target,
+                cause,
             } => {
                 if sticky_cleared {
                     sticky_index = None;
                 }
+                skip_causes.push(cause);
                 if target.is_some() {
                     fallback_target = target;
                 }
@@ -1423,15 +1428,12 @@ async fn dispatch_routed(
             // The wait is named in the message, not only in `Retry-After`. A header is invisible to
             // whoever reads the error body, and "cooling down" without a duration reads as broken:
             // the operator cannot tell a four-second backoff from a four-day one.
-            let message = match app.health.earliest_reset() {
-                Some(until) if until > now_ms => format!(
-                    "every step for this model has an account cooling down or unavailable; the \
-                     earliest of them recovers in {}",
-                    humanize_wait(until.saturating_sub(now_ms) / 1000)
-                ),
-                _ => "every step for this model has an account cooling down or unavailable"
-                    .to_owned(),
-            };
+            let wait_secs = app
+                .health
+                .earliest_reset()
+                .filter(|until| *until > now_ms)
+                .map(|until| until.saturating_sub(now_ms) / 1000);
+            let message = skipped_steps_message(&skip_causes, wait_secs);
             let mut response = error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 client_dialect,
@@ -1500,6 +1502,71 @@ fn dispatch_routed_boxed(
     Box::pin(dispatch_routed(request, fallback_depth, table))
 }
 
+/// Why one step was skipped, so the terminal refusal can name the real cause.
+///
+/// Before this existed every skipped step was attributed to a cooldown, which is only true for one
+/// of the four reasons a step can be skipped. A request whose provider had disappeared from the
+/// loaded snapshot was told to wait for accounts to recover; a request whose route could not carry
+/// its modality was told the same. Both send an operator to the wrong state, and the second one
+/// hides a route that will never serve that modality no matter how long it waits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkipCause {
+    /// The step's provider index does not resolve in the loaded snapshot.
+    ProviderMissing,
+    /// No account of the step can serve the model right now.
+    NoUsableAccount,
+    /// The step's provider declares it cannot carry the request's input modality.
+    UnsupportedModality,
+    /// The step's base URL and route path do not form an absolute URL.
+    UnbuildableUrl,
+}
+
+impl SkipCause {
+    /// The clause this cause contributes to the terminal refusal, in the operator's terms.
+    fn clause(self) -> &'static str {
+        match self {
+            SkipCause::ProviderMissing => {
+                "the loaded model table no longer holds a provider for this route (reload the snapshot)"
+            }
+            SkipCause::NoUsableAccount => "no account for this model is usable right now",
+            SkipCause::UnsupportedModality => {
+                "the route cannot carry this input modality and has no usable default"
+            }
+            SkipCause::UnbuildableUrl => {
+                "the provider's base URL did not form an absolute URL for this route"
+            }
+        }
+    }
+}
+
+/// The sentence a request gets when every step was skipped, naming each distinct cause once.
+///
+/// `wait_secs` is the earliest known recovery, and is only apposite when an account is actually
+/// cooling down: a missing provider or an unbuildable URL does not recover with time, so appending a
+/// wait to it would promise something the relay cannot know.
+fn skipped_steps_message(causes: &[SkipCause], wait_secs: Option<u64>) -> String {
+    let mut seen: Vec<SkipCause> = Vec::new();
+    for cause in causes {
+        if !seen.contains(cause) {
+            seen.push(*cause);
+        }
+    }
+    if seen.is_empty() {
+        return "every step for this model was skipped".to_owned();
+    }
+    let clauses: Vec<&str> = seen.iter().map(|c| c.clause()).collect();
+    if let Some(secs) = wait_secs.filter(|s| *s > 0) {
+        if seen.contains(&SkipCause::NoUsableAccount) {
+            return format!(
+                "nothing served this model: {}; the earliest account recovery is in {}",
+                clauses.join("; "),
+                humanize_wait(secs)
+            );
+        }
+    }
+    format!("nothing served this model: {}", clauses.join("; "))
+}
+
 /// A stable per-step key for the account round-robin counter.
 ///
 /// The counter is per step rather than per provider so that two steps on one provider do not advance
@@ -1513,6 +1580,8 @@ enum Attempt {
         sticky_cleared: bool,
         /// The configured default to retry against, when the step could not carry the modality.
         fallback_target: Option<String>,
+        /// Why the step was skipped, so the terminal refusal can say it.
+        cause: SkipCause,
     },
     /// The step answered with a success; the response is ready for the client.
     Answer(Response),
@@ -1815,6 +1884,7 @@ async fn attempt_step(
         return Attempt::Skip {
             sticky_cleared,
             fallback_target: fallback_target.take(),
+            cause: SkipCause::ProviderMissing,
         };
     };
 
@@ -1867,6 +1937,7 @@ async fn attempt_step(
         return Attempt::Skip {
             sticky_cleared,
             fallback_target: fallback_target.take(),
+            cause: SkipCause::NoUsableAccount,
         };
     }
 
@@ -2056,6 +2127,7 @@ async fn attempt_step(
             return Attempt::Skip {
                 sticky_cleared,
                 fallback_target: fallback_target.take(),
+                cause: SkipCause::UnsupportedModality,
             };
         }
         Ok(None) => {}
@@ -2098,6 +2170,7 @@ async fn attempt_step(
         return Attempt::Skip {
             sticky_cleared,
             fallback_target: fallback_target.take(),
+            cause: SkipCause::UnbuildableUrl,
         };
     };
 
@@ -2756,6 +2829,7 @@ async fn run_hedge(
             Attempt::Skip {
                 fallback_target: target,
                 sticky_cleared: cleared,
+                cause: _,
             } => {
                 if target.is_some() {
                     fallback_target = target.clone();
@@ -9806,6 +9880,72 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             "a missing credential must not put an account in cooldown: {:?}",
             health.view()
         );
+    }
+
+    /// Every skip cause reaches the operator in its own words, and the wait is not invented.
+    ///
+    /// The regression this pins: all four causes used to produce "every step for this model has an
+    /// account cooling down or unavailable", which is wrong for three of them and sends the
+    /// operator to look at health state that is not the problem.
+    #[test]
+    fn every_skip_cause_is_named_in_the_terminal_refusal() {
+        let cooldown = skipped_steps_message(&[SkipCause::NoUsableAccount], Some(9));
+        assert!(
+            cooldown.contains("no account for this model is usable"),
+            "{cooldown}"
+        );
+        assert!(
+            cooldown.contains("earliest account recovery is in"),
+            "{cooldown}"
+        );
+
+        let stale = skipped_steps_message(&[SkipCause::ProviderMissing], Some(9));
+        assert!(stale.contains("no longer holds a provider"), "{stale}");
+        assert!(stale.contains("reload the snapshot"), "{stale}");
+        assert!(
+            !stale.contains("recovery is in"),
+            "a provider that is not in the snapshot does not recover with time: {stale}"
+        );
+
+        let url = skipped_steps_message(&[SkipCause::UnbuildableUrl], None);
+        assert!(url.contains("absolute URL"), "{url}");
+
+        let modality = skipped_steps_message(&[SkipCause::UnsupportedModality], Some(30));
+        assert!(modality.contains("input modality"), "{modality}");
+        assert!(!modality.contains("recovery is in"), "{modality}");
+    }
+
+    /// Two steps skipped for the same reason read as one reason, not two.
+    #[test]
+    fn repeated_skip_causes_are_stated_once() {
+        let message = skipped_steps_message(
+            &[
+                SkipCause::NoUsableAccount,
+                SkipCause::ProviderMissing,
+                SkipCause::NoUsableAccount,
+            ],
+            None,
+        );
+        assert_eq!(
+            message
+                .matches("no account for this model is usable")
+                .count(),
+            1,
+            "{message}"
+        );
+        assert_eq!(
+            message.matches("no longer holds a provider").count(),
+            1,
+            "{message}"
+        );
+    }
+
+    /// A request with no recorded cause still gets a sentence rather than an empty message.
+    #[test]
+    fn an_empty_cause_list_still_explains_itself() {
+        let message = skipped_steps_message(&[], None);
+        assert!(message.contains("skipped"), "{message}");
+        assert!(!message.is_empty());
     }
 
     /// The message counts both causes, because one step can mix them.
