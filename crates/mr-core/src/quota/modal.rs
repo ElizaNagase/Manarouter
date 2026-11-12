@@ -100,12 +100,14 @@ impl QuotaFetcher for Modal {
                 root.get("currency")
                     .and_then(Value::as_str)
                     .filter(|value| !value.trim().is_empty())
-                    .map(|currency| format!("Modal account spending ({currency})"))
-                    .unwrap_or_else(|| DEFAULT_DISPLAY_NAME.to_owned())
+                    .map_or_else(
+                        || DEFAULT_DISPLAY_NAME.to_owned(),
+                        |currency| format!("Modal account spending ({currency})"),
+                    )
             });
 
-        let total = limit.or_else(|| Some(spend + remaining));
-        let quota = UsageQuota::from_usage(spend, total.unwrap_or(0.0), &reset)
+        let total = limit.unwrap_or(spend + remaining);
+        let quota = UsageQuota::from_usage(spend, total, &reset)
             .with_source(Self::ID)
             .with_display_name(display_name);
         Ok(quota)

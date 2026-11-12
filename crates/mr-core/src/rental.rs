@@ -822,9 +822,8 @@ pub fn plan_launch(
             waves: Vec::new(),
             problems: vec![(
                 "schedule".to_string(),
-                format!(
-                    "batch size of 0 is not valid; a schedule with zero live cards can never deploy anything"
-                ),
+                "batch size of 0 is not valid; a schedule with zero live cards can never deploy anything"
+                    .to_owned(),
             )],
         };
     }

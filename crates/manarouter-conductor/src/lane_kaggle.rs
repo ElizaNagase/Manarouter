@@ -147,6 +147,12 @@ pub struct KaggleState {
     key_file_path: Option<PathBuf>,
 }
 
+impl Default for KaggleState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KaggleState {
     /// Create a new KaggleState with no credential path set.
     pub fn new() -> Self {
@@ -280,7 +286,7 @@ async fn check_kaggle_cli() -> Result<(), KaggleError> {
 /// Callers MUST delete the directory in all exit paths.
 fn create_kaggle_config_dir(
     key_path: Option<&PathBuf>,
-    run_dir: &PathBuf,
+    run_dir: &std::path::Path,
 ) -> Result<PathBuf, KaggleError> {
     let config_dir = run_dir.join(".kaggle");
     fs::create_dir_all(&config_dir)
@@ -520,7 +526,7 @@ async fn run_kaggle(
     // Push the kernel.  KAGGLE_CONFIG_DIR points to our temp dir with the key.
     let mut push_cmd = Command::new("kaggle");
     push_cmd
-        .args(&["kernels", "push", "-p"])
+        .args(["kernels", "push", "-p"])
         .arg(&run_dir)
         .env("KAGGLE_CONFIG_DIR", &kaggle_config_dir);
 
@@ -638,7 +644,7 @@ async fn get_run_status(
     // Poll Kaggle status.
     let mut status_cmd = Command::new("kaggle");
     status_cmd
-        .args(&["kernels", "status", "-s"])
+        .args(["kernels", "status", "-s"])
         .env("KAGGLE_CONFIG_DIR", run_dir.join(".kaggle"));
 
     if let Some(slug) = &run.slug {
@@ -692,9 +698,9 @@ async fn get_run_status(
     if new_state == RunStateEnum::Complete {
         let mut output_cmd = Command::new("kaggle");
         output_cmd
-            .args(&["kernels", "output", "-p"])
+            .args(["kernels", "output", "-p"])
             .arg(run_dir)
-            .arg(&run.slug.clone().unwrap_or_default())
+            .arg(run.slug.clone().unwrap_or_default())
             .env("KAGGLE_CONFIG_DIR", run_dir.join(".kaggle"));
 
         if let Ok(output_out) = output_cmd.output().await {
@@ -762,6 +768,12 @@ async fn list_runs(State(app_state): State<AppState>) -> Json<Value> {
 
 #[cfg(test)]
 mod tests {
+    // The tests below change the process-wide `PATH`, so they serialize on `PATH_LOCK`. That guard
+    // must span the whole test body, await points included; releasing it earlier would let another
+    // test observe the fake `kaggle` binary. `await_holding_lock` is the right lint for production
+    // code and the wrong one here.
+    #![allow(clippy::await_holding_lock)]
+
     use super::*;
     // `oneshot` lives on the `ServiceExt` extension trait; only tests build a router by hand.
     use std::env;
@@ -944,7 +956,7 @@ exit 1
         // Poll the run status
         let req = axum::http::Request::builder()
             .method("GET")
-            .uri(&format!("/api/gpu/lanes/kaggle/run/{}", run_id))
+            .uri(format!("/api/gpu/lanes/kaggle/run/{run_id}"))
             .body(axum::body::Body::empty())
             .unwrap();
 

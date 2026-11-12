@@ -132,12 +132,6 @@ impl SizingConfidence {
     }
 }
 
-impl Default for SizingConfidence {
-    fn default() -> Self {
-        Self::Unavailable
-    }
-}
-
 /// A measurement by the operator that a prediction can be compared against.
 ///
 /// Carried in the request rather than looked up, so that the caller decides which run is the
@@ -954,9 +948,9 @@ mod tests {
         for _ in 0..64 {
             layer_types.push(Value::String("linear_attention".to_string()));
         }
-        for index in 0..64 {
+        for (index, layer) in layer_types.iter_mut().enumerate().take(64) {
             if index % 4 == 3 {
-                layer_types[index] = Value::String("full_attention".to_string());
+                *layer = Value::String("full_attention".to_string());
             }
         }
         json!({
@@ -1059,7 +1053,7 @@ mod tests {
             );
         let rejected = size_deployment(&naive);
         assert_eq!(rejected.kv_bytes_per_token, Some(131_072));
-        assert_eq!(rejected.implied_overhead_bytes.unwrap() < 0, true);
+        assert!(rejected.implied_overhead_bytes.unwrap() < 0);
         assert_eq!(rejected.kv_pool_tokens, None);
         assert_eq!(rejected.confidence, SizingConfidence::Unavailable);
         let reason = rejected.rejection.expect("a refusal");

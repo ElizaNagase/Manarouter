@@ -908,7 +908,7 @@ mod tests {
         // `sizing` imply a negative overhead against the measured pool.
         let geometry = facts.kv_geometry(1, "fp8");
         assert_eq!(geometry.kv_bytes_per_token, Some(131_072));
-        assert_eq!(geometry.kv_bytes_per_token, Some(64 * 8 * 128 * 1 * 2));
+        assert_eq!(geometry.kv_bytes_per_token, Some(64 * 8 * 128 * 2));
         assert!(geometry.warning.is_none());
     }
 
@@ -1320,9 +1320,9 @@ mod tests {
         for _ in 0..64 {
             layer_types.push(Value::String("linear_attention".to_string()));
         }
-        for index in 0..64 {
+        for (index, layer) in layer_types.iter_mut().enumerate().take(64) {
             if index % 4 == 3 {
-                layer_types[index] = Value::String("full_attention".to_string());
+                *layer = Value::String("full_attention".to_string());
             }
         }
         serde_json::json!({
@@ -1392,7 +1392,7 @@ mod tests {
 
         // The naive form — `num_hidden_layers × heads × head_dim × bytes × 2` — spelled out here on
         // purpose, so the falsification lives in the test rather than only in a comment.
-        let naive = 64u64 * 4 * 256 * 1 * 2;
+        let naive = 64u64 * 4 * 256 * 2;
         assert_eq!(naive, 131_072);
         assert_eq!(naive, correct * 4);
     }

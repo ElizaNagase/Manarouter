@@ -205,12 +205,6 @@ impl RequantizePath {
     }
 }
 
-impl Default for RequantizePath {
-    fn default() -> Self {
-        Self::Dense
-    }
-}
-
 /// The card the gate stopped on, and why.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FailedOn {
@@ -751,8 +745,7 @@ pub fn is_known_quantization_flag(value: &str) -> bool {
     if value.is_empty() {
         return false;
     }
-    probe_order().iter().any(|known| *known == value)
-        || catalog::quant_method_by_id(value).is_some()
+    probe_order().contains(&value) || catalog::quant_method_by_id(value).is_some()
 }
 
 /// Host RAM the recipe needs: the checkpoint's weights at two bytes each, scaled by the documented
@@ -917,9 +910,7 @@ mod tests {
             .any(|command| command.starts_with("pip install \"llm-compressor==0.15.0\"")));
         let python_file = format!("write requantize.py (see {RECIPES_URL} §2.2)");
         assert!(commands.iter().any(|command| *command == python_file));
-        assert!(commands
-            .iter()
-            .any(|command| *command == "python requantize.py"));
+        assert!(commands.contains(&"python requantize.py"));
         assert!(
             !commands
                 .iter()

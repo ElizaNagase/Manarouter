@@ -1101,7 +1101,7 @@ mod tests {
         let result = TcpStream::connect(addr).await;
         assert!(result.is_err(), "connection should fail to a closed port");
         let err = result.unwrap_err();
-        let health = classify_probe(None, Some(&Error::Io(err.into())), false);
+        let health = classify_probe(None, Some(&Error::Io(err)), false);
         assert_eq!(health, ProbeHealth::HostUnreachable);
     }
 
@@ -1346,11 +1346,11 @@ mod tests {
         spent.account = "spent".to_owned();
         spent.used_secs = Some(BUDGET_SECONDS_PER_MONTH);
 
-        let registrations = vec![spent.clone(), healthy.clone()];
+        let registrations = [spent.clone(), healthy.clone()];
         let chosen = pick_best(registrations.iter()).expect("one is picked");
         assert_eq!(chosen.account, healthy.account);
 
-        let reversed = vec![healthy, spent];
+        let reversed = [healthy, spent];
         let chosen = pick_best(reversed.iter()).expect("one is picked");
         assert_eq!(chosen.account, "primary");
     }

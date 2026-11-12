@@ -1136,9 +1136,7 @@ impl BatchLane {
 
     /// `DELETE /v1/files/{id}`.
     async fn delete_file(&self, id: &str) -> Option<Result<Value, Refusal>> {
-        let Some(mut meta) = self.file(id) else {
-            return None;
-        };
+        let mut meta = self.file(id)?;
         meta.deleted = true;
         // The bytes stay on disk: a batch that references this file may still be resumed after a
         // crash, and re-reading the input file is how a resume knows what the items were.
@@ -1292,9 +1290,7 @@ impl BatchLane {
     /// Cancellation stops the queue, not the wire: an item already dispatched is allowed to finish and
     /// is kept, because it was paid for. What is *not* run is everything still queued.
     async fn cancel(&self, id: &str) -> Option<Result<Value, Refusal>> {
-        let Some(job) = lock(&self.jobs).get(id).cloned() else {
-            return None;
-        };
+        let job = lock(&self.jobs).get(id).cloned()?;
         if lock(&job.meta).status.is_terminal() {
             let status = lock(&job.meta).status.as_str().to_owned();
             return Some(Err(Refusal::bad_request(
@@ -3241,7 +3237,6 @@ mod tests {
         // the two figures differ and why the batch report is the one to reconcile against.
         let totals = store
             .gpu_usage_totals(Millis::now().plus_secs(-60), Millis::now().plus_secs(60))
-            .ok()
             .expect("the ledger is readable");
         assert_eq!(totals.requests, 4);
     }
