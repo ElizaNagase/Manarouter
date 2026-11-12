@@ -27,6 +27,7 @@
 //! A failed attach (e.g. the tunnel does not establish) manifests as `host_unreachable` and the
 //! operator must re-attach with correct credentials.
 
+use async_trait::async_trait;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -34,7 +35,6 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use async_trait::async_trait;
 use mr_core::error::{Error, Result as CoreResult};
 use mr_core::ids::Millis;
 use mr_core::quota::http::{HyperQuotaHttp, QuotaHttp, QuotaRequest, QuotaResponse};
@@ -182,7 +182,11 @@ struct SaturnStateInner {
     /// Registrations keyed by account label.
     pub registrations: HashMap<String, SaturnRegistration>,
     /// Seconds of compute consumed this month, across all Saturn accounts.
-    pub used_secs: u64,
+    ///
+    /// `None` means the operator has not told this process how much of the 150-hour allowance is
+    /// gone. Reporting `0` there would be a claim we cannot support, and the difference matters:
+    /// `0` says "a full month remains", which is how a lane quietly overspends its cap.
+    pub used_secs: Option<u64>,
 }
 
 /// Global state for the Saturn lane: registrations, tunnel handles, budget ledger.
@@ -208,13 +212,15 @@ impl SaturnState {
     /// Whether the monthly budget is fully consumed.
     pub async fn is_quota_exhausted(&self) -> bool {
         let inner = self.lock().await;
-        inner.used_secs >= BUDGET_SECONDS_PER_MONTH
+        check_budget(inner.used_secs)
     }
 
-    /// Seconds remaining before the budget cap.
-    pub async fn seconds_remaining(&self) -> u64 {
+    /// Seconds remaining before the budget cap, or `None` when usage was never recorded.
+    pub async fn seconds_remaining(&self) -> Option<u64> {
         let inner = self.lock().await;
-        BUDGET_SECONDS_PER_MONTH.saturating_sub(inner.used_secs)
+        inner
+            .used_secs
+            .map(|used| BUDGET_SECONDS_PER_MONTH.saturating_sub(used))
     }
 }
 
@@ -294,8 +300,10 @@ pub fn classify_probe(
 }
 
 /// Check whether the Saturn lane's monthly budget is exhausted.
-pub fn check_budget(used_secs: u64) -> bool {
-    used_secs >= BUDGET_SECONDS_PER_MONTH
+pub fn check_budget(used_secs: Option<u64>) -> bool {
+    used_secs
+        .map(|used| used >= BUDGET_SECONDS_PER_MONTH)
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -320,7 +328,11 @@ impl SaturnHttp {
     pub async fn probe(&self, url: &str, token: &str) -> CoreResult<QuotaResponse> {
         let endpoint = format!("{}/v1/models", url.trim_end_matches('/'));
         self.inner
-            .request(QuotaRequest::get(endpoint).bearer(token).timeout(Duration::from_secs(10)))
+            .request(
+                QuotaRequest::get(endpoint)
+                    .bearer(token)
+                    .timeout(Duration::from_secs(10)),
+            )
             .await
     }
 }
@@ -340,7 +352,9 @@ impl QuotaHttp for SharedSaturnHttp {
     fn request<'life0, 'async_trait>(
         &'life0 self,
         request: QuotaRequest,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CoreResult<QuotaResponse>> + Send + 'async_trait>>
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = CoreResult<QuotaResponse>> + Send + 'async_trait>,
+    >
     where
         'life0: 'async_trait,
         Self: 'async_trait,
@@ -436,23 +450,19 @@ pub async fn attach_for(
                 ProbeHealth::Healthy => None,
                 _ => Some(format!("probe failed: {:?}", health)),
             },
-            failure_count: if health == ProbeHealth::Healthy {
-                0
-            } else {
-                1
-            },
+            failure_count: if health == ProbeHealth::Healthy { 0 } else { 1 },
             used_secs: None,
         },
     );
-    info!(
-        "saturn lane attached: account={} host={}",
-        account, host
-    );
+    info!("saturn lane attached: account={} host={}", account, host);
 
-    (StatusCode::OK, Json(json!({
-        "status": "ok",
-        "account": account,
-    })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "ok",
+            "account": account,
+        })),
+    )
 }
 
 /// Probe a previously-attached account and update its health.
@@ -463,10 +473,7 @@ pub async fn attach_for(
 /// 3. Probe the endpoint.
 /// 4. Update health based on the result.
 /// 5. If 3 consecutive failures, deregister the account.
-pub async fn probe_for(
-    state: &SaturnState,
-    account: String,
-) -> (StatusCode, Json<Value>) {
+pub async fn probe_for(state: &SaturnState, account: String) -> (StatusCode, Json<Value>) {
     let mut inner = state.inner.lock().await;
 
     let reg = match inner.registrations.get(&account) {
@@ -484,8 +491,10 @@ pub async fn probe_for(
         }
     };
 
-    // Budget check.
-    if inner.used_secs >= BUDGET_SECONDS_PER_MONTH {
+    // Budget check. An unrecorded ledger (`None`) is not exhausted — it is unknown, and a probe is
+    // how you find out whether the endpoint answers at all.
+    let budget_exhausted = check_budget(inner.used_secs);
+    if budget_exhausted {
         return (
             StatusCode::PAYMENT_REQUIRED,
             Json(json!({
@@ -500,10 +509,10 @@ pub async fn probe_for(
     let key = account.clone();
     let health = match SaturnHttp::new() {
         Ok(http) => match http.probe(&reg.host, &reg.token).await {
-            Ok(resp) => classify_probe(Some(resp.status), None, inner.used_secs >= BUDGET_SECONDS_PER_MONTH),
-            Err(e) => classify_probe(None, Some(&e), inner.used_secs >= BUDGET_SECONDS_PER_MONTH),
+            Ok(resp) => classify_probe(Some(resp.status), None, budget_exhausted),
+            Err(e) => classify_probe(None, Some(&e), budget_exhausted),
         },
-        Err(e) => classify_probe(None, Some(&e), inner.used_secs >= BUDGET_SECONDS_PER_MONTH),
+        Err(e) => classify_probe(None, Some(&e), budget_exhausted),
     };
 
     let now = Millis::now();
@@ -560,10 +569,7 @@ pub async fn probe_for(
 }
 
 /// Deregister an account and stop its tunnel.
-pub async fn down_for(
-    state: &SaturnState,
-    account: String,
-) -> (StatusCode, Json<Value>) {
+pub async fn down_for(state: &SaturnState, account: String) -> (StatusCode, Json<Value>) {
     let mut inner = state.inner.lock().await;
 
     if inner.registrations.contains_key(&account) {
@@ -631,9 +637,12 @@ pub async fn status_for(state: &SaturnState) -> Json<Value> {
         "total_accounts": s.registrations.len(),
         "budget": {
             "used_secs": s.used_secs,
-            "remaining_secs": BUDGET_SECONDS_PER_MONTH.saturating_sub(s.used_secs),
+            // `null` rather than a number when nothing was recorded: the honest answer to "how much
+            // is left" is "nobody wrote it down", and a fabricated full allowance reads as headroom.
+            "remaining_secs": s.used_secs.map(|used| BUDGET_SECONDS_PER_MONTH.saturating_sub(used)),
             "total_secs": BUDGET_SECONDS_PER_MONTH,
-            "cap_exceeded": s.used_secs >= BUDGET_SECONDS_PER_MONTH,
+            "measured": s.used_secs.is_some(),
+            "cap_exceeded": check_budget(s.used_secs),
         },
         "plan": {
             "usable": plan.usable,
@@ -651,10 +660,48 @@ pub async fn status_for(state: &SaturnState) -> Json<Value> {
 /// The routes this module owns.
 ///
 /// Mounted under `/api/gpu/lanes/saturn/` by the conductor's serve layer.
+/// The budget block a status or a recording answers with, so both say the same thing.
+fn budget_value(used_secs: Option<u64>) -> Value {
+    json!({
+        "used_secs": used_secs,
+        "remaining_secs": used_secs.map(|used| BUDGET_SECONDS_PER_MONTH.saturating_sub(used)),
+        "total_secs": BUDGET_SECONDS_PER_MONTH,
+        "measured": used_secs.is_some(),
+        "cap_exceeded": check_budget(used_secs),
+    })
+}
+
+/// Record how much of the 150-hour free allowance is gone.
+///
+/// Saturn has no endpoint this router can read remaining hours from, so the number comes from the
+/// operator. This is the only write path for the ledger: without it `used_secs` would always be
+/// `None` and the cap would never trip.
+pub async fn record_budget_for(
+    state: &SaturnState,
+    used_secs: Option<u64>,
+) -> (StatusCode, Json<Value>) {
+    let mut inner = state.lock().await;
+    inner.used_secs = used_secs;
+    let exhausted = check_budget(used_secs);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "lane": "saturn",
+            "budget": budget_value(used_secs),
+            "note": match (used_secs, exhausted) {
+                (None, _) => "Cleared the usage record; the status reports an unmeasured budget again.",
+                (Some(_), true) => "Recorded as fully consumed; probes answer 402 until the record is cleared.",
+                (Some(_), false) => "Recorded the operator-reported usage for this month.",
+            },
+        })),
+    )
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/gpu/lanes/saturn/status", get(get_status))
         .route("/api/gpu/lanes/saturn/attach", post(attach_lane))
+        .route("/api/gpu/lanes/saturn/budget", post(record_budget))
         .route("/api/gpu/lanes/saturn/down", post(down_lane))
         .route("/api/gpu/lanes/saturn/probe", post(probe_lane))
 }
@@ -688,6 +735,13 @@ async fn probe_lane(
     probe_for(&app.saturn, payload.account).await
 }
 
+async fn record_budget(
+    State(app): State<AppState>,
+    Json(payload): Json<BudgetRequest>,
+) -> impl IntoResponse {
+    record_budget_for(&app.saturn, payload.used_secs).await
+}
+
 // ---------------------------------------------------------------------------
 // Request bodies
 // ---------------------------------------------------------------------------
@@ -710,6 +764,15 @@ pub struct DownRequest {
 #[derive(Debug, Deserialize)]
 pub struct ProbeRequest {
     pub account: String,
+}
+
+/// `POST /api/gpu/lanes/saturn/budget` body.
+///
+/// `{"used_secs": 43200}` records the month's consumption; `{"used_secs": null}` clears the record,
+/// so the status stops implying a full allowance it cannot prove.
+#[derive(Debug, Deserialize)]
+pub struct BudgetRequest {
+    pub used_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -742,7 +805,13 @@ mod tests {
         token: &str,
         account: &str,
     ) -> (AxumStatusCode, Value) {
-        let (status, json) = attach_for(&state, account.to_owned(), host.to_owned(), token.to_owned()).await;
+        let (status, json) = attach_for(
+            &state,
+            account.to_owned(),
+            host.to_owned(),
+            token.to_owned(),
+        )
+        .await;
         (status, json.0)
     }
 
@@ -834,7 +903,10 @@ mod tests {
         assert!(reg.is_some(), "account should be registered");
         let reg = reg.unwrap();
         assert_eq!(reg.host, format!("http://127.0.0.1:{port}"));
-        assert!(reg.is_warm(), "account should be warm after successful attach");
+        assert!(
+            reg.is_warm(),
+            "account should be warm after successful attach"
+        );
     }
 
     /// Test 2: attach rejects an empty host or token with a 400.
@@ -970,7 +1042,7 @@ mod tests {
         {
             let mut inner = state.inner.lock().await;
             // Set budget to the exact cap.
-            inner.used_secs = BUDGET_SECONDS_PER_MONTH;
+            inner.used_secs = Some(BUDGET_SECONDS_PER_MONTH);
         }
 
         // Attach should be refused.
@@ -983,7 +1055,10 @@ mod tests {
         .await;
         assert_eq!(status, AxumStatusCode::PAYMENT_REQUIRED);
         assert!(
-            body["error"]["code"].as_str().unwrap().contains("quota_exhausted"),
+            body["error"]["code"]
+                .as_str()
+                .unwrap()
+                .contains("quota_exhausted"),
             "expected quota_exhausted, got {:?}",
             body["error"]["code"]
         );
@@ -1018,7 +1093,13 @@ mod tests {
         let (_, body) = call_status(state).await;
 
         // No accounts registered — budget shows 0 used, null per-account usage.
-        assert_eq!(body["budget"]["used_secs"], 0);
+        assert!(
+            body["budget"]["used_secs"].is_null(),
+            "an unrecorded ledger must render as null, not 0: {}",
+            body["budget"]
+        );
+        assert!(body["budget"]["remaining_secs"].is_null());
+        assert_eq!(body["budget"]["measured"], false);
         assert!(
             !body["accounts"].is_array() || body["accounts"].as_array().unwrap().is_empty(),
             "accounts should be empty or null"
@@ -1064,13 +1145,22 @@ mod tests {
         }
 
         let s = state.inner.lock().await;
-        let _healthy = s.registrations.values().find(|r| r.account == "healthy").unwrap();
-        let _failing = s.registrations.values().find(|r| r.account == "failing").unwrap();
+        let _healthy = s
+            .registrations
+            .values()
+            .find(|r| r.account == "healthy")
+            .unwrap();
+        let _failing = s
+            .registrations
+            .values()
+            .find(|r| r.account == "failing")
+            .unwrap();
 
         // pick_best should choose the healthy account.
         let best = pick_best(s.registrations.values());
         assert_eq!(
-            best.unwrap().account, "healthy",
+            best.unwrap().account,
+            "healthy",
             "pick_best should prefer a healthy account"
         );
 
@@ -1126,7 +1216,10 @@ mod tests {
         );
 
         let inner = state.inner.lock().await;
-        let registration = inner.registrations.get("primary").expect("still registered");
+        let registration = inner
+            .registrations
+            .get("primary")
+            .expect("still registered");
         assert_eq!(registration.failure_count, 1);
         assert_eq!(
             registration.last_probe_error.as_deref(),
@@ -1152,7 +1245,11 @@ mod tests {
 
         for expected in 1..=2u32 {
             let (status, body) = probe_for(&state, "primary".to_owned()).await;
-            assert_eq!(status, axum::http::StatusCode::OK, "probe {expected} still answers");
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "probe {expected} still answers"
+            );
             // The class of failure is the server's business; the lane's contract is that a failed
             // probe counts and three consecutive ones deregister.
             assert_ne!(body.0["health"], "healthy");
@@ -1186,5 +1283,33 @@ mod tests {
         let reversed = vec![healthy, spent];
         let chosen = pick_best(reversed.iter()).expect("one is picked");
         assert_eq!(chosen.account, "primary");
+    }
+
+    /// Recording the month's usage turns an unmeasured ledger into a spent one, and a spent budget
+    /// answers 402 before any network call — the cap must not depend on the endpoint being reachable.
+    #[tokio::test]
+    async fn recording_usage_exhausts_the_budget_and_probe_refuses() {
+        let state = fresh_state();
+
+        let (status, body) = record_budget_for(&state, Some(BUDGET_SECONDS_PER_MONTH)).await;
+        assert_eq!(status, AxumStatusCode::OK);
+        assert_eq!(body.0["budget"]["cap_exceeded"], true);
+        assert_eq!(body.0["budget"]["remaining_secs"], 0);
+        assert_eq!(body.0["budget"]["measured"], true);
+
+        state.inner.lock().await.registrations.insert(
+            "primary".to_owned(),
+            registration_against("127.0.0.1:1".parse().unwrap()),
+        );
+        let (status, body) = probe_for(&state, "primary".to_owned()).await;
+        assert_eq!(status, AxumStatusCode::PAYMENT_REQUIRED);
+        assert_eq!(body.0["error"]["code"], "quota_exhausted");
+
+        let (status, body) = record_budget_for(&state, None).await;
+        assert_eq!(status, AxumStatusCode::OK);
+        assert_eq!(body.0["budget"]["measured"], false);
+        assert!(body.0["budget"]["remaining_secs"].is_null());
+        assert!(!state.is_quota_exhausted().await);
+        assert_eq!(state.seconds_remaining().await, None);
     }
 }
