@@ -329,9 +329,15 @@ own doc comments.
 
 ## 9. Testing a lane without a platform account
 
-- The lane modules carry their own tests (11 Kaggle, 6 molab, 13 Saturn, 18 Cerebrium) which build a
-  router from `AppState::for_test` and drive it with `tower::ServiceExt::oneshot`. None of them
-  needs a network.
+- The lane modules carry their own tests (11 Kaggle, 8 molab, 13 Saturn, 19 Cerebrium, 6 for the
+  vault round trip) which build a router from `AppState::for_test` and drive it with
+  `tower::ServiceExt::oneshot`. None of them needs a network.
+- Which of those have met a real platform: Saturn's attach and its vault restore were driven through
+  the panel and a second conductor against a fake endpoint (attach → restart unprobed → probe → down
+  → restart gone), and molab's attach has been exercised the same way. Cerebrium's attach and restore
+  are unit-tested and compile-checked only — this host holds no Cerebrium credential, so the first
+  real attach is still the test. It is written to the same shape as the other two, but "written" is
+  not "proven".
 - HTTP lanes take an injected `QuotaHttp`, so a `FakeHttp` answers with a canned status and body and
   a `DeadHttp` simulates a refused connection. That is how `host_unreachable` and
   `credential_rejected` are tested without a socket.
