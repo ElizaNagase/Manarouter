@@ -1,6 +1,6 @@
 # 24 — Provider dialects
 
-A **dialect** is the shape of HTTP API an upstream speaks. This document says what each of the seven
+A **dialect** is the shape of HTTP API an upstream speaks. This document says what each of the nine
 is on the wire, which client routes can reach it, what the relay rewrites on the way in and on the
 way back, and where the edges are. It is one level above the per-provider guides in
 [providers/](providers/README.md): those describe a *vendor*, this describes a *protocol*.
@@ -17,25 +17,26 @@ upstream's, and two providers that share a dialect share every code path
 The set is closed and small — seven members (`dialect.rs:17-45`, and `Dialect::ALL` at
 `dialect.rs:137-145`):
 
-| `Dialect` | Canonical id (`Dialect::as_str`, `dialect.rs:78-88`) | Serde id (what a `config.json` or `catalog/providers.toml` entry carries) | Templates in `catalog/providers.toml` |
+| `Dialect` | Canonical id (`Dialect::as_str`, `dialect.rs:94-104`) | Serde id (what a `config.json` or `catalog/providers.toml` entry carries) | Templates in `catalog/providers.toml` |
 |---|---|---|---|
-| `OpenAi` | `openai` | `open-ai` | 49 |
-| `Anthropic` | `anthropic` | `anthropic` | 1 |
+| `OpenAi` | `openai` | `open-ai` | 195 |
+| `Anthropic` | `anthropic` | `anthropic` | 6 |
 | `Google` | `google` | `google` | 0 |
 | `GoogleAiStudio` | `google-ai-studio` | `google-ai-studio` | 1 |
 | `Codex` | `codex` | `codex` | 1 |
 | `Copilot` | `copilot` | `copilot` | 1 |
 | `Antigravity` | `antigravity` | `antigravity` | 1 |
 | `CommandCodeGo` | `command-code-go` | `command-code-go` | 1 |
+| `ModalVllm` | `modal-vllm` | `modal-vllm` | 0 |
 
 Two spellings exist for a reason, and they differ for one member. `as_str` is the permissive,
 human-facing id; `serde`'s `kebab-case` rename is the strict wire form, and the two differ exactly
-once — serde produces `open-ai` where `as_str` returns `openai` (`dialect.rs:69-77`). `GoogleAiStudio`
+once — serde produces `open-ai` where `as_str` returns `openai` (`dialect.rs:94-104`). `GoogleAiStudio`
 is the case where the two agree, and it is also why the dialect exists: `google` names the envelope
 shape, `google-ai-studio` names the public API whose thinking rules differ. The panel's list is
 pinned to the serde form by a cross-language test so the stricter of the two cannot be forgotten.
 
-`Dialect::parse` (`dialect.rs:97-111`) is the permissive parser used for hand-written config and for
+`Dialect::parse` (`dialect.rs:122-160`) is the permissive parser used for hand-written config and for
 migrated OmniRoute data: `openai`, `openai-compatible`, `oa` and `compatible` all mean `OpenAi`;
 `claude` and `messages` mean `Anthropic`; `gemini`, `google-ai-studio`, `googleaistudio`,
 `ai-studio` and `aistudio` mean `GoogleAiStudio`, while `google` and `generativelanguage` mean the
@@ -182,6 +183,20 @@ it unconditionally (`crates/mr-dialects/src/responses.rs:71-76`) and Command Cod
 (`crates/mr-dialects/src/commandcode.rs:80-83`); Antigravity sets it from the *request's* stream
 intent and chooses `v1internal:streamGenerateContent?alt=sse` or `v1internal:generateContent` to
 match (`crates/mr-dialects/src/google.rs:67-93`).
+
+---
+
+## `modal-vllm` — Modal-hosted vLLM
+
+**On the wire.** A single-tenant vLLM server hosted on Modal, exposed through the OpenAI-compatible `POST /v1/chat/completions` endpoint. Unlike the generic `open-ai` dialect, this dialect is chat-only; its default path is `/v1/chat/completions` and it does not use `/v1/models` for request routing.
+
+**Authentication.** Store the Modal Proxy Token ID and Token Secret together as the account secret, exactly `TOKEN_ID.TOKEN_SECRET`. The relay splits the value and sends `Modal-Key` and `Modal-Secret` headers; do not put either value in the URL or static provider headers. This is distinct from Modal's hosted model API. See [Modal-hosted vLLM](providers/modal-vllm.md#auth-modal-proxy-tokens).
+
+**Capacity and accounting.** Provider settings can bound per-request context (`max_context`), aggregate in-flight prompt-token reservations (`kv_pool_tokens`), and concurrent requests (`max_concurrent`). Model-level `context_length` takes precedence over the provider-level `max_context`; that override also defines the admission limit, independently of `/v1/models`. Reservations use a coarse request-body-size token estimate, are local to the relay process and keyed by provider/model, and remain held through response-body completion or drop. Requests that exceed context/pool capacity or concurrency are refused locally before dispatch. `price_per_second` records estimated GPU seconds as request wall-clock duration for successfully completed response bodies; multiply by the configured USD-per-second rate. It is not Modal's actual billable container lifetime and excludes idle/startup time outside the request.
+
+**Cold start.** Modal scale-to-zero may return HTTP 503. For this dialect a 503 is classified as `cold-start`, enters the bounded exponential cooldown (honoring `Retry-After`), and lets a combo continue to a later hosted step rather than looping immediately against the same endpoint. `cold_start_ttfb_timeout_ms` configures the first-byte window for cold starts and long prefill; set it to suit startup latency (for example, 300000 ms). A timeout setting also permits a longer connection/total window, but cannot turn a provider-returned 503 into a successful response.
+
+**Read next.** [Modal-hosted vLLM](providers/modal-vllm.md) for setup and operator validation.
 
 ---
 

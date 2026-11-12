@@ -94,7 +94,7 @@ magic[8] | version u32 | digest u64 | payload_len u32 | checksum u64 | payload[.
 | Field | Offset | Type | Protects against |
 |---|---|---|---|
 | `magic` | 0 | 8 bytes | Being handed an unrelated file. The constant is `SNAPSHOT_MAGIC = *b"MROUTES1"` in `mr-core/src/lib.rs`. A mismatch is reported as *"this is not a compiled routing snapshot"*, before any structure is built. |
-| `version` | 8 | `u32` LE | Loading a layout this binary cannot interpret. `SNAPSHOT_VERSION = 7`. A mismatch is refused, not guessed at. |
+| `version` | 8 | `u32` LE | Loading a layout this binary cannot interpret. `SNAPSHOT_VERSION = 8`. A mismatch is refused, not guessed at. |
 | `digest` | 12 | `u64` LE | Being unable to tell "the file changed" from "the bytes changed" without comparing whole snapshots. Copied from `Config::routing_digest()`. |
 | `payload_len` | 20 | `u32` LE | A truncated or padded file. Checked against the actual byte count in both directions: fewer bytes is a precise "truncated" error, more bytes is a "trailing bytes" error. |
 | `checksum` | 24 | `u64` LE | A single flipped byte anywhere meaningful. |
@@ -413,7 +413,7 @@ yet, not a routing decision — a `Default` snapshot resolves everything to `Not
 
 ## 10. Version and compatibility
 
-`SNAPSHOT_MAGIC` is `*b"MROUTES1"` and `SNAPSHOT_VERSION` is `7`, both in
+`SNAPSHOT_MAGIC` is `*b"MROUTES1"` and `SNAPSHOT_VERSION` is `8`, both in
 `crates/mr-core/src/lib.rs`.
 
 The version history is worth recording, because it has moved repeatedly. Version 3 added the
@@ -424,9 +424,12 @@ feature: a step's level metadata is now actually encoded, and every lookup entry
 resolves to (`level` plus the `requested` it is compared against). Version 5 added compiled
 client-key limits and proxy assignments/settings, version 6 added modality fallback defaults, and
 version 7 added the provider's cooldown scope byte — the scope governs which key the relay records a
-refusal under, so a frame that omits it would silently reintroduce account-wide cooldowns. A
-version-2 through version-6 snapshot is therefore refused rather than read as though it carried
-fields it does not.
+refusal under, so a frame that omits it would silently reintroduce account-wide cooldowns. Version 8
+added the five self-hosted capacity and billing fields on a provider plan — `kv_pool_tokens`,
+`max_context`, `max_concurrent`, `price_per_second` and `cold_start_ttfb_timeout_ms` — which is what
+lets a rented GPU endpoint be admission-controlled and billed from the relay without a second config
+read. A version-2 through version-7 snapshot is therefore refused rather than read as though it
+carried fields it does not.
 
 The rule is absolute: **a change to the compiled layout requires a `SNAPSHOT_VERSION` bump.** The
 version is not a semver hint; the decoder has no compatibility paths, and a table written under a

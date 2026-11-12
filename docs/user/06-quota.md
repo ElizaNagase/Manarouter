@@ -16,7 +16,10 @@ allowance to read. These are the readers in this build:
 | Reader | Recognised by |
 |---|---|
 | Antigravity, Claude, Codex, Command Code, Cursor, DeepSeek, GitHub, GLM, Grok, Kimi, MiniMax, Moonshot, OpenRouter, Qwen | the provider id, or the host its base URL points at |
+| Modal | provider id `modal` and account-specific `modalQuotaEndpoint` metadata |
 | OpenCode Go | the provider id `opencode-go` only — `/usage` exists on the Go host and 404s on the others |
+
+Modal has no assumed vendor endpoint: configure `modalQuotaEndpoint` in that account's provider-specific metadata. It accepts an HTTPS URL string or an object such as `{ "url": "https://your-controlled-endpoint.example/modal-quota", "auth": "bearer" }`; `auth` may be `bearer` (default), `x-api-key`, or `none`. The endpoint returns JSON with numeric non-negative `spend` and `remaining` at the root or under `data`; optional `limit` (or `total`) supplies the window total, otherwise it is derived as `spend + remaining`. Optional `currency`, `display_name`, and `reset_at` (or `resetAt`) are carried into the quota snapshot. This is an operator-owned endpoint contract, not a claimed Modal API shape. Store any credential only in the account's normal secret field; never embed it in the URL or metadata.
 
 Everything else falls to the generic OpenAI-compatible reader, which reports nothing unless the
 account declares a `quotaEndpoint`. An account with no reader and no declaration is left off the

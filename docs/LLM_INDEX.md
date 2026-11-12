@@ -68,7 +68,7 @@ measured baseline of an existing Javascript router on the development machine �
 | Add an OAuth platform | `docs/14-oauth-adding-a-platform.md`, `docs/omniroute-reference.md` |
 | Touch credentials or secrets | `docs/21-security.md` — read before writing any code |
 | Change the configuration schema | `docs/03-configuration.md` §1 first — unknown-key preservation is mandatory |
-| Change the snapshot format | `docs/04-routing-snapshot.md` — a format change requires a version bump; the current version is **6** |
+| Change the snapshot format | `docs/04-routing-snapshot.md` — a format change requires a version bump; the current version is **8** |
 | Change model naming, reasoning levels, or `/v1/models` | `docs/18-api-reference.md` §"Model addressing", `docs/04-routing-snapshot.md` §5-§7, `crates/mr-core/src/snapshot.rs` (`compile`, `explain_miss`) |
 | Work on the panel | `docs/15-web-panel.md`, `docs/01-architecture.md` §5 |
 | Migrate from OmniRoute | `docs/17-migrating-from-omniroute.md` |
@@ -213,7 +213,7 @@ accepted in configuration and returned by the API. Anything not listed is a vali
 
 ### `Dialect` — how a provider speaks
 `open-ai` · `anthropic` · `google` · `google-ai-studio` · `codex` · `copilot` · `antigravity` ·
-`command-code-go`
+`command-code-go` · `modal-vllm`
 
 `google` and `google-ai-studio` are the same request and response body on two different surfaces:
 the Cloud Code envelope and the public API. The public API rejects the `thinkingLevel` +
@@ -436,7 +436,7 @@ trigger.
     { "path": "docs/01-architecture.md", "purpose": "Why there are two processes, what the compiled snapshot is, and the full request path", "read_when": "changing anything structural" },
     { "path": "docs/02-quickstart.md", "purpose": "A working configuration in five minutes", "read_when": "installing or writing a test harness" },
     { "path": "docs/03-configuration.md", "purpose": "The complete config.json schema, plus why unknown keys are preserved", "read_when": "changing any config field" },
-    { "path": "docs/04-routing-snapshot.md", "purpose": "The compiled binary table: layout (format version 7), level-aware compilation, index precedence, versioning, hot swap", "read_when": "changing the snapshot format or the relay's lookup" },
+    { "path": "docs/04-routing-snapshot.md", "purpose": "The compiled binary table: layout (format version 8), level-aware compilation, index precedence, versioning, hot swap", "read_when": "changing the snapshot format or the relay's lookup" },
     { "path": "docs/05-key-selection.md", "purpose": "priority, round-robin, random and least-used, and how dead accounts are skipped", "read_when": "touching account selection" },
     { "path": "docs/06-combos.md", "purpose": "The combo reference and worked examples", "read_when": "changing combo semantics" },
     { "path": "docs/07-hedged-race.md", "purpose": "The eligibility gate, the four on-failure modes, midstream policy, session affinity", "read_when": "touching the race — read it all" },
@@ -457,7 +457,7 @@ trigger.
     { "path": "docs/21-security.md", "purpose": "Threat model, the vault, cookie prohibition, ToS posture", "read_when": "before writing credential code" },
     { "path": "docs/22-sync-design.md", "purpose": "The intended cross-instance sync design; v1 implements nothing", "read_when": "touching ids, revisions or tombstones" },
     { "path": "docs/23-implementation-status.md", "purpose": "What actually runs today, with the command that checks each claim", "read_when": "before claiming a feature is implemented" },
-    { "path": "docs/24-provider-dialects.md", "purpose": "The seven wire dialects: what each upstream speaks, which client routes reach it, and what the relay translates", "read_when": "adding a dialect or tracing a translation" },
+    { "path": "docs/24-provider-dialects.md", "purpose": "The nine wire dialects: what each upstream speaks, which client routes reach it, and what the relay translates", "read_when": "adding a dialect or tracing a translation" },
     { "path": "docs/combo-cookbook.md", "purpose": "Copy-pasteable combo configurations for common goals", "read_when": "building a combo" },
     { "path": "docs/credits.md", "purpose": "Attribution for the quota fetchers derived from OmniRoute", "read_when": "checking licensing or provenance" },
     { "path": "docs/providers/README.md", "purpose": "How the provider catalogue works and how to add an entry", "read_when": "adding a provider" },
@@ -482,7 +482,14 @@ trigger.
     { "path": "docs/user/09-pricing.md", "purpose": "What a request costs upstream and how the relay counts it", "read_when": "estimating cost" },
     { "path": "docs/user/10-troubleshooting.md", "purpose": "The failures an operator hits most, and what causes each", "read_when": "something is failing for a user" },
     { "path": "docs/user/11-security.md", "purpose": "The vault, the panel's access controls, and what must not be exposed", "read_when": "reviewing a deployment" },
-    { "path": "docs/user/12-cli-reference.md", "purpose": "Every mr command with its flags", "read_when": "looking up a command" }
+    { "path": "docs/user/12-cli-reference.md", "purpose": "Every mr command with its flags", "read_when": "looking up a command" },
+    { "path": "docs/25-gpu-rentals.md", "purpose": "Renting a GPU for a self-hosted model: the two lanes, KV capacity sizing, and what Manarouter will not do for you", "read_when": "planning self-hosted GPU capacity" },
+    { "path": "docs/providers/modal-vllm.md", "purpose": "The Modal vLLM provider: proxy-token auth, capacity settings and lifecycle fields", "read_when": "configuring a rented Modal endpoint" },
+    { "path": "docs/research/ARCHITECTURE-gpu-rentals.md", "purpose": "The frozen interface spec for GPU rentals: config schema, conductor API, two catalogs, and the sizing rules", "read_when": "implementing or reviewing the GPU-rental feature" },
+    { "path": "docs/research/vllm-sizing-and-quant.md", "purpose": "vLLM's exact KV formula, its quoting-layer and head-dim fallbacks, and the hybrid-attention correction", "read_when": "computing or reviewing a KV footprint" },
+    { "path": "docs/research/huggingface-discovery.md", "purpose": "How to detect gating, size and quantisation from the HuggingFace API, including gated repos with no token", "read_when": "inspecting a model repo before renting for it" },
+    { "path": "docs/research/hybrid-attention-kv.md", "purpose": "Which vLLM KV-cache code path a hybrid linear/full-attention model takes, quoted file by file, and what the fixed GDN state costs", "read_when": "deciding whether a model's KV footprint grows per token" },
+    { "path": "docs/research/requantize-recipes.md", "purpose": "How to requantise a model locally when a rented card cannot execute the published weights: llm-compressor recipes, verified versions, and the eight things that could not be confirmed", "read_when": "serving a quant a card or repo does not ship" }
   ],
   "machine_readable_state": {
     "compiled_snapshot": "crates/mr-core/src/snapshot.rs",

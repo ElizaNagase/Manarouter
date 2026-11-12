@@ -49,7 +49,7 @@ given so you can re-run it.
 | Component | State | Evidence / limitation |
 |---|---|---|
 | `mr-core` — config, snapshot compiler, vault, usage store, OAuth | **Substantial, not complete** | Codex, Copilot, and Antigravity OAuth authorization/token exchange/refresh/Google userinfo identity code is wired; Antigravity IDE client details remain reverse-engineered and unverified. |
-| `mr-dialects` — OpenAI, Anthropic, Responses, Google, Command Code translation | **Reachable, test coverage uneven** | Relay dispatches request and response translation per selected step. The Responses implementation now covers the arms that are only reachable in combination — reasoning replay, a mid-conversation system turn keeping its place, the encrypted-reasoning include, a dropped output cap, and a truncated stream closed with an error — and the relay drives it through a per-stream `responses::Translator`; the other dialects are better covered than it is. `docs/24-provider-dialects.md` documents the eight dialects, including `google-ai-studio`, whose
+| `mr-dialects` — OpenAI, Anthropic, Responses, Google, Command Code translation | **Reachable, test coverage uneven** | Relay dispatches request and response translation per selected step. The Responses implementation now covers the arms that are only reachable in combination — reasoning replay, a mid-conversation system turn keeping its place, the encrypted-reasoning include, a dropped output cap, and a truncated stream closed with an error — and the relay drives it through a per-stream `responses::Translator`; the other dialects are better covered than it is. `docs/24-provider-dialects.md` documents the nine dialects, including `google-ai-studio`, whose
 thinking fragment is level-only because the public API refuses a level and a budget together. |
 | `manarouter-relay` — HTTP API, auth, snapshot, account selection, translation | **Runs; the hedged race runs and the winner's recovery works** | Startup, flag/config precedence, listener bind selection and the 2 s `config.json` reload poller live in `crates/manarouter-relay/src/startup.rs` (declared at `crates/manarouter-relay/src/lib.rs:54`; 17 tests). The step loop and the race share one attempt implementation (`attempt_step` in `crates/manarouter-relay/src/server.rs`), so the sequential and concurrent paths cannot drift; `hedge_decide` decides the race and the losers are dropped when a winner is committed; the participants that passed the race are kept for the recovery to use. Winner recovery is implemented in `crates/manarouter-relay/src/recovery.rs` (`pick-highest-passed`, the default): the winner's body is watched, and a failure is recovered from the highest-priority participant that passed — silently before any byte reached the client, with the `manarouter.retry` boundary after, refused after a tool-call delta. All four `WinnerFailMode`s are implemented: `pick-highest-passed` and `pick-highest-passed-different-provider` reuse the participants that passed the race, while `rerun-excluding` and `stable-fallback` issue new upstream work only when the winner actually fails, bounded by `max_rounds` (one round for `stable-fallback`). Priority combos with `hedge.enabled` now remember the successful provider/model for a configurable inactivity window (default 1800s), combo-wide across callers; the preference is process-local and rechecked against current eligibility on each request. Client-key scan exits at first match (a deliberate latency tradeoff that reveals configured match position to a local timing observer). |
 | `manarouter-conductor` — auth, API, state, serving, provider quota refresh | **Partial** | `/api/quota` returns cached provider/account quota snapshots and declares refresh routes. Provider-specific OAuth refresh is reported unsupported. `GET /api/usage` serves the per-request usage ledger with the provider's prompt/completion counts, its cache-read and cache-write split, the generation window and a derived tokens-per-second figure (an em dash, never a zero, when the provider reported no timing); where the provider reported no counts the router's estimate is used and the row says so, and that estimate is computed in the panel process, never on the relay's request path. Every authenticated request is recorded, not only those made with a capped key. The older per-account `usage` table is still never written. No live/provider refresh was exercised in this audit. |
@@ -187,6 +187,146 @@ participant it dispatched.
   a target that also lacks the modality, or names no known model, fails with HTTP 501
   `modality_fallback_unavailable` rather than looping. Covered by five tests in
   `crates/manarouter-relay/src/server.rs`.
+
+### 4.1 GPU rentals (issue #4) — implemented and exercised end to end, with two named limits
+
+The feature is split the way the rest of the project is: **pure logic in `mr-core`**, the HTTP surface
+in the conductor, presentation in the panel, and the request path in the relay.
+
+* `crates/mr-core/src/gpu/catalog.rs` — cards, prices, plans, quant support, all with a source and a
+  `verified`/`unverified` marker per figure.
+* `crates/mr-core/src/gpu/arch.rs` — a HuggingFace `config.json` (plus a gated repo's `base_model`
+  fallback) → cache topology and bytes per token.
+* `crates/mr-core/src/gpu/sizing.rs` — the KV-pool arithmetic and the `SizingResult` wire type.
+* `crates/mr-core/src/gpu/requantize.rs` — the "this quant does not exist, here is how to make it"
+  planner.
+* `crates/mr-core/src/rental.rs` — the persisted account and deployment shapes.
+* `crates/mr-core/src/gpu/cerebrium.rs` — a `cerebrium.toml` generator (issue #10): a **pure,
+  side-effect-free** function from a request to the file text, the deploy command and the base URL —
+  it writes no config, no vault, and no filesystem artefact. A test posts the body through the real
+  router and asserts the config bytes and snapshot bytes are **unchanged** (20 tests).
+* `crates/mr-core/src/lane/` — one descriptor per host, with the platform's own words for what the
+  host will not let you do; no HTTP, no clock, no verdicts beyond the ones quoted.
+* `crates/manarouter-conductor/src/gpu_api.rs` — **six routes**: catalog, probe, rentals, apply,
+  lanes, and cerebrium/bundle (full paths: `GET /api/gpu/catalog`, `POST /api/gpu/probe`,
+  `GET /api/gpu/rentals`, `POST /api/gpu/apply`, `GET /api/lanes`,
+  `POST /api/gpu/lanes/cerebrium/bundle`).
+* `panel/gpu-setup-model.js` (pure) and `panel/view-gpu-rentals.js` (the two-mode view).
+* The panel's Cerebrium bundle button is **pending** — `grep -n cerebrium panel/view-gpu-rentals.js`
+  returns zero matches; no UI control for Cerebrium bundles exists on the rentals page.
+* `crates/manarouter-relay/src/batch.rs` — the durable batch lane that mode B dispatches through.
+
+`crates/mr-core/src/gpu/mod.rs` states the split: that tree contains **no HTTP, no filesystem access
+and no clock**, so every number is checkable in a unit test with no network and no GPU.
+
+**What has actually been exercised.** `cargo test -p mr-core gpu::cerebrium` is green — 20 passed.
+`node --test panel/test/gpu-setup-model.test.mjs` is green — 113 passed. The whole workspace suite
+is green — 1 685 passed, 0 failed, 4 ignored (`cargo test --workspace`) — the panel suite is green
+(303 tests, `node --test panel/test/*.test.mjs`), and — the part that matters most — a second
+conductor built from this tree was driven over a socket on `127.0.0.1:20999` with its own config and
+state directories, through the real sequence: catalog → probe → create account → create deployment →
+read the rental back. Live captures of four of those responses are committed under
+`docs/research/fixtures/` so that the next change is checked against the real wire shape rather than a
+remembered one.
+
+**Four defects that only a socket could find.** Each of these was invisible to a green unit suite on
+both sides, because each was a disagreement *between* two correct-in-isolation halves:
+
+1. The generated Modal bundle wrote `""fp8""` — a pre-quoted, pre-escaped `py_str(..)` interpolated
+   inside another quote pair. The Python was never executed, so nothing caught it; the response is now
+   `ast.parse`d during verification, and a Rust test asserts each argument is quoted exactly once.
+2. The probe read `{repo}/resolve/main/config.json`, which answers **307** to a cache host. The shared
+   quota client does not follow redirects, so the gated-repo `base_model` fallback could never run.
+   `/raw/{rev}/config.json` answers 200 directly; the fix made `arch.source: "base_model"` reachable
+   for the first time. `curl -L` would have hidden this — it proves the server is fine, not that the
+   product's client works.
+3. The panel sent a session ladder shaped like a display table (`{context, sessions}`); the conductor
+   re-parses `sizing` into `SizingResult`, whose `SessionsAtContext` has non-`Option` `context_len`,
+   `blocks_per_session` and `bytes_per_session`. HTTP 400. Rows are now emitted in the server's shape.
+4. `GET /api/gpu/rentals` reported `fit: {known: true, kv_pool_tokens: null, sessions_at_max_len:
+   null}`: the panel computed the pool but never forwarded the derived fields, and `fit_of` reads them.
+   Fixed on **both** halves — the panel now emits `kv_pool_tokens_aligned`, `kv_blocks`,
+   `kv_bytes_per_session_at_max_len` and `simultaneous_sessions_at_max_len`, and the conductor falls
+   back to dividing the pool when a client forwards only the raw figure. Verified in all three states
+   (stale payload, regenerated payload, stored record).
+
+The general lesson, worth stating because it will recur: **a `bool`-returning usability predicate that
+reads one field will certify an object missing everything else**, and `known: true` beside nulls is a
+degraded summary rather than a healthy one. Both halves of a JSON contract need a test that posts the
+client's real payload at the real server.
+
+**Limit 1 — no Modal deployment has ever been created by this code.** The `modal` CLI and the Python
+`modal` package are absent from this machine, and Modal publishes no public deployment REST API
+(`/docs/api`, `/docs/rest`, `/docs/guide/deploying-apps` and `api.modal.com` all fail; the CLI is the
+only documented path and has no `--detach`). Manarouter therefore generates the bundle, `ast.parse`s
+it, reports its SHA-256, and prints the exact `modal deploy` command plus the proxy-token headers a
+curl call needs. A human runs it. The endpoint then becomes an ordinary `modal-vllm` provider whose
+`base_url` the operator pastes at the review step. That boundary is deliberate and documented, not a
+gap to be closed by pretending.
+
+**Limit 2 — requirement 10 cannot be implemented as literally written.** Modal documents no per-GPU
+free/paid gating: all eleven cards carry an unconditional per-second price, and "using a GPU requires
+having a valid payment method on file" applies to the account as a whole. A `(Paid)` badge on cards
+that were never refused would be fabricated. The catalogue records `free_plan: "unknown"` for every
+card except H100, which was **observed** refused on the Starter plan, with `free_plan_source` carrying
+that provenance separately from the price's (`documented`); `(Paid)` renders only for `"unavailable"`.
+The plan limits are quoted with their source (Starter: $30/month plus compute, 10 GPU concurrency;
+Team: $250/month plus compute, 50).
+
+**The batch lane, and the question the issue actually asks.** `batch.rs` is a durable queue — an
+internal queue rather than a pass-through, per-item isolation, retry only for transience (three
+attempts, never on a 4xx), resume from disk, cancellation, token admission through `kv_budget.rs`, and
+cost in dollars with the boot fee on its own line. What the issue asks beyond that is the economic
+question — *is this batch too small to be worth a cold start* — and the answer is now reported from
+measured dollars rather than a predicted token count: the usage block carries `boot_share_pct` and
+`cold_start_verdict` (`boot_dominates` above half the bill, `work_dominates` below, `unknown` when
+there is no price to divide). A pre-flight hold would need a throughput figure this build does not
+have for any card; inventing one is the guess the module refuses to make.
+
+Still not verified: no batch has been submitted to a real GPU and observed to complete, so every
+figure in the lane is a computation over a recorded measurement rather than a fresh observation.
+
+**The other four hosts (issues #10–#13), and why only one of them grew code.** The catalogue now
+answers two different questions separately, because they have different answers per host: *what
+hardware exists* (`GET /api/gpu/catalog`) and *what may I do with it* (`GET /api/lanes`). The second
+route reports, per host, the shape of the lane (serving / batch / attended), whether a request can be
+answered while it is open, how a job is submitted, which credential kind is needed, session and idle
+limits, the published quota rules, and — the part that decides two of the four — a **refusal** with the
+platform's own clause and URL when the platform itself forbids the feature that was requested. The
+refusals are derived at request time from the same `LaneFacts` the route reports, so a row can never
+claim "usable" while a refusal exists for that traffic type.
+
+* **#10 Cerebrium is implemented**, additively: `POST /api/gpu/lanes/cerebrium/bundle` renders the
+  `cerebrium.toml` and the deterministic base URL
+  `https://api.cerebrium.ai/v4/{project}/{app}/v1` — **side-effect-free**: no config write, no vault
+  write, no filesystem artefact. That route is deliberately separate from `POST /api/gpu/apply`
+  rather than a generic "any platform" path: apply's inputs (a saved `RentalDeployment`, a Modal
+  `gpu_by_id`, a vault credential, a *pasted* `base_url`) are all wrong for a host whose URL is
+  computable and whose artefact needs no token. A test posts the body through the real router and
+  then asserts the config bytes and the snapshot bytes are **unchanged**, proving nothing was
+  persisted.
+* **#11 Kaggle and #13 molab are documented refusals, not missing work.** Kaggle's Terms §3 allows one
+  active account and restricts the service to "your own internal, personal, non-commercial use"; the
+  issue asks for two pooled accounts rotated per request. molab's restrictions page prohibits "remote
+  control such as by SSH", "exposing molab compute to outside traffic" and "using notebooks for
+  non-interactive jobs", which is precisely the tunnelled OpenAI-compatible server the issue specifies.
+  The batch half of Kaggle's lane is real and reported as usable; the multi-account half is refused with
+  the sentence quoted.
+* **#12 Saturn Cloud is buildable for its own reason**: its **Token Factory inference endpoints are
+  already an ordinary OpenAI-compatible provider** (base URL, bearer token, `GET /v1/models`), and the
+  whole lifecycle is API-creatable. So the lane needs a catalogue row and documentation, not a tunnel.
+  Its spec'd `ssh -L` port-forward design is unverified and is not claimed.
+
+Two honesty constraints carried into the UI: a `(Paid)` per-card badge is only shown where the platform
+really does gate card types by plan (Cerebrium, enforced at deploy time), not on Modal, which documents
+no such gating; and the panel invents no facts — it renders the route's rows, including the refusal
+clauses, verbatim.
+
+The panel Cerebrium button is **pending, not implemented**: `grep -n cerebrium panel/view-gpu-rentals.js` returns
+nothing, so no Cerebrium UI is claimed here. The conductor route exists; the panel does not yet render it.
+
+Test totals: `cargo test -p mr-core gpu::cerebrium` → **12 passed; 0 failed; 0 ignored**.
+`node --test panel/test/gpu-setup-model.test.mjs` → **tests 113, pass 113, fail 0**.
 
 ## 5. Claims that remain unverified or false
 

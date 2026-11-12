@@ -1,0 +1,286 @@
+# The GPU rentals view, as a browser rendered it
+
+Captured 2026-11-12 06:13 from the working tree, not from a mock:
+headless Chromium loaded the real panel (`panel/` served by `tools/panel-lab/serve.mjs`), which
+proxied `/api` to a throwaway conductor on 127.0.0.1:20999 holding one synthetic account and one
+synthetic deployment. The text below is every visible string in the rendered document, in document
+order, with tags stripped — so it is the page a person would read, not the source that produced it.
+
+The credential in this capture is the synthetic `wk-SYNTHETICID0001` / `SYNTHETICsecret0001` pair
+described in `README.md`; it exists only in a throwaway vault under /tmp and has never been valid.
+
+What this capture is evidence for:
+  * the plan table, accounts table, deployments table, bundle panel and catalogue all render with
+    live data from the four `/api/gpu/*` routes (the fields are not `undefined` or empty);
+  * the sessions cell reads `~6 of 6` — a derived figure against the configured ceiling;
+  * `(Paid)` appears on H100 and on nothing else, which is the requirement-10 decision made visible;
+  * B300's VRAM column is an em dash rather than a guessed number;
+  * the bundle panel says the record does not carry its app text and shows the command only.
+
+What it is not evidence for: that any of those numbers is correct (the sizing fixtures and the Rust
+tests carry that argument), or that the view is pleasant — a text capture cannot judge layout.
+
+---
+>
+Skip to content
+. Focus
+it in place and leave the hash — and the current view — alone. -->
+Manarouter
+Overview
+Configure
+Providers
+Combos
+Models
+Aliases
+GPU rentals
+Access
+Keys
+Quota
+System
+Settings
+Documentation
+v0.2.3
+Overview
+control plane unreachable
+control plane unreachable
+healthy · up 35 s
+, so it persists across every view -->
+GPU rentals
+Plan and track GPU capacity for self-hosted providers.
+GPU rentals · 1 account · 1 deployment
+Refresh
+New deployment
+Updated 6:11:48 AM. Live usage is re-read every 15 seconds while this tab is visible.
+Plan limits — Modal
+The plan boundary that matters is concurrency and included credits, not which cards exist. Every number below is quoted from the platform's own documentation, with its source next to it.
+Plan
+$/month
+Included credits
+GPU concurrency
+Seats
+Source
+Starter
+$0.00/mo
+$30.00
+10 GPUs
+3
+documented
+·
+source
+Team
+$250.00/mo
+$100.00
+50 GPUs
+—
+documented
+·
+source
+Rental accounts
+One account is one platform credential bundle. The secret is never rendered: only a fingerprint, which is what tells two keys apart without exposing either.
+Instance usage
+· one ledger total for every provider on this instance
+GPU requests
+0
+GPU time
+0 s
+Cost
+$0.00
+Account
+Platform
+Plan
+Credential
+Container ceiling
+GPU requests
+GPU time
+Cost
+mana-modal
+modal
+free
+· 10 GPU concurrency · source: documented
+wk…0001
+—
+—
+—
+—
+Live columns come from GET /api/gpu/rentals and are re-read every 15 seconds while this tab is visible. While the tab is hidden the panel stops asking, rather than waking a socket nobody is looking at.
+The conductor reports usage as one instance-wide total, with no per-account filter. The account rows therefore show — for those columns rather than dividing the total between accounts.
+Deployments
+Provider
+Account
+Model
+Card
+Mode
+Quant
+KV dtype
+Sessions
+KV pool
+State
+Problems
+rental-mana-modal-qwen3-8-27b-uncensored-fp8
+mana-modal
+orcarouter/Qwen3.8-27B-Uncensored-FP8
+· 262.1 k ctx
+RTX-PRO-6000
+batch
+→ L40S
+fp8
+fp8
+~6
+/ 6 seqs
+1.8 M
+enabled
+none
+Session counts and KV pool sizes are derived estimates, marked with ~. The vLLM startup line ("GPU KV cache size: N tokens") is authoritative; these are the defaults written into the provider and can be overridden. Select a row to see its bundle.
+Deployment bundle — rental-mana-modal-qwen3-8-27b-uncensored-fp8
+Modal publishes no deployment REST API. Manarouter cannot deploy for you: it generates the app file and the exact command, and this bundle is the deployment. Run the command yourself.
+Modal has no public REST endpoint that deploys or updates an app; deployment goes through the `modal` CLI or `modal.App.deploy()` from a Python process. The conductor therefore generates the app and the operator deploys it — it never claims to have deployed anything itself.
+The deployment record does not carry its generated app text, so the panel shows the command only rather than reconstructing a file it cannot see. Re-run the setup flow to regenerate the bundle.
+Exact command
+Copy command
+modal deploy modal_app.py
+SDK alternative, when you would rather not use the CLI: modal.App / app.deploy()
+GPU catalogue
+Platform
+Modal
+·
+pricing documentation
+Prices are per card and unconditional; the free-plan column is what the platform states about renting that card without paying, with its provenance beside it. Weight quantisation and KV cache dtype legality are checked per card in the setup flow.
+Card
+VRAM
+$/hour
+$/second
+Free plan
+Source
+T4
+T4
+16 GiB
+$0.5904
+$0.000164
+free tier unknown
+documented
+· checked 5 h 11 m ago
+·
+source
+·
+note
+L4
+L4
+24 GiB
+$0.7992
+$0.000222
+free tier unknown
+documented
+· checked 5 h 11 m ago
+·
+source
+·
+note
+A10
+A10
+24 GiB
+$1.10
+$0.000306
+free tier unknown
+documented
+· checked 5 h 11 m ago
+·
+source
+·
+note
+L40S
+L40S
+48 GiB
+$1.95
+$0.000542
+free tier unknown
+documented
+· checked 5 h 11 m ago
+·
+source
+·
+note
+A100-40GB
+A100 40GB
+40 GiB
+$2.10
+$0.000583
+free tier unknown
+documented
+· checked 5 h 11 m ago
+·
+source
+·
+note
+A100-80GB
+A100 80GB
+80 GiB
+$2.50
+$0.000694
+free tier unknown
+documented
+· checked 5 h 11 m ago
+·
+source
+·
+note
+RTX-PRO-6000
+RTX PRO 6000
+96 GiB
+$3.03
+$0.000842
+free tier unknown
+documented
+· checked 5 h 11 m ago
+·
+source
+·
+note
+H100
+H100
+80 GiB
+$3.95
+$0.001097
+(Paid)
+documented
+· checked 5 h 11 m ago
+·
+source
+·
+note
+H200
+H200
+141 GiB
+$4.54
+$0.001261
+free tier unknown
+documented
+· checked 5 h 11 m ago
+·
+source
+·
+note
+B200
+B200
+188 GiB
+$6.25
+$0.001736
+free tier unknown
+documented
+· checked 5 h 11 m ago
+·
+source
+·
+note
+B300
+B300
+—
+$7.10
+$0.001972
+free tier unknown
+documented
+· checked 5 h 11 m ago
+·
+source
+·
+note
+This panel requires JavaScript.

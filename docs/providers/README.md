@@ -33,7 +33,7 @@ So the catalogue is curated data, reviewed like code.
 |---|---|
 | `id` | Stable identifier. Referenced by combos as `provider/model`. Renaming one breaks stored combos. |
 | `label` | Display name for the panel. Free to change. |
-| `dialect` | **One of the seven.** Determines request and response translation. |
+| `dialect` | **One of the nine.** Determines request and response translation. |
 | `base_url` | Where requests go: the prefix the route path is appended to. The version segment, if the provider has one, is part of it. |
 | `auth` | An `AuthKind`: `bearer`, `api-key-header`, `header`, `query-param`, `oauth`. The relay sends `bearer`, `api-key-header` and `header`; it never sends `query-param`, because a credential does not go in a URL. |
 | `capabilities` | Which behaviours are claimed. Drives what the router will even attempt. |
@@ -48,13 +48,13 @@ OAuth entries add `oauth_platform`, `oauth_*_url`, `oauth_scopes`, `oauth_redire
 `oauth_pkce`, and for the Copilot family `copilot_*` fields. See
 [OAuth overview](../10-oauth-overview.md).
 
-### The eight dialects
+### The nine dialects
 
 `open-ai`, `anthropic`, `google`, `google-ai-studio`, `codex`, `copilot`, `antigravity`,
-`command-code-go`. The two Gemini entries are different surfaces of the same body: `google` is the
+`command-code-go`, `modal-vllm`. The two Gemini entries are different surfaces of the same body: `google` is the
 Cloud Code envelope shape and `google-ai-studio` is the public `generativelanguage` API, whose
 thinking rules are its own — see
-[the dialects guide](../24-provider-dialects.md#google-ai-studio--the-same-body-on-the-public-api).
+[the dialects guide](../24-provider-dialects.md#google-ai-studio--the-same-body-on-the-public-api). Modal vLLM is a self-hosted OpenAI chat endpoint with separate proxy-token headers and capacity settings; see [Modal vLLM](modal-vllm.md) and the operator-facing [GPU rentals](../25-gpu-rentals.md) guide.
 
 A dialect must be one of those. There is no "custom" dialect, and that is deliberate: a provider whose
 requests cannot be described by one of these is a provider the router cannot route to, and pretending
@@ -118,3 +118,4 @@ catalogue is a secret.
 - [Command Code](commandcode.md)
 - [Codex](codex.md) · [Copilot](copilot.md) · [Antigravity](antigravity.md)
 - [Configuration](../03-configuration.md) — the provider schema in full.
+- [Saturn Token Factory](saturn-token-factory.md) — OpenAI-compatible endpoint with Bearer token auth.
