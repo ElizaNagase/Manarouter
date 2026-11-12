@@ -398,3 +398,35 @@
 
 /* Bundle code blocks: scroll horizontally instead of wrapping long commands. */
 .gpu-rentals .gpu-bundle .gpu-pre { overflow-x: auto; }
+
+/* ---------- per-lane status cards and launch-plan preview ---------- */
+
+.gpu-rentals .gpu-lane-cards { margin-top: 10px; }
+
+/* One card per platform: a hairline between them, no box, so the page keeps one column of text. */
+.gpu-rentals .gpu-lane-cards .gpu-section { border-top: 1px solid var(--line); padding-top: 10px; }
+.gpu-rentals .gpu-lane-cards .gpu-section:first-of-type { border-top: 0; padding-top: 0; }
+
+.gpu-rentals .gpu-lane-status { margin-bottom: 4px; }
+
+/* Warnings are advisory, never failures: amber rule, secondary text, no alarm colour. */
+.gpu-rentals .gpu-warnings { margin: 4px 0 6px; padding: 0; list-style: none; font-size: 12px; }
+.gpu-rentals .gpu-warnings li {
+  margin: 0 0 3px; padding-left: 8px; border-left: 2px solid var(--amber); color: var(--tx2);
+}
+
+.gpu-rentals .gpu-lane-accounts { margin: 6px 0 0; padding-left: 16px; font-size: 12px; color: var(--tx2); }
+.gpu-rentals .gpu-lane-accounts li { margin-bottom: 2px; }
+.gpu-rentals .gpu-lane-accounts .mono { font-family: var(--mono); color: var(--tx1); }
+
+.gpu-rentals .gpu-plan { margin-top: 10px; }
+
+.gpu-rentals .gpu-plan-controls { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.gpu-rentals .gpu-plan-controls select { min-width: 140px; }
+
+/* The plan block is a detail of the card, not a second card: indent with a rule, not a border box. */
+.gpu-rentals .gpu-plan-block { margin-top: 8px; padding-left: 8px; border-left: 1px solid var(--line); }
+.gpu-rentals .gpu-plan-block > h4 {
+  margin: 0 0 4px; font-size: 11px; color: var(--tx3);
+  text-transform: uppercase; letter-spacing: .04em;
+}

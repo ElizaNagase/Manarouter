@@ -504,10 +504,51 @@ const lanes = () => ({
   note: 'Policy facts read from each platform.'
 });
 
+// Every endpoint the inventory reads on mount, in the order it asks. The four lane status routes
+// are fetched together and independently: one lane being down must not hide the other three.
+const ENDPOINTS = [
+  '/api/gpu/rentals',
+  '/api/gpu/catalog',
+  '/api/lanes',
+  '/api/gpu/lanes/kaggle/status',
+  '/api/gpu/lanes/molab/status',
+  '/api/gpu/lanes/saturn/status',
+  '/api/gpu/lanes/cerebrium/status',
+];
+
+// Lane statuses shaped like the conductor's answers: Kaggle reports readiness and per-account
+// health, Saturn reports a budget that is null until an operator records usage, Cerebrium reports a
+// registered app, and Molab reports a warm host.
+const laneStatuses = () => ({
+  '/api/gpu/lanes/kaggle/status': {
+    ready: true,
+    accounts: [{ account: 'kaggle-work', host: 'kaggle.com', health: 'healthy', failure_count: 0, warnings: [] }],
+  },
+  '/api/gpu/lanes/molab/status': {
+    status: 'ok',
+    accounts: [{ account: 'molab-main', host: 'molab.google.com', warm: true, remaining: 3600, failure_count: 0 }],
+  },
+  '/api/gpu/lanes/saturn/status': {
+    status: 'ok',
+    plan: {
+      budget: { used_secs: null, remaining_secs: null, total_secs: 540000, measured: false, cap_exceeded: false },
+      warnings: [{ code: 'budget_unrecorded', message: 'usage is recorded by the operator' }],
+    },
+    accounts: [{ account: 'saturn-work', host: 'saturncloud.io', health: 'healthy', warm: false, failure_count: 0 }],
+  },
+  '/api/gpu/lanes/cerebrium/status': {
+    status: 'ok',
+    ready: true,
+    detail: null,
+    accounts: [{ account: 'cerebrium-main', app: 'manarouter-a1b2', project: 'proj-1', health: 'healthy', warm: false }],
+  },
+});
+
 const standardHandlers = () => ({
   '/api/gpu/rentals': rentals(),
   '/api/gpu/catalog': catalog(),
   '/api/lanes': lanes(),
+  ...laneStatuses(),
 });
 
 // ---------------------------------------------------------------------------
@@ -518,8 +559,8 @@ test('inventory renders the account table with a fingerprint and never the secre
   const { mount, calls } = await mountView({ handlers: standardHandlers() });
   const text = textOf(mount);
 
-  assert.deepEqual(calls, ['/api/gpu/rentals', '/api/gpu/catalog', '/api/lanes'],
-    'the view reads all three endpoints on mount');
+  assert.deepEqual(calls, ENDPOINTS,
+    'the view reads the inventory and every lane status on mount');
   assert.match(text, /Rental accounts/);
   assert.match(text, /Mana Modal/);
   assert.match(text, /mana-modal/, 'the slug is shown when it differs from the label');
@@ -583,9 +624,11 @@ test('inventory renders deployments with mode, batch card and the derived sizing
   assert.match(text, /derived estimates, marked with ~/,
     'the table explains what the ~ means and which number is authoritative');
 
-  const enabled = descendants(mount).filter((el) => classesOf(el).includes('chip-green'));
+  // Only deployment rows say "enabled"; the lane cards use their own readiness wording, so this
+  // count still means "exactly one deployment is enabled".
+  const enabled = descendants(mount)
+    .filter((el) => classesOf(el).includes('chip-green') && textOf(el).trim() === 'enabled');
   assert.equal(enabled.length, 1);
-  assert.equal(textOf(enabled[0]).trim(), 'enabled');
 });
 
 test('the (Paid) marker appears once, and only for free_plan unavailable', async () => {
@@ -723,6 +766,10 @@ test('an empty response renders neutral empty states and a next step', async () 
       '/api/gpu/rentals': { accounts: [], deployments: [] },
       '/api/gpu/catalog': { platforms: [] },
       '/api/lanes': { lanes: [] },
+      '/api/gpu/lanes/kaggle/status': { ready: false, accounts: [] },
+      '/api/gpu/lanes/molab/status': { status: 'ok', accounts: [] },
+      '/api/gpu/lanes/saturn/status': { status: 'ok', accounts: [] },
+      '/api/gpu/lanes/cerebrium/status': { status: 'ok', ready: false, accounts: [] },
     },
   });
   const text = textOf(mount);
@@ -777,13 +824,15 @@ test('a hidden tab stops asking for usage numbers', async (t) => {
   const show = (state) => { globalThis.document.visibilityState = state; onVisibility(); };
 
   await settle();
-  assert.equal(calls.length, 3, 'the mount reads all three endpoints once');
+  assert.equal(calls.length, ENDPOINTS.length,
+    'the mount reads the inventory and every lane status once');
   assert.equal(timers.size, 0, 'a hidden tab arms no timer at all');
 
   // Returning to the tab fires one immediate tick, and then the interval re-reads.
   show('visible');
   await settle();
-  assert.equal(calls.length, 3, 'the first tick is skipped: the mount just read the same data');
+  assert.equal(calls.length, ENDPOINTS.length,
+    'the first tick is skipped: the mount just read the same data');
   assert.equal(timers.size, 1, 'a visible tab arms the next read');
 
   const flush = async () => {
@@ -793,14 +842,16 @@ test('a hidden tab stops asking for usage numbers', async (t) => {
     await settle();
   };
   await flush();
-  assert.equal(calls.length, 6, 'the interval re-reads every endpoint while the tab is visible');
-  assert.deepEqual(calls.slice(0, 3), calls.slice(3), 'the same three endpoints are re-read');
+  assert.equal(calls.length, ENDPOINTS.length * 2,
+    'the interval re-reads every endpoint while the tab is visible');
+  assert.deepEqual(calls.slice(0, ENDPOINTS.length), calls.slice(ENDPOINTS.length),
+    'the same endpoints are re-read, in the same order');
 
   show('hidden');
   await settle();
   assert.equal(timers.size, 0, 'hiding the tab cancels the pending read');
   await flush();
-  assert.equal(calls.length, 6, 'and nothing is fetched once it is hidden');
+  assert.equal(calls.length, ENDPOINTS.length * 2, 'and nothing is fetched once it is hidden');
 });
 
 // ---------------------------------------------------------------------------
@@ -986,7 +1037,7 @@ test('setup mode either mounts the step flow or names the module it is missing',
 test('render() accepts a missing param without throwing', async () => {
   const { mount, calls } = await mountView({ handlers: standardHandlers() });
   assert.ok(mount.children.length > 0);
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, ENDPOINTS.length);
 });
 
 test('the lane table quotes the platform that refuses, and invents nothing where it does not', async () => {
@@ -1018,3 +1069,61 @@ test('the lane table quotes the platform that refuses, and invents nothing where
   assert.equal(kaggleLinks.length, 1,
     'two pages on one host collapse to one link, so the cell stays readable');
 });
+
+// ---------------------------------------------------------------------------
+// Lane status cards: one platform down must not hide the other three
+// ---------------------------------------------------------------------------
+
+test('a lane whose status route fails is named, and the other lanes still render', async () => {
+  const { mount } = await mountView({
+    handlers: { ...laneStatuses(), '/api/gpu/lanes/kaggle/status': new Error('connect refused') },
+  });
+  const text = textOf(mount);
+
+  assert.match(text, /GET \/api\/gpu\/lanes\/kaggle\/status failed/,
+    'the failed route is named, with its own path');
+  assert.match(text, /connect refused/, 'the reason is quoted, not swallowed');
+  assert.match(text, /molab-main/, 'the lane that answered is still on screen');
+  assert.match(text, /saturn-work/);
+  assert.match(text, /cerebrium-main/);
+});
+
+test('a Saturn budget that was never recorded reads as unrecorded, not as full allowance', async () => {
+  const { mount } = await mountView({ handlers: standardHandlers() });
+  const text = textOf(mount);
+
+  // The fixture reports used_secs: null. Printing "0s used" would invent a measurement nobody took.
+  assert.match(text, /budget_unrecorded/, 'the warning travels with the lane');
+  assert.doesNotMatch(text, /Budget used\s*0s/, 'an unrecorded ledger is never shown as zero');
+});
+
+test('the plan preview posts the schedule and shows each wave with the deployments it holds',
+  async () => {
+    const { mount } = await mountView({ handlers: standardHandlers() });
+    const plan = {
+      schedule: 'sequential',
+      max_live: 1,
+      note: 'Sequential launches one deployment at a time.',
+      waves: [{ cards: 1, deployments: [0] }, { cards: 1, deployments: [1] }],
+      problems: [],
+      malformed: [],
+      deployments: [
+        { index: 0, provider: 'modal', repo: 'org/qwen3-27b', gpu: 'rtx-pro-6000', gpu_count: 1, account: 'modal-1' },
+        { index: 1, provider: 'modal', repo: 'org/llama-8b', gpu: 'l40s', gpu_count: 1, account: 'modal-1' },
+      ],
+    };
+    await withPost(plan, async (posts) => {
+      fire(findButton(mount, 'Plan launch'), 'click');
+      await settle();
+
+      assert.equal(posts.length, 1, 'one request per press');
+      assert.equal(posts[0].path, '/api/gpu/launch-plan');
+      assert.equal(posts[0].body.schedule, 'sequential', 'the chosen schedule is what is sent');
+
+      const text = textOf(mount);
+      assert.match(text, /Launch waves/, 'the answer is rendered as waves');
+      assert.match(text, /org\/qwen3-27b/, 'a wave names the deployment it holds, not only its index');
+      assert.match(text, /org\/llama-8b/);
+      assert.match(text, /does not start/i, 'the preview says it starts nothing');
+    });
+  });

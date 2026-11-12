@@ -421,6 +421,10 @@ function bundlePanel(bundle, platform, { emptyNote = null } = {}) {
 
 const USAGE_POLL_MS = 15000;
 
+/* The four GPU-rental lanes the conductor can report on. Order matters: it is the order the
+   status cards appear in, and the index the parallel fetch results are matched against. */
+const LANE_PLATFORMS = Object.freeze(['kaggle', 'molab', 'saturn', 'cerebrium']);
+
 export async function render(mount, ctx, param = null) {
   navigateFromView = (hash) => ctx.navigate(hash);
   mount.classList?.add('gpu-rentals');
@@ -507,6 +511,9 @@ async function renderInventory(mount, ctx) {
     cerebriumBusy: false,
     cerebriumResult: null,
     cerebriumError: null,
+    laneStatuses: null,
+    planBusy: false,
+    planResult: null,
   };
 
   const countEl = h('span', { class: 'count' }, 'GPU rentals');
@@ -517,6 +524,8 @@ async function renderInventory(mount, ctx) {
   const bundleBox = h('div', { class: 'gpu-bundle-panel' });
   const catalogBox = h('div', { class: 'gpu-catalog' });
   const lanesBox = h('div', { class: 'gpu-lanes' });
+  const laneCardsBox = h('div', { class: 'gpu-lane-cards' });
+  const planBox = h('div', { class: 'gpu-plan' });
   const cerebriumBox = h('div', { class: 'gpu-cerebrium' });
 
   const toolbar = h('div', { class: 'toolbar' },
@@ -526,15 +535,21 @@ async function renderInventory(mount, ctx) {
     button('New deployment', () => ctx.navigate('#/gpu-rentals/new/platform'),
       { className: 'btn btn-primary', title: 'Start the platform, account, model, card, sizing, review flow' }));
 
-  mount.replaceChildren(toolbar, statusEl, plansBox, accountsBox, deploymentsBox, bundleBox, catalogBox, lanesBox, cerebriumBox);
+  mount.replaceChildren(toolbar, statusEl, plansBox, accountsBox, deploymentsBox, bundleBox, catalogBox, lanesBox, laneCardsBox, planBox, cerebriumBox);
 
   async function refresh(quiet) {
     if (!view.alive) return;
     if (!quiet) statusEl.textContent = 'Reading GPU rentals…';
-    const [rentals, catalog, lanes] = await Promise.allSettled([
+    const [rentals, catalog, lanes, laneStatuses] = await Promise.allSettled([
       api.get('/api/gpu/rentals'),
       api.get('/api/gpu/catalog'),
       api.get('/api/lanes'),
+      Promise.allSettled([
+        api.get('/api/gpu/lanes/kaggle/status'),
+        api.get('/api/gpu/lanes/molab/status'),
+        api.get('/api/gpu/lanes/saturn/status'),
+        api.get('/api/gpu/lanes/cerebrium/status'),
+      ]),
     ]);
     if (!view.alive) return;
     view.rentals = rentals.status === 'fulfilled' ? rentals.value : null;
@@ -543,6 +558,21 @@ async function renderInventory(mount, ctx) {
     view.catalogError = catalog.status === 'rejected' ? catalog.reason : null;
     view.lanes = lanes.status === 'fulfilled' ? lanes.value : null;
     view.lanesError = lanes.status === 'rejected' ? lanes.reason : null;
+    // The inner `Promise.allSettled` never rejects, so the only useful signal is whether the
+    // wrapper itself settled. When it did not, every lane reports the same reason rather than one
+    // card silently disappearing.
+    if (laneStatuses.status === 'fulfilled' && Array.isArray(laneStatuses.value)) {
+      view.laneStatuses = laneStatuses.value.map((r) => (
+        r.status === 'fulfilled'
+          ? { ok: true, data: r.value }
+          : { ok: false, error: r.reason }
+      ));
+    } else {
+      const reason = laneStatuses.reason instanceof Error
+        ? laneStatuses.reason
+        : new Error('lane status requests did not settle');
+      view.laneStatuses = LANE_PLATFORMS.map(() => ({ ok: false, error: reason }));
+    }
     view.updatedAt = new Date();
     if (quiet) view.quietFailed = Boolean(view.rentalsError || view.catalogError);
     paint();
@@ -719,6 +749,305 @@ async function renderInventory(mount, ctx) {
     } else {
       cerebriumBox.replaceChildren();
     }
+  }
+
+  /**
+   * Per-platform lane cards: "Lane endpoints" — one card per platform, showing readiness, accounts,
+   * warnings, and the Saturn plan block when present. Loaded in parallel with Promise.allSettled.
+   *
+   * The Rust status handlers each return a different shape:
+   *   kaggle    → { ready, accounts: [{ account, host, health, failure_count, warnings[] }] }
+   *   molab     → { status, accounts: [{ account, host, warm, remaining, failure_count, errors[] }] }
+   *   saturn    → { status, plan: { budget, warnings[] }, accounts: [{ account, host, health, warm, ... }] }
+   *   cerebrium → { status, ready, detail, accounts: [{ app, project, health, warm }] }
+   */
+  function readinessLabel(status) {
+    // Derive a human-readable readiness from the status. Green is only when the status itself says
+    // healthy or ready; otherwise we say the account count in words.
+    if (status.ready === true) return { cls: 'chip-green', text: 'ready' };
+    if (status.ready === false) return { cls: 'chip-neutral', text: 'not ready' };
+    // Derive from account count: Molab has no `ready` field.
+    const count = (status.accounts || []).length;
+    if (count === 0) return { cls: 'chip-neutral', text: 'no accounts' };
+    return { cls: 'chip-neutral', text: `${count} account${count === 1 ? '' : 's'}` };
+  }
+
+  function laneAccountRow(acc) {
+    const label = asString(pick(acc, 'account', 'label')).trim() || '(unnamed)';
+    const host = asString(pick(acc, 'host')).trim();
+    const project = asString(pick(acc, 'project')).trim();
+    const health = asString(pick(acc, 'health')).trim();
+    const warm = asString(pick(acc, 'warm', 'is_warm')).trim();
+    const failures = asNumber(pick(acc, 'failure_count', 'failures'));
+
+    const parts = [h('span', { class: 'mono' }, label)];
+    if (host) parts.push(h('span', { class: 'hint' }, ` · ${host}`));
+    if (project) parts.push(h('span', { class: 'hint' }, ` · project: ${project}`));
+    if (health) parts.push(h('span', { class: 'hint' }, ` · ${health}`));
+    if (warm) parts.push(h('span', { class: 'hint' }, ` · ${warm}`));
+    if (failures !== null && failures > 0) parts.push(h('span', { class: 'hint mono' }, `failures: ${failures}`));
+    return h('li', {}, ...parts);
+  }
+
+  function paintLaneCards() {
+    laneCardsBox.replaceChildren();
+    if (!view.laneStatuses) return;
+
+    const card = section('Lane endpoints');
+    card.append(hint(
+      'One card per platform, fetched independently. A single failure leaves the others visible.'));
+
+    const cards = [];
+    for (let i = 0; i < LANE_PLATFORMS.length; i++) {
+      const platform = LANE_PLATFORMS[i];
+      const entry = view.laneStatuses[i];
+      const statusLine = h('p', { class: 'hint mono' }, `GET /api/gpu/lanes/${platform}/status`);
+
+      if (!entry || !entry.ok) {
+        const err = entry ? entry.error : new Error('no data');
+        cards.push(h('section', { class: 'card gpu-section' },
+          h('h2', {}, `${platform} (endpoint unavailable)`),
+          statusLine,
+          failedEndpoint(`GET /api/gpu/lanes/${platform}/status`, err)));
+        continue;
+      }
+
+      const status = objectOf(entry.data) ?? {};
+      const accounts = listOf(pick(status, 'accounts')).map(objectOf).filter(Boolean);
+      const warnings = listOf(pick(status, 'warnings')).map(objectOf).filter(Boolean);
+      const plan = objectOf(pick(status, 'plan'));
+      const ready = readinessLabel(status);
+
+      const parts = [];
+      // Readiness chip
+      parts.push(h('div', { class: 'gpu-lane-status' }, chip(ready.text, ready.cls)));
+
+      // Warnings as plain list (advisory, not errors)
+      if (warnings.length) {
+        const warningLines = [];
+        for (const w of warnings) {
+          const code = asString(pick(w, 'code')).trim();
+          const msg = asString(pick(w, 'message', 'reason', 'text')).trim();
+          warningLines.push(code ? `${code}: ${msg}` : msg);
+        }
+        parts.push(h('ul', { class: 'gpu-warnings' },
+          ...warningLines.map((l) => h('li', {}, l))));
+      }
+
+      // Plan block (Saturn emits a plan with budget + warnings)
+      if (plan) {
+        const planParts = [];
+        const budget = objectOf(pick(plan, 'budget'));
+        if (budget) {
+          const used = asNumber(pick(budget, 'used_seconds', 'used'));
+          const total = asNumber(pick(budget, 'total_seconds', 'total'));
+          const remaining = asNumber(pick(budget, 'remaining_seconds', 'remaining'));
+          const rows = [];
+          if (used !== null) rows.push(['Budget used', `${used}s`]);
+          if (total !== null) rows.push(['Budget total', `${total}s`]);
+          if (remaining !== null) rows.push(['Budget remaining', `${remaining}s`]);
+          if (rows.length) planParts.push(kv(rows));
+        }
+        const planWarnings = listOf(pick(plan, 'warnings')).map(objectOf).filter(Boolean);
+        if (planWarnings.length) {
+          for (const w of planWarnings) {
+            const code = asString(pick(w, 'code')).trim();
+            const msg = asString(pick(w, 'message', 'reason', 'text')).trim();
+            planParts.push(richHint(code ? `${code}: ${msg}` : msg, 'hint'));
+          }
+        }
+        const refusals = listOf(pick(plan, 'refusals')).map(objectOf).filter(Boolean);
+        if (refusals.length) {
+          for (const r of refusals) {
+            const msg = asString(pick(r, 'message', 'reason', 'text')).trim();
+            if (msg) planParts.push(h('p', { class: 'gpu-failed' }, msg));
+          }
+        }
+        if (planParts.length) {
+          parts.push(h('div', { class: 'gpu-plan-block' },
+            h('h4', {}, 'Plan'), ...planParts));
+        }
+      }
+
+      // Account rows
+      if (accounts.length) {
+        parts.push(h('ul', { class: 'gpu-lane-accounts' },
+          ...accounts.map(laneAccountRow)));
+      } else {
+        parts.push(h('p', { class: 'hint' },
+          'The conductor has no account attached for this platform.'));
+      }
+
+      const cardEl = h('section', { class: 'card gpu-section' },
+        h('h2', {}, platform),
+        statusLine, ...parts,
+        h('div', { class: 'gpu-actions', style: 'margin-top:8px' },
+          ghostButton('Refresh', () => refreshSingleLane(platform),
+            `Re-fetch ${platform} lane status only`)));
+
+      cards.push(cardEl);
+    }
+    card.append(...cards);
+    laneCardsBox.append(card);
+  }
+
+  async function refreshSingleLane(platform) {
+    try {
+      const data = await api.get(`/api/gpu/lanes/${platform}/status`);
+      // Update the slot in view.laneStatuses
+      const idx = LANE_PLATFORMS.indexOf(platform);
+      if (idx >= 0 && view.laneStatuses && view.laneStatuses[idx]) {
+        view.laneStatuses[idx] = { ok: true, data };
+      }
+      paintLaneCards();
+    } catch (err) {
+      const idx = LANE_PLATFORMS.indexOf(platform);
+      if (idx >= 0 && view.laneStatuses && view.laneStatuses[idx]) {
+        view.laneStatuses[idx] = { ok: false, error: err };
+      }
+      paintLaneCards();
+    }
+  }
+
+  /**
+   * Preview a launch plan: POST /api/gpu/launch-plan with { schedule } and render the answer.
+   * This is a PREVIEW ONLY — it does not start any deployment.
+   */
+  async function planLaunch() {
+    if (view.planBusy) return;
+    const select = planBox.querySelector('select');
+    const schedule = select ? asString(select.value).trim() : 'sequential';
+    if (!schedule) return;
+    view.planBusy = true;
+    view.planResult = null;
+    paintPlan();
+    try {
+      const result = await api.post('/api/gpu/launch-plan', { schedule });
+      view.planResult = objectOf(result) ?? result;
+    } catch (err) {
+      // Show the error in the plan box
+      view.planResult = { error: err };
+    } finally {
+      view.planBusy = false;
+      paintPlan();
+    }
+  }
+
+  /**
+   * Render the launch-plan preview result.
+   *
+   * Response shape (from gpu_api.rs launch_plan_body):
+   *   schedule (string), max_live (number), waves [{cards, deployments:[indices]}],
+   *   problems [{field, message}], malformed [{provider, message}], deployments[{index,provider,repo,gpu,gpu_count,account}]
+   */
+  function paintPlan() {
+    const controls = planBox.querySelector('.gpu-plan-controls');
+    if (controls) {
+      const btn = controls.querySelector('button');
+      if (btn) {
+        btn.disabled = view.planBusy;
+        btn.textContent = view.planBusy ? 'Planning…' : 'Plan launch';
+      }
+    }
+
+    if (!view.planResult) return;
+
+    // Clear previous result (keep controls)
+    const existingResult = planBox.querySelector('.gpu-plan-result');
+    if (existingResult) existingResult.remove();
+
+    const box = h('div', { class: 'gpu-plan-result', style: 'margin-top:12px' });
+
+    // Error case
+    if (view.planResult.error) {
+      box.append(h('p', { class: 'hint' }, 'The plan request could not be completed.'));
+      box.append(errorBlock(view.planResult.error));
+      planBox.append(box);
+      return;
+    }
+
+    const plan = objectOf(view.planResult) ?? {};
+    const schedule = asString(pick(plan, 'schedule')).trim();
+    const maxLive = asNumber(pick(plan, 'max_live'));
+    const note = asString(pick(plan, 'note')).trim();
+    const waves = listOf(pick(plan, 'waves')).map(objectOf).filter(Boolean);
+    const problems = listOf(pick(plan, 'problems')).map(objectOf).filter(Boolean);
+    const malformed = listOf(pick(plan, 'malformed')).map(objectOf).filter(Boolean);
+    const deployments = listOf(pick(plan, 'deployments')).map(objectOf).filter(Boolean);
+
+    // Build a map: index → deployment
+    const depMap = new Map();
+    for (const d of deployments) {
+      const idx = asNumber(pick(d, 'index'));
+      if (idx !== null) depMap.set(idx, d);
+    }
+
+    // Summary line: schedule, max_live, note
+    const summaryParts = [];
+    if (schedule) summaryParts.push(`schedule: ${schedule}`);
+    if (maxLive !== null) summaryParts.push(`max live: ${maxLive}`);
+    if (note) summaryParts.push(note);
+    if (summaryParts.length) {
+      box.append(h('p', { class: 'hint' }, summaryParts.join(' · ')));
+    }
+
+    // Malformed deployments
+    if (malformed.length) {
+      const parts = [];
+      for (const m of malformed) {
+        const provider = asString(pick(m, 'provider')).trim();
+        const msg = asString(pick(m, 'message')).trim();
+        parts.push(h('p', { class: 'hint' }, `Deployment "${provider}": ${msg}`));
+      }
+      box.append(h('div', { class: 'gpu-plan-malformed' }, ...parts));
+    }
+
+    // Problems as amber warnings: "field: message"
+    if (problems.length) {
+      for (const p of problems) {
+        const field = asString(pick(p, 'field')).trim();
+        const message = asString(pick(p, 'message', 'reason', 'text')).trim();
+        box.append(h('p', { class: 'hint', style: 'color:inherit' }, field ? `${field}: ${message}` : message));
+      }
+    }
+
+    // Waves table
+    if (waves.length === 0 && problems.length === 0 && !malformed.length) {
+      box.append(h('p', { class: 'hint' }, 'No deployments are configured to launch.'));
+    } else if (waves.length === 0 && !malformed.length) {
+      // Problems exist but no waves — that's valid, no deployments planned
+      // (already shown problems above)
+    } else {
+      const waveRows = waves.map((wave) => {
+        const cardCount = asNumber(pick(wave, 'cards'));
+        const depIndices = listOf(pick(wave, 'deployments'));
+        const depNames = [];
+        for (const rawIdx of depIndices) {
+          const idx = asNumber(rawIdx);
+          const dep = idx !== null ? depMap.get(idx) : null;
+          if (dep) {
+            const provider = asString(pick(dep, 'provider')).trim();
+            const repo = asString(pick(dep, 'repo')).trim();
+            const gpu = asString(pick(dep, 'gpu')).trim();
+            const gpuCount = asNumber(pick(dep, 'gpu_count'));
+            const account = asString(pick(dep, 'account')).trim();
+            const name = [provider, repo, gpu].filter(Boolean).join(' / ');
+            depNames.push(name || `index ${idx}`);
+          } else {
+            depNames.push(`index ${rawIdx}`);
+          }
+        }
+        return h('tr', {},
+          h('td', { class: 'num' }, asString(cardCount === null ? cardCount : cardCount)),
+          h('td', {}, h('span', { class: 'mono' }, depNames.join(', '))));
+      });
+      box.append(h('h4', {}, 'Launch waves'));
+      box.append(dataTable(
+        [{ label: 'Cards', num: true }, { label: 'Deployments' }],
+        waveRows));
+    }
+
+    planBox.append(box);
   }
 
   function paintPlans() {
@@ -1011,6 +1340,31 @@ async function renderInventory(mount, ctx) {
     card.append(hint('Session counts and KV pool sizes are derived estimates, marked with ~. The '
       + 'vLLM startup line ("GPU KV cache size: N tokens") is authoritative; these are the defaults '
       + 'written into the provider and can be overridden. Select a row to see its bundle.'));
+
+    // Plan-launch preview control (PREVIEW ONLY: does not start anything)
+    const planControls = h('div', { class: 'gpu-plan-controls', style: 'margin-top:12px' });
+    const planSchedule = h('select', {
+      class: 'input',
+      'aria-label': 'Launch schedule mode',
+      onchange: () => { paintPlan(); },
+    });
+    for (const opt of ['sequential', 'batched:2', 'batched:4', 'batched:8']) {
+      planSchedule.append(h('option', { value: opt }, opt));
+    }
+    planSchedule.value = 'sequential';
+    const planBtn = h('button', {
+      class: 'btn btn-primary',
+      type: 'button',
+      disabled: view.planBusy,
+      title: 'Preview: shows how the deployments would be ordered into waves; does not start anything.',
+      onclick: () => planLaunch(),
+    }, view.planBusy ? 'Planning…' : 'Plan launch');
+    planControls.append(planSchedule, h('span', { class: 'spacer' }), planBtn);
+    planBox.replaceChildren(h('p', { class: 'hint' },
+      'Preview only: shows how the configured deployments would be ordered into launch waves. '
+      + 'Does not start any deployment.'));
+    planBox.append(planControls);
+
     deploymentsBox.append(card);
   }
 
@@ -1149,6 +1503,8 @@ async function renderInventory(mount, ctx) {
     paintBundle();
     paintCatalog();
     paintLanes();
+    paintLaneCards();
+    paintPlan();
   }
 
   await refresh(false);
