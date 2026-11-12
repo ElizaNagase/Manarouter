@@ -36,6 +36,13 @@
 //! with the GPU name misspelled. [`RentalDeployment::from_provider_extra`] therefore returns a
 //! [`Result`] and a malformed value is a validation *error* the panel can report against the
 //! offending field — never a silent default that quietly rents the wrong card.
+//!
+//! ## Scheduling concurrent GPU launches
+//!
+//! A deployment may request more than one GPU, and operators need to bring up deployments
+//! sequentially (one card alive at a time) or in batches.  [`RentalSchedule`] expresses the
+//! launch policy — sequential or batched with a ceiling — and [`plan_launch`] turns a list of
+//! deployments into waves respecting that ceiling.
 
 use std::collections::BTreeMap;
 
@@ -667,6 +674,224 @@ impl RentalDeployment {
     }
 }
 
+/// Which launch policy the operator chose for bringing up deployments.
+///
+/// The requirement is explicit: *"gpu rentals should be able to be done in sequence so 2 gpus
+/// are never running or as batches of multiple GPUs."* This type expresses that choice.
+///
+/// The kebab-case identifiers — `"sequential"` and `"batched"` — are the **kinds**; they do not
+/// carry the batch size. `RentalSchedule::as_str` returns only the kind because a number cannot be
+/// part of a stable serialisable identifier the way a platform id is: the size is a separate
+/// field (`RentalPlan::waves[].cards`).  This is the same shape [`RentalPlatform`] uses for
+/// platform identifiers — the string says *what*, a numeric field says *how many*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RentalSchedule {
+    /// At most one card is live at any moment.
+    #[default]
+    Sequential,
+    /// Up to `max_live` cards are live together.
+    Batched { max_live: u32 },
+}
+
+impl RentalSchedule {
+    /// The stable identifier written to config or config-like strings.
+    ///
+    /// Returns `"sequential"` or `"batched"`.  Because `Batched` carries a number, the string
+    /// is only the kind — a round-trip from serialised form always produces `Batched { max_live:
+    /// 1 }` when the size is absent, which is why [`Self::parse`] returns `None` for a bare
+    /// `"batched"` rather than guessing.  The size is always provided separately.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sequential => "sequential",
+            Self::Batched { .. } => "batched",
+        }
+    }
+
+    /// Parse a schedule kind, accepting case-insensitive trimmed input.
+    ///
+    /// Returns `Some(Sequential)` for `"sequential"`.  Returns `Some(Self::Batched { max_live:
+    /// N })` for `"batched:N"` where `N` is a non-negative decimal integer.
+    ///
+    /// Returns `None` for a bare `"batched"` (no size).  A batch without a size cannot be
+    /// planned — silently choosing 1 would make `"batched"` indistinguishable from `"sequential"`,
+    /// and the operator's intent is unknown.  The caller should present a prompt or reject the
+    /// input.
+    pub fn parse(s: &str) -> Option<Self> {
+        let trimmed = s.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower == "sequential" {
+            return Some(Self::Sequential);
+        }
+        if lower == "batched" {
+            // No size → cannot plan; return None rather than guessing.
+            return None;
+        }
+        if let Some(rest) = lower.strip_prefix("batched:") {
+            return rest
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .map(|n| Self::Batched { max_live: n });
+        }
+        None
+    }
+
+    /// Construct a batched schedule with an explicit size.
+    pub fn batched(max_live: u32) -> Self {
+        Self::Batched { max_live }
+    }
+
+    /// The maximum number of cards that may be live simultaneously under this schedule.
+    pub const fn max_live(self) -> u32 {
+        match self {
+            Self::Sequential => 1,
+            Self::Batched { max_live } => max_live,
+        }
+    }
+}
+
+/// A wave: a set of deployments that may start simultaneously.
+///
+/// The `deployments` field holds indices into the original slice passed to [`plan_launch`], in
+/// the order they were encountered during the greedy fill.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RentalWave {
+    /// Indices into the slice that was planned, in the original order.
+    pub deployments: Vec<usize>,
+    /// Cards live simultaneously in this wave.
+    pub cards: u32,
+}
+
+/// A plan for launching a set of GPU deployments.
+///
+/// The plan may contain **both** waves and problems — a deployment that exceeds the ceiling is
+/// reported as a problem and simply excluded from waves; the other deployments still get scheduled.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LaunchPlan {
+    /// The schedule that produced this plan.
+    pub schedule: RentalSchedule,
+    /// Waves to launch, in order.
+    pub waves: Vec<RentalWave>,
+    /// Problems that made a deployment unschedulable, as (field, message), matching the
+    /// existing `problems()` convention in this file.
+    #[serde(default)]
+    pub problems: Vec<(String, String)>,
+}
+
+/// Plan launch waves for a set of deployments under the given schedule.
+///
+/// The function walks the input in original order, filling waves greedily up to
+/// `schedule.max_live()` cards per wave.  Deployments whose `gpu_count` alone exceeds the
+/// ceiling are reported as problems and excluded.
+///
+/// ## Greedy fill and order preservation
+///
+/// The walk preserves the order of `deployments`: the first deployment that fits goes into the
+/// first wave, the next into the same wave if room, or a new wave if not.  The operator can
+/// therefore control launch order simply by ordering the config.
+///
+/// ## Account ceilings are reported, not enforced
+///
+/// After waves are built the function counts deployments per account and reports a problem
+/// whenever a `RentalAccount::max_concurrent_containers` ceiling is exceeded.  It does **not**
+/// re-plan the waves to satisfy the ceiling because `max_concurrent_containers` is documented
+/// only for one platform (Modal) and is `None` for all others — re-planning on an unverified
+/// number would move the operator's work for no reason.  An account id with no matching
+/// `RentalAccount` is also not a problem: validation of unknown accounts belongs to whoever
+/// validates the deployment, not to the launcher.
+pub fn plan_launch(
+    schedule: RentalSchedule,
+    deployments: &[RentalDeployment],
+    accounts: &[RentalAccount],
+) -> LaunchPlan {
+    let max_live = schedule.max_live();
+
+    // Rule 1: zero is never valid.
+    if max_live == 0 {
+        return LaunchPlan {
+            schedule,
+            waves: Vec::new(),
+            problems: vec![(
+                "schedule".to_string(),
+                format!(
+                    "batch size of 0 is not valid; a schedule with zero live cards can never deploy anything"
+                ),
+            )],
+        };
+    }
+
+    let mut problems: Vec<(String, String)> = Vec::new();
+    let mut waves: Vec<RentalWave> = Vec::new();
+    let mut current_wave: Vec<usize> = Vec::new();
+    let mut current_cards: u32 = 0;
+
+    // Rule 2 + 3: walk in order, skip deployments that cannot fit, fill greedily.
+    for (i, dep) in deployments.iter().enumerate() {
+        let cards = dep.gpu_count;
+        if cards > max_live {
+            // Rule 2: report and skip; do NOT clamp, split, or silently drop.
+            problems.push((
+                "gpu_count".to_string(),
+                format!(
+                    "deployment {} (repo {}) requests {} card(s) but the schedule allows at most {} live card(s) simultaneously",
+                    i, dep.repo, cards, max_live
+                ),
+            ));
+            continue;
+        }
+        if current_cards + cards > max_live {
+            // Flush current wave and start a new one.
+            waves.push(RentalWave {
+                deployments: std::mem::take(&mut current_wave),
+                cards: current_cards,
+            });
+            current_cards = 0;
+        }
+        current_wave.push(i);
+        current_cards += cards;
+    }
+    // Flush the last wave.
+    if !current_wave.is_empty() {
+        waves.push(RentalWave {
+            deployments: current_wave,
+            cards: current_cards,
+        });
+    }
+
+    // Rule 4: report account ceilings, do not re-plan.
+    for wave in &waves {
+        let mut account_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for &idx in &wave.deployments {
+            let acc = &deployments[idx].account;
+            *account_counts.entry(acc.as_str()).or_default() += 1;
+        }
+        for (acc_id, count) in &account_counts {
+            if let Some(account) = accounts.iter().find(|a| &a.id == acc_id) {
+                if let Some(ceiling) = account.max_concurrent_containers {
+                    if *count as u32 > ceiling {
+                        problems.push((
+                            "account".to_string(),
+                            format!(
+                                "account {} has {} deployment(s) in this wave but its max_concurrent_containers is {} (reported, not enforced)",
+                                acc_id, count, ceiling
+                            ),
+                        ));
+                    }
+                }
+                // If None, no ceiling is documented for this platform → ignore.
+                // If no account matches, validation of unknown accounts is not our job → ignore.
+            }
+        }
+    }
+
+    LaunchPlan {
+        schedule,
+        waves,
+        problems,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -947,5 +1172,159 @@ mod tests {
             serde_json::to_string(&FreePlan::Unavailable).unwrap(),
             "\"unavailable\""
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Launch-schedule tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn sequential_puts_every_deployment_in_its_own_wave() {
+        let deps = [
+            RentalDeployment::new("a", "repo/1", "L40S"),
+            RentalDeployment::new("a", "repo/2", "L40S"),
+            RentalDeployment::new("a", "repo/3", "L40S"),
+        ];
+        let plan = plan_launch(RentalSchedule::Sequential, &deps, &[]);
+        assert_eq!(plan.waves.len(), 3);
+        assert_eq!(plan.waves[0].cards, 1);
+        assert_eq!(plan.waves[1].cards, 1);
+        assert_eq!(plan.waves[2].cards, 1);
+        assert!(plan.problems.is_empty());
+    }
+
+    #[test]
+    fn sequential_refuses_a_two_card_deployment() {
+        let mut d = RentalDeployment::new("a", "multi-gpu-repo", "L40S");
+        d.gpu_count = 2;
+        let deps = [d];
+        let plan = plan_launch(RentalSchedule::Sequential, &deps, &[]);
+        assert!(plan.waves.is_empty());
+        assert_eq!(plan.problems.len(), 1);
+        assert_eq!(plan.problems[0].0, "gpu_count");
+        assert!(plan.problems[0].1.contains("multi-gpu-repo"));
+        assert!(plan.problems[0].1.contains("2"));
+        assert!(plan.problems[0].1.contains("1"));
+    }
+
+    #[test]
+    fn batched_fills_a_wave_up_to_the_ceiling() {
+        let mut deps = [
+            RentalDeployment::new("a", "repo/1", "L40S"),
+            RentalDeployment::new("a", "repo/2", "L40S"),
+            RentalDeployment::new("a", "repo/3", "L40S"),
+            RentalDeployment::new("a", "repo/4", "L40S"),
+        ];
+        for d in &mut deps {
+            d.gpu_count = 2;
+        }
+        let plan = plan_launch(
+            RentalSchedule::batched(4),
+            &deps,
+            &[],
+        );
+        assert_eq!(plan.waves.len(), 2);
+        assert_eq!(plan.waves[0].deployments.len(), 2);
+        assert_eq!(plan.waves[0].cards, 4);
+        assert_eq!(plan.waves[1].deployments.len(), 2);
+        assert_eq!(plan.waves[1].cards, 4);
+    }
+
+    #[test]
+    fn batched_that_cannot_fit_one_deployment_reports_it() {
+        let mut d = RentalDeployment::new("a", "big-repo", "L40S");
+        d.gpu_count = 3;
+        let deps = [d];
+        let plan = plan_launch(RentalSchedule::batched(2), &deps, &[]);
+        assert!(plan.waves.is_empty());
+        assert_eq!(plan.problems.len(), 1);
+        assert_eq!(plan.problems[0].0, "gpu_count");
+    }
+
+    #[test]
+    fn a_zero_ceiling_is_a_problem_not_a_clamp() {
+        let deps = [RentalDeployment::new("a", "repo/1", "L40S")];
+        let plan = plan_launch(RentalSchedule::batched(0), &deps, &[]);
+        assert!(plan.waves.is_empty());
+        assert_eq!(plan.problems.len(), 1);
+        assert_eq!(plan.problems[0].0, "schedule");
+        assert!(plan.problems[0].1.contains("0"));
+    }
+
+    #[test]
+    fn order_is_preserved() {
+        let deps = [
+            RentalDeployment::new("a", "repo/0", "L40S"),
+            RentalDeployment::new("a", "repo/1", "L40S"),
+            RentalDeployment::new("a", "repo/2", "L40S"),
+            RentalDeployment::new("a", "repo/3", "L40S"),
+        ];
+        let plan = plan_launch(
+            RentalSchedule::batched(3),
+            &deps,
+            &[],
+        );
+        assert_eq!(plan.waves[0].deployments, vec![0, 1, 2]);
+        assert_eq!(plan.waves[1].deployments, vec![3]);
+    }
+
+    #[test]
+    fn an_account_ceiling_is_reported_not_replanned() {
+        let mut acc = RentalAccount::new("mana");
+        acc.max_concurrent_containers = Some(1);
+        let deps = [
+            RentalDeployment::new("mana", "repo/1", "L40S"),
+            RentalDeployment::new("mana", "repo/2", "L40S"),
+        ];
+        let plan = plan_launch(
+            RentalSchedule::batched(4),
+            &deps,
+            &[acc],
+        );
+        // Still one wave — proving no re-planning happened.
+        assert_eq!(plan.waves.len(), 1);
+        assert_eq!(plan.waves[0].deployments.len(), 2);
+        // But one problem about the account ceiling.
+        assert!(plan.problems.iter().any(|(f, m)| f == "account"
+            && m.contains("mana")
+            && m.contains("1")));
+    }
+
+    #[test]
+    fn an_unknown_account_is_not_a_problem() {
+        let deps = [
+            RentalDeployment::new("unknown-account", "repo/1", "L40S"),
+        ];
+        let plan = plan_launch(
+            RentalSchedule::batched(4),
+            &deps,
+            &[],
+        );
+        assert_eq!(plan.waves.len(), 1);
+        assert!(plan.problems.is_empty());
+    }
+
+    #[test]
+    fn parse_rejects_a_bare_batched() {
+        assert_eq!(RentalSchedule::parse("batched"), None);
+        assert_eq!(
+            RentalSchedule::parse("sequential"),
+            Some(RentalSchedule::Sequential)
+        );
+        assert_eq!(
+            RentalSchedule::parse("  SEQUENTIAL "),
+            Some(RentalSchedule::Sequential)
+        );
+        assert_eq!(
+            RentalSchedule::parse("Batched:4"),
+            Some(RentalSchedule::Batched { max_live: 4 })
+        );
+    }
+
+    #[test]
+    fn an_empty_set_plans_nothing() {
+        let plan = plan_launch(RentalSchedule::Sequential, &[], &[]);
+        assert!(plan.waves.is_empty());
+        assert!(plan.problems.is_empty());
     }
 }
