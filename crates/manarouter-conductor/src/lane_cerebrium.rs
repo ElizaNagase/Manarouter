@@ -86,7 +86,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::api::error_body;
+use crate::api::{error_body, TypedJson};
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -1048,7 +1048,7 @@ async fn get_status(State(app): State<AppState>) -> Json<Value> {
 
 async fn post_attach(
     State(app): State<AppState>,
-    Json(body): Json<AttachRequest>,
+    TypedJson(body): TypedJson<AttachRequest>,
 ) -> Result<Json<Value>, CerebriumError> {
     let http = shared_cerebrium_http()
         .map_err(|error| CerebriumError::ClientUnavailable(error.to_string()))?;
@@ -1057,7 +1057,7 @@ async fn post_attach(
 
 async fn post_deploy(
     State(app): State<AppState>,
-    Json(body): Json<DeployRequest>,
+    TypedJson(body): TypedJson<DeployRequest>,
 ) -> Result<Json<Value>, CerebriumError> {
     let http = shared_cerebrium_http()
         .map_err(|error| CerebriumError::ClientUnavailable(error.to_string()))?;
@@ -1066,7 +1066,7 @@ async fn post_deploy(
 
 async fn post_down(
     State(app): State<AppState>,
-    Json(body): Json<DownRequest>,
+    TypedJson(body): TypedJson<DownRequest>,
 ) -> Result<Json<Value>, CerebriumError> {
     let http = shared_cerebrium_http()
         .map_err(|error| CerebriumError::ClientUnavailable(error.to_string()))?;
@@ -1075,7 +1075,7 @@ async fn post_down(
 
 async fn post_probe(
     State(app): State<AppState>,
-    Json(body): Json<ProbeRequest>,
+    TypedJson(body): TypedJson<ProbeRequest>,
 ) -> Result<Json<Value>, CerebriumError> {
     let http = shared_cerebrium_http()
         .map_err(|error| CerebriumError::ClientUnavailable(error.to_string()))?;

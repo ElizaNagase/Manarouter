@@ -62,7 +62,7 @@ use tokio::time::{Duration, Instant};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::api::error_body;
+use crate::api::{error_body, TypedJson};
 use crate::state::AppState;
 use mr_core::lane::kaggle::{FACTS, GPU_QUOTA_DOCS, NOTEBOOK_DOCS, TERMS};
 
@@ -421,7 +421,7 @@ async fn get_status(State(app_state): State<AppState>) -> Result<Json<Value>, Ka
 /// and returns `{ run_id, state: "submitted" }`.
 async fn run_kaggle(
     State(app_state): State<AppState>,
-    Json(job_spec): Json<KaggleJobSpec>,
+    TypedJson(job_spec): TypedJson<KaggleJobSpec>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // Validate deadline before anything is spawned.
     let deadline_secs = job_spec.deadline_secs.unwrap_or(MAX_DEADLINE_SECS);
@@ -1116,6 +1116,43 @@ exit 1
         assert_eq!(json["kaggle_cli_present"], false);
         assert_eq!(json["ready"], false);
         assert_eq!(json["lane"], "kaggle");
+    }
+
+    /// A body that is not even the right *shape* must still be an error envelope.
+    ///
+    /// The lane routes read a typed body, and axum answers a failed typed read itself — with a
+    /// plain-text sentence the panel cannot parse. This test holds the extractor that fixes it:
+    /// the same `{}` that produced `Failed to deserialize… [422]` in a live probe must come back
+    /// as `invalid_json`, and the sentence must name the field that was missing so an operator can
+    /// act on it.
+    #[tokio::test]
+    async fn a_malformed_body_is_an_error_envelope() {
+        let (app_state, _state_dir) = kaggle_state(KaggleState::new());
+        let router = Router::new()
+            .route("/api/gpu/lanes/kaggle/run", post(run_kaggle))
+            .with_state(app_state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/gpu/lanes/kaggle/run")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body_bytes).expect("the body must be JSON");
+
+        assert_eq!(status, 400, "a bad body is the caller's mistake: {json}");
+        assert_eq!(json["error"]["code"], "invalid_json");
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("account"),
+            "the message must name the missing field, got {message:?}"
+        );
+        assert!(json["error"]["details"].is_array());
     }
 
     #[tokio::test]

@@ -75,7 +75,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::api::error_body;
+use crate::api::{error_body, TypedJson};
 use crate::state::AppState;
 use tracing::{error, info, warn};
 
@@ -293,7 +293,7 @@ async fn status_for(state: &Arc<Mutex<MolabState>>) -> Json<Value> {
 /// — which is exactly what we want: redirects are a failure, not a magic resolution.
 async fn attach_lane(
     State(app): State<AppState>,
-    Json(payload): Json<AttachRequest>,
+    TypedJson(payload): TypedJson<AttachRequest>,
 ) -> impl IntoResponse {
     attach_for(&app.molab, payload).await
 }
@@ -405,7 +405,7 @@ async fn attach_for(
 /// Deregister the lane for the given account.
 async fn down_lane(
     State(app): State<AppState>,
-    Json(payload): Json<DownRequest>,
+    TypedJson(payload): TypedJson<DownRequest>,
 ) -> impl IntoResponse {
     down_for(&app.molab, payload).await
 }

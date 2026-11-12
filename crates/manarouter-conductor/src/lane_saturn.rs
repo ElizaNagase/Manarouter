@@ -46,6 +46,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::api::TypedJson;
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -714,7 +715,7 @@ async fn get_status(State(app): State<AppState>) -> Json<Value> {
 /// `POST /api/gpu/lanes/saturn/attach` — register an account.
 async fn attach_lane(
     State(app): State<AppState>,
-    Json(payload): Json<AttachRequest>,
+    TypedJson(payload): TypedJson<AttachRequest>,
 ) -> impl IntoResponse {
     attach_for(&app.saturn, payload.account, payload.host, payload.token).await
 }
@@ -722,7 +723,7 @@ async fn attach_lane(
 /// `POST /api/gpu/lanes/saturn/down` — deregister an account.
 async fn down_lane(
     State(app): State<AppState>,
-    Json(payload): Json<DownRequest>,
+    TypedJson(payload): TypedJson<DownRequest>,
 ) -> impl IntoResponse {
     down_for(&app.saturn, payload.account).await
 }
@@ -730,14 +731,14 @@ async fn down_lane(
 /// `POST /api/gpu/lanes/saturn/probe` — readiness-probe an account's endpoint.
 async fn probe_lane(
     State(app): State<AppState>,
-    Json(payload): Json<ProbeRequest>,
+    TypedJson(payload): TypedJson<ProbeRequest>,
 ) -> impl IntoResponse {
     probe_for(&app.saturn, payload.account).await
 }
 
 async fn record_budget(
     State(app): State<AppState>,
-    Json(payload): Json<BudgetRequest>,
+    TypedJson(payload): TypedJson<BudgetRequest>,
 ) -> impl IntoResponse {
     record_budget_for(&app.saturn, payload.used_secs).await
 }

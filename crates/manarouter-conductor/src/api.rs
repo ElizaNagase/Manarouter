@@ -474,6 +474,36 @@ where
     }
 }
 
+/// A typed JSON body whose rejections stay inside the error envelope.
+///
+/// `Json<T>` for a concrete `T` is the obvious way to read a body, and it is what axum makes easy
+/// — but its rejection is answered by axum itself, in its own plain-text shape. A caller that has
+/// been promised `{"error": {"code", "message", "details"}}` on every failure then gets a sentence
+/// it cannot parse, and a panel shows "unexpected token" instead of "missing field `account`".
+///
+/// This wrapper adds nothing to the successful path: the body is deserialised exactly as `Json<T>`
+/// would, and only the rejections are translated. It exists because `JsonBody` does the same for
+/// `Value` bodies and a typed route cannot use that one.
+pub struct TypedJson<T>(pub T);
+
+impl<S, T> axum::extract::FromRequest<S> for TypedJson<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned,
+    Json<T>: axum::extract::FromRequest<S, Rejection = JsonRejection>,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            // The rejection's own wording is already the most useful sentence available ("missing
+            // field `account` at line 1 column 2"), so it is passed through rather than replaced.
+            Err(rejection) => Err(ApiError::bad("invalid_json", rejection.to_string())),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Small shared helpers
 // ---------------------------------------------------------------------------
