@@ -678,6 +678,14 @@ mod tests {
     use std::env;
     use tempfile::TempDir;
 
+    /// Serialises the tests that rewrite `PATH`.
+    ///
+    /// Both of them prepend a fake `kaggle` to the process-wide environment, and the fake lives in a
+    /// temporary directory per test. Running them concurrently means one test's restore can pull the
+    /// binary out from under the other mid-run — which showed up as a spurious 500. Cargo runs tests
+    /// on threads of one process, so the environment really is shared; a lock is the honest fix.
+    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Build a fake `kaggle` binary that lives in `temp_dir`/bin.
     fn create_fake_kaggle_bin(temp_dir: &TempDir) -> PathBuf {
         let fake_bin = temp_dir.path().join("bin").join("kaggle");
@@ -733,55 +741,6 @@ exit 1
         fake_bin
     }
 
-    /// Create a fake kaggle that simulates a run that never finishes past submitted.
-    fn create_fake_kaggle_never_done(temp_dir: &TempDir) -> PathBuf {
-        let fake_bin = temp_dir.path().join("bin").join("kaggle_never_done");
-        std::fs::create_dir_all(temp_dir.path().join("bin")).unwrap();
-
-        let script = r#"#!/bin/bash
-case "$1" in
-    --version)
-        echo "kaggle 2.0.0"
-        exit 0
-        ;;
-    kernels)
-        case "$2" in
-            push)
-                DIR=""
-                for arg in "$@"; do
-                    if [ "$arg" = "-p" ]; then shift; DIR="$1"; break; fi
-                    shift
-                done
-                if [ -n "$DIR" ]; then
-                    echo "mytestslug-$$" > "$DIR/.slug"
-                fi
-                exit 0
-                ;;
-            status)
-                # Always say running — never complete
-                echo "slug:mytestslug-$$ state:running"
-                exit 0
-                ;;
-            output)
-                echo '["reply1"]' > "$1/response.json"
-                exit 0
-                ;;
-        esac
-        exit 1
-        ;;
-esac
-exit 1
-"#;
-        std::fs::write(&fake_bin, script).unwrap();
-        std::fs::set_permissions(&fake_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        fake_bin
-    }
-
-    /// Helper: get the temp dir from an environment variable set by the test setup.
-    fn get_temp_bin_path() -> PathBuf {
-        env::var("KAGGLE_TEST_BIN").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/usr/local/bin"))
-    }
-
     /// Check that kaggle CLI detection works.
     /// An `AppState` carrying `state`, with every path in a fresh temporary directory.
     ///
@@ -833,11 +792,12 @@ exit 1
         assert_eq!(resp.status(), 400);
         let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(json["error"], "deadline_exceeds_cap");
+        assert_eq!(json["error"]["code"], "deadline_exceeds_cap");
     }
 
     #[tokio::test]
     async fn test_successful_run_reaches_complete() {
+        let _path_guard = PATH_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // Create a fake kaggle binary
         let temp = TempDir::new().unwrap();
         let _fake_bin = create_fake_kaggle_bin(&temp);
@@ -909,6 +869,7 @@ exit 1
 
     #[tokio::test]
     async fn test_kaggle_config_dir_cleanup() {
+        let _path_guard = PATH_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // After a run, the credential directory should be cleaned up.
         let temp = TempDir::new().unwrap();
         let _fake_bin = create_fake_kaggle_bin(&temp);
@@ -1015,5 +976,77 @@ exit 1
         assert_eq!(json["lane"].as_str().unwrap(), "kaggle");
         // May or may not be ready depending on environment
         assert!(json["ready"].is_boolean());
+    }
+
+    /// A run id this process never registered is answered as `404 run_not_found`.
+    ///
+    /// It used to be a 502, which said "Kaggle broke" about a request that was simply wrong.
+    #[tokio::test]
+    async fn an_unknown_run_id_is_a_404_naming_the_run() {
+        let (app_state, _state_dir) = kaggle_state(KaggleState::new());
+        let error = get_run_status(State(app_state), Path("no-such-run".to_owned()))
+            .await
+            .unwrap_err();
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["code"], "run_not_found");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no-such-run"),
+            "the message must name the run that was not found: {}",
+            json["error"]["message"]
+        );
+    }
+
+    /// A run past its deadline is a `504` and is marked `expired` without asking Kaggle.
+    ///
+    /// The deadline is checked before the CLI runs, so this test needs no fake `kaggle` on `PATH`
+    /// and cannot race another test's `PATH` edit. `submitted_instant` is the monotonic clock the
+    /// handler compares against, so seeding it in the past is what makes the run expired.
+    #[tokio::test]
+    async fn a_run_past_its_deadline_is_a_504_and_is_marked_expired() {
+        let (app_state, _state_dir) = kaggle_state(KaggleState::new());
+        let run_dir = TempDir::new().unwrap();
+        let run_id = "run-past-deadline".to_owned();
+        let submitted_instant = Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .expect("the monotonic clock has been running for more than two minutes");
+        app_state
+            .kaggle
+            .registry
+            .insert(RunState {
+                run_id: run_id.clone(),
+                account: "test-account".to_owned(),
+                model: "test-model".to_owned(),
+                items: vec!["prompt".to_owned()],
+                accelerator: "NvidiaTeslaT4".to_owned(),
+                deadline_secs: 60,
+                submitted_at: 0,
+                submitted_instant,
+                slug: Some("some-slug".to_owned()),
+                result_path: run_dir.path().to_path_buf(),
+                state: RunStateEnum::Running,
+            })
+            .await;
+
+        let error = get_run_status(State(app_state.clone()), Path(run_id.clone()))
+            .await
+            .unwrap_err();
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["code"], "kaggle_deadline_exceeded");
+
+        let stored = app_state.kaggle.registry.get(&run_id).await.unwrap();
+        assert_eq!(stored.state, RunStateEnum::Expired);
     }
 }

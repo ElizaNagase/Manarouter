@@ -534,44 +534,8 @@ mod tests {
     use axum::http::StatusCode as AxumStatusCode;
     use std::net::SocketAddr;
     use std::time::Duration;
-    use bytes::Bytes;
     // `TcpStream`'s write/flush come from the extension traits, not inherent methods.
     use tokio::io::AsyncWriteExt;
-
-    // ---------------------------------------------------------------------------
-    // Fake HTTP client — implements QuotaHttp, no network
-    // ---------------------------------------------------------------------------
-
-    /// A fake that replays a scripted reply and remembers what it was asked — the shape Phase C's
-    /// and the registry's tests inject.
-    #[derive(Debug)]
-    struct FakeHttp {
-        reply: QuotaResponse,
-    }
-
-    impl FakeHttp {
-        fn new(status: u16, body: &'static str) -> Self {
-            Self {
-                reply: QuotaResponse {
-                    status,
-                    headers: vec![("content-type".to_owned(), "application/json".to_owned())],
-                    body: Bytes::from(body.to_owned()),
-                },
-            }
-        }
-
-        /// Return the request the fake received — useful for asserting the right URL/token.
-        fn reply(&self) -> &QuotaResponse {
-            &self.reply
-        }
-    }
-
-    #[async_trait]
-    impl QuotaHttp for FakeHttp {
-        async fn request(&self, _request: QuotaRequest) -> CoreResult<QuotaResponse> {
-            Ok(self.reply.clone())
-        }
-    }
 
     /// Run a TCP server that returns a valid `/v1/models` response.
     async fn run_valid_server(addr: SocketAddr) -> std::io::Result<tokio::task::JoinHandle<()>> {
@@ -709,7 +673,8 @@ mod tests {
         .await;
 
         assert!((400..500).contains(&status.as_u16()));
-        let error = body["error"].as_str().unwrap();
+        let error = body["error"]["message"].as_str().unwrap();
+        assert_eq!(body["error"]["code"], "redirect_not_followed");
         assert!(
             error.to_lowercase().contains("redirect")
                 || error.contains("302"),
