@@ -369,6 +369,8 @@ pub struct StepPlan {
     /// How this model is priced, when anything is known. Compiled in so a cost estimate on the
     /// request path never reads configuration or the bundled table.
     pub pricing: Option<PricingPlan>,
+    /// Declared or discovered context window. Provider-level max_context overrides this value.
+    pub context_length: Option<u32>,
 }
 
 impl StepPlan {
@@ -462,6 +464,16 @@ pub struct ProviderPlan {
     pub http2: Http2Preference,
     /// Whether to keep idle connections warm.
     pub prewarm: bool,
+    /// KV-pool budget for self-hosted providers.
+    pub kv_pool_tokens: Option<u64>,
+    /// Maximum declared context tokens.
+    pub max_context: Option<u64>,
+    /// Maximum concurrent requests accepted by the endpoint.
+    pub max_concurrent: Option<u32>,
+    /// Price per second in USD. When set, GPU-second billing is enabled.
+    pub price_per_second: Option<f64>,
+    /// Request timeout used to accommodate cold starts.
+    pub cold_start_ttfb_timeout_ms: Option<u64>,
     /// One step per visible model, so a `provider/model` or bare-model request can be served
     /// without a combo. Hidden models are absent.
     pub steps: Vec<StepPlan>,
@@ -746,6 +758,11 @@ impl RoutingSnapshot {
                 route_overrides: provider.route_overrides.clone(),
                 http2: provider.http2,
                 prewarm: provider.prewarm,
+                kv_pool_tokens: provider.kv_pool_tokens,
+                max_context: provider.max_context,
+                max_concurrent: provider.max_concurrent,
+                price_per_second: provider.price_per_second,
+                cold_start_ttfb_timeout_ms: provider.cold_start_ttfb_timeout_ms,
                 steps: Vec::new(),
             };
             let visible: Vec<&ModelEntry> = provider.models.iter().filter(|m| !m.hidden).collect();
@@ -1842,6 +1859,11 @@ fn plan_step(
         reasoning_json: reasoning_fragments(provider.dialect, model, levels),
         input_modalities: modalities,
         pricing: model.pricing.clone(),
+        context_length: model.context_length.or_else(|| {
+            provider
+                .max_context
+                .and_then(|context| u32::try_from(context).ok())
+        }),
     }
 }
 
@@ -2020,6 +2042,7 @@ fn dialect_reasoning_fragment(
                 }
             }
         }),
+        Dialect::ModalVllm => serde_json::json!({ "reasoning_effort": effort }),
         // Google and Antigravity take thinking inside `generationConfig`. The relay's merge is
         // recursive, so the fragment is shaped exactly as deep as the field it has to reach.
         // `thinkingLevel` is a two-value switch in the Gemini API, so everything from `medium` up
@@ -2337,6 +2360,11 @@ fn encode_provider(encoder: &mut Encoder, provider: &ProviderPlan) {
     encode_string_map(encoder, &provider.route_overrides);
     encoder.put_u8(http2_tag(provider.http2));
     encoder.put_bool(provider.prewarm);
+    encoder.put_u64(provider.kv_pool_tokens.unwrap_or(0));
+    encoder.put_u64(provider.max_context.unwrap_or(0));
+    encoder.put_u32(provider.max_concurrent.unwrap_or(0));
+    encoder.put_u64(provider.price_per_second.map(f64::to_bits).unwrap_or(0));
+    encoder.put_u64(provider.cold_start_ttfb_timeout_ms.unwrap_or(0));
     encoder.put_u32(provider.steps.len() as u32);
     for step in &provider.steps {
         encode_step(encoder, step);
@@ -2382,6 +2410,7 @@ fn encode_auth(encoder: &mut Encoder, auth: &AuthKind) {
             let id = encoder.str_id(param);
             encoder.put_u32(id);
         }
+        AuthKind::Modal => encoder.put_u8(5),
         AuthKind::OAuth { platform } => {
             encoder.put_u8(4);
             let id = encoder.str_id(platform);
@@ -2410,6 +2439,7 @@ fn encode_step(encoder: &mut Encoder, step: &StepPlan) {
     }
     encoder.put_u32(step.input_modalities);
     encode_pricing(encoder, step.pricing.as_ref());
+    encoder.put_u32(step.context_length.unwrap_or(0));
 }
 
 /// Encode an optional price table.
@@ -2505,6 +2535,10 @@ fn decode_step(
     }
     let input_modalities = reader.u32()?;
     let pricing = decode_pricing(reader)?;
+    let context_length = match reader.u32()? {
+        0 => None,
+        value => Some(value),
+    };
     Ok(StepPlan {
         provider_index,
         provider_id: provider.id.clone(),
@@ -2522,6 +2556,7 @@ fn decode_step(
         reasoning_json,
         input_modalities,
         pricing,
+        context_length,
     })
 }
 
@@ -2741,6 +2776,28 @@ fn decode_providers(reader: &mut Reader, strings: &[String]) -> Result<Vec<Provi
         let route_overrides = decode_string_map(reader, strings)?;
         let http2 = http2_from_tag(reader.u8()?)?;
         let prewarm = reader.bool()?;
+        let kv_pool_tokens = match reader.u64()? {
+            0 => None,
+            n => Some(n),
+        };
+        let max_context = match reader.u64()? {
+            0 => None,
+            n => Some(n),
+        };
+        let max_concurrent = match reader.u32()? {
+            0 => None,
+            n => Some(n),
+        };
+        let price_bits = reader.u64()?;
+        let price_per_second = if price_bits == 0 {
+            None
+        } else {
+            Some(f64::from_bits(price_bits))
+        };
+        let cold_start_ttfb_timeout_ms = match reader.u64()? {
+            0 => None,
+            n => Some(n),
+        };
 
         let mut provider = ProviderPlan {
             id,
@@ -2761,6 +2818,11 @@ fn decode_providers(reader: &mut Reader, strings: &[String]) -> Result<Vec<Provi
             route_overrides,
             http2,
             prewarm,
+            kv_pool_tokens,
+            max_context,
+            max_concurrent,
+            price_per_second,
+            cold_start_ttfb_timeout_ms,
             steps: Vec::new(),
         };
 
@@ -3066,6 +3128,7 @@ fn decode_auth(reader: &mut Reader, strings: &[String]) -> Result<AuthKind> {
         4 => Ok(AuthKind::OAuth {
             platform: reader.string(strings)?,
         }),
+        5 => Ok(AuthKind::Modal),
         tag => Err(Error::Snapshot(format!(
             "snapshot contains unknown auth kind tag {tag}"
         ))),
@@ -3650,6 +3713,37 @@ mod tests {
             },
         ];
         config
+    }
+
+    #[test]
+    fn provider_context_override_is_compiled_into_the_step() {
+        let mut config = Config::default();
+        let mut provider = provider("modal");
+        provider.dialect = Dialect::ModalVllm;
+        provider.max_context = Some(262_144);
+        provider.models = vec![model("qwen")];
+        provider.accounts = vec![account("a", "a", 0)];
+        config.providers = vec![provider];
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+        let step = &snapshot.providers()[0].steps[0];
+        assert_eq!(step.context_length, Some(262_144));
+    }
+
+    #[test]
+    fn model_context_is_preserved_when_no_provider_override_exists() {
+        let mut config = Config::default();
+        let mut provider = provider("modal");
+        provider.dialect = Dialect::ModalVllm;
+        let mut entry = model("qwen");
+        entry.context_length = Some(196_608);
+        provider.models = vec![entry];
+        provider.accounts = vec![account("a", "a", 0)];
+        config.providers = vec![provider];
+        let snapshot = RoutingSnapshot::compile(&config).unwrap();
+        assert_eq!(
+            snapshot.providers()[0].steps[0].context_length,
+            Some(196_608)
+        );
     }
 
     #[test]
