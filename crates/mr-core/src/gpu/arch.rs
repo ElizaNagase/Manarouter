@@ -202,8 +202,10 @@ impl ArchFacts {
         facts.num_attention_heads = u64_field(source, &["num_attention_heads"]);
         facts.hidden_size = u64_field(source, &["hidden_size", "n_embd", "d_model"]);
         facts.intermediate_size = u64_field(source, &["intermediate_size", "n_inner"]);
-        facts.max_position_embeddings =
-            u64_field(source, &["max_position_embeddings", "n_positions", "max_seq_len"]);
+        facts.max_position_embeddings = u64_field(
+            source,
+            &["max_position_embeddings", "n_positions", "max_seq_len"],
+        );
         facts.sliding_window = u64_field(source, &["sliding_window"]);
         facts.rope_scaling = source.get("rope_scaling").filter(|v| !v.is_null()).cloned();
         // Likewise the stored dtype: it is a property of the saved weights, so the root's statement
@@ -302,7 +304,9 @@ impl ArchFacts {
 
     /// Parse a `config.json` string. Convenience for callers that already hold text.
     pub fn from_config_str(text: &str) -> Result<Self> {
-        Ok(Self::from_config_value(&serde_json::from_str::<Value>(text)?))
+        Ok(Self::from_config_value(&serde_json::from_str::<Value>(
+            text,
+        )?))
     }
 
     /// Whether the config told us enough to consider the dense KV formula.
@@ -318,7 +322,9 @@ impl ArchFacts {
     /// `None` when the config states no dtype, or states one this crate does not map. The caller
     /// then has to choose, and [`super::sizing`] records the resulting assumption explicitly.
     pub fn torch_dtype_bytes(&self) -> Option<u32> {
-        self.torch_dtype.as_deref().and_then(bytes_per_element_for_dtype)
+        self.torch_dtype
+            .as_deref()
+            .and_then(bytes_per_element_for_dtype)
     }
 
     /// The KV geometry for a chosen cache dtype, or the reason there is none.
@@ -409,9 +415,7 @@ impl ArchFacts {
             };
             (
                 full,
-                format!(
-                    "full_attention_layers={full} of {layers} (hybrid linear attention)"
-                ),
+                format!("full_attention_layers={full} of {layers} (hybrid linear attention)"),
             )
         } else {
             (layers, format!("{layers} layers"))
@@ -667,11 +671,7 @@ pub fn base_model_hint_from_hf_api(value: &Value) -> Option<BaseModelHint> {
     let repo_id = card
         .and_then(|card| card.get("base_model"))
         .and_then(base_model_repo_id)
-        .or_else(|| {
-            value
-                .get("base_model")
-                .and_then(base_model_repo_id)
-        })?;
+        .or_else(|| value.get("base_model").and_then(base_model_repo_id))?;
     let relation = card
         .and_then(|card| string_field(card, "base_model_relation"))
         .or_else(|| string_field(value, "base_model_relation"));
@@ -768,7 +768,11 @@ fn count_layers(layer_types: &[String], predicate: fn(&str) -> bool) -> u64 {
 }
 
 /// Infer the KV topology from the fields a config actually carries.
-fn infer_topology(source: &Value, facts: &ArchFacts, declares_linear_attention: bool) -> KvTopology {
+fn infer_topology(
+    source: &Value,
+    facts: &ArchFacts,
+    declares_linear_attention: bool,
+) -> KvTopology {
     if facts.kv_lora_rank.is_some() {
         return KvTopology::Mla;
     }
@@ -800,7 +804,9 @@ fn infer_topology(source: &Value, facts: &ArchFacts, declares_linear_attention: 
     // A sliding-window model that also declares a shorter window than its context stores less than
     // the dense figure implies.
     match (facts.sliding_window, facts.max_position_embeddings) {
-        (Some(window), Some(context)) if window > 0 && window < context => KvTopology::SlidingWindow,
+        (Some(window), Some(context)) if window > 0 && window < context => {
+            KvTopology::SlidingWindow
+        }
         (Some(window), None) if window > 0 => KvTopology::SlidingWindow,
         _ => KvTopology::Dense,
     }
@@ -873,8 +879,16 @@ mod tests {
         );
         assert_eq!(geometry.kv_bytes_per_token, Some(57_344));
         assert!(geometry.problem.is_none());
-        assert!(geometry.basis.contains("head_dim was derived"), "{}", geometry.basis);
-        assert!(geometry.basis.contains("3584 / num_attention_heads 28"), "{}", geometry.basis);
+        assert!(
+            geometry.basis.contains("head_dim was derived"),
+            "{}",
+            geometry.basis
+        );
+        assert!(
+            geometry.basis.contains("3584 / num_attention_heads 28"),
+            "{}",
+            geometry.basis
+        );
     }
 
     #[test]
@@ -901,7 +915,10 @@ mod tests {
     #[test]
     fn absent_num_key_value_heads_means_mha_and_says_so() {
         let mut value = qwen2_config();
-        value.as_object_mut().expect("object").remove("num_key_value_heads");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("num_key_value_heads");
         let facts = ArchFacts::from_config_value(&value);
         assert_eq!(facts.num_key_value_heads, Some(28));
         assert!(facts.num_key_value_heads_derived);
@@ -932,11 +949,19 @@ mod tests {
         assert!(facts.nested_text_config);
         assert!(facts.has_vision_config);
         assert_eq!(facts.model_type.as_deref(), Some("qwen2_5_vl"));
-        assert_eq!(facts.num_hidden_layers, Some(28), "from text_config, not the root");
+        assert_eq!(
+            facts.num_hidden_layers,
+            Some(28),
+            "from text_config, not the root"
+        );
         assert_eq!(facts.head_dim, Some(128));
         let geometry = facts.kv_geometry(2, "bfloat16");
         assert_eq!(geometry.kv_bytes_per_token, Some(57_344));
-        assert!(geometry.basis.contains("nested text_config"), "{}", geometry.basis);
+        assert!(
+            geometry.basis.contains("nested text_config"),
+            "{}",
+            geometry.basis
+        );
         assert!(
             facts.has_vision_config,
             "the caller has to know the weights include a vision tower"
@@ -986,7 +1011,9 @@ mod tests {
         let geometry = facts.kv_geometry(2, "bfloat16");
         assert_eq!(geometry.kv_bytes_per_token, Some(32 * 8 * 128 * 2 * 2));
         assert!(geometry.problem.is_none());
-        let warning = geometry.warning.expect("a window is a caveat, not a blocker");
+        let warning = geometry
+            .warning
+            .expect("a window is a caveat, not a blocker");
         assert!(warning.contains("4096"), "{warning}");
     }
 
@@ -1017,14 +1044,21 @@ mod tests {
     fn an_empty_config_produces_a_problem_not_a_guess() {
         let facts = ArchFacts::from_config_value(&serde_json::json!({}));
         assert_eq!(facts, ArchFacts::default());
-        assert!(facts.is_dense_kv(), "an empty config is not evidence of MLA");
+        assert!(
+            facts.is_dense_kv(),
+            "an empty config is not evidence of MLA"
+        );
         let geometry = facts.kv_geometry(2, "bfloat16");
         assert_eq!(geometry.kv_bytes_per_token, None);
         let problem = geometry.problem.expect("problem");
         for field in ["num_hidden_layers", "num_key_value_heads", "head_dim"] {
             assert!(problem.contains(field), "{problem} must name {field}");
         }
-        assert!(geometry.basis.contains("does not state"), "{}", geometry.basis);
+        assert!(
+            geometry.basis.contains("does not state"),
+            "{}",
+            geometry.basis
+        );
     }
 
     #[test]
@@ -1039,7 +1073,10 @@ mod tests {
         assert_eq!(geometry.kv_bytes_per_token, None);
         let problem = geometry.problem.expect("problem");
         assert!(problem.contains("num_hidden_layers"), "{problem}");
-        assert!(!problem.contains("head_dim"), "head_dim was present: {problem}");
+        assert!(
+            !problem.contains("head_dim"),
+            "head_dim was present: {problem}"
+        );
     }
 
     #[test]
@@ -1063,7 +1100,10 @@ mod tests {
             head_dim: Some(128),
             ..ArchFacts::default()
         };
-        assert_eq!(zero_heads.kv_geometry(2, "bfloat16").kv_bytes_per_token, None);
+        assert_eq!(
+            zero_heads.kv_geometry(2, "bfloat16").kv_bytes_per_token,
+            None
+        );
     }
 
     #[test]
@@ -1146,7 +1186,11 @@ mod tests {
         );
         assert_eq!(weights_bytes_from_param_count(1_000, 0.0), None);
         assert_eq!(weights_bytes_from_param_count(1_000, f64::NAN), None);
-        assert_eq!(weights_bytes_from_param_count(u64::MAX, 2.0), None, "no overflow wrap");
+        assert_eq!(
+            weights_bytes_from_param_count(u64::MAX, 2.0),
+            None,
+            "no overflow wrap"
+        );
     }
 
     #[test]
@@ -1161,11 +1205,18 @@ mod tests {
         assert_eq!(gated_state_from_hf_api(&api), Some(GatedState::Open));
 
         let gated_auto = serde_json::json!({"gated": "auto", "safetensors": {"total": "1000"}});
-        assert_eq!(params_from_hf_api(&gated_auto), Some(1_000), "numeric strings are read");
+        assert_eq!(
+            params_from_hf_api(&gated_auto),
+            Some(1_000),
+            "numeric strings are read"
+        );
         assert_eq!(gated_state_from_hf_api(&gated_auto), Some(GatedState::Auto));
 
         let gated_manual = serde_json::json!({"gated": "manual"});
-        assert_eq!(gated_state_from_hf_api(&gated_manual), Some(GatedState::Manual));
+        assert_eq!(
+            gated_state_from_hf_api(&gated_manual),
+            Some(GatedState::Manual)
+        );
 
         let unknown = serde_json::json!({"id": "org/repo"});
         assert_eq!(
@@ -1174,7 +1225,10 @@ mod tests {
             "an absent `gated` key is not a promise that the repo is open"
         );
         assert_eq!(params_from_hf_api(&unknown), None);
-        assert_eq!(params_from_hf_api(&serde_json::json!({"safetensors": {"total": -1}})), None);
+        assert_eq!(
+            params_from_hf_api(&serde_json::json!({"safetensors": {"total": -1}})),
+            None
+        );
     }
 
     #[test]
@@ -1197,7 +1251,10 @@ mod tests {
         )
         .expect("valid config parses");
         assert_eq!(facts.head_dim, Some(128));
-        assert_eq!(facts.kv_geometry(2, "bfloat16").kv_bytes_per_token, Some(32 * 8 * 128 * 2 * 2));
+        assert_eq!(
+            facts.kv_geometry(2, "bfloat16").kv_bytes_per_token,
+            Some(32 * 8 * 128 * 2 * 2)
+        );
 
         // An HTML error page from the wrong URL must be an error, not "no architecture".
         let error = ArchFacts::from_config_json(b"<html><body>404 Not Found</body></html>")
@@ -1298,7 +1355,11 @@ mod tests {
         assert_eq!(facts.kv_topology, KvTopology::HybridLinear);
         assert_eq!(facts.num_full_attention_layers, Some(16));
         assert_eq!(facts.num_linear_attention_layers, Some(48));
-        assert_eq!(facts.head_dim, Some(256), "the explicit key, never 5120 / 24");
+        assert_eq!(
+            facts.head_dim,
+            Some(256),
+            "the explicit key, never 5120 / 24"
+        );
 
         let geometry = facts.kv_geometry(1, "fp8");
         assert_eq!(
@@ -1315,7 +1376,10 @@ mod tests {
             geometry.basis
         );
         let warning = geometry.warning.expect("a hybrid model carries a caveat");
-        assert!(warning.contains("48"), "the warning names the state layers: {warning}");
+        assert!(
+            warning.contains("48"),
+            "the warning names the state layers: {warning}"
+        );
     }
 
     #[test]
@@ -1374,10 +1438,7 @@ mod tests {
         assert_eq!(facts.mamba_ssm_dtype.as_deref(), Some("float32"));
         // Declared as a fact about the file, and deliberately not used anywhere: whether
         // `mamba_ssm_dtype` is the switch vLLM reads for the recurrent state is unverified.
-        let warning = facts
-            .kv_geometry(1, "fp8")
-            .warning
-            .expect("hybrid warning");
+        let warning = facts.kv_geometry(1, "fp8").warning.expect("hybrid warning");
         assert!(warning.contains("mamba_ssm_cache_dtype"), "{warning}");
         assert!(
             warning.contains("--kv-cache-dtype"),
@@ -1414,7 +1475,10 @@ mod tests {
         let hint = base_model_hint_from_hf_api(&quantised).expect("the base model is stated");
         assert_eq!(hint.repo_id, "Qwen/Qwen3.8-27B");
         assert!(hint.shares_architecture());
-        assert_eq!(gated_state_from_hf_api(&quantised), Some(GatedState::Manual));
+        assert_eq!(
+            gated_state_from_hf_api(&quantised),
+            Some(GatedState::Manual)
+        );
 
         // The array form, which the Hub also uses.
         let listed = serde_json::json!({
@@ -1444,7 +1508,10 @@ mod tests {
         assert!(is_linear_attention_layer("mamba2"));
         assert!(!is_linear_attention_layer("full_attention"));
         assert_eq!(
-            count_layers(&["full_attention".to_string(), "linear_attention".to_string()], is_full_attention_layer),
+            count_layers(
+                &["full_attention".to_string(), "linear_attention".to_string()],
+                is_full_attention_layer
+            ),
             1
         );
     }

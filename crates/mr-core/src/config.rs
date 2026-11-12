@@ -1602,8 +1602,8 @@ pub fn is_advisory(problem: &str) -> bool {
 mod tests {
     use super::*;
     use crate::ids::{AccountId, ComboId};
-    use crate::rental::RentalPlan;
     use crate::model::{Account, ComboStep, ModelEntry, ModelSource};
+    use crate::rental::RentalPlan;
 
     fn provider(id: &str) -> Provider {
         Provider::new(id, crate::Dialect::OpenAi, "https://example.test")
@@ -1698,7 +1698,8 @@ mod tests {
         acct.secret_ref = Some("vault/modal".to_string());
         acct.max_concurrent_containers = Some(10);
         // An unknown member survives, exactly as it does at the top level.
-        acct.extra.insert("future_field".to_string(), Value::from(7));
+        acct.extra
+            .insert("future_field".to_string(), Value::from(7));
         cfg.rental_accounts.push(acct);
         cfg.save(&p).unwrap();
 
@@ -1725,9 +1726,10 @@ mod tests {
 
         // An unknown *sibling* still lands in `extra`: the added field has not disturbed the
         // flatten that makes downgrade safe.
-        raw.as_object_mut()
-            .unwrap()
-            .insert("future_sibling".to_string(), serde_json::json!({"nested": true}));
+        raw.as_object_mut().unwrap().insert(
+            "future_sibling".to_string(),
+            serde_json::json!({"nested": true}),
+        );
         std::fs::write(&p, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
         let sibling = Config::load(&p).unwrap();
         assert_eq!(

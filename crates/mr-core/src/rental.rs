@@ -274,7 +274,9 @@ impl RentalAccount {
     /// A GPU account with no credential cannot deploy anything; the panel says so before the
     /// operator fills in the rest of a wizard.
     pub fn has_credential(&self) -> bool {
-        self.secret_ref.as_deref().is_some_and(|s| !s.trim().is_empty())
+        self.secret_ref
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
     }
 
     /// The single, non-negotiable rule: an account's plan is never inferred.
@@ -434,7 +436,11 @@ fn default_gpu_count() -> u32 {
 
 impl RentalDeployment {
     /// The smallest coherent deployment: an account, a repo and a card.
-    pub fn new(account: impl Into<String>, repo: impl Into<String>, gpu: impl Into<String>) -> Self {
+    pub fn new(
+        account: impl Into<String>,
+        repo: impl Into<String>,
+        gpu: impl Into<String>,
+    ) -> Self {
         Self {
             account: account.into(),
             repo: repo.into(),
@@ -579,7 +585,9 @@ impl RentalDeployment {
                         format!(
                             "{}: {} on {} — {}",
                             verdict.support.as_str(),
-                            method.map(|m| m.label).unwrap_or(self.weight_quant.as_str()),
+                            method
+                                .map(|m| m.label)
+                                .unwrap_or(self.weight_quant.as_str()),
                             gpu.label,
                             verdict.reason
                         ),
@@ -861,7 +869,8 @@ pub fn plan_launch(
 
     // Rule 4: report account ceilings, do not re-plan.
     for wave in &waves {
-        let mut account_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let mut account_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
         for &idx in &wave.deployments {
             let acc = &deployments[idx].account;
             *account_counts.entry(acc.as_str()).or_default() += 1;
@@ -982,7 +991,10 @@ mod tests {
         let mut account = RentalAccount::new("a");
         account.secret_ref = Some("s".to_string());
         account.max_concurrent_containers = Some(0);
-        assert!(account.problems().iter().any(|p| p.contains("zero concurrent")));
+        assert!(account
+            .problems()
+            .iter()
+            .any(|p| p.contains("zero concurrent")));
     }
 
     #[test]
@@ -1218,11 +1230,7 @@ mod tests {
         for d in &mut deps {
             d.gpu_count = 2;
         }
-        let plan = plan_launch(
-            RentalSchedule::batched(4),
-            &deps,
-            &[],
-        );
+        let plan = plan_launch(RentalSchedule::batched(4), &deps, &[]);
         assert_eq!(plan.waves.len(), 2);
         assert_eq!(plan.waves[0].deployments.len(), 2);
         assert_eq!(plan.waves[0].cards, 4);
@@ -1259,11 +1267,7 @@ mod tests {
             RentalDeployment::new("a", "repo/2", "L40S"),
             RentalDeployment::new("a", "repo/3", "L40S"),
         ];
-        let plan = plan_launch(
-            RentalSchedule::batched(3),
-            &deps,
-            &[],
-        );
+        let plan = plan_launch(RentalSchedule::batched(3), &deps, &[]);
         assert_eq!(plan.waves[0].deployments, vec![0, 1, 2]);
         assert_eq!(plan.waves[1].deployments, vec![3]);
     }
@@ -1276,30 +1280,21 @@ mod tests {
             RentalDeployment::new("mana", "repo/1", "L40S"),
             RentalDeployment::new("mana", "repo/2", "L40S"),
         ];
-        let plan = plan_launch(
-            RentalSchedule::batched(4),
-            &deps,
-            &[acc],
-        );
+        let plan = plan_launch(RentalSchedule::batched(4), &deps, &[acc]);
         // Still one wave — proving no re-planning happened.
         assert_eq!(plan.waves.len(), 1);
         assert_eq!(plan.waves[0].deployments.len(), 2);
         // But one problem about the account ceiling.
-        assert!(plan.problems.iter().any(|(f, m)| f == "account"
-            && m.contains("mana")
-            && m.contains("1")));
+        assert!(plan
+            .problems
+            .iter()
+            .any(|(f, m)| f == "account" && m.contains("mana") && m.contains("1")));
     }
 
     #[test]
     fn an_unknown_account_is_not_a_problem() {
-        let deps = [
-            RentalDeployment::new("unknown-account", "repo/1", "L40S"),
-        ];
-        let plan = plan_launch(
-            RentalSchedule::batched(4),
-            &deps,
-            &[],
-        );
+        let deps = [RentalDeployment::new("unknown-account", "repo/1", "L40S")];
+        let plan = plan_launch(RentalSchedule::batched(4), &deps, &[]);
         assert_eq!(plan.waves.len(), 1);
         assert!(plan.problems.is_empty());
     }

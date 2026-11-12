@@ -53,11 +53,9 @@ pub const API_DOCS: &str = "https://www.kaggle.com/docs/api";
 pub const AUTH_REFERENCE: &str =
     "https://github.com/Kaggle/kaggle-cli/blob/main/skills/references/auth.md";
 /// Where create-or-update-and-run, status, logs, output and `-t` were read.
-pub const KERNELS_DOCS: &str =
-    "https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels.md";
+pub const KERNELS_DOCS: &str = "https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels.md";
 /// Where the 12 h/9 h session lengths, the 20 min idle claim and `/kaggle/working` were read.
-pub const NOTEBOOK_DOCS: &str =
-    "https://www.kaggle.com/docs/notebooks#technical-specifications";
+pub const NOTEBOOK_DOCS: &str = "https://www.kaggle.com/docs/notebooks#technical-specifications";
 /// Where the weekly 30-hour GPU quota and the 60 min idle claim were read.
 pub const GPU_QUOTA_DOCS: &str = "https://www.kaggle.com/docs/efficient-gpu-usage";
 /// Where the TPU hours and the 9 h TPU session cap were read.
@@ -90,7 +88,8 @@ pub static FACTS: LaneFacts = LaneFacts {
     quota: &[
         QuotaRule {
             what: "gpu-hours",
-            limit: "The quota resets weekly and is 30 hours or sometimes higher depending on demand \
+            limit:
+                "The quota resets weekly and is 30 hours or sometimes higher depending on demand \
                     and resources",
             reset: Some("weekly"),
             source: GPU_QUOTA_DOCS,
@@ -109,7 +108,8 @@ pub static FACTS: LaneFacts = LaneFacts {
         },
     ],
     use_scope: Some(Restriction {
-        text: "You will only use the Services for your own internal, personal, non-commercial use, \
+        text:
+            "You will only use the Services for your own internal, personal, non-commercial use, \
                and not on behalf of or for the benefit of any third party",
         source: TERMS,
     }),
@@ -169,8 +169,18 @@ mod tests {
 
     #[test]
     fn the_lane_is_automatable_but_cannot_serve_a_request() {
-        assert!(!FACTS.serves_traffic(), "there is no inbound socket to answer a request");
-        assert!(FACTS.automatable(), "push, status and output run without a browser");
-        assert_eq!(FACTS.max_session_secs, Some(43_200), "12 h GPU session ceiling");
+        assert!(
+            !FACTS.serves_traffic(),
+            "there is no inbound socket to answer a request"
+        );
+        assert!(
+            FACTS.automatable(),
+            "push, status and output run without a browser"
+        );
+        assert_eq!(
+            FACTS.max_session_secs,
+            Some(43_200),
+            "12 h GPU session ceiling"
+        );
     }
 }

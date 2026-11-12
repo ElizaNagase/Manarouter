@@ -104,7 +104,9 @@ impl LaneKind {
 
     /// Parse a wire id. Case-sensitive: an id is a key, not a sentence.
     pub fn parse(value: &str) -> Option<LaneKind> {
-        LaneKind::ALL.into_iter().find(|kind| kind.as_str() == value)
+        LaneKind::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == value)
     }
 
     /// From a persisted discriminant. Returns `None` rather than panicking on an unknown number, so
@@ -447,14 +449,22 @@ pub struct LanePlan {
 ///
 /// It does not check quotas against live usage: that needs a clock and a counter, and this module
 /// has neither. A quota-exhausted lane fails at submission, which is the honest place for it.
-pub fn plan_lane(lane: LaneKind, traffic: Traffic, accounts: usize, for_third_parties: bool) -> LanePlan {
+pub fn plan_lane(
+    lane: LaneKind,
+    traffic: Traffic,
+    accounts: usize,
+    for_third_parties: bool,
+) -> LanePlan {
     let facts = lane.facts();
     let mut refusals = Vec::new();
 
     if accounts == 0 {
         refusals.push(Refusal {
             code: "no_account",
-            message: format!("{} needs at least one account before it can run anything", facts.display),
+            message: format!(
+                "{} needs at least one account before it can run anything",
+                facts.display
+            ),
             clause: None,
             source: None,
         });
@@ -561,7 +571,10 @@ mod tests {
     fn every_lane_has_a_descriptor_that_names_itself_and_cites_a_source() {
         for kind in LaneKind::ALL {
             let facts = kind.facts();
-            assert_eq!(facts.kind, kind, "{kind} descriptor is wired to the wrong variant");
+            assert_eq!(
+                facts.kind, kind,
+                "{kind} descriptor is wired to the wrong variant"
+            );
             assert_eq!(facts.id, kind.as_str());
             assert!(!facts.display.is_empty(), "{kind} has no label");
             assert!(
@@ -569,7 +582,10 @@ mod tests {
                 "{kind} cites nothing, so its facts cannot be checked"
             );
             for source in facts.sources {
-                assert!(source.starts_with("https://"), "{kind} cites a non-URL: {source}");
+                assert!(
+                    source.starts_with("https://"),
+                    "{kind} cites a non-URL: {source}"
+                );
             }
             assert!(!facts.headline.is_empty(), "{kind} has no headline");
         }
@@ -580,19 +596,26 @@ mod tests {
         for kind in LaneKind::ALL {
             assert_eq!(LaneKind::parse(kind.as_str()), Some(kind));
             assert_eq!(LaneKind::from_u8(kind as u8), Some(kind));
-            assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::json!(kind.as_str()));
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::json!(kind.as_str())
+            );
         }
         assert_eq!(LaneKind::parse("Modal"), None, "ids are keys, not prose");
         assert_eq!(LaneKind::parse("vast"), None);
-        assert_eq!(LaneKind::from_u8(5), None, "a newer writer's lane is rejected, not guessed");
+        assert_eq!(
+            LaneKind::from_u8(5),
+            None,
+            "a newer writer's lane is rejected, not guessed"
+        );
     }
 
     #[test]
     fn only_a_serving_lane_with_a_public_endpoint_can_answer_a_request() {
         for kind in LaneKind::ALL {
             let facts = kind.facts();
-            let expected = facts.shape == LaneShape::Serving
-                && facts.inbound == Inbound::PublicEndpoint;
+            let expected =
+                facts.shape == LaneShape::Serving && facts.inbound == Inbound::PublicEndpoint;
             assert_eq!(facts.serves_traffic(), expected, "{kind}");
         }
     }
@@ -603,7 +626,11 @@ mod tests {
             let facts = kind.facts();
             let plan = plan_lane(kind, Traffic::Synchronous, 1, false);
             if facts.serves_traffic() {
-                assert!(plan.usable, "{kind} serves traffic but was refused: {:?}", plan.refusals);
+                assert!(
+                    plan.usable,
+                    "{kind} serves traffic but was refused: {:?}",
+                    plan.refusals
+                );
                 continue;
             }
             assert!(!plan.usable, "{kind} cannot serve but was allowed");
@@ -614,7 +641,10 @@ mod tests {
                 LaneShape::Serving => "lane_is_owner_only",
             };
             assert_eq!(code, expected, "{kind}");
-            assert!(plan.refusals[0].source.is_some(), "{kind} refused without a citation");
+            assert!(
+                plan.refusals[0].source.is_some(),
+                "{kind} refused without a citation"
+            );
         }
     }
 
@@ -625,7 +655,10 @@ mod tests {
                 continue;
             }
             let plan = plan_lane(kind, Traffic::Batch, 1, false);
-            assert!(!plan.usable, "{kind} is attended, so even batch work cannot be queued");
+            assert!(
+                !plan.usable,
+                "{kind} is attended, so even batch work cannot be queued"
+            );
             assert_eq!(plan.refusals[0].code, "lane_is_attended");
         }
     }
@@ -642,7 +675,9 @@ mod tests {
             // The clause never blocks: a lane whose terms forbid a second account (per person) is
             // still runnable, because the operator decided pooled accounts are the deployment shape.
             assert!(
-                plan.refusals.iter().all(|r| r.code != "multiple_accounts_forbidden"),
+                plan.refusals
+                    .iter()
+                    .all(|r| r.code != "multiple_accounts_forbidden"),
                 "{kind} refused a second account, but the router must run the accounts it is given"
             );
             assert_eq!(
@@ -657,20 +692,30 @@ mod tests {
                     .iter()
                     .find(|w| w.code == "multiple_accounts_forbidden")
                     .unwrap_or_else(|| panic!("{kind} forbids two accounts but said nothing"));
-                assert!(warning.clause.unwrap().len() > 40, "{kind}'s clause is a summary");
+                assert!(
+                    warning.clause.unwrap().len() > 40,
+                    "{kind}'s clause is a summary"
+                );
                 assert!(warning.source.unwrap().starts_with("https://"));
                 assert!(
-                    one.warnings.iter().all(|w| w.code != "multiple_accounts_forbidden"),
+                    one.warnings
+                        .iter()
+                        .all(|w| w.code != "multiple_accounts_forbidden"),
                     "{kind} warned about a second account when only one was asked for"
                 );
             } else {
                 assert!(
-                    plan.warnings.iter().all(|w| w.code != "multiple_accounts_forbidden"),
+                    plan.warnings
+                        .iter()
+                        .all(|w| w.code != "multiple_accounts_forbidden"),
                     "{kind} allows several accounts"
                 );
             }
         }
-        assert!(saw_one, "no lane reports an account prohibition, so the check proved nothing");
+        assert!(
+            saw_one,
+            "no lane reports an account prohibition, so the check proved nothing"
+        );
     }
 
     #[test]
@@ -682,15 +727,23 @@ mod tests {
             let others = plan_lane(kind, traffic, 1, true);
             if facts.use_scope.is_some() {
                 assert!(
-                    others.warnings.iter().any(|w| w.code == "third_party_traffic_restricted"),
+                    others
+                        .warnings
+                        .iter()
+                        .any(|w| w.code == "third_party_traffic_restricted"),
                     "{kind} restricts use but said nothing about other people's traffic"
                 );
                 assert!(
-                    own.warnings.iter().all(|w| w.code != "third_party_traffic_restricted"),
+                    own.warnings
+                        .iter()
+                        .all(|w| w.code != "third_party_traffic_restricted"),
                     "{kind} warned about third parties when the work was the operator's own"
                 );
             } else {
-                assert!(own.usable, "{kind} should be usable for the operator's own work");
+                assert!(
+                    own.usable,
+                    "{kind} should be usable for the operator's own work"
+                );
             }
             // Traffic scope is the operator's call, so it can never make a lane unusable.
             assert_eq!(
@@ -725,9 +778,19 @@ mod tests {
         // Only the shape is a refusal now: Kaggle has no endpoint a chat request can be answered
         // from. The terms findings travel separately.
         let refusals = json["refusals"].as_array().unwrap();
-        assert_eq!(refusals.len(), 1, "only the shape refuses this plan: got {refusals:?}");
-        let batch = refusals.iter().find(|r| r["code"] == "lane_is_batch_only").unwrap();
-        assert!(batch.get("clause").is_none(), "a shape refusal quotes no clause");
+        assert_eq!(
+            refusals.len(),
+            1,
+            "only the shape refuses this plan: got {refusals:?}"
+        );
+        let batch = refusals
+            .iter()
+            .find(|r| r["code"] == "lane_is_batch_only")
+            .unwrap();
+        assert!(
+            batch.get("clause").is_none(),
+            "a shape refusal quotes no clause"
+        );
 
         let warnings = json["warnings"].as_array().unwrap();
         assert_eq!(warnings.len(), 2, "accounts plus scope: got {warnings:?}");
@@ -744,13 +807,25 @@ mod tests {
         // Kaggle with one account and the operator's own traffic: the clause still applies to the
         // platform, but nothing here trips it, so the plan is usable and both lists are empty.
         let plan = plan_lane(LaneKind::Kaggle, Traffic::Batch, 1, false);
-        assert!(plan.usable, "the batch lane is exactly what Kaggle is for: {:?}", plan.refusals);
+        assert!(
+            plan.usable,
+            "the batch lane is exactly what Kaggle is for: {:?}",
+            plan.refusals
+        );
         assert!(plan.refusals.is_empty());
-        assert!(plan.warnings.is_empty(), "nothing applies, so nothing should be said: {:?}", plan.warnings);
+        assert!(
+            plan.warnings.is_empty(),
+            "nothing applies, so nothing should be said: {:?}",
+            plan.warnings
+        );
 
         // And a warned plan keeps `usable` true, which is the whole point of the split.
         let warned = plan_lane(LaneKind::Kaggle, Traffic::Batch, 3, true);
-        assert!(warned.usable, "warnings must not decide usability: {:?}", warned.refusals);
+        assert!(
+            warned.usable,
+            "warnings must not decide usability: {:?}",
+            warned.refusals
+        );
         assert!(warned.refusals.is_empty());
         assert_eq!(warned.warnings.len(), 2);
     }
@@ -764,7 +839,11 @@ mod tests {
         assert_eq!(json["submission"], serde_json::json!("kernel-push"));
         assert_eq!(json["accounts"]["verdict"], serde_json::json!("prohibited"));
         assert!(json["accounts"]["clause"].as_str().unwrap().len() > 40);
-        assert!(json["quota"].as_array().unwrap().iter().any(|q| q["what"] == "gpu-hours"));
+        assert!(json["quota"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|q| q["what"] == "gpu-hours"));
     }
 
     /// A representative traffic shape for a lane, used by the tests that only care about accounts or
@@ -791,18 +870,36 @@ mod tests {
         ];
         for (lane, sync_ok, batch_ok) in known {
             let sync = plan_lane(lane, Traffic::Synchronous, 1, false);
-            assert_eq!(sync.usable, sync_ok, "{lane} sync: expected usable={sync_ok}");
+            assert_eq!(
+                sync.usable, sync_ok,
+                "{lane} sync: expected usable={sync_ok}"
+            );
             if sync.usable {
-                assert!(sync.refusals.is_empty(), "{lane} sync is usable but has refusals");
+                assert!(
+                    sync.refusals.is_empty(),
+                    "{lane} sync is usable but has refusals"
+                );
             } else {
-                assert!(!sync.refusals.is_empty(), "{lane} sync refused with no reason");
+                assert!(
+                    !sync.refusals.is_empty(),
+                    "{lane} sync refused with no reason"
+                );
             }
             let batch = plan_lane(lane, Traffic::Batch, 1, false);
-            assert_eq!(batch.usable, batch_ok, "{lane} batch: expected usable={batch_ok}");
+            assert_eq!(
+                batch.usable, batch_ok,
+                "{lane} batch: expected usable={batch_ok}"
+            );
             if batch.usable {
-                assert!(batch.refusals.is_empty(), "{lane} batch is usable but has refusals");
+                assert!(
+                    batch.refusals.is_empty(),
+                    "{lane} batch is usable but has refusals"
+                );
             } else {
-                assert!(!batch.refusals.is_empty(), "{lane} batch refused with no reason");
+                assert!(
+                    !batch.refusals.is_empty(),
+                    "{lane} batch refused with no reason"
+                );
             }
         }
     }

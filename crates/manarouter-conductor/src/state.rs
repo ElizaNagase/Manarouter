@@ -310,7 +310,9 @@ impl AppState {
             started_at: Instant::now(),
             config_seen: Arc::new(StdMutex::new(None)),
             kaggle: crate::lane_kaggle::KaggleState::new(),
-            molab: Arc::new(tokio::sync::Mutex::new(crate::lane_molab::MolabState::default())),
+            molab: Arc::new(tokio::sync::Mutex::new(
+                crate::lane_molab::MolabState::default(),
+            )),
             saturn: std::sync::Arc::new(crate::lane_saturn::SaturnState::new()),
             cerebrium: std::sync::Arc::new(crate::lane_cerebrium::CerebriumState::new()),
         };

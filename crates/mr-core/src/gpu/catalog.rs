@@ -134,9 +134,7 @@ impl Serialize for ComputeCapability {
 }
 
 impl<'de> Deserialize<'de> for ComputeCapability {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct CapabilityVisitor;
 
         impl<'de> serde::de::Visitor<'de> for CapabilityVisitor {
@@ -146,10 +144,7 @@ impl<'de> Deserialize<'de> for ComputeCapability {
                 f.write_str("a compute capability such as \"8.9\", 8.9, or 9")
             }
 
-            fn visit_str<E: serde::de::Error>(
-                self,
-                value: &str,
-            ) -> Result<ComputeCapability, E> {
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<ComputeCapability, E> {
                 ComputeCapability::parse(value).ok_or_else(|| {
                     E::custom(format!(
                         "cannot read {value:?} as a compute capability; \
@@ -759,7 +754,8 @@ const MODAL: PlatformSpec = PlatformSpec {
     ],
     deployment: PlatformDeployment {
         programmatic: false,
-        explain: "Modal has no public REST endpoint that deploys or updates an app; deployment goes \
+        explain:
+            "Modal has no public REST endpoint that deploys or updates an app; deployment goes \
                   through the `modal` CLI or `modal.App.deploy()` from a Python process. The \
                   conductor therefore generates the app and the operator deploys it — it never \
                   claims to have deployed anything itself.",
@@ -1002,7 +998,8 @@ pub static KV_CACHE_DTYPES: &[KvCacheDtype] = &[
         min_cuda: Some("11.8"),
         source: FactSource::Documented,
         source_url: VLLM_KV_CACHE_URL,
-        notes: "One byte per element, halving the cache against BF16 — the single biggest lever on \
+        notes:
+            "One byte per element, halving the cache against BF16 — the single biggest lever on \
                 how many tokens fit. Storage-only: it needs CUDA 11.8+ and **not** sm89, so it is \
                 legal on the T4 and the A100 even though FP8 GEMM is not. This is the dtype the \
                 operator measured both reference pools with.",
@@ -1015,7 +1012,8 @@ pub static KV_CACHE_DTYPES: &[KvCacheDtype] = &[
         min_cuda: Some("11.8"),
         source: FactSource::Documented,
         source_url: VLLM_KV_CACHE_URL,
-        notes: "The explicit spelling of the 4-bit-exponent FP8 format: one byte per element, wider \
+        notes:
+            "The explicit spelling of the 4-bit-exponent FP8 format: one byte per element, wider \
                 range than E5M2 at the cost of mantissa precision. Same hardware rules as `fp8`.",
     },
     KvCacheDtype {
@@ -1353,7 +1351,10 @@ fn quant_reason(method: &QuantMethod, gpu: &GpuSpec, support: QuantSupport) -> S
                 card,
                 method.notes
             ),
-            None => format!("documented as impossible on {}: {}", gpu.label, method.notes),
+            None => format!(
+                "documented as impossible on {}: {}",
+                gpu.label, method.notes
+            ),
         },
         QuantSupport::Unverified => {
             if method.cells.is_none() {
@@ -1396,7 +1397,10 @@ pub fn resolve_kv_dtype_for(gpu: &GpuSpec, dtype_id: &str) -> Option<QuantVerdic
                  capability, so {} can cache in it",
                 dtype.id, cuda, gpu.label
             ),
-            None => format!("documented as available on {} (no special hardware needed)", gpu.label),
+            None => format!(
+                "documented as available on {} (no special hardware needed)",
+                gpu.label
+            ),
         },
         _ => format!(
             "{} has no documented compute capability in this catalog, so this dtype is unverified \
@@ -1471,14 +1475,22 @@ mod tests {
         ];
         for (id, hourly) in anchors {
             let gpu = gpu_by_id(id).expect("anchor card is in the catalog");
-            assert!((gpu.price_usd_per_hour - hourly).abs() < 1e-9, "{id} hourly");
+            assert!(
+                (gpu.price_usd_per_hour - hourly).abs() < 1e-9,
+                "{id} hourly"
+            );
         }
     }
 
     #[test]
     fn every_card_has_a_documented_price_provenance() {
         for gpu in GPUS {
-            assert_eq!(gpu.source, FactSource::Documented, "{} price source", gpu.id);
+            assert_eq!(
+                gpu.source,
+                FactSource::Documented,
+                "{} price source",
+                gpu.id
+            );
             assert_eq!(gpu.source_url, MODAL_PRICING_URL, "{} price url", gpu.id);
             assert_eq!(gpu.checked_at, CATALOG_CHECKED_AT, "{} checked_at", gpu.id);
         }
@@ -1500,7 +1512,12 @@ mod tests {
         for gpu in GPUS {
             // The price is documented on every row, including the one whose free-plan flag was
             // observed: the two provenances never share a field.
-            assert_eq!(gpu.source, FactSource::Documented, "{} price source", gpu.id);
+            assert_eq!(
+                gpu.source,
+                FactSource::Documented,
+                "{} price source",
+                gpu.id
+            );
             if gpu.id == "H100" {
                 assert_eq!(
                     gpu.free_plan_source,
@@ -1537,8 +1554,21 @@ mod tests {
             gpu_by_id("A10G").is_none(),
             "A10G is not a valid gpu= value, so it must not resolve"
         );
-        assert!(gpu_by_id("A100").is_none(), "A100 alone is ambiguous: use a variant id");
-        for id in ["A100-40GB", "A100-80GB", "H100", "H200", "B200", "B300", "T4", "L4", "L40S"] {
+        assert!(
+            gpu_by_id("A100").is_none(),
+            "A100 alone is ambiguous: use a variant id"
+        );
+        for id in [
+            "A100-40GB",
+            "A100-80GB",
+            "H100",
+            "H200",
+            "B200",
+            "B300",
+            "T4",
+            "L4",
+            "L40S",
+        ] {
             assert!(gpu_by_id(id).is_some(), "{id} must resolve");
         }
     }
@@ -1592,7 +1622,11 @@ mod tests {
             match (gpu.vram_gib, gpu.vram_bytes, gpu.vram_source) {
                 (Some(gib), Some(bytes), Some(_)) => {
                     let expected = (gib * 1024.0 * 1024.0 * 1024.0) as u64;
-                    assert_eq!(bytes, expected, "{} vram_bytes must follow vram_gib", gpu.id);
+                    assert_eq!(
+                        bytes, expected,
+                        "{} vram_bytes must follow vram_gib",
+                        gpu.id
+                    );
                 }
                 (None, None, None) => {}
                 other => panic!("{} has an inconsistent VRAM triple: {other:?}", gpu.id),
@@ -1662,13 +1696,23 @@ mod tests {
     fn native_fp8_gemm_requires_capability_eight_nine() {
         assert_eq!(NATIVE_FP8_GEMM_MIN, ComputeCapability::new(8, 9));
         assert!(gpu_by_id("L4").expect("present").supports_native_fp8_gemm());
-        assert!(gpu_by_id("L40S").expect("present").supports_native_fp8_gemm());
-        assert!(gpu_by_id("RTX-PRO-6000").expect("present").supports_native_fp8_gemm());
+        assert!(gpu_by_id("L40S")
+            .expect("present")
+            .supports_native_fp8_gemm());
+        assert!(gpu_by_id("RTX-PRO-6000")
+            .expect("present")
+            .supports_native_fp8_gemm());
         assert!(!gpu_by_id("T4").expect("present").supports_native_fp8_gemm());
-        assert!(!gpu_by_id("A10").expect("present").supports_native_fp8_gemm());
-        assert!(!gpu_by_id("A100-80GB").expect("present").supports_native_fp8_gemm());
+        assert!(!gpu_by_id("A10")
+            .expect("present")
+            .supports_native_fp8_gemm());
+        assert!(!gpu_by_id("A100-80GB")
+            .expect("present")
+            .supports_native_fp8_gemm());
         // Unknown capability is not a pass: the answer is "cannot say", which is false here.
-        assert!(!gpu_by_id("B300").expect("present").supports_native_fp8_gemm());
+        assert!(!gpu_by_id("B300")
+            .expect("present")
+            .supports_native_fp8_gemm());
     }
 
     #[test]
@@ -1719,7 +1763,11 @@ mod tests {
         assert_eq!(width("bfloat16"), Some(2));
         assert_eq!(width("float16"), Some(2));
         assert_eq!(width("auto"), None);
-        assert!(kv_cache_dtype_by_id("auto").expect("present").follows_model_dtype);
+        assert!(
+            kv_cache_dtype_by_id("auto")
+                .expect("present")
+                .follows_model_dtype
+        );
         assert!(kv_cache_dtype_by_id("int4").is_none(), "not a vLLM dtype");
         for dtype in KV_CACHE_DTYPES {
             assert_eq!(dtype.source_url, VLLM_KV_CACHE_URL);
@@ -1793,7 +1841,11 @@ mod tests {
     fn int8_w4a8_is_impossible_on_every_modal_card() {
         let method = quant_method_by_id("int8_w4a8").expect("present");
         let cells = method.cells.expect("explicit cells");
-        assert_eq!(cells.len(), GPUS.len(), "the row is explicit for every card");
+        assert_eq!(
+            cells.len(),
+            GPUS.len(),
+            "the row is explicit for every card"
+        );
         for gpu in GPUS {
             let verdict = resolve_quant_for(gpu, "int8_w4a8").expect("exists");
             assert_eq!(
@@ -1811,7 +1863,10 @@ mod tests {
         let t4 = gpu_by_id("T4").expect("present");
         let verdict = resolve_quant_for(t4, "awq").expect("exists");
         assert_eq!(verdict.support, QuantSupport::Unverified);
-        assert!(verdict.runnable(), "unverified is not a documented impossibility");
+        assert!(
+            verdict.runnable(),
+            "unverified is not a documented impossibility"
+        );
         let method = quant_method_by_id("awq").expect("present");
         assert!(
             method.notes.contains("disagree"),
@@ -1827,7 +1882,10 @@ mod tests {
     #[test]
     fn a_theoretical_capability_never_clears_an_unknown_card() {
         let b300 = gpu_by_id("B300").expect("present");
-        assert!(b300.compute_capability.is_none(), "the premise: no capability");
+        assert!(
+            b300.compute_capability.is_none(),
+            "the premise: no capability"
+        );
         for method in QUANT_METHODS {
             let verdict = resolve_quant_for(b300, method.id).expect("exists");
             // Nothing can be *cleared* for a card whose capability is unknown: a missing input
@@ -1905,10 +1963,22 @@ mod tests {
             .iter()
             .find(|limit| limit.id == "paid")
             .expect("team row");
-        assert_eq!(modal.max_concurrent_containers.free, starter.gpu_concurrency.expect("stated"));
-        assert_eq!(modal.max_concurrent_containers.paid, team.gpu_concurrency.expect("stated"));
-        assert_eq!(modal.max_concurrent_containers.source, FactSource::Documented);
-        assert_eq!(modal.max_concurrent_containers.source_url, MODAL_PRICING_URL);
+        assert_eq!(
+            modal.max_concurrent_containers.free,
+            starter.gpu_concurrency.expect("stated")
+        );
+        assert_eq!(
+            modal.max_concurrent_containers.paid,
+            team.gpu_concurrency.expect("stated")
+        );
+        assert_eq!(
+            modal.max_concurrent_containers.source,
+            FactSource::Documented
+        );
+        assert_eq!(
+            modal.max_concurrent_containers.source_url,
+            MODAL_PRICING_URL
+        );
     }
 
     #[test]
@@ -1927,8 +1997,14 @@ mod tests {
     #[test]
     fn platform_flags_the_things_the_bundle_cannot_forget() {
         let modal = modal();
-        assert!(!modal.deployment.programmatic, "Modal has no REST deploy API");
-        assert!(!modal.deployment.has_detach_flag, "`modal deploy` has no --detach");
+        assert!(
+            !modal.deployment.programmatic,
+            "Modal has no REST deploy API"
+        );
+        assert!(
+            !modal.deployment.has_detach_flag,
+            "`modal deploy` has no --detach"
+        );
         assert!(modal.deployment.strategies.contains(&"rolling"));
         assert!(modal.deployment.strategies.contains(&"recreate"));
         assert_eq!(modal.deployment.multi_gpu_syntax, "gpu=\"H100:8\"");
@@ -1954,16 +2030,28 @@ mod tests {
 
     #[test]
     fn compute_capability_parses_strings_numbers_and_display_forms() {
-        assert_eq!(ComputeCapability::parse("8.9"), Some(ComputeCapability::new(8, 9)));
-        assert_eq!(ComputeCapability::parse(" 12.0 "), Some(ComputeCapability::new(12, 0)));
-        assert_eq!(ComputeCapability::parse("9"), Some(ComputeCapability::new(9, 0)));
+        assert_eq!(
+            ComputeCapability::parse("8.9"),
+            Some(ComputeCapability::new(8, 9))
+        );
+        assert_eq!(
+            ComputeCapability::parse(" 12.0 "),
+            Some(ComputeCapability::new(12, 0))
+        );
+        assert_eq!(
+            ComputeCapability::parse("9"),
+            Some(ComputeCapability::new(9, 0))
+        );
         assert_eq!(ComputeCapability::parse("eight"), None);
         assert_eq!(
             ComputeCapability::from_f64(8.9),
             Some(ComputeCapability::new(8, 9)),
             "the float 8.9 must not truncate to 8.8"
         );
-        assert_eq!(ComputeCapability::from_f64(9.0), Some(ComputeCapability::new(9, 0)));
+        assert_eq!(
+            ComputeCapability::from_f64(9.0),
+            Some(ComputeCapability::new(9, 0))
+        );
         assert_eq!(ComputeCapability::from_f64(-1.0), None);
         assert_eq!(ComputeCapability::new(8, 9).as_string(), "8.9");
         assert!(ComputeCapability::new(8, 9) > ComputeCapability::new(8, 6));
@@ -1980,7 +2068,10 @@ mod tests {
         let numeric: ComputeCapability = serde_json::from_str("8.9").expect("accepts a number");
         assert_eq!(numeric, ComputeCapability::new(8, 9));
         let wrong: Result<ComputeCapability, _> = serde_json::from_str("\"sm89\"");
-        assert!(wrong.is_err(), "an unparseable capability is an error, not a default");
+        assert!(
+            wrong.is_err(),
+            "an unparseable capability is an error, not a default"
+        );
     }
 
     #[test]
@@ -2003,7 +2094,10 @@ mod tests {
         assert_eq!(rtx["source_url"], MODAL_PRICING_URL);
         assert_eq!(rtx["compute_capability"], "12.0");
         assert_eq!(rtx["max_gpus_per_container"], 8);
-        let b300 = gpus.iter().find(|gpu| gpu["id"] == "B300").expect("b300 row");
+        let b300 = gpus
+            .iter()
+            .find(|gpu| gpu["id"] == "B300")
+            .expect("b300 row");
         assert!(b300["vram_gib"].is_null());
         assert!(b300["vram_bytes"].is_null());
         assert_eq!(b300["min_cuda"], "13.1");
@@ -2019,21 +2113,26 @@ mod tests {
     fn quant_rows_serialise_their_cells_and_provenance() {
         let value = serde_json::to_value(quant_methods()).expect("methods serialise");
         let rows = value.as_array().expect("array");
-        let fp8 = rows
-            .iter()
-            .find(|row| row["id"] == "fp8")
-            .expect("fp8 row");
+        let fp8 = rows.iter().find(|row| row["id"] == "fp8").expect("fp8 row");
         assert_eq!(fp8["min_compute_capability"], "8.9");
         assert_eq!(fp8["bytes_per_param"], 1.0);
         assert_eq!(fp8["source"], "documented");
         let cells = fp8["cells"].as_array().expect("cells array");
         assert!(
-            cells.iter().any(|cell| cell[0] == "T4" && cell[1] == "unsupported"),
+            cells
+                .iter()
+                .any(|cell| cell[0] == "T4" && cell[1] == "unsupported"),
             "the T4 exclusion must survive serialisation"
         );
-        let gptq = rows.iter().find(|row| row["id"] == "gptq").expect("gptq row");
+        let gptq = rows
+            .iter()
+            .find(|row| row["id"] == "gptq")
+            .expect("gptq row");
         assert_eq!(gptq["bytes_per_param"], 0.5);
-        let gguf = rows.iter().find(|row| row["id"] == "gguf").expect("gguf row");
+        let gguf = rows
+            .iter()
+            .find(|row| row["id"] == "gguf")
+            .expect("gguf row");
         assert!(
             gguf["bytes_per_param"].is_null(),
             "GGUF's width depends on the file, so it must not be given a number"

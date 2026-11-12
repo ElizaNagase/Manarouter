@@ -389,9 +389,7 @@ pub fn plan_requantize(request: &RecipeRequest) -> RequantizePlan {
             "the target is requested as `{}` but llm-compressor writes \
              quant_method=\"{}\" with format=\"{}\" — vLLM reads that from config.json and raises \
              ValueError if a `--quantization` flag disagrees with it, so the flag is never emitted",
-            request.target.id,
-            request.target.produced_quant_method,
-            request.target.produced_format
+            request.target.id, request.target.produced_quant_method, request.target.produced_format
         ));
     }
 
@@ -674,7 +672,10 @@ pub fn plan_requantize(request: &RecipeRequest) -> RequantizePlan {
         requires_host_ram_bytes,
         requires_disk_bytes,
         estimated_minutes: request.base_minutes,
-        estimated_minutes_range: [request.estimated_minutes_min(), request.estimated_minutes_max()],
+        estimated_minutes_range: [
+            request.estimated_minutes_min(),
+            request.estimated_minutes_max(),
+        ],
         estimated_cost_usd,
         tool: TOOL.to_string(),
         tool_version: TOOL_VERSION.to_string(),
@@ -776,7 +777,9 @@ pub fn recomputed_dense_vram_bytes(params: u64, layers: u64) -> Option<u64> {
     let bf16 = slice.checked_mul(2)?;
     let held_twice = bf16.checked_mul(2)?;
     let across_ranks = held_twice.checked_mul(4)?;
-    across_ranks.checked_add(VISION_TOWER_BYTES)?.checked_add(RUNTIME_BYTES)
+    across_ranks
+        .checked_add(VISION_TOWER_BYTES)?
+        .checked_add(RUNTIME_BYTES)
 }
 
 /// The vision tower's weights, charged once to the converting rank. An upper bound, not a reading.
@@ -824,9 +827,9 @@ mod tests {
 
     /// Whether any token is `--quantization`, in either the space-separated or `=` spelling.
     fn passes_quantization_flag(command: &str) -> bool {
-        argv_of(command).iter().any(|token| {
-            *token == "--quantization" || token.starts_with("--quantization=")
-        })
+        argv_of(command)
+            .iter()
+            .any(|token| *token == "--quantization" || token.starts_with("--quantization="))
     }
 
     #[test]
@@ -841,7 +844,9 @@ mod tests {
             passes_quantization_flag("vllm serve <your-repo> --quantization awq"),
             "the detector must still see a flag that is genuinely there"
         );
-        assert!(passes_quantization_flag("vllm serve m --quantization=compressed-tensors"));
+        assert!(passes_quantization_flag(
+            "vllm serve m --quantization=compressed-tensors"
+        ));
         assert!(!passes_quantization_flag(
             "vllm serve m  # no --quantization flag: it is read from config.json"
         ));
@@ -912,12 +917,18 @@ mod tests {
             .any(|command| command.starts_with("pip install \"llm-compressor==0.15.0\"")));
         let python_file = format!("write requantize.py (see {RECIPES_URL} §2.2)");
         assert!(commands.iter().any(|command| *command == python_file));
-        assert!(commands.iter().any(|command| *command == "python requantize.py"));
+        assert!(commands
+            .iter()
+            .any(|command| *command == "python requantize.py"));
         assert!(
-            !commands.iter().any(|command| command.starts_with("llmcompressor")),
+            !commands
+                .iter()
+                .any(|command| command.starts_with("llmcompressor")),
             "there is no llmcompressor CLI entry point to call: {commands:?}"
         );
-        assert!(commands.iter().any(|command| command.contains("upload the produced directory")));
+        assert!(commands
+            .iter()
+            .any(|command| command.contains("upload the produced directory")));
     }
 
     #[test]
@@ -934,7 +945,10 @@ mod tests {
             .steps
             .iter()
             .any(|step| step.command.contains("hf auth login")));
-        assert!(gated.notes.iter().any(|note| note.contains("Check the source repo's licence")));
+        assert!(gated
+            .notes
+            .iter()
+            .any(|note| note.contains("Check the source repo's licence")));
     }
 
     #[test]
@@ -958,7 +972,10 @@ mod tests {
             assert!(plan.vram_gate_evaluated, "{card}");
             assert_eq!(plan.feasible_on_gpu, Some(true), "{card}");
             assert_eq!(plan.failed_on, None, "{card}");
-            assert!(plan.card_vram_bytes.expect("vram") > plan.requires_vram_bytes, "{card}");
+            assert!(
+                plan.card_vram_bytes.expect("vram") > plan.requires_vram_bytes,
+                "{card}"
+            );
         }
         assert_eq!(DENSE_REQUIRES_VRAM_BYTES, 12_884_901_888);
         assert_eq!(REQUIRES_EXTRA_VRAM_BYTES, 0);
@@ -1007,8 +1024,7 @@ mod tests {
         });
         assert_eq!(plan.card_vram_bytes, Some(17_179_869_184));
         assert!(
-            DENSE_REQUIRES_VRAM_BYTES as f64
-                <= (17_179_869_184f64 * VRAM_GATE_HEADROOM).floor(),
+            DENSE_REQUIRES_VRAM_BYTES as f64 <= (17_179_869_184f64 * VRAM_GATE_HEADROOM).floor(),
             "the premise: the T4 passes VRAM, so disk is the first gate that can stop it"
         );
         let failed = plan.failed_on.expect("the plan must name what stopped it");
@@ -1040,7 +1056,10 @@ mod tests {
             ..RecipeRequest::default()
         });
         assert_eq!(offloaded.feasible_on_gpu, Some(true));
-        assert!(offloaded.notes.iter().any(|note| note.contains("auto_offload")));
+        assert!(offloaded
+            .notes
+            .iter()
+            .any(|note| note.contains("auto_offload")));
     }
 
     #[test]
@@ -1084,7 +1103,10 @@ mod tests {
         assert_eq!(rows[2].speedup, 3.8);
         assert_eq!(rows[2].wall_clock_hours, 2.11);
         assert_eq!(rows[2].gpu_hours, 8.42);
-        assert!(rows[2].cost_usd > rows[0].cost_usd, "5 % off perfect at four ranks costs money");
+        assert!(
+            rows[2].cost_usd > rows[0].cost_usd,
+            "5 % off perfect at four ranks costs money"
+        );
         assert!(rows
             .iter()
             .all(|row| row.speedup_source == FactSource::Observed));
@@ -1168,13 +1190,22 @@ mod tests {
     #[test]
     fn the_plan_lists_the_alternative_cards_that_clear_the_same_gate() {
         let plan = plan();
-        assert!(plan.alternative_cards.iter().any(|card| card == "RTX-PRO-6000"));
+        assert!(plan
+            .alternative_cards
+            .iter()
+            .any(|card| card == "RTX-PRO-6000"));
         assert!(plan.alternative_cards.iter().any(|card| card == "T4"));
         assert!(
-            !plan.alternative_cards.iter().any(|card| card == REFERENCE_CARD),
+            !plan
+                .alternative_cards
+                .iter()
+                .any(|card| card == REFERENCE_CARD),
             "the chosen card is not its own alternative"
         );
-        assert!(plan.notes.iter().any(|note| note.contains("the run will be quick")));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("the run will be quick")));
     }
 
     #[test]
@@ -1228,10 +1259,16 @@ mod tests {
             "publishable",
             "notes",
         ] {
-            assert!(value.get(field).is_some(), "the wire shape must carry `{field}`");
+            assert!(
+                value.get(field).is_some(),
+                "the wire shape must carry `{field}`"
+            );
         }
         assert_eq!(value["path"], serde_json::json!("dense"));
-        assert_eq!(value["target"]["produced_quant_method"], serde_json::json!("compressed-tensors"));
+        assert_eq!(
+            value["target"]["produced_quant_method"],
+            serde_json::json!("compressed-tensors")
+        );
         assert_eq!(value["feasible_on_gpu"], serde_json::json!(true));
         assert_eq!(value["failed_on"], serde_json::Value::Null);
 

@@ -73,7 +73,9 @@ use axum::{
 };
 use http::Method;
 use mr_core::error::Result as CoreResult;
-use mr_core::gpu::cerebrium::{app_name_is_safe as renderer_app_name_is_safe, compute_by_id, COOLDOWN_RANGE, PORT};
+use mr_core::gpu::cerebrium::{
+    app_name_is_safe as renderer_app_name_is_safe, compute_by_id, COOLDOWN_RANGE, PORT,
+};
 use mr_core::ids::Millis;
 use mr_core::quota::http::{HyperQuotaHttp, QuotaHttp, QuotaRequest};
 use serde::Deserialize;
@@ -178,7 +180,10 @@ impl CerebriumRegistration {
 
     /// The inference base URL a provider should be pointed at once the app is running.
     fn inference_base_url(&self) -> String {
-        format!("{INFERENCE_HOST}/v4/{}/{}/v1", self.project_id, self.app_name)
+        format!(
+            "{INFERENCE_HOST}/v4/{}/{}/v1",
+            self.project_id, self.app_name
+        )
     }
 }
 
@@ -475,7 +480,9 @@ pub async fn attach_for(
         ));
     }
     if project_id.is_empty() {
-        return Err(CerebriumError::Invalid("project_id is required.".to_owned()));
+        return Err(CerebriumError::Invalid(
+            "project_id is required.".to_owned(),
+        ));
     }
     if token.is_empty() {
         return Err(CerebriumError::Invalid(
@@ -598,7 +605,10 @@ fn app_name_problem(app_name: &str) -> Option<String> {
             "app_name {app_name:?} contains upper case; Cerebrium app names are lower case."
         ));
     }
-    if !app_name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+    if !app_name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
         return Some(format!(
             "app_name {app_name:?} contains a character Cerebrium does not allow; use lower-case \
              letters, digits and dashes."
@@ -631,12 +641,13 @@ pub async fn deploy_for(
     let record = deploy_record(&app_name, &request)?;
 
     let mut outbound = control_request(Method::POST, url, &token);
-    outbound.headers.push((
-        "content-type".to_owned(),
-        "application/json".to_owned(),
-    ));
+    outbound
+        .headers
+        .push(("content-type".to_owned(), "application/json".to_owned()));
     outbound.body = serde_json::to_vec(&record)
-        .map_err(|error| CerebriumError::Invalid(format!("the request did not serialise: {error}")))?
+        .map_err(|error| {
+            CerebriumError::Invalid(format!("the request did not serialise: {error}"))
+        })?
         .into();
 
     let response = send(http, outbound).await?;
@@ -725,7 +736,8 @@ fn deploy_record(app_name: &str, request: &DeployRequest) -> Result<Value, Cereb
     let gpu_count = request.gpu_count.unwrap_or(1);
     if gpu_count == 0 {
         return Err(CerebriumError::Invalid(
-            "gpu_count 0 would deploy a CPU app that cannot serve a model; use at least 1.".to_owned(),
+            "gpu_count 0 would deploy a CPU app that cannot serve a model; use at least 1."
+                .to_owned(),
         ));
     }
     if gpu_count > compute_type.max_gpu_count {
@@ -822,16 +834,19 @@ pub async fn down_for(
     let app_id = match app_id {
         Some(app_id) => app_id,
         None => {
-            let response = send(http, control_request(Method::GET, apps_url.clone(), &token)).await?;
+            let response =
+                send(http, control_request(Method::GET, apps_url.clone(), &token)).await?;
             match response.status {
                 200..=299 => {}
                 404 => return Err(CerebriumError::ProjectNotFound),
                 status => return Err(classify(status, &String::from_utf8_lossy(&response.body))),
             }
-            let body = response.json().map_err(|error| CerebriumError::Unavailable {
-                status: response.status,
-                detail: format!("the app list was not JSON: {error}"),
-            })?;
+            let body = response
+                .json()
+                .map_err(|error| CerebriumError::Unavailable {
+                    status: response.status,
+                    detail: format!("the app list was not JSON: {error}"),
+                })?;
             find_app_id(&body, &app_name).ok_or(CerebriumError::AppNotFound)?
         }
     };
@@ -943,7 +958,10 @@ pub async fn probe_for(
 /// `GET /status` — local truth only, so a panel refresh never waits on Cerebrium.
 pub async fn status_for(state: &CerebriumState) -> Json<Value> {
     let registrations = state.lock().await;
-    let mut accounts: Vec<Value> = registrations.values().map(CerebriumRegistration::view).collect();
+    let mut accounts: Vec<Value> = registrations
+        .values()
+        .map(CerebriumRegistration::view)
+        .collect();
     accounts.sort_by(|a, b| {
         a.get("account")
             .and_then(Value::as_str)
@@ -1032,7 +1050,8 @@ async fn post_attach(
     State(app): State<AppState>,
     Json(body): Json<AttachRequest>,
 ) -> Result<Json<Value>, CerebriumError> {
-    let http = shared_cerebrium_http().map_err(|error| CerebriumError::ClientUnavailable(error.to_string()))?;
+    let http = shared_cerebrium_http()
+        .map_err(|error| CerebriumError::ClientUnavailable(error.to_string()))?;
     attach_for(&app.cerebrium, http.as_ref(), body).await
 }
 
@@ -1040,7 +1059,8 @@ async fn post_deploy(
     State(app): State<AppState>,
     Json(body): Json<DeployRequest>,
 ) -> Result<Json<Value>, CerebriumError> {
-    let http = shared_cerebrium_http().map_err(|error| CerebriumError::ClientUnavailable(error.to_string()))?;
+    let http = shared_cerebrium_http()
+        .map_err(|error| CerebriumError::ClientUnavailable(error.to_string()))?;
     deploy_for(&app.cerebrium, http.as_ref(), body).await
 }
 
@@ -1048,7 +1068,8 @@ async fn post_down(
     State(app): State<AppState>,
     Json(body): Json<DownRequest>,
 ) -> Result<Json<Value>, CerebriumError> {
-    let http = shared_cerebrium_http().map_err(|error| CerebriumError::ClientUnavailable(error.to_string()))?;
+    let http = shared_cerebrium_http()
+        .map_err(|error| CerebriumError::ClientUnavailable(error.to_string()))?;
     down_for(&app.cerebrium, http.as_ref(), body).await
 }
 
@@ -1056,7 +1077,8 @@ async fn post_probe(
     State(app): State<AppState>,
     Json(body): Json<ProbeRequest>,
 ) -> Result<Json<Value>, CerebriumError> {
-    let http = shared_cerebrium_http().map_err(|error| CerebriumError::ClientUnavailable(error.to_string()))?;
+    let http = shared_cerebrium_http()
+        .map_err(|error| CerebriumError::ClientUnavailable(error.to_string()))?;
     probe_for(&app.cerebrium, http.as_ref(), body).await
 }
 
@@ -1249,7 +1271,8 @@ mod tests {
         );
 
         request.acknowledge_public_endpoint = Some(true);
-        let record = deploy_record("qwen3-coder", &request).expect("acknowledged public endpoint is allowed");
+        let record = deploy_record("qwen3-coder", &request)
+            .expect("acknowledged public endpoint is allowed");
         assert_eq!(record["disableAuth"], true);
     }
 
@@ -1303,7 +1326,9 @@ mod tests {
     async fn deploy_on_an_unregistered_account_is_a_404_naming_it() {
         let http = FakeHttp::with(&[]);
         let state = CerebriumState::new();
-        let error = deploy_for(&state, &http, deploy("ghost")).await.unwrap_err();
+        let error = deploy_for(&state, &http, deploy("ghost"))
+            .await
+            .unwrap_err();
         assert_eq!(error.code(), "account_not_registered");
         assert_eq!(error.status(), StatusCode::NOT_FOUND);
     }

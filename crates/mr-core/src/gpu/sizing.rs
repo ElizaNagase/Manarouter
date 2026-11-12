@@ -668,7 +668,8 @@ pub fn size_deployment(request: &SizingRequest) -> SizingResult {
     };
 
     if rejection.is_none() && kv_budget_bytes < 0 {
-        rejection = Some(format!(
+        rejection =
+            Some(format!(
             "the weights ({} bytes) and the overhead ({} bytes) exceed the usable {} bytes, so no \
              KV cache fits at all",
             request.weights_bytes, request.overhead_bytes, scaled.unwrap_or_default()
@@ -995,7 +996,10 @@ mod tests {
         assert_eq!(result.kv_pool_tokens, Some(1_784_103));
         assert_eq!(result.kv_blocks, Some(27_876));
         assert_eq!(result.kv_pool_tokens_aligned, Some(1_784_064));
-        assert_eq!(result.kv_bytes_per_session_at_max_len, Some(32_768 * 262_144));
+        assert_eq!(
+            result.kv_bytes_per_session_at_max_len,
+            Some(32_768 * 262_144)
+        );
         assert_eq!(result.max_num_seqs_effective, Some(6));
         let sessions: Vec<(u64, Option<u64>)> = result
             .simultaneous_sessions_at
@@ -1152,7 +1156,10 @@ mod tests {
             "the overhead was fitted to this same pair, so agreement cannot be presented as a \
              check: {joined}"
         );
-        assert!(joined.contains("calibrated on that same pair of runs"), "{joined}");
+        assert!(
+            joined.contains("calibrated on that same pair of runs"),
+            "{joined}"
+        );
     }
 
     #[test]
@@ -1166,8 +1173,7 @@ mod tests {
         // function: a fit that is fitted to its own test set is not evidence of anything.
         let residual_rtx = 93_845_035_417i64 - MEASURED_WEIGHTS_BYTES as i64;
         let residual_l40s = 45_440_753_991i64 - MEASURED_WEIGHTS_BYTES as i64;
-        let retired =
-            (residual_rtx - residual_l40s) as f64 / (1_777_758f64 - 281_729f64);
+        let retired = (residual_rtx - residual_l40s) as f64 / (1_777_758f64 - 281_729f64);
         let architecture = 32_768f64;
         let error_pct = (retired - architecture).abs() / architecture * 100.0;
         assert!((32_000.0..32_500.0).contains(&retired), "{retired}");
@@ -1225,7 +1231,10 @@ mod tests {
         assert_eq!(result.vram_bytes, None);
         assert_eq!(result.confidence, SizingConfidence::Unavailable);
         assert_eq!(result.kv_pool_tokens, None);
-        assert!(result.rejection.expect("a refusal").contains("no VRAM figure"));
+        assert!(result
+            .rejection
+            .expect("a refusal")
+            .contains("no VRAM figure"));
     }
 
     #[test]
@@ -1235,7 +1244,10 @@ mod tests {
                 .with_architecture("x/y", ArchFacts::from_config_value(&hybrid_config())),
         );
         assert_eq!(result.confidence, SizingConfidence::Unavailable);
-        assert!(result.rejection.expect("a refusal").contains("unknown card"));
+        assert!(result
+            .rejection
+            .expect("a refusal")
+            .contains("unknown card"));
         assert!(result
             .warnings
             .iter()
@@ -1281,7 +1293,10 @@ mod tests {
         );
         let reason = result.rejection.expect("a refusal");
         assert!(reason.contains("int4"), "{reason}");
-        assert!(reason.contains("fp8"), "the refusal lists what is known: {reason}");
+        assert!(
+            reason.contains("fp8"),
+            "the refusal lists what is known: {reason}"
+        );
     }
 
     #[test]
@@ -1349,7 +1364,8 @@ mod tests {
         assert_eq!(result.kv_pool_tokens, Some(1_784_103));
         assert_eq!(result.kv_pool_tokens_aligned, Some(1_784_064));
         assert!(
-            result.kv_pool_tokens_aligned.expect("aligned") < result.kv_pool_tokens.expect("tokens")
+            result.kv_pool_tokens_aligned.expect("aligned")
+                < result.kv_pool_tokens.expect("tokens")
         );
         assert!(
             !result
@@ -1364,10 +1380,8 @@ mod tests {
         // the 8 GiB default overhead, weights of 36 847 542 599 leave exactly 3 276 800 bytes: 100
         // tokens at 32 768 bytes each, which is one 64-token block and a 36 % remainder.
         let remainder = size_deployment(
-            &SizingRequest::new("L40S", 36_847_542_599, "fp8", 8192).with_architecture(
-                "x/y",
-                ArchFacts::from_config_value(&hybrid_config()),
-            ),
+            &SizingRequest::new("L40S", 36_847_542_599, "fp8", 8192)
+                .with_architecture("x/y", ArchFacts::from_config_value(&hybrid_config())),
         );
         assert_eq!(remainder.kv_pool_tokens, Some(100));
         assert_eq!(remainder.kv_blocks, Some(1));
@@ -1482,18 +1496,27 @@ mod tests {
             );
         }
         assert_eq!(value["confidence"], json!("analytic"));
-        assert_eq!(value["arch_source"], json!("orcarouter/Qwen3.8-27B-Uncensored-FP8"));
+        assert_eq!(
+            value["arch_source"],
+            json!("orcarouter/Qwen3.8-27B-Uncensored-FP8")
+        );
         // The canonical request carries the RTX PRO 6000 measurement, so the wire shape reports the
         // overhead that run implies — 8.19 GiB, the third of the three fitted values — beside the
         // shipped constant rather than replacing it.
         assert_eq!(value["implied_overhead_bytes"], json!(8_797_875_799i64));
-        assert_eq!(value["measured_reference"]["kv_pool_tokens"], json!(1_777_758));
+        assert_eq!(
+            value["measured_reference"]["kv_pool_tokens"],
+            json!(1_777_758)
+        );
         assert_eq!(value["rejection"], Value::Null);
-        assert_eq!(value["simultaneous_sessions_at"][0]["context_len"], json!(2048));
+        assert_eq!(
+            value["simultaneous_sessions_at"][0]["context_len"],
+            json!(2048)
+        );
 
         // A refused result keeps the same shape, with the reason attached.
-        let refused = serde_json::to_value(size_deployment(&SizingRequest::default()))
-            .expect("serialises");
+        let refused =
+            serde_json::to_value(size_deployment(&SizingRequest::default())).expect("serialises");
         assert_eq!(refused["confidence"], json!("unavailable"));
         assert_eq!(refused["kv_pool_tokens"], Value::Null);
     }
@@ -1503,7 +1526,10 @@ mod tests {
         let result = size_deployment(&canonical_request());
         assert_eq!(result.overhead_bytes, DEFAULT_OVERHEAD_BYTES);
         let joined = result.assumptions.join("\n");
-        assert!(joined.contains("calibrated constant, not a measurement"), "{joined}");
+        assert!(
+            joined.contains("calibrated constant, not a measurement"),
+            "{joined}"
+        );
         assert!(joined.contains("±0.6 GiB"), "{joined}");
 
         let mut overridden = canonical_request();
@@ -1514,8 +1540,7 @@ mod tests {
             .iter()
             .any(|line| line.contains("replaces the shipped 8 GiB default")));
         assert!(
-            result.kv_budget_bytes
-                > size_deployment(&canonical_request()).kv_budget_bytes,
+            result.kv_budget_bytes > size_deployment(&canonical_request()).kv_budget_bytes,
             "a smaller overhead leaves more cache, and the result says which was used"
         );
     }
@@ -1532,7 +1557,13 @@ mod tests {
     #[test]
     fn the_measured_frames_are_reported_without_being_confused() {
         let nominal = size_deployment(&canonical_request());
-        assert_eq!(nominal.measured_reference.as_ref().map(|m| m.kv_pool_tokens), Some(1_777_758));
+        assert_eq!(
+            nominal
+                .measured_reference
+                .as_ref()
+                .map(|m| m.kv_pool_tokens),
+            Some(1_777_758)
+        );
 
         // Stating no usable capacity is not the same as stating the sticker figure: with nothing but
         // the card's nameplate the analytic number is produced and no measurement is claimed.
@@ -1580,10 +1611,8 @@ mod tests {
     #[test]
     fn a_zero_max_model_len_is_refused_rather_than_divided_by() {
         let result = size_deployment(
-            &SizingRequest::new("RTX-PRO-6000", MEASURED_WEIGHTS_BYTES, "fp8", 0).with_architecture(
-                "x/y",
-                ArchFacts::from_config_value(&hybrid_config()),
-            ),
+            &SizingRequest::new("RTX-PRO-6000", MEASURED_WEIGHTS_BYTES, "fp8", 0)
+                .with_architecture("x/y", ArchFacts::from_config_value(&hybrid_config())),
         );
         assert_eq!(result.confidence, SizingConfidence::Unavailable);
         assert!(result
@@ -1595,10 +1624,8 @@ mod tests {
     #[test]
     fn zero_weights_are_flagged_rather_than_believed() {
         let result = size_deployment(
-            &SizingRequest::new("RTX-PRO-6000", 0, "fp8", 8192).with_architecture(
-                "x/y",
-                ArchFacts::from_config_value(&hybrid_config()),
-            ),
+            &SizingRequest::new("RTX-PRO-6000", 0, "fp8", 8192)
+                .with_architecture("x/y", ArchFacts::from_config_value(&hybrid_config())),
         );
         assert!(result
             .warnings
@@ -1634,7 +1661,10 @@ mod tests {
         }
         // The one honest disagreement, stated rather than smoothed: 8 GiB is above 7.9 GiB.
         let overshoot = DEFAULT_OVERHEAD_BYTES as i64 - l40s;
-        assert!(overshoot > 0, "the shipped constant is above the fitted band's top");
+        assert!(
+            overshoot > 0,
+            "the shipped constant is above the fitted band's top"
+        );
         assert!(
             (overshoot as f64 / GIB as f64) < 0.16,
             "{} GiB above the band",

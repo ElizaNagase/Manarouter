@@ -56,15 +56,15 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
-use tokio::process::Command;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::api::error_body;
 use crate::state::AppState;
-use mr_core::lane::kaggle::{FACTS, NOTEBOOK_DOCS, GPU_QUOTA_DOCS, TERMS};
+use mr_core::lane::kaggle::{FACTS, GPU_QUOTA_DOCS, NOTEBOOK_DOCS, TERMS};
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -89,8 +89,8 @@ struct RunState {
     submitted_at: u64,
     /// Monotonic clock — not serialised.
     submitted_instant: Instant,
-    slug: Option<String>,  // kernel slug returned by push
-    result_path: PathBuf,  // run directory — cleaned up on completion
+    slug: Option<String>, // kernel slug returned by push
+    result_path: PathBuf, // run directory — cleaned up on completion
     state: RunStateEnum,
 }
 
@@ -117,12 +117,19 @@ pub struct RunRegistry {
 }
 
 impl RunRegistry {
-    fn new() -> Self { Self::default() }
+    fn new() -> Self {
+        Self::default()
+    }
     async fn insert(&self, r: RunState) {
         self.runs.lock().await.push(r);
     }
     async fn get(&self, run_id: &str) -> Option<RunState> {
-        self.runs.lock().await.iter().find(|r| r.run_id == run_id).cloned()
+        self.runs
+            .lock()
+            .await
+            .iter()
+            .find(|r| r.run_id == run_id)
+            .cloned()
     }
     async fn update(&self, run_id: &str, upd: RunState) {
         let mut runs = self.runs.lock().await;
@@ -143,11 +150,17 @@ pub struct KaggleState {
 impl KaggleState {
     /// Create a new KaggleState with no credential path set.
     pub fn new() -> Self {
-        Self { registry: RunRegistry::new(), key_file_path: None }
+        Self {
+            registry: RunRegistry::new(),
+            key_file_path: None,
+        }
     }
     /// Create with a pre-stored credential file path.
     pub fn with_key(path: PathBuf) -> Self {
-        Self { registry: RunRegistry::new(), key_file_path: Some(path) }
+        Self {
+            registry: RunRegistry::new(),
+            key_file_path: Some(path),
+        }
     }
 }
 
@@ -178,13 +191,27 @@ impl std::fmt::Display for KaggleError {
 impl IntoResponse for KaggleError {
     fn into_response(self) -> axum::response::Response {
         let (status, code, message) = match &self {
-            KaggleError::CliAbsent => (StatusCode::SERVICE_UNAVAILABLE, "kaggle_cli_absent", "kaggle CLI is not available on PATH"),
-            KaggleError::DeadlineExceeded => (StatusCode::GATEWAY_TIMEOUT, "kaggle_deadline_exceeded", "Kaggle session deadline exceeded"),
+            KaggleError::CliAbsent => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "kaggle_cli_absent",
+                "kaggle CLI is not available on PATH",
+            ),
+            KaggleError::DeadlineExceeded => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "kaggle_deadline_exceeded",
+                "Kaggle session deadline exceeded",
+            ),
             // A run this process never registered is the caller's mistake, not an upstream fault.
             // Answering 502 for it said "Kaggle broke", which is a different and wrong statement.
             KaggleError::NotFound(msg) => (StatusCode::NOT_FOUND, "run_not_found", msg.as_str()),
-            KaggleError::KaggleApi(msg) => (StatusCode::BAD_GATEWAY, "kaggle_api_error", msg.as_str()),
-            KaggleError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", msg.as_str()),
+            KaggleError::KaggleApi(msg) => {
+                (StatusCode::BAD_GATEWAY, "kaggle_api_error", msg.as_str())
+            }
+            KaggleError::Internal(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                msg.as_str(),
+            ),
         };
         (status, Json(error_body(code, message, Vec::new()))).into_response()
     }
@@ -243,19 +270,28 @@ async fn check_kaggle_cli() -> Result<(), KaggleError> {
 
 /// Create a temporary config directory with the credential and return its path.
 /// Callers MUST delete the directory in all exit paths.
-fn create_kaggle_config_dir(key_path: Option<&PathBuf>, run_dir: &PathBuf) -> Result<PathBuf, KaggleError> {
+fn create_kaggle_config_dir(
+    key_path: Option<&PathBuf>,
+    run_dir: &PathBuf,
+) -> Result<PathBuf, KaggleError> {
     let config_dir = run_dir.join(".kaggle");
-    fs::create_dir_all(&config_dir).map_err(|e| KaggleError::Internal(format!("failed to create config dir: {e}")))?;
+    fs::create_dir_all(&config_dir)
+        .map_err(|e| KaggleError::Internal(format!("failed to create config dir: {e}")))?;
 
     if let Some(key_path) = key_path {
         if key_path.exists() {
-            let content = fs::read(key_path).map_err(|e| KaggleError::Internal(format!("failed to read key file: {e}")))?;
+            let content = fs::read(key_path)
+                .map_err(|e| KaggleError::Internal(format!("failed to read key file: {e}")))?;
             let dest = config_dir.join("kaggle.json");
-            fs::write(&dest, &content).map_err(|e| KaggleError::Internal(format!("failed to write key: {e}")))?;
+            fs::write(&dest, &content)
+                .map_err(|e| KaggleError::Internal(format!("failed to write key: {e}")))?;
             // 0600 — only the current user can read
-            let mut perms = fs::metadata(&dest).map_err(|e| KaggleError::Internal(format!("failed to stat key dest: {e}")))?.permissions();
+            let mut perms = fs::metadata(&dest)
+                .map_err(|e| KaggleError::Internal(format!("failed to stat key dest: {e}")))?
+                .permissions();
             perms.set_mode(0o600);
-            fs::set_permissions(&dest, perms).map_err(|e| KaggleError::Internal(format!("failed to chmod key: {e}")))?;
+            fs::set_permissions(&dest, perms)
+                .map_err(|e| KaggleError::Internal(format!("failed to chmod key: {e}")))?;
         }
     }
     Ok(config_dir)
@@ -349,7 +385,12 @@ async fn get_status(State(app_state): State<AppState>) -> Result<Json<Value>, Ka
         Err(e) => return Err(e),
     };
 
-    let credential_configured = app_state.kaggle.key_file_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+    let credential_configured = app_state
+        .kaggle
+        .key_file_path
+        .as_ref()
+        .map(|p| p.exists())
+        .unwrap_or(false);
 
     Ok(Json(json!({
         "lane": "kaggle",
@@ -409,39 +450,62 @@ async fn run_kaggle(
     if let Err(e) = fs::create_dir_all(&run_dir) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(error_body("internal_error", format!("create run dir: {e}"), Vec::new())),
+            Json(error_body(
+                "internal_error",
+                format!("create run dir: {e}"),
+                Vec::new(),
+            )),
         ));
     }
 
     // Write credential into a per-run config dir (mode 0600).
-    let kaggle_config_dir = match create_kaggle_config_dir(app_state.kaggle.key_file_path.as_ref(), &run_dir) {
-        Ok(d) => d,
-        Err(e) => {
-            cleanup_run_dir(&run_dir);
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(error_body("internal_error", format!("create kaggle config: {e:?}"), Vec::new())),
-            ));
-        }
-    };
+    let kaggle_config_dir =
+        match create_kaggle_config_dir(app_state.kaggle.key_file_path.as_ref(), &run_dir) {
+            Ok(d) => d,
+            Err(e) => {
+                cleanup_run_dir(&run_dir);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(error_body(
+                        "internal_error",
+                        format!("create kaggle config: {e:?}"),
+                        Vec::new(),
+                    )),
+                ));
+            }
+        };
 
     // Write metadata (no credentials).
     let meta_path = run_dir.join("kernel-metadata.json");
-    if let Err(e) = fs::write(&meta_path, render_metadata(&run_id, &job_spec.model, &job_spec.accelerator)) {
+    if let Err(e) = fs::write(
+        &meta_path,
+        render_metadata(&run_id, &job_spec.model, &job_spec.accelerator),
+    ) {
         cleanup_run_dir(&run_dir);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(error_body("internal_error", format!("write metadata: {e}"), Vec::new())),
+            Json(error_body(
+                "internal_error",
+                format!("write metadata: {e}"),
+                Vec::new(),
+            )),
         ));
     }
 
     // Write Python script (no credentials).
     let script_path = run_dir.join("script.py");
-    if let Err(e) = fs::write(&script_path, render_script(&job_spec.model, &job_spec.items)) {
+    if let Err(e) = fs::write(
+        &script_path,
+        render_script(&job_spec.model, &job_spec.items),
+    ) {
         cleanup_run_dir(&run_dir);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(error_body("internal_error", format!("write script: {e}"), Vec::new())),
+            Json(error_body(
+                "internal_error",
+                format!("write script: {e}"),
+                Vec::new(),
+            )),
         ));
     }
 
@@ -458,7 +522,11 @@ async fn run_kaggle(
             cleanup_run_dir(&run_dir);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(error_body("internal_error", format!("kaggle push: {e}"), Vec::new())),
+                Json(error_body(
+                    "internal_error",
+                    format!("kaggle push: {e}"),
+                    Vec::new(),
+                )),
             ));
         }
     };
@@ -537,9 +605,12 @@ async fn get_run_status(
     State(app_state): State<AppState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, KaggleError> {
-    let run = app_state.kaggle.registry.get(&run_id).await.ok_or_else(|| {
-        KaggleError::NotFound(format!("run {run_id} not found"))
-    })?;
+    let run = app_state
+        .kaggle
+        .registry
+        .get(&run_id)
+        .await
+        .ok_or_else(|| KaggleError::NotFound(format!("run {run_id} not found")))?;
 
     let run_dir = &run.result_path;
     let now = Instant::now();
@@ -574,7 +645,9 @@ async fn get_run_status(
         })));
     }
 
-    let status_out = status_cmd.output().await
+    let status_out = status_cmd
+        .output()
+        .await
         .map_err(|e| KaggleError::Internal(format!("kaggle status: {e}")))?;
 
     let status_text = String::from_utf8_lossy(&status_out.stdout);
@@ -623,7 +696,9 @@ async fn get_run_status(
             } else if output_out.status.success() {
                 // Try to find response.json in the downloaded files
                 let stdout_text = String::from_utf8_lossy(&output_out.stdout);
-                result = Some(json!({ "downloaded": true, "preview": stdout_text.chars().take(1000).collect::<String>() }));
+                result = Some(
+                    json!({ "downloaded": true, "preview": stdout_text.chars().take(1000).collect::<String>() }),
+                );
             }
         }
     }
@@ -656,12 +731,19 @@ async fn get_run_status(
 /// List all runs this process knows about.
 async fn list_runs(State(app_state): State<AppState>) -> Json<Value> {
     let runs = app_state.kaggle.registry.runs.lock().await;
-    let items: Vec<RunListItem> = runs.iter().map(|r| RunListItem {
-        run_id: r.run_id.clone(),
-        state: serde_json::to_value(&r.state).unwrap_or(json!("unknown")).as_str().unwrap_or("unknown").to_string(),
-        model: r.model.clone(),
-        submitted_at: r.submitted_at.to_string(),
-    }).collect();
+    let items: Vec<RunListItem> = runs
+        .iter()
+        .map(|r| RunListItem {
+            run_id: r.run_id.clone(),
+            state: serde_json::to_value(&r.state)
+                .unwrap_or(json!("unknown"))
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string(),
+            model: r.model.clone(),
+            submitted_at: r.submitted_at.to_string(),
+        })
+        .collect();
     Json(json!({
         "runs": items,
         "count": items.len(),
@@ -674,9 +756,9 @@ async fn list_runs(State(app_state): State<AppState>) -> Json<Value> {
 mod tests {
     use super::*;
     // `oneshot` lives on the `ServiceExt` extension trait; only tests build a router by hand.
-    use tower::ServiceExt;
     use std::env;
     use tempfile::TempDir;
+    use tower::ServiceExt;
 
     /// Serialises the tests that rewrite `PATH`.
     ///
@@ -790,14 +872,18 @@ exit 1
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 400);
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(json["error"]["code"], "deadline_exceeds_cap");
     }
 
     #[tokio::test]
     async fn test_successful_run_reaches_complete() {
-        let _path_guard = PATH_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _path_guard = PATH_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Create a fake kaggle binary
         let temp = TempDir::new().unwrap();
         let _fake_bin = create_fake_kaggle_bin(&temp);
@@ -840,7 +926,9 @@ exit 1
 
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 200);
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(json["state"], "submitted");
         let run_id = json["run_id"].as_str().unwrap().to_string();
@@ -854,13 +942,16 @@ exit 1
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 200);
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&body_bytes).unwrap();
         let state = json["state"].as_str().unwrap();
         // With the fake returning "complete", the result should include fetched data
         assert!(
             matches!(state, "submitted" | "running" | "complete"),
-            "run should reach at least running state, got: {}", state
+            "run should reach at least running state, got: {}",
+            state
         );
 
         // Restore PATH
@@ -869,7 +960,9 @@ exit 1
 
     #[tokio::test]
     async fn test_kaggle_config_dir_cleanup() {
-        let _path_guard = PATH_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _path_guard = PATH_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // After a run, the credential directory should be cleaned up.
         let temp = TempDir::new().unwrap();
         let _fake_bin = create_fake_kaggle_bin(&temp);
@@ -927,12 +1020,30 @@ exit 1
         let metadata = render_metadata(run_id, model, accelerator);
 
         // Neither should contain common credential patterns.
-        assert!(!script.contains("kaggle.json"), "script should not reference kaggle.json");
-        assert!(!script.contains("KAGGLE_CONFIG_DIR"), "script should not reference KAGGLE_CONFIG_DIR");
-        assert!(!metadata.contains("kaggle.json"), "metadata should not reference kaggle.json");
-        assert!(!metadata.contains("KAGGLE_CONFIG_DIR"), "metadata should not reference KAGGLE_CONFIG_DIR");
-        assert!(!script.contains("KGAT_"), "script should not contain Kaggle API token");
-        assert!(!metadata.contains("KGAT_"), "metadata should not contain Kaggle API token");
+        assert!(
+            !script.contains("kaggle.json"),
+            "script should not reference kaggle.json"
+        );
+        assert!(
+            !script.contains("KAGGLE_CONFIG_DIR"),
+            "script should not reference KAGGLE_CONFIG_DIR"
+        );
+        assert!(
+            !metadata.contains("kaggle.json"),
+            "metadata should not reference kaggle.json"
+        );
+        assert!(
+            !metadata.contains("KAGGLE_CONFIG_DIR"),
+            "metadata should not reference KAGGLE_CONFIG_DIR"
+        );
+        assert!(
+            !script.contains("KGAT_"),
+            "script should not contain Kaggle API token"
+        );
+        assert!(
+            !metadata.contains("KGAT_"),
+            "metadata should not contain Kaggle API token"
+        );
     }
 
     #[tokio::test]
@@ -950,7 +1061,9 @@ exit 1
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 200);
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(json["runs"].as_array().unwrap().len(), 0);
         assert_eq!(json["count"].as_u64().unwrap(), 0);
@@ -971,7 +1084,9 @@ exit 1
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 200);
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(json["lane"].as_str().unwrap(), "kaggle");
         // May or may not be ready depending on environment

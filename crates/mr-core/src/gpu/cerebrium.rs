@@ -380,11 +380,19 @@ pub fn artefact(tuning: &Tuning) -> Result<Artefact, Problem> {
     // admission limit to copy, so the documented example value (32) is used and said out loud.
     let (concurrency, concurrency_basis) = match tuning.max_num_seqs {
         Some(seqs) => (seqs, "the server's --max-num-seqs".to_owned()),
-        None => (32, "the platform's own vLLM example, because no --max-num-seqs was chosen".to_owned()),
+        None => (
+            32,
+            "the platform's own vLLM example, because no --max-num-seqs was chosen".to_owned(),
+        ),
     };
 
     let mut entrypoint: Vec<String> = vec!["vllm".to_owned(), "serve".to_owned(), repo.to_owned()];
-    if let Some(revision) = tuning.revision.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+    if let Some(revision) = tuning
+        .revision
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
         entrypoint.push("--revision".to_owned());
         entrypoint.push(revision.to_owned());
     }
@@ -576,9 +584,9 @@ pub fn repo_is_safe(repo: &str) -> bool {
     !owner.is_empty()
         && !name.is_empty()
         && repo.len() <= 120
-        && repo.chars().all(|ch| {
-            ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/')
-        })
+        && repo
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/'))
 }
 
 /// A TOML basic string for `value`.
@@ -700,7 +708,10 @@ mod tests {
         anonymous.project = None;
         let anonymous_artefact =
             artefact(&anonymous).expect("a valid tuning renders without a project");
-        assert_eq!(anonymous_artefact.base_url, None, "no project id, no invented URL");
+        assert_eq!(
+            anonymous_artefact.base_url, None,
+            "no project id, no invented URL"
+        );
     }
 
     #[test]
@@ -746,25 +757,46 @@ mod tests {
         let mut request = tuning();
         request.app = "manarouter\"; disable_auth = true; x \"".to_owned();
         assert_eq!(
-            artefact(&request).expect_err("quotes are not an app name").code(),
+            artefact(&request)
+                .expect_err("quotes are not an app name")
+                .code(),
             "bad_app_name"
         );
 
         request = tuning();
         request.repo = "Qwen/../../etc/passwd".to_owned();
-        assert_eq!(artefact(&request).expect_err("dots are fine, slashes are not").code(), "bad_repo");
+        assert_eq!(
+            artefact(&request)
+                .expect_err("dots are fine, slashes are not")
+                .code(),
+            "bad_repo"
+        );
 
         request.repo = "Qwen".to_owned();
-        assert_eq!(artefact(&request).expect_err("a bare owner is not a repo").code(), "bad_repo");
+        assert_eq!(
+            artefact(&request)
+                .expect_err("a bare owner is not a repo")
+                .code(),
+            "bad_repo"
+        );
     }
 
     #[test]
     fn the_warnings_state_the_cost_and_the_cold_start_rather_than_leaving_them_to_be_found() {
         let rendered = artefact(&tuning()).expect("a valid tuning renders");
         let warnings = rendered.warnings.join("\n");
-        assert!(warnings.contains("$2.4984/hour"), "the derived hourly rate: {warnings}");
-        assert!(warnings.contains("×3600"), "the derivation is named: {warnings}");
-        assert!(warnings.contains("cold start"), "the cold start is named: {warnings}");
+        assert!(
+            warnings.contains("$2.4984/hour"),
+            "the derived hourly rate: {warnings}"
+        );
+        assert!(
+            warnings.contains("×3600"),
+            "the derivation is named: {warnings}"
+        );
+        assert!(
+            warnings.contains("cold start"),
+            "the cold start is named: {warnings}"
+        );
         assert!(
             warnings.contains("response_grace_period"),
             "the request timeout is named: {warnings}"
@@ -775,7 +807,10 @@ mod tests {
         unpinned.vllm_pin = None;
         let unpinned_artefact = artefact(&unpinned).expect("an unpinned vLLM still renders");
         assert!(
-            unpinned_artefact.warnings.iter().any(|warning| warning.contains("unpinned")),
+            unpinned_artefact
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unpinned")),
             "got: {:?}",
             unpinned_artefact.warnings
         );
@@ -811,9 +846,15 @@ mod tests {
             request.gpu_count = compute.max_gpu_count.min(1);
             let artefact = artefact(&request)
                 .unwrap_or_else(|problem| panic!("{} does not render: {problem}", compute.id));
-            assert!(artefact.text.contains(&format!("compute = \"{}\"", compute.id)));
+            assert!(artefact
+                .text
+                .contains(&format!("compute = \"{}\"", compute.id)));
         }
-        assert_eq!(COMPUTE_TYPES.len(), 13, "the platform publishes 13 accepted ids");
+        assert_eq!(
+            COMPUTE_TYPES.len(),
+            13,
+            "the platform publishes 13 accepted ids"
+        );
     }
 
     #[test]
@@ -826,10 +867,18 @@ mod tests {
 
         let mut request = tuning();
         request.cpu = 0.0;
-        assert_eq!(artefact(&request).expect_err("zero cores is not a machine").code(), "bad_hardware");
+        assert_eq!(
+            artefact(&request)
+                .expect_err("zero cores is not a machine")
+                .code(),
+            "bad_hardware"
+        );
         request.cpu = 4.0;
         request.memory_gb = -1.0;
-        assert_eq!(artefact(&request).expect_err("negative RAM").code(), "bad_hardware");
+        assert_eq!(
+            artefact(&request).expect_err("negative RAM").code(),
+            "bad_hardware"
+        );
     }
 
     #[test]
@@ -883,7 +932,11 @@ mod tests {
         let mut request = tuning();
         request.cooldown_secs = 3600;
         let artefact = artefact(&request).expect("3600 s is within COOLDOWN_RANGE");
-        assert!(artefact.text.contains("cooldown = 3600"), "got: {}", artefact.text);
+        assert!(
+            artefact.text.contains("cooldown = 3600"),
+            "got: {}",
+            artefact.text
+        );
     }
 
     #[test]
@@ -894,10 +947,16 @@ mod tests {
         request.compute = "INF2".to_owned(); // no published price
         request.vllm_pin = None;
         let artefact = artefact(&request).expect("compute without price still renders");
-        assert!(!artefact.warnings.is_empty(), "warnings must never be empty");
+        assert!(
+            !artefact.warnings.is_empty(),
+            "warnings must never be empty"
+        );
         // Price warning for unpriced compute.
         assert!(
-            artefact.warnings.iter().any(|w| w.contains("no published per-second price")),
+            artefact
+                .warnings
+                .iter()
+                .any(|w| w.contains("no published per-second price")),
             "got: {:?}",
             artefact.warnings
         );
@@ -909,7 +968,10 @@ mod tests {
         );
         // Concurrency warning must be present.
         assert!(
-            artefact.warnings.iter().any(|w| w.contains("replica_concurrency")),
+            artefact
+                .warnings
+                .iter()
+                .any(|w| w.contains("replica_concurrency")),
             "got: {:?}",
             artefact.warnings
         );

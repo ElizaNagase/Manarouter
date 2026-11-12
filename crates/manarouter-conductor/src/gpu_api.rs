@@ -78,7 +78,7 @@ use mr_core::gpu::catalog::{
 };
 use mr_core::gpu::cerebrium::{
     artefact as cerebrium_artefact, compute_by_id as cerebrium_compute_by_id,
-    COMPUTE_TYPES as cerebrium_compute_types, Tuning as CerebriumTuning,
+    Tuning as CerebriumTuning, COMPUTE_TYPES as cerebrium_compute_types,
 };
 use mr_core::gpu::sizing::{size_deployment, SizingRequest, SizingResult};
 use mr_core::lane::{plan_lane, LaneKind, Traffic};
@@ -173,7 +173,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/gpu/apply", post(post_apply))
         .route("/api/gpu/launch-plan", post(post_launch_plan))
         .route("/api/gpu/lanes/cerebrium/bundle", post(post_lane_bundle))
-        .route("/api/gpu/lanes/cerebrium/compute", get(get_cerebrium_compute))
+        .route(
+            "/api/gpu/lanes/cerebrium/compute",
+            get(get_cerebrium_compute),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -469,9 +472,8 @@ async fn post_lane_bundle(JsonBody(body): JsonBody) -> ApiResult<Json<Value>> {
         vllm_pin: string_field(&map, "vllm_pin"),
     };
 
-    let artefact = cerebrium_artefact(&tuning).map_err(|problem| {
-        ApiError::bad(problem.code(), problem.to_string())
-    })?;
+    let artefact = cerebrium_artefact(&tuning)
+        .map_err(|problem| ApiError::bad(problem.code(), problem.to_string()))?;
 
     Ok(Json(json!({
         "lane": "cerebrium",
@@ -593,8 +595,7 @@ async fn post_probe(
         token: probe_token(&state, &map).await?,
         repo,
     };
-    let http = crate::quota_api::shared_http()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let http = crate::quota_api::shared_http().map_err(|e| ApiError::internal(e.to_string()))?;
     let mut body = probe_http(http.as_ref(), &input).await;
     scrub_secret(&mut body, input.token.as_deref());
     Ok(Json(body))
@@ -636,7 +637,12 @@ pub(crate) async fn probe_http(http: &dyn QuotaHttp, input: &ProbeInput) -> Valu
     let from_name = params_from_name(&input.repo);
 
     // --- 1. repository metadata, anonymously ---
-    let (metadata, metadata_status) = fetch_json(http, &metadata_url(&input.repo, input.revision.as_deref()), None).await;
+    let (metadata, metadata_status) = fetch_json(
+        http,
+        &metadata_url(&input.repo, input.revision.as_deref()),
+        None,
+    )
+    .await;
     let gated_state = metadata.as_ref().and_then(gated_state_from_hf_api);
     let params_total = metadata.as_ref().and_then(params_from_hf_api);
     let sha = metadata
@@ -647,11 +653,11 @@ pub(crate) async fn probe_http(http: &dyn QuotaHttp, input: &ProbeInput) -> Valu
 
     // --- 2. the repository's own architecture ---
     let config_url = raw_config_url(&input.repo, input.revision.as_deref());
-    let (own_facts, own_failure) = match fetch_config(http, &config_url, input.token.as_deref()).await
-    {
-        Ok(facts) => (Some(facts), None),
-        Err(failure) => (None, Some(failure)),
-    };
+    let (own_facts, own_failure) =
+        match fetch_config(http, &config_url, input.token.as_deref()).await {
+            Ok(facts) => (Some(facts), None),
+            Err(failure) => (None, Some(failure)),
+        };
 
     let mut arch_source = "repo";
     let mut arch_repo = input.repo.clone();
@@ -692,11 +698,10 @@ pub(crate) async fn probe_http(http: &dyn QuotaHttp, input: &ProbeInput) -> Valu
                              either: {}",
                             hint.repo_id, second
                         ));
-                        if let Some(first) = own_failure.as_ref().map(|failure| failure.to_string()) {
-                            errors.insert(
-                                0,
-                                format!("`{}` could not be read: {first}", input.repo),
-                            );
+                        if let Some(first) = own_failure.as_ref().map(|failure| failure.to_string())
+                        {
+                            errors
+                                .insert(0, format!("`{}` could not be read: {first}", input.repo));
                         }
                     }
                 }
@@ -749,7 +754,10 @@ pub(crate) async fn probe_http(http: &dyn QuotaHttp, input: &ProbeInput) -> Valu
         object.insert("repo".to_owned(), json!(arch_repo));
         object.insert("relation".to_owned(), json!(arch_relation));
         object.insert("shares_architecture".to_owned(), json!(arch_shares));
-        object.insert("kv_bytes_per_token_elem".to_owned(), json!(kv_bytes_per_element));
+        object.insert(
+            "kv_bytes_per_token_elem".to_owned(),
+            json!(kv_bytes_per_element),
+        );
         if let (Some(facts), Some(bytes)) = (facts.as_ref(), kv_bytes_per_element) {
             let geometry = facts.kv_geometry(bytes, &input.kv_cache_dtype);
             object.insert(
@@ -795,11 +803,22 @@ pub(crate) async fn probe_http(http: &dyn QuotaHttp, input: &ProbeInput) -> Valu
         .as_ref()
         .and_then(|facts| facts.quant_method.as_deref())
         .map(str::to_owned);
-    let quants = quant_rows(declared_quant.as_deref(), gpu, input.weight_quant.as_deref());
+    let quants = quant_rows(
+        declared_quant.as_deref(),
+        gpu,
+        input.weight_quant.as_deref(),
+    );
 
     // --- 8. sizing ---
-    let (sizing, confidence, sizing_weight_bytes) =
-        sizing_for(input, facts.as_ref(), params_total, from_name.as_ref().map(|h| h.value), gpu, &mut warnings, &mut errors);
+    let (sizing, confidence, sizing_weight_bytes) = sizing_for(
+        input,
+        facts.as_ref(),
+        params_total,
+        from_name.as_ref().map(|h| h.value),
+        gpu,
+        &mut warnings,
+        &mut errors,
+    );
 
     if arch_source == "unavailable" && facts.is_none() {
         warnings.push(
@@ -909,13 +928,15 @@ async fn fetch_config(
             (401 | 403, false) => ConfigFailure::Unauthorized {
                 status: response.status,
             },
-            (status, _) => ConfigFailure::Other(format!(
-                "the Hub answered {status} for `config.json`"
-            )),
+            (status, _) => {
+                ConfigFailure::Other(format!("the Hub answered {status} for `config.json`"))
+            }
         });
     }
     arch_facts_from_config_bytes(&response.body).map_err(|e| {
-        ConfigFailure::Other(format!("`config.json` was served but could not be read: {e}"))
+        ConfigFailure::Other(format!(
+            "`config.json` was served but could not be read: {e}"
+        ))
     })
 }
 
@@ -1140,9 +1161,7 @@ fn sizing_for(
         .as_deref()
         .filter(|id| *id != "none")
         .or(declared)
-        .and_then(|id| {
-            quant_method_by_id(id).map(|method| (method.id, method.bytes_per_param))
-        });
+        .and_then(|id| quant_method_by_id(id).map(|method| (method.id, method.bytes_per_param)));
     let (bytes_per_param, basis) = match method_id {
         Some((id, Some(bytes))) => (
             Some(bytes),
@@ -1157,13 +1176,12 @@ fn sizing_for(
         }
         None => (None, String::new()),
     };
-    let (weights_bytes, basis) = match (bytes_per_param, facts.and_then(ArchFacts::torch_dtype_bytes))
-    {
+    let (weights_bytes, basis) = match (
+        bytes_per_param,
+        facts.and_then(ArchFacts::torch_dtype_bytes),
+    ) {
         (Some(bytes), _) => match weights_bytes_from_param_count(params, bytes) {
-            Some(total) => (
-                Some(total),
-                format!("{basis}; {total} bytes in total"),
-            ),
+            Some(total) => (Some(total), format!("{basis}; {total} bytes in total")),
             None => (None, basis),
         },
         (None, Some(dtype_bytes)) => {
@@ -1198,10 +1216,10 @@ fn sizing_for(
         return (Value::Null, "unavailable", Value::Null);
     };
 
-    let Some(max_model_len) = input.max_model_len.or_else(|| {
-        facts
-            .and_then(|facts| facts.max_position_embeddings)
-    }) else {
+    let Some(max_model_len) = input
+        .max_model_len
+        .or_else(|| facts.and_then(|facts| facts.max_position_embeddings))
+    else {
         warnings.push(
             "no `max_model_len` was supplied and the architecture declares no \
              `max_position_embeddings`, so the KV budget has no context length to divide by"
@@ -1577,13 +1595,11 @@ async fn create_account(state: &AppState, map: &Map<String, Value>) -> ApiResult
     let plan = match string_field(&account_map, "plan") {
         Some(plan) => match RentalPlan::parse(&plan) {
             Some(plan) => plan,
-            None => {
-                return Err(ApiError::bad(
-                    "invalid_body",
-                    "`plan` must be one of `free`, `paid`, or `unknown`; it is never inferred from \
+            None => return Err(ApiError::bad(
+                "invalid_body",
+                "`plan` must be one of `free`, `paid`, or `unknown`; it is never inferred from \
                      the card, because the card's free-plan state is usually unknown",
-                ))
-            }
+            )),
         },
         // Absent means unknown. Guessing free would be the exact mistake the catalog's three-state
         // free plan exists to prevent.
@@ -1618,13 +1634,11 @@ async fn create_account(state: &AppState, map: &Map<String, Value>) -> ApiResult
         (Some(token), None, None) => Some(token),
         (None, Some(token_id), Some(token_secret)) => Some(format!("{token_id}.{token_secret}")),
         (None, None, None) => None,
-        _ => {
-            return Err(ApiError::bad(
-                "invalid_body",
-                "a Modal account needs both `token_id` and `token_secret`, or neither; the pair is \
+        _ => return Err(ApiError::bad(
+            "invalid_body",
+            "a Modal account needs both `token_id` and `token_secret`, or neither; the pair is \
                  the two halves of one credential",
-            ))
-        }
+        )),
     };
     if let Some(combined) = &combined {
         if let Some(problem) = modal_credential_problem(combined) {
@@ -1798,16 +1812,15 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
             format!("`{gpu_id}` is not a GPU id in the catalog; see GET /api/gpu/catalog"),
         ));
     };
-    let base_url = match string_field(&deployment_map, "base_url") {
-        Some(url) => url,
-        None => {
-            return Err(ApiError::bad(
+    let base_url =
+        match string_field(&deployment_map, "base_url") {
+            Some(url) => url,
+            None => return Err(ApiError::bad(
                 "invalid_body",
                 "the deployment needs a `base_url`: the endpoint URL Modal prints when the bundle \
                  is deployed. It cannot be guessed, because Modal assigns it per app.",
-            ))
-        }
-    };
+            )),
+        };
     if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
         return Err(ApiError::bad(
             "invalid_body",
@@ -1870,10 +1883,7 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
                 QuantSupport::Unsupported => {
                     return Err(ApiError::bad(
                         "unsupported_quantization",
-                        format!(
-                            "{} cannot run `{weight_quant}`: {}",
-                            gpu.id, verdict.reason
-                        ),
+                        format!("{} cannot run `{weight_quant}`: {}", gpu.id, verdict.reason),
                     ))
                 }
                 QuantSupport::Unverified => warnings.push(format!(
@@ -1898,7 +1908,10 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
             QuantSupport::Unsupported => {
                 return Err(ApiError::bad(
                     "unsupported_kv_cache_dtype",
-                    format!("{} cannot use `{kv_cache_dtype}`: {}", gpu.id, verdict.reason),
+                    format!(
+                        "{} cannot use `{kv_cache_dtype}`: {}",
+                        gpu.id, verdict.reason
+                    ),
                 ))
             }
             QuantSupport::Unverified => warnings.push(format!(
@@ -1978,7 +1991,11 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
     }
 
     let provider_id = provider_id_for(&account.id, &repo);
-    if current.providers.iter().any(|p| p.id.as_ref() == provider_id) {
+    if current
+        .providers
+        .iter()
+        .any(|p| p.id.as_ref() == provider_id)
+    {
         return Err(ApiError::conflict(format!(
             "a provider with id `{provider_id}` already exists; delete it or apply this deployment \
              to the account under a different repository name"
@@ -2338,10 +2355,9 @@ fn slug_problem(id: &str) -> Option<String> {
             "the account `id` `{id}` must start with a lowercase letter or a digit"
         ));
     }
-    if let Some(bad) = id
-        .chars()
-        .find(|ch| !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && !matches!(ch, '.' | '_' | '-'))
-    {
+    if let Some(bad) = id.chars().find(|ch| {
+        !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && !matches!(ch, '.' | '_' | '-')
+    }) {
         return Some(format!(
             "the account `id` `{id}` contains `{bad}`, which is not allowed; use lowercase \
              letters, digits, and `.`, `_`, `-`"
@@ -2677,7 +2693,11 @@ mod tests {
         // The gated repository refuses its config, exactly as the Hub does.
         http.on(
             "/acme/Qwen3.8-27B-AWQ/raw/main/config.json",
-            Reply::status(401, &[("x-error-code", "GatedRepo")], "{\"error\":\"GatedRepo\"}"),
+            Reply::status(
+                401,
+                &[("x-error-code", "GatedRepo")],
+                "{\"error\":\"GatedRepo\"}",
+            ),
         );
         http.on(
             "/Qwen/Qwen3.8-27B/raw/main/config.json",
@@ -2845,7 +2865,10 @@ mod tests {
             "the token was sent as a bearer header: {headers:?}"
         );
         for url in http.urls() {
-            assert!(!url.contains(TOKEN), "the token must not appear in a URL: {url}");
+            assert!(
+                !url.contains(TOKEN),
+                "the token must not appear in a URL: {url}"
+            );
         }
 
         assert!(
@@ -2872,9 +2895,19 @@ mod tests {
         let hint = params_from_name("Qwen/Qwen3.8-27B").expect("27B is in the name");
         assert_eq!(hint.token, "27B");
         assert_eq!(hint.value, 27_000_000_000);
-        assert_eq!(params_from_name("meta-llama/Llama-3.1-8B").map(|h| h.value), Some(8_000_000_000));
-        assert_eq!(params_from_name("acme/mistral-7b-instruct").map(|h| h.value), Some(7_000_000_000));
-        assert_eq!(params_from_name("acme/model-1500M"), None, "only `B` is a parameter count");
+        assert_eq!(
+            params_from_name("meta-llama/Llama-3.1-8B").map(|h| h.value),
+            Some(8_000_000_000)
+        );
+        assert_eq!(
+            params_from_name("acme/mistral-7b-instruct").map(|h| h.value),
+            Some(7_000_000_000)
+        );
+        assert_eq!(
+            params_from_name("acme/model-1500M"),
+            None,
+            "only `B` is a parameter count"
+        );
         // `3.8` is a version, and a trailing `B` with no number is not a size.
         assert_eq!(params_from_name("acme/Qwen3.8"), None);
     }
@@ -2937,8 +2970,7 @@ mod tests {
         // One byte per parameter and 27e9 parameters: the weights are priced from the declared
         // quantisation, not from the dtype.
         assert_eq!(
-            body["weight_bytes"]["bytes"],
-            27_000_000_000u64,
+            body["weight_bytes"]["bytes"], 27_000_000_000u64,
             "sizing priced the weights at the declared quantisation"
         );
     }
@@ -3003,7 +3035,10 @@ mod tests {
         assert_eq!(bundle.filename, "modal_app.py");
         assert!(bundle.id.starts_with("bundle-"));
         assert_eq!(bundle.command, "modal deploy modal_app.py");
-        assert!(!bundle.command.contains("--detach"), "Modal has no detach flag");
+        assert!(
+            !bundle.command.contains("--detach"),
+            "Modal has no detach flag"
+        );
         assert!(bundle.text.contains("modal.web_server(port=8000"));
         assert!(bundle.text.contains("\"Qwen/Qwen3.8-27B\""));
         assert!(bundle.text.contains("\"H100\""));
@@ -3034,12 +3069,15 @@ mod tests {
         let bundle = deployment_bundle("rental-acc-qwen38", &deployment, gpu);
 
         assert!(
-            bundle.text.contains("        \"--quantization\",\n        \"fp8\",\n"),
+            bundle
+                .text
+                .contains("        \"--quantization\",\n        \"fp8\",\n"),
             "each argument is one Python string literal:\n{}",
             bundle.text
         );
         assert!(
-            bundle.text
+            bundle
+                .text
                 .contains("        \"--kv-cache-dtype\",\n        \"fp8\",\n"),
             "the KV dtype is one Python string literal:\n{}",
             bundle.text
@@ -3050,8 +3088,15 @@ mod tests {
             bundle.text
         );
         // The numeric arguments take their values from the deployment, not from a default.
-        for expected in ["\"--max-model-len\",\n        \"262144\",", "\"--max-num-seqs\",\n        \"6\","] {
-            assert!(bundle.text.contains(expected), "missing {expected}:\n{}", bundle.text);
+        for expected in [
+            "\"--max-model-len\",\n        \"262144\",",
+            "\"--max-num-seqs\",\n        \"6\",",
+        ] {
+            assert!(
+                bundle.text.contains(expected),
+                "missing {expected}:\n{}",
+                bundle.text
+            );
         }
     }
 
@@ -3072,7 +3117,9 @@ mod tests {
         .expect("only five fields are required");
         let mut sizing = mr_core::gpu::sizing::size_deployment(&request);
         let pool = sizing.kv_pool_tokens.expect("the arithmetic resolved");
-        let aligned = sizing.kv_pool_tokens_aligned.expect("the arithmetic aligned");
+        let aligned = sizing
+            .kv_pool_tokens_aligned
+            .expect("the arithmetic aligned");
         assert!(aligned <= pool);
 
         // Derive nothing, the way a minimal client would.
@@ -3136,7 +3183,10 @@ mod tests {
                 let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                     .await
                     .expect("read the error body");
-                Err(format!("HTTP {status}: {}", String::from_utf8_lossy(&bytes)))
+                Err(format!(
+                    "HTTP {status}: {}",
+                    String::from_utf8_lossy(&bytes)
+                ))
             }
         }
     }
@@ -3176,7 +3226,10 @@ mod tests {
         .expect("create the account");
         assert_eq!(created["action"], "create-account");
         assert_eq!(created["account"]["has_credential"], true);
-        assert!(!created.to_string().contains(credential), "the credential must never be echoed");
+        assert!(
+            !created.to_string().contains(credential),
+            "the credential must never be echoed"
+        );
 
         // The vault holds the combined string at the id the spec names, as one value.
         {
@@ -3275,7 +3328,10 @@ mod tests {
                 "one workspace, one credential entry, however many deployments"
             );
             assert_eq!(
-                vault.get("rental:mana-modal").expect("read the vault").as_deref(),
+                vault
+                    .get("rental:mana-modal")
+                    .expect("read the vault")
+                    .as_deref(),
                 Some(credential)
             );
         }
@@ -3289,10 +3345,20 @@ mod tests {
             account["credential_fingerprint"].is_string(),
             "a fingerprint, not the value: {account}"
         );
-        assert_eq!(body["deployments"].as_array().expect("deployments").len(), 2);
+        assert_eq!(
+            body["deployments"].as_array().expect("deployments").len(),
+            2
+        );
         assert_eq!(body["deployments"][1]["account"], "mana-modal");
-        assert_eq!(body["errors"], json!([]), "nothing should have been dropped: {body}");
-        assert!(!body.to_string().contains(credential), "the credential must never be echoed");
+        assert_eq!(
+            body["errors"],
+            json!([]),
+            "nothing should have been dropped: {body}"
+        );
+        assert!(
+            !body.to_string().contains(credential),
+            "the credential must never be echoed"
+        );
     }
 
     #[tokio::test]
@@ -3317,7 +3383,10 @@ mod tests {
             body["accounts"][0]["credential_fingerprint"].is_null(),
             "there is no credential, so there is no fingerprint to show"
         );
-        assert_eq!(body["deployments"].as_array().expect("deployments").len(), 0);
+        assert_eq!(
+            body["deployments"].as_array().expect("deployments").len(),
+            0
+        );
 
         // Deploying from it is refused by name. The refusal must leave no half-written provider
         // behind, which is what going through `commit` is for.
@@ -3334,7 +3403,10 @@ mod tests {
             }),
         )
         .await;
-        assert!(refused.is_err(), "a deployment with no credential must be refused");
+        assert!(
+            refused.is_err(),
+            "a deployment with no credential must be refused"
+        );
         assert_eq!(state.current_config().await.providers.len(), 0);
         let vault = state.vault.lock().await;
         assert!(
@@ -3353,8 +3425,14 @@ mod tests {
     #[test]
     fn the_config_url_avoids_the_redirecting_resolve_path() {
         let url = raw_config_url("Qwen/Qwen3.8-27B", None);
-        assert_eq!(url, "https://huggingface.co/Qwen/Qwen3.8-27B/raw/main/config.json");
-        assert!(!url.contains("/resolve/"), "the resolve path redirects and is not followed: {url}");
+        assert_eq!(
+            url,
+            "https://huggingface.co/Qwen/Qwen3.8-27B/raw/main/config.json"
+        );
+        assert!(
+            !url.contains("/resolve/"),
+            "the resolve path redirects and is not followed: {url}"
+        );
         assert!(url.ends_with("/config.json"));
         assert_eq!(
             raw_config_url("acme/Model", Some("v1.2")),
@@ -3377,16 +3455,32 @@ mod tests {
 
         // Three hosts answer a request while it is open. Kaggle collects files. molab needs a human.
         for id in ["modal", "cerebrium", "saturn"] {
-            assert_eq!(row(id)["can_serve_requests"], json!(true), "{id} should serve requests");
+            assert_eq!(
+                row(id)["can_serve_requests"],
+                json!(true),
+                "{id} should serve requests"
+            );
         }
         assert_eq!(row("kaggle")["can_serve_requests"], json!(false));
-        assert_eq!(row("kaggle")["can_run_batch"], json!(true), "a kernel push is unattended");
+        assert_eq!(
+            row("kaggle")["can_run_batch"],
+            json!(true),
+            "a kernel push is unattended"
+        );
         assert_eq!(row("molab")["can_serve_requests"], json!(false));
-        assert_eq!(row("molab")["can_run_batch"], json!(false), "molab has no job API");
+        assert_eq!(
+            row("molab")["can_run_batch"],
+            json!(false),
+            "molab has no job API"
+        );
 
         // A refusal must quote the platform, not the router's opinion.
         let kaggle_batch = &row("kaggle")["refusals"]["batch"];
-        assert_eq!(kaggle_batch, &json!([]), "batch work is allowed on one account");
+        assert_eq!(
+            kaggle_batch,
+            &json!([]),
+            "batch work is allowed on one account"
+        );
         let kaggle_sync = row("kaggle")["refusals"]["synchronous"].clone();
         assert_eq!(kaggle_sync[0]["code"], json!("lane_is_batch_only"));
 
@@ -3394,7 +3488,11 @@ mod tests {
         for row in rows {
             assert!(row["display"].as_str().unwrap().len() > 1);
             assert!(row["shape"].is_string(), "shape is a word, not an index");
-            assert!(row["sources"].as_array().unwrap().iter().all(|s| s.as_str().unwrap().starts_with("https://")));
+            assert!(row["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s.as_str().unwrap().starts_with("https://")));
             assert!(row["headline"].as_str().unwrap().len() > 20);
         }
         assert!(body["note"].as_str().unwrap().contains("not live quotas"));
@@ -3440,7 +3538,12 @@ mod tests {
             .await
             .expect("router responded");
         let status = response.status();
-        let bytes = response.into_body().collect().await.expect("body").to_bytes();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
         let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, json)
     }
@@ -3453,7 +3556,11 @@ mod tests {
         let before_snapshot = std::fs::read(dir.path().join("routes.snapshot")).ok();
 
         let (status, body) = post_bundle(&state, cerebrium_body("HOPPER_H100")).await;
-        assert_eq!(status, StatusCode::OK, "the bundle route should answer: {body}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the bundle route should answer: {body}"
+        );
 
         let text = body["text"].as_str().expect("the file text");
         assert_eq!(body["filename"], json!("cerebrium.toml"));
@@ -3492,7 +3599,10 @@ mod tests {
 
         // Hardware figures are required, and the refusal says why rather than defaulting them.
         let mut without_memory = cerebrium_body("HOPPER_H100");
-        without_memory.as_object_mut().expect("object").remove("memory_gb");
+        without_memory
+            .as_object_mut()
+            .expect("object")
+            .remove("memory_gb");
         let (status, body) = post_bundle(&state, without_memory).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], json!("invalid_body"));
@@ -3510,9 +3620,7 @@ mod tests {
         let body = compute_body();
         assert_eq!(body["lane"], "cerebrium");
 
-        let rows = body["compute"]
-            .as_array()
-            .expect("compute is an array");
+        let rows = body["compute"].as_array().expect("compute is an array");
         assert_eq!(rows.len(), 13, "the platform publishes 13 accepted ids");
 
         let ids: Vec<&str> = rows
@@ -3558,7 +3666,9 @@ mod tests {
         .expect("a minimal provider deserialises");
         provider.extra.insert(
             mr_core::rental::RENTAL_EXTRA_KEY.to_owned(),
-            deployment.to_extra_value().expect("the deployment serialises"),
+            deployment
+                .to_extra_value()
+                .expect("the deployment serialises"),
         );
         provider
     }
@@ -3587,7 +3697,10 @@ mod tests {
         let body = launch_plan_body(&state, RentalSchedule::Sequential).await;
         assert_eq!(body["schedule"], json!("sequential"));
         assert_eq!(body["max_live"], json!(1));
-        assert_eq!(body["deployments"].as_array().expect("deployments").len(), 2);
+        assert_eq!(
+            body["deployments"].as_array().expect("deployments").len(),
+            2
+        );
         let waves = body["waves"].as_array().expect("waves");
         assert_eq!(waves.len(), 2, "one card per wave: {body}");
         assert_eq!(waves[0]["cards"], json!(1));
@@ -3617,15 +3730,12 @@ mod tests {
         // partial plan cannot look complete.
         {
             let mut config = state.config.write().await;
-            let mut broken = rental_provider(
-                "lane-c",
-                "acct-3",
-                "Qwen/Qwen3.8-27B",
-                "RTX-PRO-6000",
+            let mut broken =
+                rental_provider("lane-c", "acct-3", "Qwen/Qwen3.8-27B", "RTX-PRO-6000");
+            broken.extra.insert(
+                mr_core::rental::RENTAL_EXTRA_KEY.to_owned(),
+                json!("not an object"),
             );
-            broken
-                .extra
-                .insert(mr_core::rental::RENTAL_EXTRA_KEY.to_owned(), json!("not an object"));
             config.providers.push(broken);
         }
         let body = launch_plan_body(&state, RentalSchedule::Sequential).await;
@@ -3635,7 +3745,10 @@ mod tests {
             "the unparseable deployment is named: {body}"
         );
         assert_eq!(body["malformed"][0]["provider"], json!("lane-c"));
-        assert_eq!(body["deployments"].as_array().expect("deployments").len(), 2);
+        assert_eq!(
+            body["deployments"].as_array().expect("deployments").len(),
+            2
+        );
     }
 
     #[test]

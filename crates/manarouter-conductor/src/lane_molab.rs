@@ -57,6 +57,7 @@
 //! - Registrations expire at 14 400 s (exactly 12 h).
 //! - Account selection among warm lanes prefers `priority`, not least-used.
 
+use async_trait::async_trait;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -64,7 +65,6 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use async_trait::async_trait;
 use mr_core::error::Result as CoreResult;
 use mr_core::ids::Millis;
 use mr_core::quota::http::{HyperQuotaHttp, QuotaHttp, QuotaRequest, QuotaResponse};
@@ -114,7 +114,9 @@ impl Registration {
     /// How many seconds remain until this registration hits the 12 h cap.
     pub fn seconds_remaining(&self) -> u64 {
         let now = Millis::now();
-        let elapsed_ms = now.as_millis().saturating_sub(self.registered_at.as_millis());
+        let elapsed_ms = now
+            .as_millis()
+            .saturating_sub(self.registered_at.as_millis());
         Self::MAX_SESSION_SECS.saturating_sub((elapsed_ms / 1000) as u64)
     }
 
@@ -249,7 +251,11 @@ async fn get_status(State(app): State<AppState>) -> Json<Value> {
 /// The body of [`get_status`], taking the registry explicitly so a test can hand it a fresh one.
 async fn status_for(state: &Arc<Mutex<MolabState>>) -> Json<Value> {
     let molab_state = state.lock().await;
-    let warm_lanes = molab_state.registrations.values().filter(|r| r.is_warm()).count();
+    let warm_lanes = molab_state
+        .registrations
+        .values()
+        .filter(|r| r.is_warm())
+        .count();
 
     if warm_lanes == 0 && molab_state.registrations.is_empty() {
         // Literal sentence from the spec: nothing registered at all.
@@ -372,10 +378,13 @@ async fn attach_for(
         molab_state.registrations.insert(account_key, registration);
         info!("molab lane attached");
 
-        (StatusCode::OK, Json(json!({
-            "status": "ok",
-            "account": account_label,
-        })))
+        (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "account": account_label,
+            })),
+        )
     } else {
         let body = response.body_str();
         (
@@ -418,10 +427,13 @@ async fn down_for(
     if let Some(key) = key {
         molab_state.registrations.remove(&key);
         info!("molab lane down: {}", account_label);
-        (StatusCode::OK, Json(json!({
-            "status": "ok",
-            "account": account_label,
-        })))
+        (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "account": account_label,
+            })),
+        )
     } else {
         (
             StatusCode::NOT_FOUND,
@@ -466,10 +478,7 @@ async fn probe_all(state: &Arc<Mutex<MolabState>>) {
     for (key, reg) in molab_state.registrations.iter_mut() {
         // Check 12 h cap first.
         if reg.is_expired() {
-            warn!(
-                "molab lane {} expired (12 h cap)",
-                reg.account
-            );
+            warn!("molab lane {} expired (12 h cap)", reg.account);
             to_remove.push(key.clone());
             continue;
         }
@@ -542,10 +551,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let handle = tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
-                let _ = stream.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n\
-                     {\"object\":\"list\",\"data\":[{\"id\":\"fake-model\",\"object\":\"model\"}]}"
-                ).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n\
+                     {\"object\":\"list\",\"data\":[{\"id\":\"fake-model\",\"object\":\"model\"}]}",
+                    )
+                    .await;
                 let _ = stream.flush().await;
             }
         });
@@ -557,9 +568,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let handle = tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
-                let _ = stream.write_all(
-                    b"HTTP/1.1 302 Found\r\nLocation: http://example.com/models\r\n\r\n"
-                ).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://example.com/models\r\n\r\n")
+                    .await;
                 let _ = stream.flush().await;
             }
         });
@@ -676,8 +687,7 @@ mod tests {
         let error = body["error"]["message"].as_str().unwrap();
         assert_eq!(body["error"]["code"], "redirect_not_followed");
         assert!(
-            error.to_lowercase().contains("redirect")
-                || error.contains("302"),
+            error.to_lowercase().contains("redirect") || error.contains("302"),
             "error should mention redirect: {}",
             error
         );
@@ -711,7 +721,9 @@ mod tests {
         }
 
         // Start error server.
-        let _server = run_persistent_error_server(addr.parse().unwrap()).await.unwrap();
+        let _server = run_persistent_error_server(addr.parse().unwrap())
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Run 3 probe cycles (each probes once).
@@ -722,7 +734,10 @@ mod tests {
         // The account should have 3 consecutive failures and be deregistered.
         let molab_state = state.lock().await;
         assert!(
-            !molab_state.registrations.values().any(|r| r.account == "fail-acc"),
+            !molab_state
+                .registrations
+                .values()
+                .any(|r| r.account == "fail-acc"),
             "account should be deregistered after 3 failures"
         );
     }
@@ -809,7 +824,8 @@ mod tests {
         let molab_state = state.lock().await;
         let best = Registration::pick_best(molab_state.registrations.values());
         assert_eq!(
-            best.unwrap().account, "high-pri",
+            best.unwrap().account,
+            "high-pri",
             "priority should beat least-used"
         );
     }
