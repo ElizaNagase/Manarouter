@@ -25,6 +25,54 @@ explains. Those are two different questions: how many providers does this file d
 many of OmniRoute's credentialed providers could be carried across.
 
 
+## Templated base URLs: `{account_id}` and `{account}`
+
+Two of the 206 entries cannot spell their base URL without knowing something about *one particular
+account*, so their `base_url` carries a placeholder:
+
+| id | base URL | name |
+|---|---|---|
+| `cloudflare-ai` | `https://api.cloudflare.com/client/v4/accounts/{account_id}` | `account_id` |
+| `snowflake` | `https://{account}.snowflakecomputing.com/api/v2` | `account` |
+
+Note the second one: the placeholder is in the **host**, not the path. That is why the rule below is
+about URL components rather than about path segments.
+
+**How the value is chosen.** Each account carries a `placeholders` map, name to value, and the relay
+fills the base URL from the account it is about to use. The map is per account, not per provider,
+because one provider entry can serve several accounts (a personal one and a work one, each with its
+own account id) — the whole point of the snapshot's account list.
+
+```json
+{ "id": "acc-1", "label": "work", "identity": "…", "secret_ref": "…",
+  "placeholders": { "account_id": "023e105f4ecef8ad9ca31a8372d0c353" } }
+```
+
+**The value rule.** A value must be a single RFC 3986 *unreserved* component: letters, digits, `-`,
+`.`, `_`, `~`, and nothing else. `/`, `:`, `%`, `?`, `#`, `@` and whitespace are refused, because the
+value is spliced into a path *or a host* and an unchecked value could move the request to a different
+host or break out of the path. A value that fails the rule is refused rather than percent-encoded:
+percent-encoding an account id produces a URL the provider does not recognise, which is the failure
+this feature exists to stop.
+
+**What failure looks like.** A missing or unusable value is a `502` with code
+`account_placeholder_unfilled`, naming the provider, the account and the missing name(s), with
+`retry_accounts: true` — the value belongs to the account, so a combo with a second account of the
+same provider carries on to it. The request is never sent with a literal `{account_id}` in the URL.
+
+**Where to set it today.** In the account's `placeholders` object in `config.json`, or through
+`PUT /api/config`. The panel's account editor round-trips the account object, so it **preserves** a
+`placeholders` map an operator has set, but it does not offer fields to create one yet — that is a
+gap in the panel, not in the relay. `mr account add` has no flag for it either.
+
+**Why this exists.** Before it, the literal `{account_id}` went upstream unchanged and Cloudflare
+answered `404`: the relay reported a provider failure for what was, in fact, a missing configuration
+value. The error body's `%7Baccount_id%7D` is what proved the braces were being sent. Two tests in
+`mr-core` now hold the invariant: every shipped base URL uses only well-formed placeholders, and no
+route override carries one.
+
+---
+
 ## OAuth-backed (10)
 
 | id | label | dialect | base URL | auth | capabilities |

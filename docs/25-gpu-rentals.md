@@ -349,6 +349,8 @@ own type.
 
 - [research/ARCHITECTURE-gpu-rentals.md](research/ARCHITECTURE-gpu-rentals.md) — the frozen interface:
   object model, config schema, conductor API, catalogues, and the platform facts with sources.
+- [26-gpu-lanes.md](26-gpu-lanes.md) — the four lane surfaces on the conductor: routes, request and
+  error shapes, and which platform can hold an endpoint open at all.
 - [providers/modal-vllm.md](providers/modal-vllm.md) — the `modal-vllm` dialect on the wire.
 - [research/modal-platform.md](research/modal-platform.md) — the verified Modal facts: GPU ids,
   prices, plans, proxy tokens, `scaledown_window`.

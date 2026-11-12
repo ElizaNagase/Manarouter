@@ -484,6 +484,7 @@ trigger.
     { "path": "docs/user/11-security.md", "purpose": "The vault, the panel's access controls, and what must not be exposed", "read_when": "reviewing a deployment" },
     { "path": "docs/user/12-cli-reference.md", "purpose": "Every mr command with its flags", "read_when": "looking up a command" },
     { "path": "docs/25-gpu-rentals.md", "purpose": "Renting a GPU for a self-hosted model: the two lanes, KV capacity sizing, and what Manarouter will not do for you", "read_when": "planning self-hosted GPU capacity" },
+    { "path": "docs/26-gpu-lanes.md", "purpose": "The four GPU lane surfaces behind the panel: Kaggle, molab, Saturn and Cerebrium routes, what each platform can and cannot do, and what every error means", "read_when": "driving or debugging a GPU lane" },
     { "path": "docs/providers/modal-vllm.md", "purpose": "The Modal vLLM provider: proxy-token auth, capacity settings and lifecycle fields", "read_when": "configuring a rented Modal endpoint" },
     { "path": "docs/research/ARCHITECTURE-gpu-rentals.md", "purpose": "The frozen interface spec for GPU rentals: config schema, conductor API, two catalogs, and the sizing rules", "read_when": "implementing or reviewing the GPU-rental feature" },
     { "path": "docs/research/vllm-sizing-and-quant.md", "purpose": "vLLM's exact KV formula, its quoting-layer and head-dim fallbacks, and the hybrid-attention correction", "read_when": "computing or reviewing a KV footprint" },
