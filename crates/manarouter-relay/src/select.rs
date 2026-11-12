@@ -920,6 +920,7 @@ mod tests {
             price_per_second: None,
             cold_start_ttfb_timeout_ms: None,
             steps: Vec::new(),
+            hidden_models: Vec::new(),
         }
     }
 

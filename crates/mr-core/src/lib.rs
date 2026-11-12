@@ -124,7 +124,12 @@ pub const SNAPSHOT_MAGIC: [u8; 8] = *b"MROUTES1";
 /// URL asks for, the account name a Snowflake hostname asks for. A v8 account record carries no
 /// such map, so a base URL with braces would reach the upstream literally; the frame must be
 /// rebuilt from authored config instead of reinterpreted.
-pub const SNAPSHOT_VERSION: u32 = 9;
+///
+/// Version 10 adds each provider's **hidden model ids**, so a miss can say "that model is hidden"
+/// instead of "no such model" — a typo and a checkbox need different fixes. A v9 frame carries no
+/// such list, so a hidden model would be reported as nonexistent; rebuilding from authored config
+/// is the only way to recover it.
+pub const SNAPSHOT_VERSION: u32 = 10;
 
 /// Current on-disk database schema version.
 ///

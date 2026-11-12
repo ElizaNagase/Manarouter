@@ -94,7 +94,7 @@ magic[8] | version u32 | digest u64 | payload_len u32 | checksum u64 | payload[.
 | Field | Offset | Type | Protects against |
 |---|---|---|---|
 | `magic` | 0 | 8 bytes | Being handed an unrelated file. The constant is `SNAPSHOT_MAGIC = *b"MROUTES1"` in `mr-core/src/lib.rs`. A mismatch is reported as *"this is not a compiled routing snapshot"*, before any structure is built. |
-| `version` | 8 | `u32` LE | Loading a layout this binary cannot interpret. `SNAPSHOT_VERSION = 8`. A mismatch is refused, not guessed at. |
+| `version` | 8 | `u32` LE | Loading a layout this binary cannot interpret. `SNAPSHOT_VERSION = 10`. A mismatch is refused, not guessed at. |
 | `digest` | 12 | `u64` LE | Being unable to tell "the file changed" from "the bytes changed" without comparing whole snapshots. Copied from `Config::routing_digest()`. |
 | `payload_len` | 20 | `u32` LE | A truncated or padded file. Checked against the actual byte count in both directions: fewer bytes is a precise "truncated" error, more bytes is a "trailing bytes" error. |
 | `checksum` | 24 | `u64` LE | A single flipped byte anywhere meaningful. |
@@ -413,7 +413,7 @@ yet, not a routing decision — a `Default` snapshot resolves everything to `Not
 
 ## 10. Version and compatibility
 
-`SNAPSHOT_MAGIC` is `*b"MROUTES1"` and `SNAPSHOT_VERSION` is `8`, both in
+`SNAPSHOT_MAGIC` is `*b"MROUTES1"` and `SNAPSHOT_VERSION` is `10`, both in
 `crates/mr-core/src/lib.rs`.
 
 The version history is worth recording, because it has moved repeatedly. Version 3 added the
@@ -428,8 +428,12 @@ refusal under, so a frame that omits it would silently reintroduce account-wide 
 added the five self-hosted capacity and billing fields on a provider plan — `kv_pool_tokens`,
 `max_context`, `max_concurrent`, `price_per_second` and `cold_start_ttfb_timeout_ms` — which is what
 lets a rented GPU endpoint be admission-controlled and billed from the relay without a second config
-read. A version-2 through version-7 snapshot is therefore refused rather than read as though it
-carried fields it does not.
+read. Version 9 added each account's named placeholder values, so a base URL like Cloudflare's
+`…/accounts/{account_id}` reaches the upstream filled in rather than literally. Version 10 adds each
+provider's **hidden model ids**: the models the operator hid are absent from `steps` (as they always
+were) and now also recorded, because "no such model" and "that model is hidden" are different
+problems with different fixes — a typo versus a checkbox. A version-2 through version-9 snapshot is
+therefore refused rather than read as though it carried fields it does not.
 
 The rule is absolute: **a change to the compiled layout requires a `SNAPSHOT_VERSION` bump.** The
 version is not a semver hint; the decoder has no compatibility paths, and a table written under a
@@ -451,7 +455,7 @@ routing for the interval until it does. The magic check rejects a plain non-snap
 reason — a `config.json` or a database should never be interpretable as routing data.
 
 `SNAPSHOT_MAGIC` and `SNAPSHOT_VERSION` are separate from `CONFIG_FORMAT_VERSION` (still 1) and
-`SCHEMA_VERSION` (now 4). They version three different things — the authored file, the compiled
+`SCHEMA_VERSION` (now 5). They version three different things — the authored file, the compiled
 table, and the database — and conflating them would force an unnecessary migration in two of the
 three whenever the third changed. The three are free to move independently, and now do.
 
@@ -584,6 +588,7 @@ strings         ["openai", "https://api.openai.com/v1", "a1", "gpt-5.5",
 providers[0]    id=openai dialect=openai key_strategy=priority cooldown_scope=account
                 accounts = [ a1(priority 0) ]          ← a2 dropped: disabled
                 steps    = [ gpt-5.5 ]                 ← gpt-5.5-mini dropped: hidden
+                hidden_models = [ gpt-5.5-mini ]       ← kept for the miss message only
 providers[1]    id=anthropic dialect=anthropic key_strategy=round-robin cooldown_scope=account
                 accounts = [ b1(priority 0) ]
                 steps    = [ claude-sonnet-4-5 ]

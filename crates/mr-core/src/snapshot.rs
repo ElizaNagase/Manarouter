@@ -477,6 +477,13 @@ pub struct ProviderPlan {
     /// One step per visible model, so a `provider/model` or bare-model request can be served
     /// without a combo. Hidden models are absent.
     pub steps: Vec<StepPlan>,
+    /// Model ids the operator marked hidden: present on the provider, absent from `steps`, and
+    /// never routed against.
+    ///
+    /// The list exists only so a miss can distinguish "no such model" from "that model is hidden",
+    /// which are fixed differently — a typo versus a checkbox. It carries no credential and no
+    /// routing decision.
+    pub hidden_models: Vec<String>,
 }
 
 /// A compiled account: scheduling metadata plus a reference to the credential, never its value.
@@ -770,6 +777,12 @@ impl RoutingSnapshot {
                 price_per_second: provider.price_per_second,
                 cold_start_ttfb_timeout_ms: provider.cold_start_ttfb_timeout_ms,
                 steps: Vec::new(),
+                hidden_models: provider
+                    .models
+                    .iter()
+                    .filter(|m| m.hidden)
+                    .map(|m| m.id.clone())
+                    .collect(),
             };
             let visible: Vec<&ModelEntry> = provider.models.iter().filter(|m| !m.hidden).collect();
             let mut steps = Vec::with_capacity(visible.len());
@@ -1201,7 +1214,15 @@ impl RoutingSnapshot {
                  with a -<level> suffix such as {requested}-high."
             ),
             Some((provider, rest)) => {
-                if self.providers.iter().any(|p| p.id.as_str() == provider) {
+                if let Some(hidden) = self.hidden_model_named(provider, rest) {
+                    // A hidden model is not a missing one, and telling the operator it does not
+                    // exist sends them to sync models that are already there. The fix is one
+                    // checkbox, so say that instead.
+                    format!(
+                        "provider {provider:?} has a model {hidden:?}, but it is hidden: show it in \
+                         the provider's model list to route to it"
+                    )
+                } else if self.providers.iter().any(|p| p.id.as_str() == provider) {
                     // Naming a *level* that the model does not offer is not a miss: those keys are
                     // indexed against the model's highest level. So the only way to get here with a
                     // known provider is a genuine model miss, and naming the closest candidate
@@ -1217,6 +1238,23 @@ impl RoutingSnapshot {
                 }
             }
         }
+    }
+
+    /// The hidden model id `name` would have matched, if any.
+    ///
+    /// `name` may carry a `-<level>` suffix, because that is how a request pins a tier, so the
+    /// suffix is stripped before the comparison when it names a level. Matching is exact and
+    /// case-sensitive, like the routing index: a near miss is still a miss and must say so.
+    fn hidden_model_named(&self, provider: &str, name: &str) -> Option<String> {
+        let plan = self.providers.iter().find(|p| p.id.as_str() == provider)?;
+        let base = match level_suffix(name) {
+            Some(_) => name.rsplit_once('-').map(|(base, _)| base).unwrap_or(name),
+            None => name,
+        };
+        plan.hidden_models
+            .iter()
+            .find(|hidden| hidden.as_str() == base)
+            .cloned()
     }
 
     /// The configured provider ids, comma-separated, for a miss message.
@@ -2380,6 +2418,7 @@ fn encode_provider(encoder: &mut Encoder, provider: &ProviderPlan) {
     for step in &provider.steps {
         encode_step(encoder, step);
     }
+    encode_string_list(encoder, &provider.hidden_models);
 }
 
 /// Encode an account.
@@ -2843,6 +2882,7 @@ fn decode_providers(reader: &mut Reader, strings: &[String]) -> Result<Vec<Provi
             price_per_second,
             cold_start_ttfb_timeout_ms,
             steps: Vec::new(),
+            hidden_models: Vec::new(),
         };
 
         let step_count = reader.u32()? as usize;
@@ -2876,6 +2916,10 @@ fn decode_providers(reader: &mut Reader, strings: &[String]) -> Result<Vec<Provi
             steps.push(step);
         }
         provider.steps = steps;
+        // After the steps: the hidden list is a diagnostic, not a routing input, so a frame that
+        // ends here without it is read as "nothing hidden" rather than as a corrupt provider. The
+        // version gate is what makes that safe.
+        provider.hidden_models = decode_string_list(reader, strings)?;
         providers.push(provider);
     }
     Ok(providers)
@@ -3913,6 +3957,58 @@ mod tests {
             snapshot.resolve("old-generated"),
             Resolution::NotFound { .. }
         ));
+    }
+
+    /// A hidden model is reported as hidden, not as missing.
+    ///
+    /// The regression: a model the operator could see in the provider's list was answered with
+    /// "does not offer a model matching", which sends them to sync models that are already synced.
+    /// The two states need different fixes — an id versus a checkbox — so they get different text.
+    #[test]
+    fn a_hidden_model_is_reported_as_hidden_rather_than_missing() {
+        let snapshot = RoutingSnapshot::compile(&rich_config()).unwrap();
+        assert_eq!(
+            snapshot.providers()[0].hidden_models,
+            vec!["hidden".to_owned()]
+        );
+
+        for requested in ["alpha/hidden", "alpha/hidden-high"] {
+            match snapshot.resolve(requested) {
+                Resolution::NotFound { reason } => {
+                    assert!(reason.contains("hidden"), "{requested}: {reason}");
+                    assert!(
+                        !reason.contains("does not offer"),
+                        "{requested} exists but is hidden: {reason}"
+                    );
+                }
+                other => panic!("{requested} must not resolve while hidden: {other:?}"),
+            }
+        }
+
+        // A name that is genuinely absent keeps the ordinary message.
+        match snapshot.resolve("alpha/nope") {
+            Resolution::NotFound { reason } => {
+                assert!(reason.contains("does not offer"), "{reason}");
+                assert!(!reason.contains("hidden"), "{reason}");
+            }
+            other => panic!("a missing model must not resolve: {other:?}"),
+        }
+    }
+
+    /// The hidden list survives the frame, because the relay reads it from the encoded snapshot.
+    #[test]
+    fn hidden_models_round_trip_through_the_frame() {
+        let snapshot = RoutingSnapshot::compile(&rich_config()).unwrap();
+        let bytes = snapshot.encode().unwrap();
+        let decoded = RoutingSnapshot::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.providers()[0].hidden_models,
+            snapshot.providers()[0].hidden_models
+        );
+        assert!(decoded.providers()[0]
+            .steps
+            .iter()
+            .all(|step| step.model != "hidden"));
     }
 
     #[test]
