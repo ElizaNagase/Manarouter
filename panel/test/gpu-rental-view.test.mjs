@@ -603,8 +603,10 @@ test('a lane that names what is missing is quoted, and an empty lane says how to
     'the lane\'s note about what readiness does not prove is quoted');
   assert.match(text, /POST \/api\/gpu\/lanes\/cerebrium\/attach \{account, project_id, app_name, token\}/,
     'the empty card names the route and fields, since the panel has no attach form yet');
-  assert.match(text, /held in the conductor's memory: restarting it clears them/,
-    'the restart caveat is stated where the empty account list is read');
+  assert.match(text, /kept in the conductor's memory and in the encrypted vault/,
+    'the card states that an attached account survives a restart');
+  assert.match(text, /restored account is not probed until/,
+    'and that a restored account is not a measurement');
 });
 
 test('inventory renders deployments with mode, batch card and the derived sizing', async () => {

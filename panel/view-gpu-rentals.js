@@ -898,8 +898,10 @@ async function renderInventory(mount, ctx) {
         }[platform];
         if (attach) parts.push(h('p', { class: 'hint' }, attach));
         parts.push(h('p', { class: 'hint' },
-          'Lane accounts are held in the conductor\'s memory: restarting it clears them until '
-          + 'credential persistence ships.'));
+          'An attached account is kept in the conductor\'s memory and in the encrypted vault under '
+          + 'lane:<platform>:<account>, so a restart re-registers it. A restored account is not '
+          + 'probed until the lane asks the platform again; attaching the same label again rotates '
+          + 'the credential.'));
       }
 
       const cardEl = h('section', { class: 'card gpu-section' },
