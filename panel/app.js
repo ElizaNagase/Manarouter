@@ -24,6 +24,7 @@ import { renderModels } from './view-models.js';
 import { renderQuota } from './view-quota.js';
 import { renderSettings } from './view-settings.js';
 import { renderDocs } from './view-docs.js';
+import { render as renderGpuRentals } from './view-gpu-rentals.js';
 import { startComboLive } from './combo-live.js';
 
 // ---------------------------------------------------------------------------
@@ -250,6 +251,9 @@ const ROUTES = [
   { id: 'quota', re: /^#\/quota$/, title: 'Quota', navLabel: 'Quota', navTitle: 'Review declared limits and observed usage.', render: renderQuota },
   { id: 'settings', re: /^#\/settings$/, title: 'Settings', navLabel: 'Settings', navTitle: 'Configure panel access, listen ports, and relay settings.', render: renderSettings },
   { id: 'docs', re: /^#\/docs(?:\/(.+))?$/, title: 'Documentation', navLabel: 'Documentation', navTitle: 'Read and download Manarouter documentation.', render: renderDocs },
+  // The setup flow lives on a sub-path of the same route (`#/gpu-rentals/new/<step>`), so the
+  // regex captures the step — the same shape the combos and docs routes use.
+  { id: 'gpu-rentals', re: /^#\/gpu-rentals(?:\/(.+))?$/, title: 'GPU rentals', navLabel: 'GPU rentals', navTitle: 'Plan and track GPU capacity for self-hosted providers.', render: renderGpuRentals },
 ];
 
 // Bumped on every route render: a stale view's late rejection must not touch the current route.
@@ -312,7 +316,7 @@ function renderRoute() {
   const view = h('div', { class: 'route-view' },
     h('div', { class: 'toolbar' }, spinner(), h('span', { class: 'count' }, 'Loading…')));
   mainEl.replaceChildren(head, view);
-  route.render(view, ctx, param).catch((err) => {
+  Promise.resolve(route.render(view, ctx, param)).catch((err) => {
     if (seq !== routeSeq) return; // a newer route owns <main>; its error screen is not ours to show
     clear(view);
     const box = errorBlock(err);

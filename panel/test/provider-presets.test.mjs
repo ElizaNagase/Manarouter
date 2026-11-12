@@ -102,6 +102,15 @@ test('preset names are unique across both groups', () => {
   }
 });
 
+test('Modal vLLM is offered exactly once with its dedicated dialect and auth', () => {
+  const modal = all.filter((preset) => preset.name === 'Modal vLLM');
+  assert.equal(modal.length, 1);
+  assert.equal(modal[0].dialect, 'modal-vllm');
+  assert.equal(modal[0].auth, 'modal');
+  assert.match(modal[0].hint, /HTTPS public URL/i);
+  assert.match(modal[0].hint, /Token ID\.Token Secret/i);
+});
+
 test('the OpenCode presets point at the documented hosts', () => {
   const byName = new Map(all.map((preset) => [preset.name, preset]));
   const zen = byName.get('OpenCode Zen');

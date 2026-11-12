@@ -148,7 +148,7 @@ export function buildRedirectPaste(p, ctx, session) {
 // `open-ai`, `parse` wants `openai`. A value here that the backend rejects turns "Add provider"
 // into a save-time error, which is how the pre-rename `command-code` spelling was caught. The Rust
 // test `the_panel_offers_only_dialects_this_binary_deserialises` pins this list.
-const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go'];
+const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go', 'modal-vllm'];
 const KEY_STRATEGIES = ['priority', 'round-robin', 'random', 'least-used'];
 // What a refusal parks: the credential (every model), that model on the credential, or that model
 // on every credential of the provider. Widening past `account` is only right when the upstream
@@ -275,6 +275,7 @@ const PROVIDER_PRESETS = {
     { name: 'Copilot', dialect: 'copilot', baseUrl: 'https://api.githubcopilot.com', auth: 'oauth', hint: 'GitHub Copilot — OAuth sign-in from the panel.' },
     { name: 'Antigravity', dialect: 'antigravity', baseUrl: 'https://cloudcode-pa.googleapis.com', auth: 'oauth', hint: 'Google Antigravity / Cloud Code — OAuth sign-in from the panel.' },
     { name: 'Command Code', dialect: 'command-code-go', baseUrl: 'https://api.commandcode.ai', auth: 'bearer', hint: 'Command Code — bearer auth.' },
+    { name: 'Modal vLLM', dialect: 'modal-vllm', baseUrl: '', auth: 'modal', hint: 'Enter your Modal app’s HTTPS public URL (for example https://your-app--serve.modal.run). Add the Modal Token ID.Token Secret as the account secret after saving; the panel sends it as Modal-Key and Modal-Secret headers.' },
     { name: 'OpenCode Zen', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/v1', auth: 'bearer', hint: 'OpenCode Console, pay-as-you-go. Needs a funded key: the free models are refused outside the OpenCode client, so they cannot be routed from here.' },
     { name: 'OpenCode Go', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/go/v1', auth: 'bearer', hint: 'OpenCode Go subscription tier. Every request needs an x-opencode-session header, which this provider will not add for you — set it as a static header. Only the models your plan lists will answer; sync them from this host.' },
   ],
@@ -295,6 +296,7 @@ const AUTH_KINDS = [
   ['header', 'Custom header'],
   ['query-param', 'Query parameter'],
   ['oauth', 'OAuth (platform-managed)'],
+  ['modal', 'Modal-Key + Modal-Secret'],
 ];
 
 export async function renderProviders(mount, ctx) {
@@ -1315,6 +1317,11 @@ export async function renderProviders(mount, ctx) {
       ['auth', authLabel(p.auth)],
       ['key strategy', h('span', { class: 'mono' }, p.key_strategy ?? 'priority')],
       ['cooldown scope', h('span', { class: 'mono' }, p.cooldown_scope ?? 'account')],
+      ['KV-token pool', p.kv_pool_tokens == null ? '—' : formatCompact(Number(p.kv_pool_tokens))],
+      ['declared context', p.max_context == null ? '—' : formatCompact(Number(p.max_context))],
+      ['max concurrent', p.max_concurrent == null ? '—' : String(p.max_concurrent)],
+      ['GPU price', p.price_per_second == null ? '—' : `$${Number(p.price_per_second).toFixed(4)} / second`],
+      ['Cold-start TTFB timeout', p.cold_start_ttfb_timeout_ms == null ? '—' : `${formatCompact(Number(p.cold_start_ttfb_timeout_ms))} ms`],
       ['note', p.note ?? '—'],
     ])));
 
@@ -1323,6 +1330,7 @@ export async function renderProviders(mount, ctx) {
     const timeoutFields = [
       ['connect_timeout_ms', 'connect'], ['ttfb_timeout_ms', 'TTFB'],
       ['idle_timeout_ms', 'idle'], ['total_timeout_ms', 'total'],
+      ['cold_start_ttfb_timeout_ms', 'cold-start TTFB'],
     ];
     for (const [key, label] of timeoutFields) timeoutSection.append(buildInlineNumber(p, key, label, 'Provider timeout in milliseconds.'));
     timeoutSection.append(h('p', { class: 'hint' }, 'Blank values inherit the configured timeout defaults.'));
@@ -2595,11 +2603,29 @@ export async function renderProviders(mount, ctx) {
 
     const timeouts = h('div', { class: 'grid-fields' });
     const tFields = {};
-    for (const t of ['connect_timeout_ms', 'ttfb_timeout_ms', 'idle_timeout_ms', 'total_timeout_ms']) {
+    for (const t of ['connect_timeout_ms', 'ttfb_timeout_ms', 'idle_timeout_ms', 'total_timeout_ms', 'cold_start_ttfb_timeout_ms']) {
       const input = h('input', { class: 'input', type: 'number', min: '0', 'data-field': t, value: p?.[t] ?? '' });
       tFields[t] = input;
       timeouts.append(field(t.replace('_timeout_ms', ' (ms)'), input));
     }
+    const budgetFields = {};
+    for (const key of ['kv_pool_tokens', 'max_context', 'max_concurrent', 'price_per_second']) {
+      const input = h('input', {
+        class: 'input',
+        type: 'number',
+        min: '0',
+        step: key === 'price_per_second' ? 'any' : '1',
+        value: p?.[key] ?? '',
+        'data-field': key,
+      });
+      budgetFields[key] = input;
+    }
+    const budgetSettings = h('fieldset', { class: 'plain' }, h('legend', {}, 'Self-hosted capacity and cost'),
+      h('div', { class: 'grid-fields' },
+        field('KV pool tokens', budgetFields.kv_pool_tokens, { hint: 'Total token capacity reserved across in-flight prompts.' }),
+        field('Max context tokens', budgetFields.max_context, { hint: 'Overrides discovered context length during model sync.' }),
+        field('Max concurrent requests', budgetFields.max_concurrent),
+        field('GPU price per second (USD)', budgetFields.price_per_second, { hint: 'Records elapsed request wall-clock as GPU seconds and estimates spend.' })));
 
     const keyStrat = h('select', { class: 'input', 'data-field': 'key_strategy' },
       ...KEY_STRATEGIES.map((k) => h('option', { value: k, selected: (p?.key_strategy ?? 'priority') === k }, k)));
@@ -2650,6 +2676,7 @@ export async function renderProviders(mount, ctx) {
       baseUrlSuggestion,
       h('fieldset', { class: 'plain' }, h('legend', {}, 'Auth'), authSel, authBox),
       h('fieldset', { class: 'plain' }, h('legend', {}, 'Timeouts'), timeouts),
+      budgetSettings,
       prewarmToggle.row,
       enabledToggle.row,
       field('Note (optional)', note),
@@ -2682,11 +2709,13 @@ export async function renderProviders(mount, ctx) {
         : t === 'api-key-header' ? { type: 'api-key-header', header: authHeader.value || 'x-api-key' }
           : t === 'header' ? { type: 'header', name: authName.value, prefix: authPrefix.value }
             : t === 'query-param' ? { type: 'query-param', param: authParam.value || 'key' }
-              : { type: 'oauth', platform: authPlatform.value };
+              : t === 'modal' ? { type: 'modal' }
+                : { type: 'oauth', platform: authPlatform.value };
       // Timeouts: only send a value when the operator typed one. Assigning undefined would
       // stringify the key away and silently reset the server-side value on an edit.
-      for (const [k, input] of Object.entries(tFields)) {
+      for (const [k, input] of Object.entries({ ...tFields, ...budgetFields })) {
         if (input.value !== '') payload[k] = Number(input.value);
+        else delete payload[k];
       }
 
       try {

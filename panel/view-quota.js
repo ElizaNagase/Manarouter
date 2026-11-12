@@ -221,7 +221,10 @@ export async function renderQuota(mount, ctx) {
       + `${formatTokens(totals.completion_tokens)} completion tokens`
       + (totals.cached_tokens ? `, ${formatTokens(totals.cached_tokens)} from cache` : '')
       + (totals.cache_write_tokens ? `, ${formatTokens(totals.cache_write_tokens)} written to cache` : '')
-      + (totals.estimated_requests ? `, ${totals.estimated_requests} estimated` : '')));
+      + (totals.estimated_requests ? `, ${totals.estimated_requests} estimated` : '')
+      + (totals.gpu_requests ? `, ${totals.gpu_requests} self-hosted request(s)` : '')
+      + (totals.gpu_seconds != null ? `, ${formatSeconds(totals.gpu_seconds)} GPU time` : '')
+      + (totals.gpu_cost_usd != null ? `, $${totals.gpu_cost_usd.toFixed(2)} self-hosted cost` : '')));
     return card;
   }
 
@@ -664,6 +667,14 @@ function formatTokens(value) {
 function formatRate(value) {
   if (value == null || !Number.isFinite(Number(value))) return '—';
   return Number(value).toFixed(1);
+}
+
+function formatSeconds(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value)) return '—';
+  if (value >= 3600) return `${(value / 3600).toFixed(2)}h`;
+  if (value >= 60) return `${(value / 60).toFixed(1)}m`;
+  return `${value.toFixed(1)}s`;
 }
 
 // The ledger stores milliseconds since the epoch; the panel shows it in the local timezone.
