@@ -144,6 +144,14 @@ pub struct AppState {
     /// enough (and the fast path cheap enough) that an edit within the same tick should still be
     /// noticed.
     pub config_seen: Arc<StdMutex<Option<(SystemTime, u64)>>>,
+    /// Kaggle lane state: the run registry and optional credential path.
+    pub kaggle: crate::lane_kaggle::KaggleState,
+    /// Molab lane state: the attached-endpoint registry.
+    ///
+    /// Behind its own lock rather than an `ArcSwap` because the attach/down routes are rare writes
+    /// and the probe supervisor holds the lock across a network probe — the registry is a handful of
+    /// entries, so contention is not a concern and a plain mutex keeps the ordering obvious.
+    pub molab: Arc<tokio::sync::Mutex<crate::lane_molab::MolabState>>,
 }
 
 /// The ports this process believes are live.
@@ -297,11 +305,42 @@ impl AppState {
             dirs,
             started_at: Instant::now(),
             config_seen: Arc::new(StdMutex::new(None)),
+            kaggle: crate::lane_kaggle::KaggleState::new(),
+            molab: Arc::new(tokio::sync::Mutex::new(crate::lane_molab::MolabState::default())),
         };
         // Seed the fingerprint with what we just loaded, so the first read after startup does not
         // mistake the file we started from for an external edit.
         state.mark_config_seen();
         Ok(state)
+    }
+
+    /// A fully-wired state for a test that needs a real `AppState` but cares about one module.
+    ///
+    /// Every path lives in `dir`, so the caller keeps the [`tempfile::TempDir`] alive for as long as
+    /// the state is used. The vault is a real encrypted file in that directory, which means a route
+    /// under test that stores a secret is exercising the production code path rather than a stub.
+    #[cfg(test)]
+    pub fn for_test(dir: &std::path::Path) -> Self {
+        let config_path = dir.join("config.json");
+        Config::default()
+            .save(&config_path)
+            .expect("write the initial config");
+        Self::new(
+            Config::default(),
+            StateFiles {
+                config_path,
+                snapshot_path: dir.join("routes.snapshot"),
+                database_path: dir.join("state.sqlite"),
+                dirs: ServeDirs {
+                    panel: None,
+                    docs: None,
+                },
+            },
+            PanelAuth::resolve("127.0.0.1", None, false).expect("loopback panel needs no password"),
+            20900,
+            20901,
+        )
+        .expect("build state")
     }
 
     /// Clone the current configuration.

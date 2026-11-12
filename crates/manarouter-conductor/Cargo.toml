@@ -19,7 +19,12 @@ path = "src/main.rs"
 [dependencies]
 mr-core = { workspace = true }
 mr-dialects = { workspace = true }
-tokio = { workspace = true }
+# `process` is needed by the lanes that drive a vendor CLI (Kaggle) rather than an HTTP API: there is
+# no REST surface for "push this notebook and start it", so the documented path is `kaggle kernels
+# push`. Added here rather than in the workspace so that `mr-core` stays free of process spawning —
+# that crate is deliberately I/O-free and a lane must not be able to start a subprocess from it.
+tokio = { workspace = true, features = ["process"] }
+async-trait = { workspace = true }
 tokio-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

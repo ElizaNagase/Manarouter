@@ -52,6 +52,11 @@ pub async fn serve(state: AppState) -> Result<(), String> {
         .map_err(|e| format!("the control listener has no local address: {e}"))?
         .port();
 
+    // The molab lane's health supervisor: it probes every attached endpoint and drops the ones that
+    // stop answering. Spawned here, after a bind succeeded, so a failed start does not leave a timer
+    // running against a process that is about to exit.
+    tokio::spawn(crate::lane_molab::start_supervisor(state.molab.clone()));
+
     // Record the real bound port (it differs from `port` when the config says 0) before serving,
     // so even the first `GET /api/ports` and the origin check see the truth.
     state
