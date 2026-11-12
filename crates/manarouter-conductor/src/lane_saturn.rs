@@ -1,31 +1,38 @@
-//! Saturn Cloud lane: register accounts, probe endpoints, manage SSH tunnels
+//! Saturn Cloud lane: register an endpoint, probe it, and hold the 150-hour budget.
 //!
-//! ## The one attended step
+//! ## What the lane owns
 //!
-//! The operator creates a Saturn Cloud access token manually (User Profile → Access Keys → New
-//! Token), then runs:
+//! Saturn Cloud gives a workspace a Jupyter server on port 8000 that answers the
+//! OpenAI-compatible API. Reaching it usually means an SSH tunnel, but **this lane never starts
+//! one**: a conductor that opened an SSH connection by itself would be a process nobody asked
+//! for, holding a connection nobody watches. The tunnel belongs to the operator:
 //!
 //! ```text
-//! mr lane attach saturn --account <label> --host <ssh-host> --token <saturn-token>
+//! ssh -N -L 127.0.0.1:8000:localhost:8000 <user>@<workspace>.saturncloud.io
 //! ```
 //!
-//! The lane then creates an SSH tunnel from the relay's localhost to the operator's Saturn
-//! workspace, forwards to port 8000 where the Jupyter server exposes an OpenAI-compatible API,
-//! and maintains the tunnel with periodic probes.
+//! and the lane is then attached to whatever URL that tunnel (or Saturn's Token Factory) exposes:
+//!
+//! ```text
+//! mr lane attach saturn --account <label> --host <url> --token <saturn-token>
+//! ```
+//!
+//! Attach validates the fields, probes `<host>/v1/models`, and records the account with its first
+//! health reading. `down` forgets it. The lane has no supervisor and starts no child process, so
+//! there is nothing to kill and nothing to leak.
+//!
+//! ## What the lane does not survive
+//!
+//! Registrations — including the token — live in this process's memory and are never written to
+//! disk. A conductor restart therefore empties the lane: re-attach afterwards. That is deliberate
+//! (a token on disk needs the vault, and the lanes do not touch the vault yet), and `status`
+//! reports an empty lane rather than a remembered one.
 //!
 //! ## Budget
 //!
 //! Saturn Cloud's free tier grants 150 hours per month. This lane tracks seconds used across all
 //! registered Saturn accounts and refuses new attachments or probes once the cap is exhausted,
 //! returning `quota_exhausted` rather than allowing further attempts.
-//!
-//! ## Tunnel supervision
-//!
-//! The tunnel process is spawned when the operator attaches and is killed when they call `down`.
-//! There is no background supervision loop; if the child process dies, the next `attach` or
-//! `probe` call that notices the dead child is enough to surface the failure to the operator.
-//! A failed attach (e.g. the tunnel does not establish) manifests as `host_unreachable` and the
-//! operator must re-attach with correct credentials.
 
 use async_trait::async_trait;
 use axum::{
@@ -190,7 +197,8 @@ struct SaturnStateInner {
     pub used_secs: Option<u64>,
 }
 
-/// Global state for the Saturn lane: registrations, tunnel handles, budget ledger.
+/// Global state for the Saturn lane: registrations and the budget ledger. Nothing here owns a
+/// process; the tunnel is the operator's.
 ///
 /// The `tokio::sync::Mutex` inside allows async-safe access from axum handlers.
 /// The outer `Arc` (set up by [`AppState`]) provides shared ownership.
@@ -228,49 +236,6 @@ impl SaturnState {
 // ---------------------------------------------------------------------------
 // Pure helper functions (testable, no I/O)
 // ---------------------------------------------------------------------------
-
-/// Build the `ssh -N -L <local_port>:<host>:8000 <host>` argument vector.
-///
-/// This is a pure function — it does not spawn the process, so it can be unit-tested
-/// with no network access.  The `local_port` argument is the port the relay binds on
-/// its own host for forwarding to the Saturn workspace; a free port is allocated by
-/// binding `127.0.0.1:0` and reading the address (the usual idiomatic pattern).
-///
-/// The `-f` flag forks to background after authentication, `-N` means no remote
-/// command, `-L` sets up local forwarding, `-o ExitOnForwardFailure=yes` aborts
-/// the attach if the tunnel cannot be established, and `-o ServerAliveInterval=30`
-/// sends keepalives every 30 seconds so the channel is not silently dropped.
-///
-/// # Example
-///
-/// ```
-/// let args = tunnel_command("127.0.0.1", 12345, "workspace.saturncloud.io", "user");
-/// assert_eq!(
-///     args,
-///     vec![
-///         "ssh",
-///         "-N",
-///         "-f",
-///         "-L 127.0.0.1:12345:localhost:8000",
-///         "-o", "ExitOnForwardFailure=yes",
-///         "-o", "ServerAliveInterval=30",
-///         "user@workspace.saturncloud.io",
-///     ]
-/// );
-/// ```
-pub fn tunnel_command(_host: &str, local_port: u16, saturn_host: &str, user: &str) -> Vec<String> {
-    vec![
-        "ssh".to_owned(),
-        "-N".to_owned(),
-        "-f".to_owned(),
-        format!("-L 127.0.0.1:{local_port}:localhost:8000"),
-        "-o".to_owned(),
-        "ExitOnForwardFailure=yes".to_owned(),
-        "-o".to_owned(),
-        "ServerAliveInterval=30".to_owned(),
-        format!("{user}@{saturn_host}"),
-    ]
-}
 
 /// Classify a probe result according to the three distinct outcomes the task requires.
 ///
@@ -569,7 +534,10 @@ pub async fn probe_for(state: &SaturnState, account: String) -> (StatusCode, Jso
     )
 }
 
-/// Deregister an account and stop its tunnel.
+/// Deregister an account: the lane forgets it and its token.
+///
+/// Nothing is stopped. The lane started no process, so `down` cannot leave a tunnel or an SSH
+/// child running; an operator-run tunnel keeps running until the operator ends it.
 pub async fn down_for(state: &SaturnState, account: String) -> (StatusCode, Json<Value>) {
     let mut inner = state.inner.lock().await;
 
@@ -976,26 +944,6 @@ mod tests {
         assert!(
             !json_str.contains(secret_token),
             "token leaked in status response: {json_str}"
-        );
-    }
-
-    /// Test 4: tunnel_command produces the expected argv.
-    #[test]
-    fn test_tunnel_command_produces_expected_argv() {
-        let args = tunnel_command("127.0.0.1", 12345, "workspace.saturncloud.io", "user");
-        assert_eq!(
-            args,
-            vec![
-                "ssh".to_owned(),
-                "-N".to_owned(),
-                "-f".to_owned(),
-                "-L 127.0.0.1:12345:localhost:8000".to_owned(),
-                "-o".to_owned(),
-                "ExitOnForwardFailure=yes".to_owned(),
-                "-o".to_owned(),
-                "ServerAliveInterval=30".to_owned(),
-                "user@workspace.saturncloud.io".to_owned(),
-            ]
         );
     }
 

@@ -8,6 +8,35 @@ Provenance marker used throughout: **[facts]** = verified against primary docume
 recorded in this directory's research files; **[observed]** = measured by the operator and recorded
 in `issue-4-spec.md`; **[inferred]** = derived by us and clearly labelled as an estimate in the UI.
 
+### Implementation status against this contract (2026-11-12)
+
+The sections below are the contract. This list is what the tree actually does today; where the two
+differ, the contract is the intent and this list is the truth.
+
+**Implemented**
+
+* `crates/mr-core/src/rental.rs` — the account and deployment shapes, `RentalSchedule`
+  (`sequential` by default, `batched:N`), and launch-wave planning, all unit-tested.
+* `crates/manarouter-conductor/src/gpu_api.rs` — seven routes: the five in §5 plus
+  `POST /api/gpu/launch-plan` and `GET /api/gpu/lanes/cerebrium/compute`. `apply` creates, and
+  answers `409 already_exists` for a taken id or an existing vault entry; there is no update or
+  delete route.
+* Bundle generation — `modal_app.py` and its `modal deploy` command, and the Cerebrium
+  `cerebrium.toml` and its deploy command.
+* The panel setup flow (catalog → account → model → sizing → bundle), including reuse of an account
+  that is already stored: `USE` points a second deployment at the same id and sends no credential.
+* Four lanes held in conductor memory: Kaggle, Molab, Saturn, Cerebrium.
+
+**Not implemented, and not claimed by the panel**
+
+* A router-controlled Modal lifecycle. The conductor never runs the `modal` CLI or an SDK; a
+  container starts when the operator runs the bundle's command.
+* A per-batch dollar cap. `RentalDeployment` has no budget field; the panel reports measured cost
+  after the fact and derives nothing it did not measure.
+* Lane credential persistence. An attach keeps its token in process memory, so a conductor restart
+  empties every lane (`docs/26-gpu-lanes.md`).
+* A Saturn tunnel owned by the process. The operator runs `ssh`; the lane starts no child process.
+
 ---
 
 ## 1. The problem in one paragraph

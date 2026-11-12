@@ -49,7 +49,9 @@ about these routes.
 **Secrets, and what is not yet true.** No lane writes a credential to `config.json`, and no route
 returns one. Beyond that, be precise about the current state: attach takes the credential in the
 request body and keeps it **in this process's memory** for as long as the registration lives. There
-is no `rental:` vault reference yet — the lane modules do not touch the vault at all. Two
+is a `rental:` vault reference for *rental accounts* (`rental:<account id>`, written once when the
+account is created), but no lane module reads or writes it: attaching a lane account never consults
+the vault, and a lane token is never persisted. Two
 consequences an operator will meet:
 
 - a conductor restart forgets every attached account, and the lane answers `ready: false` until the
@@ -201,12 +203,18 @@ record is cleared — the cap is checked before the probe spends anything.
 both the control plane and the OpenAI-compatible inference endpoint, so there is one credential where
 Cerebrium needs two.
 
-**The tunnel.** Saturn exposes an endpoint through SSH, so the lane builds the `ssh` argv as pure
-data (`tunnel_command`) and picks a free local port by binding `127.0.0.1:0`. Building the argv as a
-value rather than a shell string is what keeps the token out of a request body and out of a shell's
-history. The lane does **not** start the tunnel for you: `start_supervisor` exists and is
-deliberately not spawned, because a process that opens an SSH connection on conductor startup is a
-connection nobody asked for and nobody is watching.
+**The tunnel is yours, not the lane's.** Saturn exposes the Jupyter server through SSH, and the lane
+starts no process of any kind — no `ssh` child, no supervisor, nothing to kill. Open the tunnel in
+your own terminal:
+
+```text
+ssh -N -L 127.0.0.1:8000:localhost:8000 <user>@<workspace>.saturncloud.io
+```
+
+and attach `http://127.0.0.1:8000` (or the workspace's Token Factory endpoint). This is deliberate:
+a conductor that opens an SSH connection by itself would hold a connection nobody asked for, with a
+credential nobody is watching. `down` removes the registration and its token from memory; it does
+not close your tunnel, because it never opened it.
 
 **Errors**: `400 account_not_registered`, `502 host_unreachable`, `503 http_client_unavailable`,
 `402 quota_exhausted`, `502 credential_rejected`.

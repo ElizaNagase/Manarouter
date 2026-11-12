@@ -207,22 +207,24 @@ in the conductor, presentation in the panel, and the request path in the relay.
   router and asserts the config bytes and snapshot bytes are **unchanged** (20 tests).
 * `crates/mr-core/src/lane/` — one descriptor per host, with the platform's own words for what the
   host will not let you do; no HTTP, no clock, no verdicts beyond the ones quoted.
-* `crates/manarouter-conductor/src/gpu_api.rs` — **six routes**: catalog, probe, rentals, apply,
-  lanes, and cerebrium/bundle (full paths: `GET /api/gpu/catalog`, `POST /api/gpu/probe`,
-  `GET /api/gpu/rentals`, `POST /api/gpu/apply`, `GET /api/lanes`,
-  `POST /api/gpu/lanes/cerebrium/bundle`).
+* `crates/manarouter-conductor/src/gpu_api.rs` — **seven routes**: `GET /api/gpu/catalog`,
+  `POST /api/gpu/probe`, `GET /api/gpu/rentals`, `POST /api/gpu/apply`,
+  `POST /api/gpu/launch-plan`, `POST /api/gpu/lanes/cerebrium/bundle`, and
+  `GET /api/gpu/lanes/cerebrium/compute`. `apply` is create-only: there is no update or delete route
+  for an account or a deployment, which is why the panel's account step offers an already-stored
+  account (id + stored credential) instead of pretending to edit it.
 * `panel/gpu-setup-model.js` (pure) and `panel/view-gpu-rentals.js` (the two-mode view).
-* The panel's Cerebrium bundle button is **pending** — `grep -n cerebrium panel/view-gpu-rentals.js`
-  returns zero matches; no UI control for Cerebrium bundles exists on the rentals page.
+* The panel's Cerebrium bundle button is implemented, not pending:
+  `grep -c cerebrium panel/view-gpu-rentals.js` returns 29 matches.
 * `crates/manarouter-relay/src/batch.rs` — the durable batch lane that mode B dispatches through.
 
 `crates/mr-core/src/gpu/mod.rs` states the split: that tree contains **no HTTP, no filesystem access
 and no clock**, so every number is checkable in a unit test with no network and no GPU.
 
 **What has actually been exercised.** `cargo test -p mr-core gpu::cerebrium` is green — 20 passed.
-`node --test panel/test/gpu-setup-model.test.mjs` is green — 113 passed. The whole workspace suite
+`node --test panel/test/gpu-setup-model.test.mjs` is green — 116 passed. The whole workspace suite
 is green — 1 685 passed, 0 failed, 4 ignored (`cargo test --workspace`) — the panel suite is green
-(303 tests, `node --test panel/test/*.test.mjs`), and — the part that matters most — a second
+(331 tests, `node --test panel/test/*.test.mjs`), and — the part that matters most — a second
 conductor built from this tree was driven over a socket on `127.0.0.1:20999` with its own config and
 state directories, through the real sequence: catalog → probe → create account → create deployment →
 read the rental back. Live captures of four of those responses are committed under
