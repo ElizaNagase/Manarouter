@@ -272,12 +272,20 @@ plan is a property of the account, not of the request.
 
 ## 7. The panel surface
 
-`#/gpu-rentals` renders one status card per lane from the four `GET …/status` routes. It is a
-read-only surface: attach, deploy, run and down exist as routes (§10) but not yet as panel forms,
-so the panel states which route and fields a lane needs rather than pretending the button exists. The four
+`#/gpu-rentals` renders one status card per lane from the four `GET …/status` routes. The four
 requests are issued together and settle independently: one lane's failure cannot hide another lane's
 answer, and a failed route is named with its path and its reason inside its own card. Each card has
 its own refresh, so an operator waiting for a session to warm does not re-read the other three.
+
+A card for a lane with an attach route (molab, saturn, cerebrium) also carries **Attach account**,
+which opens a form holding exactly the fields that route takes (§10). The submit posts them to
+`POST /api/gpu/lanes/{platform}/attach`; the token input is a password field, is never prefilled,
+and is cleared only after the attach succeeds, so a failed attach does not make the operator retype
+a secret. The reply is quoted: when the lane reports `remembered: false` the form stays open and
+says the credential is for this process only, because a repaint would discard the one sentence the
+operator must not miss (§12). Kaggle has no form because it has no attach route — it runs through
+the `kaggle` CLI on the host — and the card says that instead. Deploy, run and down still exist only
+as routes; their cards name the route and fields rather than pretending a button exists.
 
 Saturn's budget is printed only from what the lane reported. An unrecorded ledger shows as
 unrecorded; the panel never formats `null` as `0`.
@@ -334,10 +342,11 @@ own doc comments.
 
 ## 10. Attaching a lane account for a real run
 
-The panel renders each lane's status but has no attach form, deploy form or run form: the routes
-below are the only way to bring a lane up today. The credential a lane is given is remembered in
-the encrypted vault, so a conductor restart re-registers the account instead of emptying the lane —
-§12 describes exactly what is and is not restored.
+The panel's lane card can attach an account for molab, saturn and cerebrium (§7), which is the
+shortest path when the operator is already looking at the card. The curl bodies below are the same
+request for scripts, and they remain the only path for Kaggle, deploy, run and down. The credential
+a lane is given is remembered in the encrypted vault, so a conductor restart re-registers the
+account instead of emptying the lane — §12 describes exactly what is and is not restored.
 
 Keep a credential out of `ps` and out of shell history: write the body to a `0600` file, post the
 file, delete it.

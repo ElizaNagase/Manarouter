@@ -215,16 +215,18 @@ in the conductor, presentation in the panel, and the request path in the relay.
   account (id + stored credential) instead of pretending to edit it.
 * `panel/gpu-setup-model.js` (pure) and `panel/view-gpu-rentals.js` (the two-mode view).
 * The panel's Cerebrium bundle button is implemented, not pending:
-  `grep -c cerebrium panel/view-gpu-rentals.js` returns 29 matches.
+  `grep -c cerebrium panel/view-gpu-rentals.js` returns 29 matches. Lane cards for molab, saturn and
+  cerebrium attach an account inline (`POST /api/gpu/lanes/{platform}/attach`); Kaggle has no form
+  because it has no attach route.
 * `crates/manarouter-relay/src/batch.rs` — the durable batch lane that mode B dispatches through.
 
 `crates/mr-core/src/gpu/mod.rs` states the split: that tree contains **no HTTP, no filesystem access
 and no clock**, so every number is checkable in a unit test with no network and no GPU.
 
 **What has actually been exercised.** `cargo test -p mr-core gpu::cerebrium` is green — 20 passed.
-`node --test panel/test/gpu-setup-model.test.mjs` is green — 116 passed. The whole workspace suite
-is green — 1 685 passed, 0 failed, 4 ignored (`cargo test --workspace`) — the panel suite is green
-(331 tests, `node --test panel/test/*.test.mjs`), and — the part that matters most — a second
+`node --test panel/test/gpu-setup-model.test.mjs` is green — 116 passed. The workspace lib suite
+is green — 1 696 passed, 0 failed (`cargo test --workspace --lib`) — the panel suite is green
+(333 tests, `node --test panel/test/*.test.mjs`), and — the part that matters most — a second
 conductor built from this tree was driven over a socket on `127.0.0.1:20999` with its own config and
 state directories, through the real sequence: catalog → probe → create account → create deployment →
 read the rental back. Live captures of four of those responses are committed under
