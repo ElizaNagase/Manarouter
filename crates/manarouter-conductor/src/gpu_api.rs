@@ -1545,7 +1545,14 @@ pub async fn launch_plan_body(state: &AppState, schedule: RentalSchedule) -> Val
         // the plan look complete. It is reported next to the plan instead.
         "malformed": malformed,
         "deployments": listed,
-        "note": "`waves` holds indices into `deployments`. An account's                  `max_concurrent_containers` is reported as a problem, never enforced here,                  because the platform is the authority on its own limit. Nothing is started by                  this route.",
+        // A multi-line literal keeps the source indentation inside the string; the note is read by
+        // the panel verbatim, so it is concatenated instead of wrapped.
+        "note": concat!(
+            "`waves` holds indices into `deployments`. An account's ",
+            "`max_concurrent_containers` is reported as a problem, never enforced here, ",
+            "because the platform is the authority on its own limit. Nothing is started by ",
+            "this route."
+        ),
     })
 }
 
@@ -3671,6 +3678,22 @@ mod tests {
                 .expect("the deployment serialises"),
         );
         provider
+    }
+
+    /// The plan's `note` is prose the panel renders verbatim, so it must not carry source
+    /// indentation. A wrapped string literal put a run of eighteen spaces between two words in the
+    /// production payload; nothing failed, it simply read wrong on screen.
+    #[tokio::test]
+    async fn the_launch_plan_note_has_no_baked_in_indentation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = state_in(dir.path());
+        let body = launch_plan_body(&state, RentalSchedule::Sequential).await;
+        let note = body["note"].as_str().expect("note is a string");
+        assert!(
+            !note.contains("  "),
+            "the note must read as one sentence, not as source indentation: {note}"
+        );
+        assert!(note.starts_with("`waves` holds indices into `deployments`."));
     }
 
     #[tokio::test]
