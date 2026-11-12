@@ -814,6 +814,12 @@ async function renderInventory(mount, ctx) {
 
       const status = objectOf(entry.data) ?? {};
       const accounts = listOf(pick(status, 'accounts')).map(objectOf).filter(Boolean);
+      // `detail` is the lane's own instruction for what is missing (molab: which server to attach;
+      // cerebrium: which of its two credentials the control plane needs). Kaggle answers in
+      // `notes` with the platform's own wording. This screen quotes the lane; it never writes a
+      // readiness sentence of its own.
+      const detail = asString(pick(status, 'detail')).trim();
+      const note = asString(pick(status, 'notes', 'note')).trim();
       const warnings = listOf(pick(status, 'warnings')).map(objectOf).filter(Boolean);
       const plan = objectOf(pick(status, 'plan'));
       const ready = readinessLabel(status);
@@ -821,6 +827,8 @@ async function renderInventory(mount, ctx) {
       const parts = [];
       // Readiness chip
       parts.push(h('div', { class: 'gpu-lane-status' }, chip(ready.text, ready.cls)));
+      if (detail) parts.push(h('p', { class: 'hint' }, detail));
+      if (note) parts.push(h('p', { class: 'hint' }, note));
 
       // Warnings as plain list (advisory, not errors)
       if (warnings.length) {
@@ -876,6 +884,22 @@ async function renderInventory(mount, ctx) {
       } else {
         parts.push(h('p', { class: 'hint' },
           'The conductor has no account attached for this platform.'));
+        // The lane is attached over its own route, not by creating a rental: a rental deploys a
+        // model, while a lane account is the credential and host that serve one. Say which fields
+        // the route takes, because the panel has no form for it yet.
+        const attach = {
+          kaggle: 'This lane runs through the kaggle CLI on the host and has no attach route; '
+            + 'install it and sign in before submitting a kernel.',
+          molab: 'POST /api/gpu/lanes/molab/attach {account, url, token} after the notebook '
+            + 'server is up.',
+          saturn: 'POST /api/gpu/lanes/saturn/attach {account, host, token}.',
+          cerebrium: 'POST /api/gpu/lanes/cerebrium/attach {account, project_id, app_name, token}, '
+            + 'then deploy with a cerebrium.toml.',
+        }[platform];
+        if (attach) parts.push(h('p', { class: 'hint' }, attach));
+        parts.push(h('p', { class: 'hint' },
+          'Lane accounts are held in the conductor\'s memory: restarting it clears them until '
+          + 'credential persistence ships.'));
       }
 
       const cardEl = h('section', { class: 'card gpu-section' },

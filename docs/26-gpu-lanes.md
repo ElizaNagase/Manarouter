@@ -271,7 +271,9 @@ plan is a property of the account, not of the request.
 
 ## 7. The panel surface
 
-`#/gpu-rentals` renders one status card per lane from the four `GET …/status` routes. The four
+`#/gpu-rentals` renders one status card per lane from the four `GET …/status` routes. It is a
+read-only surface: attach, deploy, run and down exist as routes (§10) but not yet as panel forms,
+so the panel states which route and fields a lane needs rather than pretending the button exists. The four
 requests are issued together and settle independently: one lane's failure cannot hide another lane's
 answer, and a failed route is named with its path and its reason inside its own card. Each card has
 its own refresh, so an operator waiting for a session to warm does not re-read the other three.
@@ -316,7 +318,7 @@ own doc comments.
 
 ## 9. Testing a lane without a platform account
 
-- The lane modules carry their own tests (9 Kaggle, 6 molab, 14 Saturn, 18 Cerebrium) which build a
+- The lane modules carry their own tests (11 Kaggle, 6 molab, 13 Saturn, 18 Cerebrium) which build a
   router from `AppState::for_test` and drive it with `tower::ServiceExt::oneshot`. None of them
   needs a network.
 - HTTP lanes take an injected `QuotaHttp`, so a `FakeHttp` answers with a canned status and body and
@@ -326,6 +328,67 @@ own doc comments.
   process's environment is a race that produces a spurious `500`.
 - A real attach is the only way to test a real platform. `scripts/test-relay.sh` exists for the
   *relay*, not for these routes; there is no scripted harness for a lane.
+
+---
+
+## 10. Attaching a lane account for a real run
+
+The panel renders each lane's status but has no attach form, deploy form or run form: the routes
+below are the only way to bring a lane up today. Every registration lives in the conductor's
+memory, so a conductor restart returns all four lanes to empty — see §1. That is a known gap, not a
+property of the platforms.
+
+Keep a credential out of `ps` and out of shell history: write the body to a `0600` file, post the
+file, delete it.
+
+```bash
+umask 077
+read -rsp 'lane token: ' TOKEN; echo
+python3 - "$TOKEN" > /tmp/lane-attach.json <<'PY'
+import json, sys
+print(json.dumps({"account": "molab-1", "url": "https://<server>", "token": sys.argv[1]}))
+PY
+curl -sS -X POST http://127.0.0.1:20901/api/gpu/lanes/molab/attach \
+  -H 'content-type: application/json' --data-binary @/tmp/lane-attach.json
+rm -f /tmp/lane-attach.json
+```
+
+**molab** takes `{account, url, token}` and probes the URL before registering; a redirect or a
+non-JSON answer is refused rather than stored. `POST …/molab/down {account}` forgets it. The URL
+must be the notebook's own serving endpoint — molab's terms forbid proxying its compute elsewhere,
+so the lane does not build a tunnel for you.
+
+**Saturn** takes `{account, host, token}` and expects the operator's SSH tunnel to be up on
+`127.0.0.1:8000`; the lane never opens one. `POST …/saturn/budget {"used_secs": N}` records the
+month's consumption against the 150-hour free allowance, `{"used_secs": null}` clears it, and
+`POST …/saturn/probe {account}` asks the platform for the endpoint's view. `down` tears down the
+deployment, not your tunnel.
+
+**Cerebrium** takes two different credentials and refuses to conflate them:
+`POST …/cerebrium/attach {account, project_id, app_name, token}` where `token` is the
+**service-account** token for `rest.cerebrium.ai`. A deploy then needs the complete
+`cerebrium.toml` (a deploy replaces the app record, so omitted keys take their defaults), a
+`compute` id from the catalogue, and an explicit `disable_auth` — `true` additionally requires
+`acknowledge_public_endpoint`, because Cerebrium otherwise publishes an unauthenticated endpoint.
+Generate the TOML with `POST …/cerebrium/bundle`, then pass it verbatim:
+
+```bash
+curl -sS -X POST http://127.0.0.1:20901/api/gpu/lanes/cerebrium/deploy \
+  -H 'content-type: application/json' --data-binary @/tmp/cerebrium-deploy.json
+```
+
+`POST …/cerebrium/probe {account}` is the platform's view; a real completion is the only proof that
+a model is serving, and it is also the only thing that clears a cold start.
+
+**Kaggle** has no attach route by design: it runs the `kaggle` CLI on this host under the
+operator's own login. `GET …/kaggle/status` reports `kaggle_cli_present` and
+`credential_configured` without contacting Kaggle, and `ready:false` means one of those two is
+missing. A run posts a kernel and returns files; it cannot answer in-line. §3's one-active-account
+finding is policy, and the lane does not enforce it.
+
+`ready:true` on any lane means a credential is registered, not that a model is up. The four status
+routes say so in their own words (`detail`, `note`, `notes`), and the panel now prints those words
+instead of reducing every lane to a chip.
 
 ---
 

@@ -293,47 +293,56 @@ have for any card; inventing one is the guess the module refuses to make.
 Still not verified: no batch has been submitted to a real GPU and observed to complete, so every
 figure in the lane is a computation over a recorded measurement rather than a fresh observation.
 
-**The other four hosts (issues #10–#13), and why only one of them grew code.** The catalogue now
-answers two different questions separately, because they have different answers per host: *what
-hardware exists* (`GET /api/gpu/catalog`) and *what may I do with it* (`GET /api/lanes`). The second
-route reports, per host, the shape of the lane (serving / batch / attended), whether a request can be
-answered while it is open, how a job is submitted, which credential kind is needed, session and idle
-limits, the published quota rules, and — the part that decides two of the four — a **refusal** with the
-platform's own clause and URL when the platform itself forbids the feature that was requested. The
-refusals are derived at request time from the same `LaneFacts` the route reports, so a row can never
-claim "usable" while a refusal exists for that traffic type.
+**The other four hosts (issues #10–#13) are implemented as lane routes, and none has been driven
+against the real platform from this host.** The catalogue answers two different questions
+separately, because they have different answers per host: *what hardware exists*
+(`GET /api/gpu/catalog`) and *what may I do with it* (`GET /api/lanes`). The second route reports,
+per host, the shape of the lane (serving / batch / attended), whether a request can be answered
+while it is open, how a job is submitted, which credential kind is needed, session and idle limits,
+the published quota rules, and a `Warning` with the platform's own clause and URL when the platform
+restricts the feature that was requested. A warning never blocks: the operator's ruling is one
+account per person, so a policy finding travels with its citation and the person who owns the
+account decides.
 
-* **#10 Cerebrium is implemented**, additively: `POST /api/gpu/lanes/cerebrium/bundle` renders the
-  `cerebrium.toml` and the deterministic base URL
-  `https://api.cerebrium.ai/v4/{project}/{app}/v1` — **side-effect-free**: no config write, no vault
-  write, no filesystem artefact. That route is deliberately separate from `POST /api/gpu/apply`
-  rather than a generic "any platform" path: apply's inputs (a saved `RentalDeployment`, a Modal
-  `gpu_by_id`, a vault credential, a *pasted* `base_url`) are all wrong for a host whose URL is
-  computable and whose artefact needs no token. A test posts the body through the real router and
-  then asserts the config bytes and the snapshot bytes are **unchanged**, proving nothing was
-  persisted.
-* **#11 Kaggle and #13 molab are documented refusals, not missing work.** Kaggle's Terms §3 allows one
-  active account and restricts the service to "your own internal, personal, non-commercial use"; the
-  issue asks for two pooled accounts rotated per request. molab's restrictions page prohibits "remote
-  control such as by SSH", "exposing molab compute to outside traffic" and "using notebooks for
-  non-interactive jobs", which is precisely the tunnelled OpenAI-compatible server the issue specifies.
-  The batch half of Kaggle's lane is real and reported as usable; the multi-account half is refused with
-  the sentence quoted.
-* **#12 Saturn Cloud is buildable for its own reason**: its **Token Factory inference endpoints are
-  already an ordinary OpenAI-compatible provider** (base URL, bearer token, `GET /v1/models`), and the
-  whole lifecycle is API-creatable. So the lane needs a catalogue row and documentation, not a tunnel.
-  Its spec'd `ssh -L` port-forward design is unverified and is not claimed.
+* **#10 Cerebrium** — five routes: `status`, `attach`, `deploy`, `down`, `probe`, plus the
+  side-effect-free `bundle` route that renders `cerebrium.toml` and the deterministic base URL
+  `https://api.cerebrium.ai/v4/{project}/{app}/v1` (a test asserts the config and snapshot bytes are
+  unchanged). Attach takes the **service-account** token for the control plane; inference needs the
+  project API key, and the lane refuses to treat one as the other. `deploy` requires an explicit
+  `disable_auth`, because Cerebrium defaults it to `true` and would otherwise publish an
+  unauthenticated endpoint.
+* **#11 Kaggle** — four routes: `status`, `run`, `run/{id}`, `runs`, batch only. It has no attach
+  route: it drives the `kaggle` CLI on this host under the operator's own login, and `status`
+  reports `kaggle_cli_present` and `credential_configured` without contacting Kaggle. A run posts a
+  kernel and returns files; it cannot answer in-line. The Terms §3 one-active-account finding is a
+  warning, not an enforcement, per the operator's ruling.
+* **#13 molab** — three routes: `status`, `attach`, `down`. Attach takes `{account, url, token}` and
+  probes before registering, so a redirect or a non-JSON answer is refused rather than stored. The
+  URL must be the notebook's own endpoint: molab's terms forbid proxying its compute, so the lane
+  builds no tunnel.
+* **#12 Saturn Cloud** — five routes: `status`, `attach`, `deploy`-equivalent `attach`, `budget`,
+  `probe`, `down`. Attach takes `{account, host, token}` and expects the operator's SSH tunnel on
+  `127.0.0.1:8000`; the lane never opens one. `budget {"used_secs": N}` records self-reported usage
+  against the 150-hour free allowance and is enforced as a refusal when it is exceeded; `null`
+  clears the record rather than implying a full allowance.
 
-Two honesty constraints carried into the UI: a `(Paid)` per-card badge is only shown where the platform
-really does gate card types by plan (Cerebrium, enforced at deploy time), not on Modal, which documents
-no such gating; and the panel invents no facts — it renders the route's rows, including the refusal
-clauses, verbatim.
+Two honesty constraints carried into the UI: a `(Paid)` per-card badge is only shown where the
+platform really does gate card types by plan (Cerebrium, enforced at deploy time), not on Modal,
+which documents no such gating; and the panel invents no facts — it renders the route's rows,
+including the warnings and the lane's own `detail`/`note`/`notes` text.
 
-The panel Cerebrium button is **pending, not implemented**: `grep -n cerebrium panel/view-gpu-rentals.js` returns
-nothing, so no Cerebrium UI is claimed here. The conductor route exists; the panel does not yet render it.
+The panel is a **read-only** lane surface: it renders one status card per host from the four
+`GET …/status` routes and states the attach route and its fields, but attach, deploy, run and down
+exist only as HTTP routes. `POST /api/gpu/lanes/cerebrium/bundle` is the one lane route with a panel
+control.
 
-Test totals: `cargo test -p mr-core gpu::cerebrium` → **12 passed; 0 failed; 0 ignored**.
-`node --test panel/test/gpu-setup-model.test.mjs` → **tests 113, pass 113, fail 0**.
+**Lane registrations live in the conductor's memory.** No lane module writes to the vault, so a
+conductor restart empties Kaggle, molab, Saturn and Cerebrium even when the platform credentials are
+still valid. Persisting them is not implemented; [26-gpu-lanes.md](26-gpu-lanes.md) §10 documents
+the attach routes as the only way to bring a lane up after a restart.
+
+Test totals: `cargo test -p manarouter-conductor` → 25 `gpu_api` tests, 11 Kaggle, 6 molab, 13
+Saturn, 18 Cerebrium (all passing). `node --test panel/test/*.test.mjs` → 332 passing.
 
 ## 5. Claims that remain unverified or false
 

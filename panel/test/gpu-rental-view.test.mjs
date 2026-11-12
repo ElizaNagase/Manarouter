@@ -586,6 +586,27 @@ test('inventory renders the account table with a fingerprint and never the secre
   assert.ok(!text.includes(TOKEN_FINGERPRINT), 'even the full fingerprint is middle-truncated');
 });
 
+test('a lane that names what is missing is quoted, and an empty lane says how to attach', async () => {
+  const handlers = standardHandlers();
+  handlers['/api/gpu/lanes/cerebrium/status'] = {
+    ready: false,
+    detail: 'No Cerebrium project is attached. Attach one with a service-account token.',
+    accounts: [],
+    note: 'ready means an account is registered, not that a model is serving.',
+  };
+  const { mount } = await mountView({ handlers });
+  const text = textOf(mount);
+
+  assert.match(text, /No Cerebrium project is attached/,
+    'the lane\'s own instruction reaches the operator instead of a generic not-ready chip');
+  assert.match(text, /ready means an account is registered/,
+    'the lane\'s note about what readiness does not prove is quoted');
+  assert.match(text, /POST \/api\/gpu\/lanes\/cerebrium\/attach \{account, project_id, app_name, token\}/,
+    'the empty card names the route and fields, since the panel has no attach form yet');
+  assert.match(text, /held in the conductor's memory: restarting it clears them/,
+    'the restart caveat is stated where the empty account list is read');
+});
+
 test('inventory renders deployments with mode, batch card and the derived sizing', async () => {
   const { mount } = await mountView({ handlers: standardHandlers() });
   const text = textOf(mount);
