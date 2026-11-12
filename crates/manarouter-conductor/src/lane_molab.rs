@@ -87,13 +87,25 @@ use tracing::{error, info, warn};
 ///
 /// The token is a bearer token supplied by the notebook at runtime. It is **never** logged,
 /// **never** written into `config.json`, and **never** placed in argv.
+/// The platform name used in the vault id: `lane:molab:<account>`.
+const PLATFORM: &str = "molab";
+
+/// What a restored account says about its health until something probes it.
+pub const RESTORED_NOT_PROBED: &str =
+    "restored from the vault; not probed since this process started";
+
+/// A molab lane registration, keyed by `(url, token)`.
+///
+/// The token is a bearer token supplied by the notebook at runtime. It is **never** logged,
+/// **never** written into `config.json`, and **never** placed in argv.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Registration {
     /// Operator label — not the bearer token.
     pub account: String,
     /// The tunnel URL.
     pub url: String,
-    /// Bearer token — never logged, never persisted to disk, never in argv.
+    /// Bearer token — never logged, never in argv, and kept only in this process and in the
+    /// encrypted vault under `lane:molab:<account>` (see [`crate::lane_vault`]).
     pub token: String,
     /// When this registration was first created (milliseconds since Unix epoch).
     pub registered_at: Millis,
@@ -295,7 +307,70 @@ async fn attach_lane(
     State(app): State<AppState>,
     TypedJson(payload): TypedJson<AttachRequest>,
 ) -> impl IntoResponse {
-    attach_for(&app.molab, payload).await
+    let account = payload.account.clone();
+    let secret = json!({
+        "account": payload.account,
+        "url": payload.url,
+        "token": payload.token,
+    });
+    let (status, mut body) = attach_for(&app.molab, payload).await;
+    if status == StatusCode::OK {
+        remember(&app, &account, &secret, &mut body.0).await;
+    }
+    (status, Json(body.0))
+}
+
+/// Keep the tunnel URL and token in the vault so a restart does not empty the lane.
+///
+/// `remembered: false` in the response is deliberate: the attach itself worked, and the operator
+/// deserves to know that this one will not survive the next restart.
+async fn remember(app: &AppState, account: &str, secret: &Value, body: &mut Value) {
+    let mut vault = app.vault.lock().await;
+    match crate::lane_vault::remember(&mut vault, PLATFORM, account, secret) {
+        Ok(()) => body["remembered"] = json!(true),
+        Err(error) => {
+            warn!(
+                "molab account {} was attached but not remembered: {}",
+                account, error
+            );
+            body["remembered"] = json!(false);
+            body["remember_error"] = json!(error);
+        }
+    }
+}
+
+/// Drop the remembered credential when the operator detaches the account.
+async fn forget(app: &AppState, account: &str) {
+    let mut vault = app.vault.lock().await;
+    if crate::lane_vault::forget(&mut vault, PLATFORM, account) {
+        info!("molab lane credential forgotten: {}", account);
+    }
+}
+
+/// Re-register an account that was attached before this process started.
+///
+/// No probe: a restored registration is a remembered fact, not a measurement, and the status says
+/// so until something actually dials the tunnel.
+pub async fn restore_for(
+    state: &Arc<Mutex<MolabState>>,
+    account: String,
+    url: String,
+    token: String,
+) {
+    let mut molab = state.lock().await;
+    molab
+        .registrations
+        .entry(account.clone())
+        .or_insert_with(|| Registration {
+            account: account.clone(),
+            url,
+            token,
+            registered_at: Millis::now(),
+            last_probe: None,
+            last_probe_error: Some(RESTORED_NOT_PROBED.to_owned()),
+            failure_count: 0,
+            priority: 0,
+        });
 }
 
 /// The authority of an endpoint URL, for an error message that has to name what was dialled.
@@ -424,7 +499,12 @@ async fn down_lane(
     State(app): State<AppState>,
     TypedJson(payload): TypedJson<DownRequest>,
 ) -> impl IntoResponse {
-    down_for(&app.molab, payload).await
+    let account = payload.account.clone();
+    let response = down_for(&app.molab, payload).await;
+    if response.0 == StatusCode::OK {
+        forget(&app, &account).await;
+    }
+    response
 }
 
 /// The body of [`down_lane`], taking the registry explicitly.
@@ -567,8 +647,14 @@ mod tests {
     #[test]
     fn an_unreachable_endpoint_is_named_by_its_host() {
         assert_eq!(endpoint_authority("http://127.0.0.1:9/v1"), "127.0.0.1:9");
-        assert_eq!(endpoint_authority("https://molab.example/"), "molab.example");
-        assert_eq!(endpoint_authority("10.0.0.4:8000/v1/models"), "10.0.0.4:8000");
+        assert_eq!(
+            endpoint_authority("https://molab.example/"),
+            "molab.example"
+        );
+        assert_eq!(
+            endpoint_authority("10.0.0.4:8000/v1/models"),
+            "10.0.0.4:8000"
+        );
         assert_eq!(endpoint_authority(""), "<host>");
         assert_eq!(endpoint_authority("http://"), "<host>");
     }

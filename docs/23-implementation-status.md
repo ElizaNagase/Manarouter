@@ -335,13 +335,18 @@ The panel is a **read-only** lane surface: it renders one status card per host f
 exist only as HTTP routes. `POST /api/gpu/lanes/cerebrium/bundle` is the one lane route with a panel
 control.
 
-**Lane registrations live in the conductor's memory.** No lane module writes to the vault, so a
-conductor restart empties Kaggle, molab, Saturn and Cerebrium even when the platform credentials are
-still valid. Persisting them is not implemented; [26-gpu-lanes.md](26-gpu-lanes.md) §10 documents
-the attach routes as the only way to bring a lane up after a restart.
+**Lane registrations survive a conductor restart.** Saturn, molab and Cerebrium write the credential
+they were given to the encrypted vault under `lane:<platform>:<account>`, and the conductor
+re-registers those accounts before it binds the listener. A restored account is not probed at
+startup, and its status says `restored from the vault; not probed since this process started` until
+a probe replaces it — remembering an endpoint is not the same as measuring it. Attaching returns
+`remembered: true|false` so an operator learns immediately when the vault refused. Kaggle is
+unaffected: its credential is the `kaggle` CLI's own login, not a lane secret.
+[26-gpu-lanes.md](26-gpu-lanes.md) §12 describes the scheme.
 
-Test totals: `cargo test -p manarouter-conductor` → 25 `gpu_api` tests, 11 Kaggle, 6 molab, 13
-Saturn, 18 Cerebrium (all passing). `node --test panel/test/*.test.mjs` → 332 passing.
+Test totals: `cargo test -p manarouter-conductor` → 25 `gpu_api` tests, 11 Kaggle, 7 molab, 13
+Saturn, 18 Cerebrium, 6 lane-vault (all passing). `cargo test --workspace --lib` → 1 694 passing.
+`node --test panel/test/*.test.mjs` → 332 passing.
 
 ## 5. Claims that remain unverified or false
 

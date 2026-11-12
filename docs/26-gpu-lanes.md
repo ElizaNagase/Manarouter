@@ -46,19 +46,20 @@ own source/origin/authentication middleware, in the order `source → origin →
 loopback for local use; exposing the panel publicly is a decision about the whole admin API, not
 about these routes.
 
-**Secrets, and what is not yet true.** No lane writes a credential to `config.json`, and no route
-returns one. Beyond that, be precise about the current state: attach takes the credential in the
-request body and keeps it **in this process's memory** for as long as the registration lives. There
-is a `rental:` vault reference for *rental accounts* (`rental:<account id>`, written once when the
-account is created), but no lane module reads or writes it: attaching a lane account never consults
-the vault, and a lane token is never persisted. Two
-consequences an operator will meet:
+**Secrets.** No lane writes a credential to `config.json`, and no route returns one. Attach takes
+the credential in the request body and keeps it **in this process's memory** for as long as the
+registration lives; Saturn, molab and Cerebrium also write it to the encrypted vault under
+`lane:<platform>:<account>` so the account survives a restart (§12). The `rental:` namespace stays
+separate: it belongs to rental accounts (`rental:<account id>`), not to lanes. Two consequences an
+operator will meet:
 
-- a conductor restart forgets every attached account, and the lane answers `ready: false` until the
-  credential is attached again;
-- the credential exists in plaintext inside the conductor process, which is why registrations are
+- a credential exists in plaintext inside the conductor process, which is why registrations are
   keyed by account *label* rather than by the token (a token used as a map key is one stray debug
-  format away from disclosure).
+  format away from disclosure);
+- a restart restores the account but not its health, so the lane says
+  `restored from the vault; not probed since this process started` until something dials it. That is
+  a report, not a failure: a tunnel that only exists while the operator is present must not be
+  marked dead at boot.
 
 Persisting lane credentials under `rental:<account>` (and `rental:<account>:hf` for Cerebrium's
 second credential) is the intended shape and is **not implemented**; treat this paragraph as the
@@ -213,7 +214,7 @@ ssh -N -L 127.0.0.1:8000:localhost:8000 <user>@<workspace>.saturncloud.io
 
 and attach `http://127.0.0.1:8000` (or the workspace's Token Factory endpoint). This is deliberate:
 a conductor that opens an SSH connection by itself would hold a connection nobody asked for, with a
-credential nobody is watching. `down` removes the registration and its token from memory; it does
+credential nobody is watching. `down` removes the registration, its token from memory and its vault entry; it does
 not close your tunnel, because it never opened it.
 
 **Errors**: `400 account_not_registered`, `502 host_unreachable`, `503 http_client_unavailable`,
@@ -334,9 +335,9 @@ own doc comments.
 ## 10. Attaching a lane account for a real run
 
 The panel renders each lane's status but has no attach form, deploy form or run form: the routes
-below are the only way to bring a lane up today. Every registration lives in the conductor's
-memory, so a conductor restart returns all four lanes to empty — see §1. That is a known gap, not a
-property of the platforms.
+below are the only way to bring a lane up today. The credential a lane is given is remembered in
+the encrypted vault, so a conductor restart re-registers the account instead of emptying the lane —
+§12 describes exactly what is and is not restored.
 
 Keep a credential out of `ps` and out of shell history: write the body to a `0600` file, post the
 file, delete it.
@@ -359,7 +360,10 @@ must be the notebook's own serving endpoint — molab's terms forbid proxying it
 so the lane does not build a tunnel for you.
 
 **Saturn** takes `{account, host, token}` and expects the operator's SSH tunnel to be up on
-`127.0.0.1:8000`; the lane never opens one. `POST …/saturn/budget {"used_secs": N}` records the
+`127.0.0.1:8000`; the lane never opens one. `host` may be a bare hostname or include a scheme:
+`workspace-abc.saturncloud.io` is probed as `https://…`, while a loopback or `localhost` host is
+probed as `http://…` because that is what a tunnel speaks. An explicit `https://` or `http://`
+always wins. `POST …/saturn/budget {"used_secs": N}` records the
 month's consumption against the 150-hour free allowance, `{"used_secs": null}` clears it, and
 `POST …/saturn/probe {account}` asks the platform for the endpoint's view. `down` tears down the
 deployment, not your tunnel.
@@ -412,6 +416,48 @@ nothing. Kaggle is the exception it cannot cover: it is batch-only, so proving i
 kernel, which consumes the operator's weekly GPU allowance and posts a notebook to their account.
 That stays a deliberate manual step. A green Saturn or Cerebrium probe means the control plane
 answered; only a real completion proves inference, which is what `POST …/probe` says in its own note.
+
+---
+
+## 12. A lane account outlives the process
+
+A registration is a credential plus an endpoint. The endpoint is not a secret; the token is. Both
+are needed again after a restart, and a conductor restart happens on every deploy — so a lane that
+forgot its accounts would have to be re-attached by hand each time, which is exactly the kind of
+operational chore that makes a feature look broken.
+
+Saturn, molab and Cerebrium therefore store what they were given in the encrypted vault:
+
+| lane | vault id | remembered fields |
+| --- | --- | --- |
+| Saturn | `lane:saturn:<account>` | `account`, `host`, `token` |
+| molab | `lane:molab:<account>` | `account`, `url`, `token` |
+| Cerebrium | `lane:cerebrium:<account>` | `account`, `project_id`, `app_name`, `token` |
+
+Nothing else is remembered. Probe timestamps, health, failure counts, a Cerebrium `app_id`, and the
+Saturn budget are measurements or derived identifiers; restoring them would be inventing a fact
+about a process that has not made one yet. Cerebrium's app id is learned again by the first probe or
+deploy, and a redeploy would have made a remembered id stale anyway.
+
+**A restored account is not a healthy account.** At startup the conductor re-registers each
+remembered account without dialling it — a Saturn host is often a tunnel that only exists while the
+operator's session does, and a conference of failed probes at boot would mark good accounts bad.
+The status route reports the truth instead:
+`restored from the vault; not probed since this process started`. The first `POST …/probe`, the
+end-to-end sweep, or any real request replaces that sentence with a measurement.
+
+Attach responses carry `remembered: true` or `remembered: false` with a `remember_error`. `false`
+means the attach worked for this process and will not survive the next restart; the usual cause is
+a vault that could not be written. `POST …/down {account}` deletes the remembered entry, so a
+deliberately removed account does not come back on the next boot. Rotating a token means attaching
+again: the write replaces the entry.
+
+The token is only ever stored encrypted, never logged, and never returned in a response. The vault
+key is the operator's (`vault.key`); backing up the vault without it is pointless, and sharing it is
+sharing every provider credential on the host.
+
+Kaggle has no entry here. Its credential is the `kaggle` CLI's own login under the operator's home
+directory, not a string this lane holds, and its readiness is reported from that login.
 
 ---
 

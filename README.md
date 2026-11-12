@@ -197,6 +197,20 @@ encrypted credentials are kept under `~/.config/manarouter`; see
 [`docs/02-quickstart.md`](docs/02-quickstart.md) for configuration, model aliases, combos, API
 clients and troubleshooting.
 
+**Where state lives.** `MANAROUTER_CONFIG_DIR` overrides `~/.config/manarouter` (configuration and
+the encrypted vault) and `MANAROUTER_STATE_DIR` overrides `~/.local/state/manarouter` (snapshot,
+database, logs). Pointing both at a temporary directory is how the test helpers below keep an
+experiment away from a live instance.
+
+Two scripts are worth knowing about:
+
+- `scripts/test-relay.sh start|stop|status|logs` copies the live config and vault into
+  `/tmp/mr-test-relay-$PORT` (default `20905`) and runs a second relay there, so a change to the
+  request path can be exercised without touching the instance your apps are using.
+- `scripts/gpu-lanes-e2e.py` is the acceptance sweep for the GPU lanes: it asks each lane for its
+  status, probes Saturn and Cerebrium where a probe route exists, and exits non-zero unless every
+  lane is ready. It starts nothing and spends nothing.
+
 **Current implementation note:** `mr serve` runs both processes together with one Ctrl-C to stop
 them — it spawns the conductor and relay as child processes, so they keep the separate runtimes the
 [architecture](docs/01-architecture.md#2-why-two-processes) depends on. `mr config` and `mr vault`

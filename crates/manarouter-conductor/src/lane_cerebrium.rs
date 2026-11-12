@@ -84,7 +84,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::api::{error_body, TypedJson};
 use crate::state::AppState;
@@ -114,6 +114,13 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How much of an upstream error body is repeated back. Enough to be diagnosable, short enough that
 /// a stray HTML error page cannot swamp the panel.
 const MAX_DETAIL: usize = 512;
+
+/// The platform name used in the vault id: `lane:cerebrium:<account>`.
+const PLATFORM: &str = "cerebrium";
+
+/// What a restored account says about its health until something probes it.
+pub const RESTORED_NOT_PROBED: &str =
+    "restored from the vault; not probed since this process started";
 
 // ---------------------------------------------------------------------------
 // State
@@ -1050,9 +1057,59 @@ async fn post_attach(
     State(app): State<AppState>,
     TypedJson(body): TypedJson<AttachRequest>,
 ) -> Result<Json<Value>, CerebriumError> {
+    let account = body.account.trim().to_owned();
+    let secret = json!({
+        "account": account.clone(),
+        "project_id": body.project_id.trim(),
+        "app_name": body.app_name.trim(),
+        "token": body.token.trim(),
+    });
     let http = shared_cerebrium_http()
         .map_err(|error| CerebriumError::ClientUnavailable(error.to_string()))?;
-    attach_for(&app.cerebrium, http.as_ref(), body).await
+    let Json(mut response) = attach_for(&app.cerebrium, http.as_ref(), body).await?;
+    let mut vault = app.vault.lock().await;
+    match crate::lane_vault::remember(&mut vault, PLATFORM, &account, &secret) {
+        Ok(()) => response["remembered"] = json!(true),
+        Err(error) => {
+            warn!(
+                "cerebrium account {} was attached but not remembered: {}",
+                account, error
+            );
+            response["remembered"] = json!(false);
+            response["remember_error"] = json!(error);
+        }
+    }
+    Ok(Json(response))
+}
+
+/// Re-register an account that was attached before this process started.
+///
+/// The app id is learned again by the first probe or deploy — the vault holds only what the
+/// operator supplied, never a derived id that a redeploy would make stale.
+pub async fn restore_for(
+    state: &CerebriumState,
+    account: String,
+    project_id: String,
+    app_name: String,
+    token: String,
+) {
+    let mut registrations = state.lock().await;
+    registrations
+        .entry(account.clone())
+        .or_insert_with(|| CerebriumRegistration {
+            account: account.clone(),
+            project_id,
+            app_name,
+            token,
+            app_id: None,
+            build_id: None,
+            compute: None,
+            disable_auth: None,
+            plan: None,
+            registered_at: Millis::now(),
+            last_probe: None,
+            last_probe_error: Some(RESTORED_NOT_PROBED.to_owned()),
+        });
 }
 
 async fn post_deploy(
@@ -1068,9 +1125,15 @@ async fn post_down(
     State(app): State<AppState>,
     TypedJson(body): TypedJson<DownRequest>,
 ) -> Result<Json<Value>, CerebriumError> {
+    let account = body.account.trim().to_owned();
     let http = shared_cerebrium_http()
         .map_err(|error| CerebriumError::ClientUnavailable(error.to_string()))?;
-    down_for(&app.cerebrium, http.as_ref(), body).await
+    let response = down_for(&app.cerebrium, http.as_ref(), body).await?;
+    let mut vault = app.vault.lock().await;
+    if crate::lane_vault::forget(&mut vault, PLATFORM, &account) {
+        info!("cerebrium lane credential forgotten: {}", account);
+    }
+    Ok(response)
 }
 
 async fn post_probe(

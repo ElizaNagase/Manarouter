@@ -33,6 +33,9 @@ use crate::state::AppState;
 /// and the operating system's reason, and asks the question the operator actually has to answer
 /// (is something else already on this port?).
 pub async fn serve(state: AppState) -> Result<(), String> {
+    // Before the listener exists, and before anything can ask a lane for its status: an account
+    // attached in an earlier process is still attached to this one.
+    crate::lane_vault::restore_all(&state).await;
     let (host, port) = {
         let config = state.current_config().await;
         (config.control.host.clone(), config.control.port)

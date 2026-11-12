@@ -66,9 +66,23 @@ use crate::state::AppState;
 const BUDGET_HOURS_PER_MONTH: u64 = 150;
 const BUDGET_SECONDS_PER_MONTH: u64 = BUDGET_HOURS_PER_MONTH * 3600; // 540,000 seconds
 
+/// The platform name used in the vault id, and nowhere else: `lane:saturn:<account>`.
+const PLATFORM: &str = "saturn";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+
+/// An account that has been attached to the Saturn lane.
+///
+/// The `token` field holds the Saturn access token and is **never** logged, returned in responses,
+/// or written to disk — it lives only in this in-memory structure.
+/// What a restored account says about its health, in the status an operator reads.
+///
+/// A registration is not a measurement. Saying this plainly is better than a green light nobody
+/// earned, and the next probe replaces it.
+pub const RESTORED_NOT_PROBED: &str =
+    "restored from the vault; not probed since this process started";
 
 /// An account that has been attached to the Saturn lane.
 ///
@@ -80,7 +94,8 @@ pub struct SaturnRegistration {
     pub account: String,
     /// SSH host of the Saturn workspace (e.g. "workspace-abc-123.saturncloud.io").
     pub host: String,
-    /// Bearer token — stored in memory only, never returned in responses.
+    /// Bearer token — never returned in responses, kept in this process and in the encrypted
+    /// vault under `lane:saturn:<account>` (see [`crate::lane_vault`]).
     pub token: String,
     /// When this registration was created (milliseconds since Unix epoch).
     pub registered_at: Millis,
@@ -291,8 +306,13 @@ impl SaturnHttp {
     }
 
     /// Probe the endpoint at `url` with the given bearer token.
+    ///
+    /// A Saturn workspace is named by its host, so an operator who pastes
+    /// `workspace-abc.saturncloud.io` must not be punished for leaving off the scheme the API
+    /// requires. See [`endpoint_with_scheme`].
     pub async fn probe(&self, url: &str, token: &str) -> CoreResult<QuotaResponse> {
-        let endpoint = format!("{}/v1/models", url.trim_end_matches('/'));
+        let base = endpoint_with_scheme(url);
+        let endpoint = format!("{}/v1/models", base.trim_end_matches('/'));
         self.inner
             .request(
                 QuotaRequest::get(endpoint)
@@ -300,6 +320,32 @@ impl SaturnHttp {
                     .timeout(Duration::from_secs(10)),
             )
             .await
+    }
+}
+
+/// Give a bare host the scheme it needs, and leave a complete URL alone.
+///
+/// The lane documents its endpoint as a host (`workspace-abc.saturncloud.io`) because that is what
+/// the operator copies out of Saturn. A URI without a scheme is not dialable, so the probe used to
+/// answer "HostUnreachable" for a perfectly good workspace — naming the operator's omission as a
+/// network failure. The local tunnel an operator runs on their own machine speaks plain HTTP;
+/// anything else is a Saturn endpoint, which is HTTPS. An explicit scheme always wins.
+fn endpoint_with_scheme(url: &str) -> String {
+    let url = url.trim();
+    if url.contains("://") {
+        return url.to_owned();
+    }
+    let host = url.split('/').next().unwrap_or(url);
+    let authority = host.rsplit('@').next().unwrap_or(host);
+    let hostname = authority.split(':').next().unwrap_or(authority);
+    let local = matches!(
+        hostname,
+        "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]" | "::1"
+    );
+    if local {
+        format!("http://{url}")
+    } else {
+        format!("https://{url}")
     }
 }
 
@@ -342,8 +388,9 @@ impl QuotaHttp for SharedSaturnHttp {
 /// 3. Probe the endpoint at `<host>/v1/models` to verify it is reachable.
 /// 4. Register the account with the token, initial health, and zero usage.
 ///
-/// The token is stored in memory but never written to disk, never logged, and never returned
-/// in any response body.
+/// The token never leaves the operator's machine unencrypted: it is held in memory and, so the
+/// account survives a restart, in the vault under `lane:saturn:<account>`. It is never logged and
+/// never returned in a response body.
 pub async fn attach_for(
     state: &SaturnState,
     account: String,
@@ -429,6 +476,29 @@ pub async fn attach_for(
             "account": account,
         })),
     )
+}
+
+/// Re-register an account that was attached before this process started.
+///
+/// The endpoint and token come from the vault, so the account is attached again without a network
+/// call. Health is *not* invented: the registration carries no probe and says so, because a
+/// restored account is exactly as likely to be down as the tunnel was when it was attached. The
+/// first [`probe_for`] — or the end-to-end sweep — replaces that sentence with a measurement.
+pub async fn restore_for(state: &SaturnState, account: String, host: String, token: String) {
+    let mut inner = state.inner.lock().await;
+    inner
+        .registrations
+        .entry(account.clone())
+        .or_insert_with(|| SaturnRegistration {
+            account: account.clone(),
+            host,
+            token,
+            registered_at: Millis::now(),
+            last_probe: None,
+            last_probe_error: Some(RESTORED_NOT_PROBED.to_owned()),
+            failure_count: 0,
+            used_secs: None,
+        });
 }
 
 /// Probe a previously-attached account and update its health.
@@ -685,7 +755,23 @@ async fn attach_lane(
     State(app): State<AppState>,
     TypedJson(payload): TypedJson<AttachRequest>,
 ) -> impl IntoResponse {
-    attach_for(&app.saturn, payload.account, payload.host, payload.token).await
+    let account = payload.account.clone();
+    let secret = json!({
+        "account": payload.account,
+        "host": payload.host,
+        "token": payload.token,
+    });
+    let (status, mut body) = attach_for(
+        &app.saturn,
+        payload.account.clone(),
+        payload.host.clone(),
+        payload.token.clone(),
+    )
+    .await;
+    if status == StatusCode::OK {
+        remember(&app, &account, &secret, &mut body.0).await;
+    }
+    (status, Json(body.0))
 }
 
 /// `POST /api/gpu/lanes/saturn/down` — deregister an account.
@@ -693,7 +779,42 @@ async fn down_lane(
     State(app): State<AppState>,
     TypedJson(payload): TypedJson<DownRequest>,
 ) -> impl IntoResponse {
-    down_for(&app.saturn, payload.account).await
+    let account = payload.account.clone();
+    let response = down_for(&app.saturn, payload.account).await;
+    if response.0 == StatusCode::OK {
+        forget(&app, &account).await;
+    }
+    response
+}
+
+/// Keep the credential, and say in the response whether that worked.
+///
+/// A lane that attaches successfully but cannot be remembered has still attached — for this
+/// process. Reporting `remembered: false` is the difference between the operator knowing a restart
+/// will empty the lane and discovering it the hard way.
+async fn remember(app: &AppState, account: &str, secret: &Value, body: &mut Value) {
+    let mut vault = app.vault.lock().await;
+    match crate::lane_vault::remember(&mut vault, PLATFORM, account, secret) {
+        Ok(()) => body["remembered"] = json!(true),
+        Err(error) => {
+            warn!(
+                "saturn account {} was attached but not remembered: {}",
+                account, error
+            );
+            body["remembered"] = json!(false);
+            body["remember_error"] = json!(error);
+        }
+    }
+}
+
+/// Drop the remembered credential when the operator detaches the account.
+///
+/// A stale entry would re-attach an account the operator deliberately removed, on the next restart.
+async fn forget(app: &AppState, account: &str) {
+    let mut vault = app.vault.lock().await;
+    if crate::lane_vault::forget(&mut vault, PLATFORM, account) {
+        info!("saturn lane credential forgotten: {}", account);
+    }
 }
 
 /// `POST /api/gpu/lanes/saturn/probe` — readiness-probe an account's endpoint.

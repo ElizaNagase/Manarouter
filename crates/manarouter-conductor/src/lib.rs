@@ -39,6 +39,7 @@ pub mod lane_cerebrium;
 pub mod lane_kaggle;
 pub mod lane_molab;
 pub mod lane_saturn;
+pub mod lane_vault;
 pub mod models_api;
 pub mod oauth_token;
 pub mod quota_api;
