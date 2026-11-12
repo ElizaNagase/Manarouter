@@ -17,6 +17,9 @@ import {
 import {
   deriveProviderHealth, accountState, formatAge, formatCompact, providerLevels, declaredLevels,
 } from './format.js';
+import {
+  placeholderNamesIn, NAME_PATTERN as PLACEHOLDER_NAME, VALUE_PATTERN as PLACEHOLDER_VALUE,
+} from './placeholders.js';
 
 // Input modalities an operator can declare per model. Empty means *derive* from the bundled
 // capability table; an explicit list is how an operator corrects the seed.
@@ -1103,7 +1106,7 @@ export async function renderProviders(mount, ctx) {
           h('td', {}, chip(s.label, s.cls, `state: ${s.key}`), quotaChip),
           buildInlineAccountNumber(p, a, 'priority', 'priority'),
           buildInlineAccountNumber(p, a, 'weight', 'weight'),
-          h('td', { class: 'actions' }, toggle, buildInlineAccountSecret(p, a), del)));
+          h('td', { class: 'actions' }, toggle, buildInlineAccountPlaceholders(p, a), buildInlineAccountSecret(p, a), del)));
       }
       accSection.append(h('div', { class: 'table-scroll provider-accounts-scroll' },
         h('table', { class: 'tbl' },
@@ -1667,6 +1670,154 @@ export async function renderProviders(mount, ctx) {
       });
     });
     return edit;
+  }
+
+  /// Edit the values a templated base URL needs, one account at a time.
+  ///
+  /// Two shipped providers cannot spell their endpoint without an account-owned value
+  /// (`cloudflare-ai` addresses `…/accounts/{account_id}/…`, Snowflake puts `{account}` in the
+  /// hostname), and until now the only way to supply one was to hand-edit `config.json`. The editor
+  /// is hidden entirely for a provider whose URL has no placeholders and whose account has none, so
+  /// the crowded actions cell does not grow a button that would do nothing.
+  function buildInlineAccountPlaceholders(p, account) {
+    const required = placeholderNamesIn(p.base_url);
+    const existing = account.placeholders && typeof account.placeholders === 'object'
+      ? Object.entries(account.placeholders).filter(([name, value]) => typeof name === 'string' && typeof value === 'string')
+      : [];
+    if (required.length === 0 && existing.length === 0) return null;
+
+    const label = account.label || account.id;
+    const button = h('button', {
+      class: 'icon-btn', type: 'button',
+      'aria-label': `Edit URL placeholders for account ${account.id}`,
+      title: required.length
+        ? `URL placeholders (this endpoint needs ${required.map((n) => `{${n}}`).join(', ')})`
+        : 'URL placeholders',
+    }, icon('link'));
+
+    button.addEventListener('click', () => {
+      const row = button.closest('tr');
+      if (!row) return;
+      row.nextElementSibling?.classList.contains('inline-editor') && row.nextElementSibling.remove();
+
+      const rows = h('div', { style: 'display:flex;flex-direction:column;gap:6px;' });
+      const missing = h('p', { class: 'hint', style: 'color:var(--amber,#c98a2b);display:none' });
+      const problem = h('p', { class: 'hint', style: 'color:var(--danger,#c0392b);display:none' });
+
+      const addRow = (name = '', value = '') => {
+        const nameInput = h('input', {
+          class: 'input mono', type: 'text', value: name, placeholder: 'account_id',
+          'aria-label': 'Placeholder name', style: 'width:160px',
+        });
+        const valueInput = h('input', {
+          class: 'input mono', type: 'text', value: value, placeholder: 'value used in the URL',
+          'aria-label': `Value for {${name || 'the placeholder'}}`, style: 'width:240px',
+        });
+        const remove = h('button', {
+          class: 'icon-btn danger', type: 'button', 'aria-label': 'Remove this placeholder',
+          title: 'Remove',
+        }, icon('trash'));
+        const entry = h('div', { style: 'display:flex;gap:6px;align-items:center;flex-wrap:wrap;' },
+          nameInput, h('span', { class: 'hint' }, '='), valueInput, remove);
+        remove.addEventListener('click', () => { entry.remove(); refreshMissing(); });
+        nameInput.addEventListener('input', refreshMissing);
+        rows.append(entry);
+        return nameInput;
+      };
+
+      // Which of the endpoint's names still have no value. Shown while editing rather than only on
+      // save: a staged account is legitimate, but a request against one answers 502, so the gap is
+      // visible before it costs a round trip.
+      const refreshMissing = () => {
+        const names = new Set();
+        for (const entry of rows.children) {
+          const [nameInput, , valueInput] = entry.querySelectorAll('input');
+          if (!nameInput || !valueInput) continue;
+          const name = nameInput.value.trim();
+          if (name && PLACEHOLDER_VALUE.test(valueInput.value.trim())) names.add(name);
+        }
+        const absent = required.filter((n) => !names.has(n));
+        if (absent.length === 0) { missing.style.display = 'none'; missing.textContent = ''; return; }
+        missing.style.display = '';
+        missing.textContent = `Still missing: ${absent.map((n) => `{${n}}`).join(', ')}. The endpoint answers 502 until ${absent.length === 1 ? 'it has a value' : 'they have values'}.`;
+      };
+
+      for (const [name, value] of existing) addRow(name, value);
+      if (existing.length === 0) addRow(required[0] ?? '', '');
+      refreshMissing();
+
+      const add = h('button', { class: 'btn btn-sm', type: 'button' }, icon('plus'), 'Add placeholder');
+      add.addEventListener('click', () => addRow().focus());
+      const save = h('button', { class: 'btn btn-sm btn-primary', type: 'button' }, 'Save');
+      const cancel = h('button', { class: 'btn btn-sm', type: 'button' }, 'Cancel');
+
+      const editorRow = h('tr', { class: 'inline-editor' },
+        h('td', { colspan: '6' },
+          h('div', { style: 'display:flex;flex-direction:column;gap:8px;' },
+            h('p', { class: 'hint' },
+              `Placeholders for ${label}. A base URL may name a value this account owns, such as `,
+              h('span', { class: 'mono' }, '{account_id}'), '; the value is spliced into the URL, so only letters, digits, ',
+              h('span', { class: 'mono' }, '- . _ ~'), ' are accepted.'),
+            rows, missing, problem,
+            h('div', { style: 'display:flex;gap:6px;align-items:center;flex-wrap:wrap;' },
+              add, h('span', { class: 'spacer' }), save, cancel))));
+
+      row.after(editorRow);
+      const close = () => editorRow.remove();
+      cancel.addEventListener('click', close);
+      editorRow.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+
+      save.addEventListener('click', async () => {
+        const next = {};
+        const problems = [];
+        for (const entry of rows.children) {
+          const [nameInput, , valueInput] = entry.querySelectorAll('input');
+          if (!nameInput || !valueInput) continue;
+          const name = nameInput.value.trim();
+          const value = valueInput.value.trim();
+          // An untouched blank row is not an entry the operator asked to keep.
+          if (!name && !value) continue;
+          if (!PLACEHOLDER_NAME.test(name)) {
+            problems.push(`"${name}" is not a usable name: start with a letter or underscore, then letters, digits or underscores, at most 64.`);
+            continue;
+          }
+          if (Object.hasOwn(next, name)) {
+            problems.push(`{${name}} is listed twice.`);
+            continue;
+          }
+          if (!PLACEHOLDER_VALUE.test(value)) {
+            problems.push(`{${name}} needs a value made of letters, digits, '-', '.', '_' or '~'.`);
+            continue;
+          }
+          next[name] = value;
+        }
+        if (problems.length) {
+          problem.style.display = '';
+          problem.textContent = problems.join(' ');
+          return;
+        }
+        save.disabled = true;
+        save.textContent = 'Saving…';
+        try {
+          // Field names are the Account struct's, and the whole map is sent: a value this editor
+          // cannot show is never silently dropped by the round trip.
+          await api.put(`/api/providers/${encodeURIComponent(p.id)}/accounts/${encodeURIComponent(account.id)}`,
+            { ...account, placeholders: next });
+          const absent = required.filter((n) => !Object.hasOwn(next, n));
+          if (absent.length) {
+            ctx.toast.warning(`Placeholders saved, but ${absent.map((n) => `{${n}}`).join(', ')} ${absent.length === 1 ? 'is' : 'are'} still missing.`);
+          } else {
+            ctx.toast.success(Object.keys(next).length ? 'Placeholders saved.' : 'Placeholders cleared.');
+          }
+          await reload(true);
+        } catch (err) {
+          save.disabled = false;
+          save.textContent = 'Save';
+          ctx.toast.error('Could not save the placeholders', err);
+        }
+      });
+    });
+    return button;
   }
 
   function buildInlineAccountNumber(p, account, key, label) {

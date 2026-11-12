@@ -50,20 +50,69 @@ function makeEl(tag) {
     removeAttribute(k) { delete el.attrs[k]; },
     addEventListener(type, fn) { (el.listeners[type] ||= []).push(fn); },
     removeEventListener() {},
-    append(...kids) { for (const kid of kids) el.children.push(kid); },
-    appendChild(kid) { el.children.push(kid); return kid; },
-    prepend(...kids) { el.children.unshift(...kids); },
-    replaceChildren(...kids) { el.children = kids.filter((kid) => kid != null); },
+    append(...kids) { for (const kid of kids) { if (kid) kid.parent = el; el.children.push(kid); } },
+    appendChild(kid) { kid.parent = el; el.children.push(kid); return kid; },
+    prepend(...kids) { for (const kid of kids) { if (kid) kid.parent = el; el.children.unshift(kid); } },
+    replaceChildren(...kids) {
+      el.children = kids.filter((kid) => kid != null);
+      for (const kid of el.children) if (kid && typeof kid === 'object') kid.parent = el;
+    },
+    after(node) {
+      const parent = el.parent;
+      if (!parent) return;
+      const at = parent.children.indexOf(el);
+      parent.children.splice(at + 1, 0, node);
+      if (node && typeof node === 'object') node.parent = parent;
+    },
     remove() {},
     focus() {},
+    scrollIntoView() {},
+    isConnected: true,
     contains(node) {
       if (node === el) return true;
       return el.children.some((kid) => kid && kid.nodeType === 1 && typeof kid.contains === 'function' && kid.contains(node));
     },
-    querySelector() { return null; },
-    querySelectorAll() { return []; },
+    querySelector(sel) { return queryAll(el, sel)[0] ?? null; },
+    querySelectorAll(sel) { return queryAll(el, sel); },
   };
   return el;
+}
+
+/**
+ * The handful of selectors this view actually asks for: `tbody`, `.drawer-body`, `tag[attr="v"]`.
+ * The provider drawer is inserted under its own row, so a stub that answered every selector with
+ * null would leave the detail detached and any assertion about it would pass vacuously.
+ */
+function selectorMatches(node, selector) {
+  if (!node || node.nodeType !== 1) return false;
+  const sel = selector.trim();
+  const attr = /\[([\w-]+)(?:="([^"]*)")?\]/.exec(sel);
+  let rest = sel;
+  const wanted = {};
+  if (attr) {
+    wanted[attr[1]] = attr[2] ?? '';
+    rest = sel.replace(attr[0], '');
+  }
+  const classes = [...rest.matchAll(/\.([\w-]+)/g)].map((m) => m[1]);
+  const tag = rest.replace(/\.[\w-]+/g, '').replace(/[#\[\]].*$/, '');
+  if (tag && node.tagName !== tag.toUpperCase()) return false;
+  for (const cls of classes) {
+    if (!String(node.className ?? '').split(/\s+/).includes(cls)) return false;
+  }
+  for (const [key, value] of Object.entries(wanted)) {
+    const actual = key === 'class' ? node.className : node.getAttribute?.(key);
+    if (String(actual ?? '') !== value) return false;
+  }
+  return true;
+}
+
+function queryAll(node, selector, out = []) {
+  if (!node || node.nodeType !== 1) return out;
+  for (const kid of node.children) {
+    if (selectorMatches(kid, selector)) out.push(kid);
+    queryAll(kid, selector, out);
+  }
+  return out;
 }
 
 const initialHealth = { snapshot: { digest: '1111111111111111' } };
@@ -78,7 +127,11 @@ globalThis.document = {
   activeElement: null,
   addEventListener() {},
 };
+// The drawer addresses its row by a CSS selector built from the provider id.
+globalThis.CSS = { escape: (value) => String(value).replace(/["\\]/g, '\\$&') };
 globalThis.window = { addEventListener() {} };
+// Opening a provider detail focuses the panel and scrolls it into view on the next frame.
+globalThis.requestAnimationFrame = (cb) => { cb(0); return 0; };
 globalThis.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
 
 const { renderProviders } = await import('../view-providers.js');
@@ -228,4 +281,88 @@ test('a health reading without a digest (control plane down) leaves the table al
   view.tick({ snapshot: {} });
   await settle();
   assert.deepEqual(view.calls, [true]);
+});
+
+/** Every element in the tree whose aria-label matches, depth first. */
+function findAllLabelled(node, pattern, out = []) {
+  if (!node || node.nodeType !== 1) return out;
+  const label = node.getAttribute?.('aria-label');
+  if (label && pattern.test(label)) out.push(node);
+  for (const kid of node.children) findAllLabelled(kid, pattern, out);
+  return out;
+}
+
+/** The first element carrying this class. `h()` sets `className`, not an attribute. */
+function findByClass(node, cls, out = null) {
+  if (!node || node.nodeType !== 1) return out;
+  if (String(node.className ?? '').split(' ').includes(cls) && node.tagName === 'BUTTON') return node;
+  for (const kid of node.children) {
+    out = findByClass(kid, cls, out);
+    if (out) return out;
+  }
+  return out;
+}
+
+/** Click the "Open" action of the row for `id`, which is how the detail becomes visible. */
+async function openDetail(view, id) {
+  const table = findOne(view.mount, 'TABLE');
+  const row = (findOne(table, 'TBODY')?.children ?? []).find(
+    (tr) => tr.getAttribute?.('data-provider-id') === id,
+  );
+  assert.ok(row, `no row for ${id}`);
+  const button = findByClass(row, 'provider-open');
+  assert.ok(button, `no Open button in the ${id} row`);
+  button.listeners.click[0]({ stopPropagation() {} });
+  await settle();
+}
+
+test('the placeholder editor appears exactly where a base URL names one', async () => {
+  // Cloudflare addresses its account inside the path and Snowflake inside the hostname; an account
+  // whose provider spells its endpoint without a placeholder has nothing to fill in, so offering the
+  // editor there would be a button that does nothing. Before the editor existed the only way to set
+  // these values was to hand-edit config.json.
+  const templated = provider('cloudflare-ai', {
+    base_url: 'https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1',
+    accounts: [
+      { id: 'cf-main', label: 'main', enabled: true },
+      { id: 'cf-second', label: 'second', enabled: true },
+    ],
+  });
+  const plain = provider('plain', { base_url: 'https://api.openai.com/v1' });
+  const view = await mountView([templated, plain]);
+
+  // Nothing is open yet: the editor lives in the account table, which only exists for the selected
+  // provider.
+  assert.equal(findAllLabelled(view.mount, /URL placeholders/).length, 0);
+
+  await openDetail(view, 'cloudflare-ai');
+  const templatedButtons = findAllLabelled(view.mount, /^Edit URL placeholders for account /);
+  assert.deepEqual(
+    templatedButtons.map((b) => b.getAttribute('aria-label')).sort(),
+    ['Edit URL placeholders for account cf-main', 'Edit URL placeholders for account cf-second'],
+    'one editor per account, named by account so a screen reader can tell them apart',
+  );
+  // The title says which names the endpoint needs, which is the whole reason the button exists.
+  assert.match(templatedButtons[0].getAttribute('title'), /\{account_id\}/);
+
+  // The drawer is replaced when another provider is opened, so this also shows the control is
+  // derived from the provider in front of the operator and not left over from the last one.
+  await openDetail(view, 'plain');
+  assert.equal(
+    findAllLabelled(view.mount, /URL placeholders/).length,
+    0,
+    'a provider that spells its endpoint without a placeholder gets no editor',
+  );
+});
+
+test('an account with placeholders keeps its editor even when the URL is no longer templated', async () => {
+  // A base URL can be edited after the values are set (or the provider replaced), and silently
+  // hiding the editor then would leave the operator no way to see or clear what is stored.
+  const retired = provider('retired', {
+    base_url: 'https://api.example.test/v1',
+    accounts: [{ id: 'old', label: 'old', enabled: true, placeholders: { account_id: 'abc123' } }],
+  });
+  const view = await mountView([retired]);
+  await openDetail(view, 'retired');
+  assert.equal(findAllLabelled(view.mount, /^Edit URL placeholders for account old$/).length, 1);
 });

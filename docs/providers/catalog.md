@@ -60,10 +60,24 @@ this feature exists to stop.
 `retry_accounts: true` — the value belongs to the account, so a combo with a second account of the
 same provider carries on to it. The request is never sent with a literal `{account_id}` in the URL.
 
-**Where to set it today.** In the account's `placeholders` object in `config.json`, or through
-`PUT /api/config`. The panel's account editor round-trips the account object, so it **preserves** a
-`placeholders` map an operator has set, but it does not offer fields to create one yet — that is a
-gap in the panel, not in the relay. `mr account add` has no flag for it either.
+**Where to set it.** Three places, with the same rules:
+
+* **The panel.** Every account row of a provider whose base URL carries a placeholder has a
+  link-shaped button (next to the key button) that opens a `name = value` editor under the row.
+  The editor is offered only where it can do something: a provider with no placeholder and an
+  account with no stored map shows no button. An account that already holds values keeps its button
+  even after the base URL stops being templated, so a stored value is never invisible or stuck.
+  The editor lists the names the endpoint still wants, refuses a name outside
+  `[A-Za-z_][A-Za-z0-9_]{0,63}` and a value outside the unreserved set *before* the save, and sends
+  the whole account back with the map replaced — a field this editor cannot show is therefore never
+  silently dropped. Saving a partial map is allowed and warns: a staged account is legitimate, but
+  its requests will answer `502` until the gap is filled.
+* **`config.json` / `PUT /api/config`.** The `placeholders` object on the account, as above.
+* **Nothing else.** `mr account add` has no flag for it, and `mr config` is not implemented.
+
+The rule itself lives in one place — `panel/placeholders.js` mirrors
+`crates/mr-core/src/placeholders.rs`, and `panel/test/placeholders.test.mjs` pins both the shipped
+URLs and the boundaries, so the editor cannot drift into offering a name the relay would ignore.
 
 **Why this exists.** Before it, the literal `{account_id}` went upstream unchanged and Cloudflare
 answered `404`: the relay reported a provider failure for what was, in fact, a missing configuration
