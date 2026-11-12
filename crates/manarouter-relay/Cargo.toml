@@ -32,6 +32,7 @@ futures-util = { workspace = true }
 bytes = { workspace = true }
 smallvec = { workspace = true }
 arc-swap = { workspace = true }
+time = { workspace = true }
 memchr = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }

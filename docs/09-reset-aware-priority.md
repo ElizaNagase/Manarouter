@@ -71,11 +71,17 @@ Each account cooling down carries an `until_ms` instant. It comes from, in order
 2. A structured reset in the response body (`resets_in_seconds`, `resets_at`) on a recognised
    quota-exhaustion code.
 3. A recovery instant stated **in words** in the body's message — `Resets every 24 hours`, `It
-   resets in 13h 24m`, `try again in 45 minutes`. The duration is only read when it follows an
-   anchor word (`resets in`, `resets every`, `retry in`, `try again in`, `available in`), because a
-   bare number in an error message is usually a request limit and not a wait. This path exists
-   because a spent daily window whose body names the reset in a sentence was otherwise read as an
-   ordinary one-minute throttle, and the account spent every minute being refused again.
+   resets in 13h 24m`, `try again in 45 minutes` — or as a **calendar date** — `It comes back on
+   12 Nov 2026 at 15:05 UTC`, `Your next rolling 7-day period starts on 19 Nov 2026 at 01:29 UTC`.
+   Either form is read only after an anchor word that promises recovery (`resets in`, `resets
+   every`, `retry in`, `try again in`, `available in`; `comes back on`, `starts on`, `resets on`,
+   `available from`, …), because a bare number or date in an error message is usually a request
+   limit or a diagnostic and not a wait. A date must carry a day, a month name *and* a four-digit
+   year; a clock is optional and assumed to be `00:00 UTC` when absent. A date in the past is
+   ignored (the width of the new window is unknown, so the guess is safer than a negative wait) and
+   so is anything more than ninety days away. This path exists because a spent daily window whose
+   body names the reset in a sentence was otherwise read as an ordinary one-minute throttle, and the
+   account spent every minute being refused again.
 4. `default_cooldown_secs` from now — **a guess**, used when the provider gives no hint.
 
 The body is read for a `429`, a `402`, a `403` and a `400`. The `400` is not a typo: a spent credit

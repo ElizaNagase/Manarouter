@@ -3377,6 +3377,130 @@ fn stated_wait_ms(text: &str) -> Option<u64> {
     ANCHORS
         .iter()
         .find_map(|anchor| lower.find(anchor).and_then(|at| duration_after(&lower[at + anchor.len()..])))
+        .or_else(|| reset_instant_ms(&lower, time::OffsetDateTime::now_utc()))
+}
+
+/// A reset the provider states as a calendar date rather than as a distance in time.
+///
+/// `Your free allowance is used up. It comes back on 12 Nov 2026 at 15:05 UTC` is the same
+/// knowledge as `resets in 4 hours`, just harder to read, and providers that meter a week or a
+/// month tend to write it this way. Reading it is worth the code: the alternative is a one-minute
+/// guess that walks the account back into the same refusal, sixty times an hour, for a week.
+///
+/// The shape accepted is narrow on purpose — a promising anchor, then a day, a month name, a
+/// four-digit year, and optionally a clock. Anything else is not a reset: a bare date in a
+/// validation message must not park an account, so the anchor is required, the year is required
+/// (guessing one turns a typo into a year-long cooldown), and a date in the past, or further away
+/// than ninety days, is left to the default guess.
+fn reset_instant_ms(text: &str, now: time::OffsetDateTime) -> Option<u64> {
+    const DATE_ANCHORS: [&str; 10] = [
+        "comes back on",
+        "come back on",
+        "starts on",
+        "starts at",
+        "resets on",
+        "reset on",
+        "resumes on",
+        "available on",
+        "available from",
+        "back on",
+    ];
+    let (at, _) = DATE_ANCHORS
+        .iter()
+        .filter_map(|anchor| text.find(anchor).map(|at| (at, anchor.len())))
+        .max_by_key(|(at, _)| *at)?;
+    let rest = &text[at..];
+
+    let mut tokens: Vec<(usize, usize, &str)> = Vec::new();
+    let mut word_start: Option<usize> = None;
+    for (i, c) in rest.char_indices() {
+        if c.is_ascii_alphanumeric() {
+            word_start.get_or_insert(i);
+        } else if let Some(start) = word_start.take() {
+            tokens.push((start, i, &rest[start..i]));
+        }
+    }
+    if let Some(start) = word_start {
+        tokens.push((start, rest.len(), &rest[start..]));
+    }
+
+    for (i, &(_, _, word)) in tokens.iter().enumerate() {
+        let Some(month) = month_of(word) else { continue };
+        let Some(day) = i.checked_sub(1).and_then(|d| tokens[d].2.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(year) = tokens.get(i + 1).and_then(|t| t.2.parse::<i32>().ok()) else {
+            continue;
+        };
+        if !(2020..=2100).contains(&year) {
+            continue;
+        }
+        let (hour, minute) = tokens
+            .get(i + 1)
+            .and_then(|(_, end, _)| clock_after(&rest[*end..]))
+            .unwrap_or((0, 0));
+        let Ok(date) = time::Date::from_calendar_date(year, month, day) else {
+            continue;
+        };
+        let Ok(target) = date.with_hms(hour, minute, 0) else {
+            continue;
+        };
+        let millis = (target.assume_utc() - now).whole_milliseconds();
+        if millis <= 0 || millis > 90 * 86_400_000 {
+            return None;
+        }
+        return u64::try_from(millis).ok();
+    }
+    None
+}
+
+/// The month a lowercase word names, full or abbreviated.
+fn month_of(word: &str) -> Option<time::Month> {
+    use time::Month;
+    Some(match word {
+        "jan" | "january" => Month::January,
+        "feb" | "february" => Month::February,
+        "mar" | "march" => Month::March,
+        "apr" | "april" => Month::April,
+        "may" => Month::May,
+        "jun" | "june" => Month::June,
+        "jul" | "july" => Month::July,
+        "aug" | "august" => Month::August,
+        "sep" | "sept" | "september" => Month::September,
+        "oct" | "october" => Month::October,
+        "nov" | "november" => Month::November,
+        "dec" | "december" => Month::December,
+        _ => return None,
+    })
+}
+
+/// A `HH:MM` clock within the next few words, as in `at 15:05 UTC`.
+fn clock_after(rest: &str) -> Option<(u8, u8)> {
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix("at ").unwrap_or(rest).trim_start();
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && i < 8 {
+        if bytes[i].is_ascii_digit() {
+            let hour_digits = bytes[i..].iter().take_while(|b| b.is_ascii_digit()).count();
+            if hour_digits <= 2 && bytes.get(i + hour_digits) == Some(&b':') {
+                let minute_at = i + hour_digits + 1;
+                let minute_digits = bytes[minute_at..].iter().take_while(|b| b.is_ascii_digit()).count();
+                if minute_digits == 2 {
+                    let hour: u8 = rest[i..i + hour_digits].parse().ok()?;
+                    let minute: u8 = rest[minute_at..minute_at + 2].parse().ok()?;
+                    return (hour < 24 && minute < 60).then_some((hour, minute));
+                }
+            }
+            i += hour_digits;
+            continue;
+        }
+        if !bytes[i].is_ascii_whitespace() {
+            return None;
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Read a human duration at the start of `rest`: `13h 24m`, `24 hours`, `45 minutes`, `2 days`.
@@ -6931,6 +7055,37 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         assert_eq!(stated_wait_ms("resets in 2 months"), None, "months are not minutes");
         assert_eq!(stated_wait_ms("resets in 3 requests"), None);
         assert_eq!(stated_wait_ms("slow down"), None);
+    }
+
+    #[test]
+    fn a_reset_stated_as_a_calendar_date_is_read() {
+        // Captured live: the provider meters a four-hour window and names its end. `Retry-After`
+        // said one hour, so the account walked back into the same refusal three times.
+        let now = time::macros::datetime!(2026-11-12 14:00:00 UTC);
+        let message = "your free allowance for ':free' models is used up. it comes back on 12 nov 2026 at 15:05 utc.";
+        assert_eq!(reset_instant_ms(message, now), Some(65 * 60_000));
+        // `stated_wait_ms` reads the clock, so its own answer moves with the wall; the fixed-clock
+        // assertion above is the one that proves the arithmetic.
+    }
+
+    #[test]
+    fn a_weekly_reset_stated_as_a_date_is_read() {
+        let now = time::macros::datetime!(2026-11-12 14:00:00 UTC);
+        let message = "your next rolling 7-day period starts on 19 nov 2026 at 01:29 utc.";
+        assert_eq!(reset_instant_ms(message, now), Some(6 * 86_400_000 + 11 * 3_600_000 + 29 * 60_000));
+    }
+
+    #[test]
+    fn a_date_that_promises_nothing_is_not_a_wait() {
+        let now = time::macros::datetime!(2026-11-12 14:00:00 UTC);
+        // No anchor, so this is a timestamp in a diagnostic, not a recovery instant.
+        assert_eq!(reset_instant_ms("request failed at 12 nov 2026 15:05 utc", now), None);
+        // Already elapsed: the width of the reset is unknown, so leave it to the default guess.
+        assert_eq!(reset_instant_ms("resets on 12 nov 2026 at 13:00 utc", now), None);
+        // Further away than any real quota window: a typo, not a fact.
+        assert_eq!(reset_instant_ms("resets on 12 nov 2027 at 15:05 utc", now), None);
+        // A year is required; a missing one would turn a typo into a very long cooldown.
+        assert_eq!(reset_instant_ms("resets on 12 nov at 15:05 utc", now), None);
     }
 
     #[test]
