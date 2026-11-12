@@ -71,7 +71,10 @@ use crate::auth::{
     SESSION_TTL,
 };
 use crate::state::{AppState, CommitError, VaultTx};
-use crate::{activity_api, gpu_api, lane_cerebrium, lane_kaggle, lane_molab, lane_saturn, models_api, quota_api};
+use crate::{
+    activity_api, gpu_api, lane_cerebrium, lane_kaggle, lane_molab, lane_saturn, models_api,
+    quota_api,
+};
 
 /// The path prefix an OpenAI-compatible client is pointed at, and the one it should have used
 /// against the relay instead of the control plane. Recorded as a constant so the routes below, the
@@ -1813,6 +1816,7 @@ async fn persist_oauth_account(
         models_deny: Vec::new(),
         quota: Vec::new(),
         proxy: None,
+        placeholders: Default::default(),
         extra: Default::default(),
     };
     provider.accounts.push(account.clone());

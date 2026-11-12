@@ -514,6 +514,12 @@ pub struct AccountPlan {
     ///
     /// The id is kept verbatim, for the same reason as [`ProviderPlan::proxy`].
     pub proxy: Option<String>,
+    /// Values for the named placeholders in the provider's base URL.
+    ///
+    /// Compiled from [`crate::model::Account::placeholders`] and carried here because the relay
+    /// fills the placeholders in at request time, once this account has been chosen. Keeping it
+    /// per account is the whole point: one provider, several accounts, several values.
+    pub placeholders: std::collections::BTreeMap<String, String>,
 }
 
 /// A compiled client key: everything the relay needs to authenticate a request and charge it to
@@ -1676,6 +1682,11 @@ fn account_plan(provider_id: &str, account: &Account) -> AccountPlan {
         models_allow: account.models_allow.clone(),
         models_deny: account.models_deny.clone(),
         proxy: account.proxy.as_deref().map(str::to_owned),
+        placeholders: account
+            .placeholders
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
     }
 }
 
@@ -2387,6 +2398,14 @@ fn encode_account(encoder: &mut Encoder, account: &AccountPlan) {
     encode_string_list(encoder, &account.models_deny);
     let proxy = encoder.opt_str_id(account.proxy.as_deref());
     encoder.put_u32(proxy);
+    // Named placeholder values, as name/value pairs. A map rather than a fixed pair of fields
+    // because the names come from the catalogue: Cloudflare asks for `{account_id}`, Snowflake for
+    // `{account}`, and a third provider will ask for something else.
+    encoder.put_u32(u32::try_from(account.placeholders.len()).unwrap_or(u32::MAX));
+    for (name, value) in &account.placeholders {
+        encoder.put_str(name);
+        encoder.put_str(value);
+    }
 }
 
 /// Encode an auth kind.
@@ -3107,6 +3126,16 @@ fn decode_account(reader: &mut Reader, strings: &[String]) -> Result<AccountPlan
         models_allow: decode_string_list(reader, strings)?,
         models_deny: decode_string_list(reader, strings)?,
         proxy: reader.opt_string(strings)?,
+        placeholders: {
+            let count = reader.u32()? as usize;
+            let mut placeholders = std::collections::BTreeMap::new();
+            for _ in 0..count {
+                let name = reader.string(strings)?;
+                let value = reader.string(strings)?;
+                placeholders.insert(name, value);
+            }
+            placeholders
+        },
     })
 }
 

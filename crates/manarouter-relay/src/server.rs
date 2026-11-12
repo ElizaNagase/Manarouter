@@ -1247,9 +1247,7 @@ async fn dispatch_routed(
                 // worth retrying on a sibling account only when another of *this step's* accounts
                 // is still usable and the refusal was about the credential rather than the bytes;
                 // a request the upstream rejected as malformed fails identically everywhere.
-                Attempt::Failed {
-                    retry_accounts, ..
-                } => {
+                Attempt::Failed { retry_accounts, .. } => {
                     *retry_accounts
                         && retries_left > 0
                         && step_has_a_live_account(&app, &table, step, now_ms)
@@ -2096,11 +2094,48 @@ async fn attempt_step(
         route_override_for(provider, route, uri.path())
     };
     let url_path = upstream_path(step.dialect, route, dialect_path.as_deref(), operator_path);
-    let Some(url) = build_url(&url_step, url_path) else {
+    let Some(built_url) = build_url(&url_step, url_path) else {
         return Attempt::Skip {
             sticky_cleared,
             fallback_target: fallback_target.take(),
         };
+    };
+
+    // --- Named placeholders in the base URL. ---
+    //
+    // A catalogue entry cannot spell some endpoints without a value that belongs to the *account*:
+    // Cloudflare Workers AI addresses `…/accounts/{account_id}/…` and Snowflake addresses
+    // `{account}.snowflakecomputing.com`. The name is in the catalogue; the value is on the
+    // account, which is why this happens here, once the account is chosen, and not when the
+    // snapshot is compiled.
+    //
+    // A name the account does not supply is reported rather than sent. Literal braces reach the
+    // upstream as `%7Baccount_id%7D` and come back as a 404 that blames the provider for a local
+    // configuration mistake — the exact failure this exists to prevent.
+    //
+    // The attempt may still be served by a *sibling account* of the same provider, because the
+    // value is per account: `retry_accounts` stays true, and the response below is what the client
+    // sees if no account of no step can fill it.
+    let url = match mr_core::placeholders::substitute(&built_url, &account.placeholders) {
+        Ok(url) => url,
+        Err(problem) => {
+            let message = format!(
+                "provider {:?} account {:?}: {}",
+                provider.id.as_str(),
+                account.label.as_deref().unwrap_or(account.id.as_str()),
+                problem.message()
+            );
+            return Attempt::Failed {
+                response: Some(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    client_dialect,
+                    "account_placeholder_unfilled",
+                    &message,
+                )),
+                sticky_cleared,
+                retry_accounts: true,
+            };
+        }
     };
 
     // --- The proxy this attempt must egress through. ---
@@ -7578,7 +7613,12 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         let config = mr_core::config::Config {
             providers: vec![
                 provider_serving("first", &first_url, "shared-model", &[InputModality::Text]),
-                provider_serving("second", &second_url, "shared-model", &[InputModality::Text]),
+                provider_serving(
+                    "second",
+                    &second_url,
+                    "shared-model",
+                    &[InputModality::Text],
+                ),
             ],
             combos: vec![combo],
             ..Default::default()
@@ -7719,7 +7759,12 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         let config = mr_core::config::Config {
             providers: vec![
                 provider_serving("first", &first_url, "shared-model", &[InputModality::Text]),
-                provider_serving("second", &second_url, "shared-model", &[InputModality::Text]),
+                provider_serving(
+                    "second",
+                    &second_url,
+                    "shared-model",
+                    &[InputModality::Text],
+                ),
             ],
             combos: vec![combo],
             ..Default::default()

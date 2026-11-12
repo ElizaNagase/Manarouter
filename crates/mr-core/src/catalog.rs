@@ -1137,10 +1137,10 @@ mod tests {
     }
 
     #[test]
-    fn cloudflare_ai_keeps_the_account_placeholder_in_the_base_url_only() {
-        // The relay substitutes nothing, so the account id may only appear as an explicit
-        // placeholder in the base URL — never smuggled into a route override, where it would reach
-        // the upstream as the literal text "{account_id}".
+    fn cloudflare_ai_names_its_account_id_as_a_placeholder() {
+        // The account id can only travel as an explicit placeholder in the base URL; the relay
+        // fills it from the account's `placeholders` map at request time. A route override carries
+        // no braces, because the override is a path the *provider* documents, not an account value.
         let cloudflare = catalog()
             .get("cloudflare-ai")
             .expect("cloudflare-ai is shipped");
@@ -1159,6 +1159,48 @@ mod tests {
             "the route override must be a plain relative path, got {value:?}"
         );
         assert_eq!(value, "ai/v1/chat/completions");
+    }
+
+    #[test]
+    fn every_catalogue_base_url_uses_only_well_formed_placeholders() {
+        // A base URL is filled from the account's `placeholders` map, so any `{` that is *not* a
+        // well-formed `{name}` would survive substitution and be sent upstream as a literal. This
+        // is the catalogue-wide guarantee that the only braces in a shipped base URL are names the
+        // relay can fill.
+        for provider in catalog().all() {
+            let id = provider.id.as_str();
+            let names = crate::placeholders::names(&provider.base_url);
+            let braces = provider.base_url.matches('{').count();
+            assert_eq!(
+                names.len(),
+                braces,
+                "provider {id:?} has a brace that is not a placeholder name: {}",
+                provider.base_url
+            );
+            for name in &names {
+                assert!(
+                    !name.is_empty(),
+                    "provider {id:?} has an empty placeholder: {}",
+                    provider.base_url
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_catalogue_route_override_carries_placeholders() {
+        // The override replaces the path, not the base URL. A placeholder there would be filled by
+        // the same rule, but no shipped provider needs one, and allowing it would let an account
+        // value redirect the request to a different path.
+        for provider in catalog().all() {
+            let id = provider.id.as_str();
+            for (route, path) in &provider.route_overrides {
+                assert!(
+                    !path.contains('{'),
+                    "provider {id:?} route {route:?} carries a placeholder: {path:?}"
+                );
+            }
+        }
     }
 
     #[test]

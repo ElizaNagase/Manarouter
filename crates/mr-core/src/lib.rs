@@ -35,10 +35,11 @@ pub mod config;
 pub mod dialect;
 pub mod error;
 pub mod gpu;
-pub mod lane;
 pub mod ids;
+pub mod lane;
 pub mod model;
 pub mod oauth;
+pub mod placeholders;
 pub mod published;
 pub mod quota;
 pub mod rental;
@@ -118,7 +119,12 @@ pub const SNAPSHOT_MAGIC: [u8; 8] = *b"MROUTES1";
 /// byte of the record — it must be rejected rather than reinterpreted.
 ///
 /// Version 8 carries provider KV capacity, cost-per-second and cold-start timeout configuration.
-pub const SNAPSHOT_VERSION: u32 = 8;
+///
+/// Version 9 adds each account's **named placeholder values** — the account id a Cloudflare base
+/// URL asks for, the account name a Snowflake hostname asks for. A v8 account record carries no
+/// such map, so a base URL with braces would reach the upstream literally; the frame must be
+/// rebuilt from authored config instead of reinterpreted.
+pub const SNAPSHOT_VERSION: u32 = 9;
 
 /// Current on-disk database schema version.
 ///

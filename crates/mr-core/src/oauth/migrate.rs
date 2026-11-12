@@ -1234,6 +1234,7 @@ async fn import_one(
             models_deny: Vec::new(),
             quota: Vec::new(),
             proxy: None,
+            placeholders: Default::default(),
             extra: Default::default(),
         });
     }

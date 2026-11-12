@@ -871,6 +871,7 @@ mod tests {
             models_allow: Vec::new(),
             models_deny: Vec::new(),
             proxy: None,
+            placeholders: Default::default(),
         }
     }
 

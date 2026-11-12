@@ -304,6 +304,18 @@ pub struct Account {
     /// or region-locked, and moving *just it* behind a proxy must not move the whole provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
+    /// Values for the named placeholders in the provider's base URL.
+    ///
+    /// A catalogue base URL may name a value only the account knows — Cloudflare Workers AI
+    /// addresses `…/accounts/{account_id}/…`, Snowflake addresses `{account}.snowflakecomputing.com`
+    /// — so the name lives in the catalogue and the value lives here. The map is per *account*
+    /// because one provider can be used by several accounts, each with its own id.
+    ///
+    /// Substitution happens in the relay, at request time, once the account is chosen; see
+    /// [`crate::placeholders`] for the rule and for why a value must be URL-safe. An empty map is
+    /// the normal case: a provider whose base URL has no braces never reads this.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub placeholders: BTreeMap<String, String>,
     /// Free-form provider-specific fields, for example a Copilot session or a Codex workspace id.
     ///
     /// Kept as an open map so a new provider needs no schema change, and preserved on round-trip
@@ -333,6 +345,7 @@ impl Account {
             models_deny: Vec::new(),
             quota: Vec::new(),
             proxy: None,
+            placeholders: BTreeMap::new(),
             extra: BTreeMap::new(),
         }
     }
