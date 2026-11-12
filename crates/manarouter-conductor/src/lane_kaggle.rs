@@ -255,12 +255,20 @@ pub struct RunListItem {
 // ── Helpers ────────────────────────────────────────────────────────────
 
 /// Check whether the `kaggle` binary is on PATH.
+///
+/// A spawn that fails with `NotFound` is the CLI being absent, which is a fact about this host and
+/// not an internal error: the status route reports it as `ready: false` and a run refuses it as
+/// `503 kaggle_cli_absent`. Reporting a 500 from a readiness probe made "this box has no `kaggle`
+/// installed" indistinguishable from a bug in the conductor.
 async fn check_kaggle_cli() -> Result<(), KaggleError> {
     let status = Command::new("kaggle")
         .arg("--version")
         .output()
         .await
-        .map_err(|e| KaggleError::Internal(format!("failed to run kaggle: {e}")))?;
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => KaggleError::CliAbsent,
+            _ => KaggleError::Internal(format!("failed to run kaggle: {e}")),
+        })?;
     if status.status.success() {
         Ok(())
     } else {
@@ -1067,6 +1075,47 @@ exit 1
         let json: Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(json["runs"].as_array().unwrap().len(), 0);
         assert_eq!(json["count"].as_u64().unwrap(), 0);
+    }
+
+    /// A host with no `kaggle` binary must be *reported*, not answered with a 500.
+    ///
+    /// This was a real bug: the readiness probe shelled out, the spawn failed with `NotFound`, that was
+    /// mapped to `Internal`, and `GET /status` answered 500 on every box without the CLI. The route's
+    /// whole purpose is to say what this host can do, and "not installed" is an answer.
+    #[tokio::test]
+    async fn a_host_without_the_kaggle_cli_is_reported_not_broken() {
+        let _path_guard = PATH_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let empty = TempDir::new().expect("temp dir");
+        let original_path = env::var("PATH").unwrap_or_default();
+        env::set_var("PATH", empty.path());
+
+        let (app_state, _state_dir) = kaggle_state(KaggleState::new());
+        let router = Router::new()
+            .route("/api/gpu/lanes/kaggle/status", get(get_status))
+            .with_state(app_state);
+
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/gpu/lanes/kaggle/status")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        env::set_var("PATH", original_path);
+
+        let json: Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            status, 200,
+            "an absent CLI is readiness information, not an internal error: {json}"
+        );
+        assert_eq!(json["kaggle_cli_present"], false);
+        assert_eq!(json["ready"], false);
+        assert_eq!(json["lane"], "kaggle");
     }
 
     #[tokio::test]
