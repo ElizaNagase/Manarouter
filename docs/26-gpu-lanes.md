@@ -286,7 +286,13 @@ says the credential is for this process only, because a repaint would discard th
 operator must not miss (§12). A successful attach closes the form and re-reads the card, and its
 confirmation is held on the view rather than in the form, so the repaint cannot erase the sentence
 that says the credential was kept. Kaggle has no form because it has no attach route — it runs
-through the `kaggle` CLI on the host — and the card says that instead. Deploy, run and down still exist only
+through the `kaggle` CLI on the host — and the card says that instead.
+
+Each account row says `warm` or `cold` in words (the lane sends a boolean, and printing
+`String(false)` as a status word would be a panel invention, not a report) and quotes the lane's own
+`last_probe_error`, including the restored-from-the-vault sentence. So an account that exists but has
+never been dialled reads `registered · cold · restored from the vault; not probed since this process
+started`, which is the whole truth and looks nothing like a healthy one. Deploy, run and down still exist only
 as routes; their cards name the route and fields rather than pretending a button exists.
 
 Saturn's budget is printed only from what the lane reported. An unrecorded ledger shows as

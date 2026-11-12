@@ -1310,3 +1310,29 @@ test('a repaint while the attach form is open does not delete what is being type
     api.get = originalGet;
   }
 });
+
+test('a lane account says warm or cold in words, and quotes what its last probe said', async () => {
+  const handlers = standardHandlers();
+  handlers['/api/gpu/lanes/saturn/status'] = {
+    lane: 'saturn',
+    healthy: 1,
+    total_accounts: 2,
+    accounts: [
+      { account: 'saturn-warm', host: '127.0.0.1:8000', warm: true, health: 'healthy', failure_count: 0 },
+      {
+        account: 'saturn-restored',
+        host: '127.0.0.1:8001',
+        warm: false,
+        health: 'registered',
+        last_probe_error: 'restored from the vault; not probed since this process started',
+      },
+    ],
+  };
+  const { mount } = await mountView({ handlers });
+  const text = textOf(mount);
+  assert.match(text, /saturn-warm\s+·\s+127\.0\.0\.1:8000\s+·\s+healthy\s+·\s+warm/);
+  assert.match(text, /saturn-restored\s+·\s+127\.0\.0\.1:8001\s+·\s+registered\s+·\s+cold/);
+  assert.match(text, /restored from the vault; not probed since this process started/,
+    'the sentence that says the account has not been dialled is shown, not just "registered"');
+  assert.ok(!text.includes('· false'), 'a boolean warm flag is not printed as the word "false"');
+});

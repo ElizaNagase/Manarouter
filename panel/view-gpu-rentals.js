@@ -781,15 +781,27 @@ async function renderInventory(mount, ctx) {
     const host = asString(pick(acc, 'host')).trim();
     const project = asString(pick(acc, 'project')).trim();
     const health = asString(pick(acc, 'health')).trim();
-    const warm = asString(pick(acc, 'warm', 'is_warm')).trim();
+    const warm = pick(acc, 'warm', 'is_warm');
+    const minutesLeft = asNumber(pick(acc, 'minutes_left'));
+    const probeError = asString(pick(acc, 'last_probe_error')).trim();
     const failures = asNumber(pick(acc, 'failure_count', 'failures'));
 
     const parts = [h('span', { class: 'mono' }, label)];
     if (host) parts.push(h('span', { class: 'hint' }, ` · ${host}`));
     if (project) parts.push(h('span', { class: 'hint' }, ` · project: ${project}`));
     if (health) parts.push(h('span', { class: 'hint' }, ` · ${health}`));
-    if (warm) parts.push(h('span', { class: 'hint' }, ` · ${warm}`));
+    // `warm` is a boolean on three lanes. Printing `String(false)` would put the word "false" on a
+    // card as if it were a status, so the boolean is said in words and any other value is quoted.
+    if (typeof warm === 'boolean') parts.push(h('span', { class: 'hint' }, warm ? ' · warm' : ' · cold'));
+    else {
+      const said = asString(warm).trim();
+      if (said) parts.push(h('span', { class: 'hint' }, ` · ${said}`));
+    }
+    if (minutesLeft !== null) parts.push(h('span', { class: 'hint' }, ` · ${minutesLeft} min left`));
     if (failures !== null && failures > 0) parts.push(h('span', { class: 'hint mono' }, `failures: ${failures}`));
+    // The lane's own measurement of the last probe, including the sentence a restored account
+    // carries before it has been dialled ("restored from the vault; not probed since …").
+    if (probeError) parts.push(h('span', { class: 'hint gpu-lane-probe' }, ` · ${probeError}`));
     return h('li', {}, ...parts);
   }
 
