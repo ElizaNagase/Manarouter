@@ -30,7 +30,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::body::Body as AxumBody;
@@ -82,7 +82,7 @@ const _: () = assert!(
 /// A distinct type rather than a `Response`, because the response is more than a hundred bytes and
 /// returning one through a `Result` makes every caller's frame that large for a case that does not
 /// happen on the happy path.
-enum BodyError {
+pub(crate) enum BodyError {
     /// The body exceeded [`MAX_BODY_BYTES`].
     TooLarge,
     /// The body could not be read at all.
@@ -91,7 +91,7 @@ enum BodyError {
 
 impl BodyError {
     /// The client-facing response.
-    fn into_response(self) -> Response {
+    pub(crate) fn into_response(self) -> Response {
         match self {
             Self::TooLarge => error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -128,6 +128,8 @@ pub struct AppState {
     pub oauth_refreshers: Arc<std::collections::HashMap<String, Arc<Refresher>>>,
     /// Metadata lookup for OAuth references attached to snapshot accounts.
     pub oauth_store: Arc<mr_core::store::Store>,
+    /// Persistent request/usage database for GPU billing records.
+    pub quota_store: Arc<mr_core::store::Store>,
     /// Per-key quota admission and settlement.
     ///
     /// The ledger it reads and writes is the same `key_usage` table the panel reads, so a cap that
@@ -141,6 +143,15 @@ pub struct AppState {
     /// written once per combo request, so it costs one uncontended lock on a path that has
     /// already done several orders of magnitude more work.
     pub activity: Arc<crate::activity::ActivityLog>,
+    /// Local provider admission plus GPU-second ledger handles.
+    pub kv_usage: Arc<crate::kv_budget::AdmissionPool>,
+    /// The batch lane: files, batches, the worker pool and the cost report.
+    ///
+    /// Held here, next to the admission pool it shares, because a batch item is dispatched **through
+    /// the request path** — the lane decides *when* an item runs and this process decides *where* it
+    /// goes — and the lane's executor needs the state to reach the routing snapshot and the upstream
+    /// client.
+    pub batch: Arc<crate::batch::BatchLane>,
 }
 
 /// Build the route table.
@@ -160,6 +171,24 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/messages", any(dispatch_anthropic))
         .route("/v1/messages/count_tokens", any(dispatch_anthropic))
         .route("/v1/models", any(list_models))
+        // The batch lane. OpenAI's file and batch surfaces, mounted on the same listener because a
+        // batch is submitted with the same client key that calls a model. Axum 0.8 spells a path
+        // parameter `{id}`, not `:id`.
+        .route(
+            "/v1/files",
+            post(crate::batch::create_file).get(crate::batch::list_files),
+        )
+        .route(
+            "/v1/files/{id}",
+            get(crate::batch::retrieve_file).delete(crate::batch::delete_file),
+        )
+        .route("/v1/files/{id}/content", get(crate::batch::file_content))
+        .route(
+            "/v1/batches",
+            post(crate::batch::create_batch).get(crate::batch::list_batches),
+        )
+        .route("/v1/batches/{id}", get(crate::batch::retrieve_batch))
+        .route("/v1/batches/{id}/cancel", post(crate::batch::cancel_batch))
         .route("/control/probe", post(control_probe))
         .route("/control/activity", get(control_activity))
         .with_state(state)
@@ -254,6 +283,7 @@ async fn control_probe(
             headers,
             body: AxumBody::from(bytes),
             pre_authorized: true,
+            pre_admitted: None,
         },
         0,
         None,
@@ -745,6 +775,15 @@ struct DispatchRequest {
     /// did not arrive over the loopback interface. It is not a bypass of the *routing* rules: the
     /// request goes through the same resolution, dialects, accounts and fallbacks a client would.
     pre_authorized: bool,
+    /// The provider whose KV-token budget **already** covers this request, when it is not the request
+    /// path that reserved it.
+    ///
+    /// Set by exactly one caller: the batch lane, which reserves an item's KV tokens before it
+    /// dispatches the item, because only the lane knows that the item is one of thousands and that its
+    /// tokens must not be counted twice. When this names the step the attempt is about to use, the
+    /// attempt skips its own reservation — the lane's lease is the one that is dropped and billed — and
+    /// a fallback attempt on a *different* provider reserves normally.
+    pre_admitted: Option<String>,
 }
 
 async fn dispatch(
@@ -764,6 +803,7 @@ async fn dispatch(
             headers,
             body,
             pre_authorized: false,
+            pre_admitted: None,
         },
         0,
         None,
@@ -876,6 +916,7 @@ async fn dispatch_routed(
         headers,
         body,
         pre_authorized,
+        pre_admitted,
     } = request;
     let started = std::time::Instant::now();
 
@@ -1115,6 +1156,9 @@ async fn dispatch_routed(
         scan_done,
         lookup_done,
         sticky_index,
+        // Cloned rather than moved: the modality-fallback re-entry below is the same request and has
+        // to carry the same reservation, so the original stays in hand after this context is built.
+        pre_admitted: pre_admitted.clone(),
     };
 
     // --- The hedged race. ---
@@ -1200,9 +1244,15 @@ async fn dispatch_routed(
         loop {
             let retry = match &attempt {
                 // A body to hand the client means the upstream answered and refused. That answer is
-                // worth retrying only while another account of this step is still usable.
-                Attempt::Failed { .. } => {
-                    retries_left > 0 && step_has_a_live_account(&app, &table, step, now_ms)
+                // worth retrying on a sibling account only when another of *this step's* accounts
+                // is still usable and the refusal was about the credential rather than the bytes;
+                // a request the upstream rejected as malformed fails identically everywhere.
+                Attempt::Failed {
+                    retry_accounts, ..
+                } => {
+                    *retry_accounts
+                        && retries_left > 0
+                        && step_has_a_live_account(&app, &table, step, now_ms)
                 }
                 _ => false,
             };
@@ -1239,6 +1289,7 @@ async fn dispatch_routed(
             Attempt::Failed {
                 response,
                 sticky_cleared,
+                retry_accounts: _,
             } => {
                 if sticky_cleared {
                     sticky_index = None;
@@ -1302,6 +1353,10 @@ async fn dispatch_routed(
                         // The re-entry is the same request, so it keeps whatever authorization
                         // the original carried — including the control-plane probe's.
                         pre_authorized,
+                        // And the same KV-token reservation, which the batch lane made for this item
+                        // before dispatching it in the first place. Cloned because the request that
+                        // is still in hand owns the original value.
+                        pre_admitted: pre_admitted.clone(),
                     },
                     fallback_depth + 1,
                     Some(table),
@@ -1425,6 +1480,15 @@ fn humanize_wait(secs: u64) -> String {
     }
 }
 
+fn budget_lease_response(
+    mut response: Response,
+    lease: crate::kv_budget::KvBudgetLease,
+) -> Response {
+    let inner = std::mem::replace(response.body_mut(), AxumBody::empty());
+    *response.body_mut() = AxumBody::new(crate::kv_budget::BudgetedBody::new(inner, lease));
+    response
+}
+
 /// A boxed call to [`dispatch_routed`], for the one place that re-enters it.
 ///
 /// An async function that calls itself has an infinitely recursive future type, which the compiler
@@ -1454,12 +1518,23 @@ enum Attempt {
     },
     /// The step answered with a success; the response is ready for the client.
     Answer(Response),
-    /// The step failed.
+    /// The step failed, but the request is still viable: the caller should try the next step.
     Failed {
         /// The failure response, when there is one to show the client.
         response: Option<Response>,
         /// Whether the sticky preference was cleared by this attempt.
         sticky_cleared: bool,
+        /// Whether trying this same step on **another of its accounts** could plausibly succeed.
+        ///
+        /// `true` for the failures that are a property of one credential or one moment — a spent
+        /// window, a throttled key, an unreachable host — because the sibling accounts are still
+        /// there and a provider holding several must not fail a request the second one can serve.
+        ///
+        /// `false` for the failures that are a property of the *request*: a malformed body, a path
+        /// the upstream does not have, a refusal of the endpoint itself. Re-sending the same bytes
+        /// to the same step under a different credential cannot change that answer, so retrying
+        /// only burns an attempt and delays the step the combo configured for exactly this case.
+        retry_accounts: bool,
     },
     /// The step failed in a way that ends the request rather than the attempt.
     Fatal {
@@ -1513,6 +1588,9 @@ struct AttemptContext<'a> {
     lookup_done: std::time::Duration,
     /// The combo step the sticky preference points at, when there is one.
     sticky_index: Option<usize>,
+    /// The provider whose KV budget the caller already reserved, when it did. See
+    /// [`DispatchRequest::pre_admitted`].
+    pre_admitted: Option<String>,
 }
 
 /// What one candidate account can contribute to an attempt.
@@ -1858,6 +1936,7 @@ async fn attempt_step(
                 ),
             )),
             sticky_cleared,
+            retry_accounts: true,
         };
     };
 
@@ -2048,6 +2127,75 @@ async fn attempt_step(
         }
     };
     let proxy_endpoint = proxy.as_ref().map(|choice| choice.endpoint.clone());
+    // Does this attempt's provider already hold a reservation made on its behalf?
+    //
+    // The batch lane reserves an item's KV tokens *before* dispatching the item, for two reasons that
+    // the request path cannot satisfy: it must not start an item it cannot run (the lane would rather
+    // wait than fail 4 000 items as the pool fills), and one item must produce exactly one ledger row,
+    // which is only possible if the lease outlives the dispatch. So when the lane's reservation names
+    // this provider, the reservation is the lane's and taking a second one here would double-count the
+    // item — the pool would report half the capacity the operator configured.
+    //
+    // The comparison is by provider id because that is the pool's key: the budget belongs to the
+    // endpoint, not to the route. A *fallback* to a different provider does not match, so it reserves
+    // normally, which is correct and deliberately over-reserves by one item — the alternative is a
+    // fallback that runs unbilled, and a cost report that quietly omits what the fallback cost.
+    let pre_admitted_here = actx.pre_admitted.as_deref() == Some(step.provider_id.as_str());
+    let budget_lease = if pre_admitted_here {
+        None
+    } else if provider.kv_pool_tokens.is_some()
+        || provider.max_concurrent.is_some()
+        || (step.dialect == Dialect::ModalVllm && provider.price_per_second.is_some())
+    {
+        let request_tokens = crate::quota::estimate_prompt_tokens(outgoing.len()).tokens;
+        match app.kv_usage.reserve(
+            step.provider_id.as_str().to_owned(),
+            mr_core::ids::new_id(),
+            request_tokens,
+            crate::kv_budget::KvBudgetLimits {
+                pool_tokens: provider.kv_pool_tokens,
+                max_context: step.context_length.map(u64::from).or(provider.max_context),
+                max_concurrent: provider.max_concurrent,
+            },
+            Some(crate::kv_budget::GpuBilling {
+                store: Arc::clone(&app.quota_store),
+                provider_id: step.provider_id.as_str().to_owned(),
+                model: step.model.clone(),
+                price_per_second: provider.price_per_second,
+                started: std::time::Instant::now(),
+            }),
+        ) {
+            Ok(lease) => Some(lease),
+            Err(reason) => {
+                let message = match reason {
+                    crate::kv_budget::KvBudgetDenial::ContextExceeded => {
+                        "the request exceeds the endpoint's configured model context"
+                    }
+                    crate::kv_budget::KvBudgetDenial::PoolTooSmall => {
+                        "the request exceeds the endpoint's configured KV-token pool"
+                    }
+                    crate::kv_budget::KvBudgetDenial::PoolFull => {
+                        "the endpoint's KV-token pool is fully reserved by in-flight requests"
+                    }
+                    crate::kv_budget::KvBudgetDenial::ConcurrencyFull => {
+                        "the endpoint is at its configured maximum concurrent requests"
+                    }
+                };
+                return Attempt::Failed {
+                    response: Some(error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        client_dialect,
+                        "kv_budget_exceeded",
+                        message,
+                    )),
+                    sticky_cleared,
+                    retry_accounts: false,
+                };
+            }
+        }
+    } else {
+        None
+    };
 
     let request = UpstreamRequest {
         method: method.clone(),
@@ -2065,10 +2213,23 @@ async fn attempt_step(
         proxy: proxy_endpoint,
         body: outgoing,
         http2: provider.http2,
-        connect_timeout: Duration::from_millis(step.connect_timeout_ms),
-        ttfb_timeout: Duration::from_millis(step.ttfb_timeout_ms),
-        total_timeout: (step.total_timeout_ms > 0)
-            .then(|| Duration::from_millis(step.total_timeout_ms)),
+        connect_timeout: Duration::from_millis(
+            provider
+                .cold_start_ttfb_timeout_ms
+                .map(|_| step.connect_timeout_ms.max(300_000))
+                .unwrap_or(step.connect_timeout_ms),
+        ),
+        ttfb_timeout: Duration::from_millis(
+            provider
+                .cold_start_ttfb_timeout_ms
+                .unwrap_or(step.ttfb_timeout_ms),
+        ),
+        total_timeout: (step.total_timeout_ms > 0).then(|| {
+            Duration::from_millis(
+                step.total_timeout_ms
+                    .max(provider.cold_start_ttfb_timeout_ms.unwrap_or(0)),
+            )
+        }),
     };
 
     match app.relay.upstream().send(request).await {
@@ -2096,7 +2257,15 @@ async fn attempt_step(
                 total_us = started.elapsed().as_micros() as u64,
                 "served"
             );
-            Attempt::Answer(build_client_response(ctx, translated_body, response, ticket).await)
+            let client_response =
+                build_client_response(ctx, translated_body, response, ticket).await;
+            Attempt::Answer(match budget_lease {
+                Some(mut lease) => {
+                    lease.mark_success();
+                    budget_lease_response(client_response, lease)
+                }
+                None => client_response,
+            })
         }
         Ok(response) => {
             if is_sticky_step {
@@ -2109,7 +2278,8 @@ async fn attempt_step(
             // than a status-code guess: it is the difference between parking a spent account for
             // the minute it takes to be refused again and parking it until it can actually serve.
             // Read this before the body is handed to the client — after that it is the client's.
-            let mut reason = classify_status(response.status);
+            let mut reason = classify_status(response.status, step.dialect == Dialect::ModalVllm);
+            let modal_cold_start = reason == select::CooldownReason::ColdStart;
             let mut named_wait = retry_after_ms(&response.headers);
             // Only a refusal is read, and only a refusal small enough to be a refusal: a provider
             // that answers a 429 or a 402 with a stream is not describing a quota window, and
@@ -2150,17 +2320,36 @@ async fn attempt_step(
                 "upstream refused the request"
             );
             let rebuilt = response;
-            // A 4xx client error (400, 404, 422…) is the client's fault, never the account's.
-            // Do not cool down the account — the credential is fine — and do not retry on
-            // another account — the same request would fail the same way there.
+            // A 4xx client error (400, 404, 422…) is a statement about the *request*, not about
+            // the account: the credential is fine, so the account is not cooled down, and another
+            // account of the same step would receive the same bytes and give the same answer.
+            //
+            // It is not a statement about the *combo*, though. An upstream can reject a dialect
+            // it does not actually implement, or refuse one model of the several a step's
+            // provider hosts, while every other step of the combo is perfectly willing to serve.
+            // Treating the 4xx as fatal therefore ended the whole request at the first step that
+            // said no, which is precisely the case a combo exists to survive: the request never
+            // reached the step configured as its fallback, and the operator saw the refusal of an
+            // upstream they had not even chosen.
+            //
+            // So the failure advances to the next step like any other, carrying the provider's own
+            // answer so that a request every step refuses still reports a real cause rather than a
+            // synthesized one.
             if matches!(reason, select::CooldownReason::InvalidRequest) {
-                return Attempt::Fatal {
-                    response: build_response(rebuilt, None),
+                return Attempt::Failed {
+                    response: Some(build_response(rebuilt, None)),
+                    sticky_cleared,
+                    retry_accounts: false,
                 };
             }
+            let effective_scope = if modal_cold_start {
+                mr_core::model::CooldownScope::Model
+            } else {
+                provider.cooldown_scope
+            };
             app.health.cool_down(
                 &select::cooldown_key(
-                    provider.cooldown_scope,
+                    effective_scope,
                     step.provider_id.as_str(),
                     account.id.as_str(),
                     &step.model,
@@ -2169,7 +2358,7 @@ async fn attempt_step(
                 select::cooldown_until(
                     reason,
                     app.health.failures(
-                        provider.cooldown_scope,
+                        effective_scope,
                         step.provider_id.as_str(),
                         account.id.as_str(),
                         &step.model,
@@ -2182,6 +2371,7 @@ async fn attempt_step(
             Attempt::Failed {
                 response: Some(build_response(rebuilt, None)),
                 sticky_cleared,
+                retry_accounts: true,
             }
         }
         Err(e) => {
@@ -2247,6 +2437,7 @@ async fn attempt_step(
             Attempt::Failed {
                 response: None,
                 sticky_cleared,
+                retry_accounts: true,
             }
         }
     }
@@ -2400,6 +2591,7 @@ struct OwnedAttempt {
     scan_done: std::time::Duration,
     lookup_done: std::time::Duration,
     sticky_index: Option<usize>,
+    pre_admitted: Option<String>,
 }
 
 /// Build an `OwnedAttempt` from the borrowed `AttemptContext`, copying out the per-request values
@@ -2426,6 +2618,7 @@ fn owned_from_actx(actx: &AttemptContext<'_>) -> OwnedAttempt {
         scan_done: actx.scan_done,
         lookup_done: actx.lookup_done,
         sticky_index: actx.sticky_index,
+        pre_admitted: actx.pre_admitted.clone(),
     }
 }
 
@@ -2453,6 +2646,7 @@ async fn attempt_from_owned(owned: &OwnedAttempt, step: &StepPlan, is_sticky: bo
         scan_done: owned.scan_done,
         lookup_done: owned.lookup_done,
         sticky_index: owned.sticky_index,
+        pre_admitted: owned.pre_admitted.clone(),
     };
     attempt_step(&ctx, step, is_sticky, false).await
 }
@@ -2820,7 +3014,7 @@ fn request_with_model(body: &Bytes, model: &str) -> Option<Bytes> {
 ///
 /// `max` is checked before the body is buffered in full, so an oversized upload is refused while it
 /// arrives rather than after it has already been held in memory.
-async fn read_body(mut body: AxumBody, max: usize) -> Result<Bytes, BodyError> {
+pub(crate) async fn read_body(mut body: AxumBody, max: usize) -> Result<Bytes, BodyError> {
     use http_body_util::BodyExt as _;
     // The limit is enforced while the body arrives, not after it has been buffered in full: a
     // client must not be able to make the relay hold an arbitrarily large upload before it is told
@@ -2851,7 +3045,7 @@ fn requested_model<'a>(head: &RequestHead, body: &'a [u8]) -> Option<&'a str> {
 /// Both are accepted on every route. Anthropic-shaped clients send `x-api-key`, OpenAI-shaped ones
 /// send `Authorization`, and refusing the "wrong" one for a given path would break working clients
 /// for no benefit.
-fn presented_key(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn presented_key(headers: &HeaderMap) -> Option<String> {
     if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         let v = v.trim();
         if !v.is_empty() {
@@ -2879,7 +3073,7 @@ fn presented_key(headers: &HeaderMap) -> Option<String> {
 
 /// Authenticate through the relay, allowing only genuinely absent credentials through open mode.
 /// Any presented credential — including an invalid one — is always checked and rejected normally.
-fn authenticate_request(
+pub(crate) fn authenticate_request(
     relay: &RelayState,
     no_key_required: bool,
     presented: Option<&str>,
@@ -2897,7 +3091,7 @@ fn authenticate_request(
 }
 
 /// Map an authentication outcome onto a response.
-fn auth_error(outcome: &AuthOutcome, dialect: Dialect) -> Response {
+pub(crate) fn auth_error(outcome: &AuthOutcome, dialect: Dialect) -> Response {
     let message = match outcome {
         AuthOutcome::Missing => {
             "no client key was presented. Send one as `Authorization: Bearer <key>` or `x-api-key: <key>`."
@@ -2999,7 +3193,7 @@ fn exhausted_by_body(body: &[u8]) -> Option<(select::CooldownReason, Option<u64>
 }
 
 /// Which cooldown a status code deserves.
-fn classify_status(status: StatusCode) -> select::CooldownReason {
+fn classify_status(status: StatusCode, modal_cold_start: bool) -> select::CooldownReason {
     match status.as_u16() {
         // The credential is wrong. Retrying cannot fix that, and the long cooldown is what stops the
         // logs filling with the same unchanged failure while nobody acts on it.
@@ -3009,6 +3203,7 @@ fn classify_status(status: StatusCode) -> select::CooldownReason {
         // A client error (400, 404, 422…) is the client’s fault. Do not cool down the account
         // and do not retry: another account would reject the same malformed request.
         400 | 404 | 405 | 413 | 415 | 422 => select::CooldownReason::InvalidRequest,
+        503 if modal_cold_start => select::CooldownReason::ColdStart,
         _ => select::CooldownReason::Backoff,
     }
 }
@@ -3020,7 +3215,7 @@ fn classify_status(status: StatusCode) -> select::CooldownReason {
 /// decades. Returning `None` for the date form is deliberate: the configured default is a better
 /// answer than a confidently wrong measurement, and the date form is rare enough that it is an
 /// acceptable loss.
-fn retry_after_ms(headers: &HeaderMap) -> Option<u64> {
+pub(crate) fn retry_after_ms(headers: &HeaderMap) -> Option<u64> {
     let raw = headers.get("retry-after")?.to_str().ok()?.trim();
     let secs: u64 = raw.parse().ok()?;
     // Capped, so a provider sending a bogus large value cannot park an account indefinitely.
@@ -3127,6 +3322,7 @@ fn dialect_version(dialect: Dialect) -> Option<&'static str> {
         Dialect::Codex => None,
         Dialect::Copilot => None,
         Dialect::CommandCodeGo => None,
+        Dialect::ModalVllm => None,
     }
 }
 
@@ -3271,6 +3467,7 @@ fn default_path(dialect: Dialect, route: RouteKind) -> &'static str {
         Dialect::Codex => "/responses",
         Dialect::Copilot => "/chat/completions",
         Dialect::CommandCodeGo => "/alpha/generate",
+        Dialect::ModalVllm => "/v1/chat/completions",
     }
 }
 
@@ -3392,6 +3589,28 @@ fn apply_auth(headers: &mut HeaderMap, auth: &AuthKind, credential: Option<&str>
         return;
     };
 
+    if matches!(auth, AuthKind::Modal) {
+        let Some((key, token_secret)) = secret.split_once('.') else {
+            tracing::warn!(
+                "could not build a Modal auth header; the credential must be TokenId.TokenSecret"
+            );
+            return;
+        };
+        match (
+            HeaderValue::from_str(key),
+            HeaderValue::from_str(token_secret),
+        ) {
+            (Ok(key), Ok(token_secret)) => {
+                headers.insert("modal-key", key);
+                headers.insert("modal-secret", token_secret);
+            }
+            _ => tracing::warn!(
+                "could not build a Modal auth header; the credential contains invalid header bytes"
+            ),
+        }
+        return;
+    }
+
     let (name, value) = match auth {
         AuthKind::Bearer => ("authorization".to_owned(), format!("Bearer {secret}")),
         AuthKind::ApiKeyHeader { header } => (header.to_ascii_lowercase(), secret.to_owned()),
@@ -3403,6 +3622,7 @@ fn apply_auth(headers: &mut HeaderMap, auth: &AuthKind, credential: Option<&str>
             };
             (name.to_ascii_lowercase(), value)
         }
+        AuthKind::Modal => unreachable!("modal auth is handled above"),
         AuthKind::QueryParam { .. } => {
             tracing::warn!(
                 "query-parameter authentication is not applied; the credential will be missing"
@@ -3828,7 +4048,7 @@ fn build_response(
 }
 
 /// A JSON response.
-fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
+pub(crate) fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
     let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
     let mut response = Response::new(AxumBody::from(bytes));
     *response.status_mut() = status;
@@ -3842,7 +4062,12 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
 ///
 /// The two envelopes genuinely differ. A client debugging a `/v1/messages` failure must not be handed
 /// OpenAI's fields — answering in the dialect you were asked in is the entire point of a shim.
-fn error_response(status: StatusCode, dialect: Dialect, code: &str, message: &str) -> Response {
+pub(crate) fn error_response(
+    status: StatusCode,
+    dialect: Dialect,
+    code: &str,
+    message: &str,
+) -> Response {
     let body = match dialect {
         Dialect::Anthropic => serde_json::json!({
             "type": "error",
@@ -3952,6 +4177,211 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => tracing::info!("interrupt received; draining"),
         _ = terminate => tracing::info!("termination requested; draining"),
+    }
+}
+
+// --- The batch lane's executor --------------------------------------------------------------
+
+/// The relay's implementation of [`crate::batch::ItemExecutor`]: where a batch item goes, and how
+/// it is dispatched.
+///
+/// The lane owns *when* an item runs and what it costs; this owns *where* it goes. The split is what
+/// makes the lane's scheduler testable without an HTTP server, and it is also why the two halves are
+/// allowed to be in different modules: the lane must never import the request path, or the seam that
+/// lets it admit an item before dispatch (and therefore refuse to start work it cannot run) would
+/// disappear.
+///
+/// `app` is installed after the state is built, because the state owns the lane and the lane owns
+/// this executor: constructing one of them first and the other second is unavoidable, and a
+/// [`OnceLock`] says so without an `Option` that every caller has to unwrap.
+#[derive(Clone, Default)]
+pub struct ServerBatchExecutor {
+    app: Arc<OnceLock<AppState>>,
+}
+
+impl ServerBatchExecutor {
+    /// Attach the shared state. Called once, after `build_state` has assembled it.
+    pub fn install(&self, app: AppState) {
+        // A second install is a startup bug, not a runtime condition: the only writer is
+        // `build_state`, and the lane cannot be running before the state exists. Ignoring it keeps
+        // the failure visible in the logs without taking the process down.
+        if self.app.set(app).is_err() {
+            tracing::error!("the batch executor was installed twice; the first state is kept");
+        }
+    }
+
+    /// The shared state, or `None` before startup finished.
+    fn app(&self) -> Option<&AppState> {
+        self.app.get()
+    }
+}
+
+impl crate::batch::ItemExecutor for ServerBatchExecutor {
+    fn plan(&self, body: &[u8]) -> Option<crate::batch::ItemPlan> {
+        let app = self.app()?;
+        let head = scan_request_head(body);
+        let model_name = head.model_str(body)?;
+        let table = Arc::clone(&*app.relay.table());
+        let step = match table.snapshot.resolve(model_name) {
+            // A combo, an alias chain, or a name that resolves to nothing: there is no single
+            // endpoint to reserve against, so the item is dispatched like any other request and the
+            // lane claims no cost for it. Guessing a provider here would bill the wrong card.
+            Resolution::Direct { step, .. } => step,
+            _ => return None,
+        };
+        let provider = table
+            .snapshot
+            .providers()
+            .get(step.provider_index as usize)?;
+
+        // The admission condition is copied from the request path on purpose. If this returned a
+        // plan for a provider the request path would not admit — and the request path's own
+        // reservation is skipped for the provider named here — then the item would run with no
+        // reservation at all, which is exactly the over-subscription the pool exists to prevent.
+        // The reverse mistake is cheaper but still a mistake: reserving where the request path does
+        // not would write GPU-second ledger rows for an endpoint the operator did not enable
+        // billing for.
+        let admits = provider.kv_pool_tokens.is_some()
+            || provider.max_concurrent.is_some()
+            || (step.dialect == Dialect::ModalVllm && provider.price_per_second.is_some());
+        if !admits {
+            return None;
+        }
+
+        Some(crate::batch::ItemPlan {
+            provider_id: step.provider_id.as_str().to_owned(),
+            model: step.model.clone(),
+            tokens: crate::quota::estimate_prompt_tokens(body.len()).tokens,
+            limits: crate::kv_budget::KvBudgetLimits {
+                pool_tokens: provider.kv_pool_tokens,
+                max_context: step.context_length.map(u64::from).or(provider.max_context),
+                max_concurrent: provider.max_concurrent,
+            },
+            price_per_second: provider.price_per_second,
+        })
+    }
+
+    fn store(&self) -> Option<Arc<mr_core::store::Store>> {
+        // The same store the request path bills against, so a batch's GPU-second rows and an
+        // interactive request's rows land in one table and one `gpu_usage_totals` answers for both.
+        self.app().map(|app| Arc::clone(&app.quota_store))
+    }
+
+    fn execute<'a>(&'a self, request: crate::batch::ItemRequest) -> crate::batch::ItemFuture<'a> {
+        Box::pin(async move {
+            let Some(app) = self.app().cloned() else {
+                return crate::batch::ItemReply {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    headers: HeaderMap::new(),
+                    body: Bytes::from_static(
+                        br#"{"error":{"message":"the batch lane is not wired to a relay","type":"internal_error","code":"internal_error"}}"#,
+                    ),
+                    cold_starts: 0,
+                };
+            };
+
+            // Cold starts are counted by observation, not by asking: the relay records a cold start
+            // as a cooldown with `CooldownReason::ColdStart` on the model's cooldown scope, and the
+            // only way to know one happened during *this* item is to see an entry appear (or change
+            // to cold-start) between the two snapshots. Counting them as errors would be wrong;
+            // counting them as nothing would hide the fixed fee the batch paid.
+            // The health map is shared, so a clone of the handle is all the observation needs: the
+            // dispatch may consume its own clone, and this one still sees what the dispatch recorded.
+            let health = Arc::clone(&app.health);
+            let before = health.snapshot();
+            let response =
+                dispatch_batch_item(app, request.uri, request.body, request.pre_admitted).await;
+            let after = health.snapshot();
+            let cold_starts = after
+                .iter()
+                .filter(|(key, cooldown)| {
+                    cooldown.reason == select::CooldownReason::ColdStart
+                        && before
+                            .get(*key)
+                            .is_none_or(|prior| prior.reason != select::CooldownReason::ColdStart)
+                })
+                .count() as u32;
+
+            let status = response.status();
+            let headers = response.headers().clone();
+            // A batch item is never a stream, so the whole answer is buffered here. The bound is the
+            // relay's own body limit: an upstream that answers a single item with more than that is
+            // a failure of the upstream, not something to hold in memory.
+            let body = match axum::body::to_bytes(response.into_body(), MAX_BODY_BYTES).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(error = %error, "a batch item's answer could not be read in full");
+                    return crate::batch::ItemReply {
+                        status: StatusCode::BAD_GATEWAY,
+                        headers,
+                        body: Bytes::from(
+                            serde_json::json!({
+                                "error": {
+                                    "message": format!("the answer to a batch item could not be read: {error}"),
+                                    "type": "upstream_error",
+                                }
+                            })
+                            .to_string(),
+                        ),
+                        cold_starts,
+                    };
+                }
+            };
+            crate::batch::ItemReply {
+                status,
+                headers,
+                body,
+                cold_starts,
+            }
+        })
+    }
+}
+
+/// Dispatch one batch item through the request path.
+///
+/// Deliberately **not** `router(app).oneshot(...)`: that would re-enter authentication, which has
+/// already happened once for the batch's client at upload time, and it would re-read a body this
+/// function already holds. What is reused is everything that matters — resolution, dialects, account
+/// selection, cooldowns, fallbacks, the KV-token reservation and the GPU-second ledger.
+///
+/// The key check is skipped (`pre_authorized`) because the items are pre-authorized: the client that
+/// uploaded the file proved its key then, and a key revoked between upload and execution should not
+/// leave a half-run batch. The consequence — per-item client-key metering is not re-applied to the
+/// individual items — is reported as a limitation of this lane rather than hidden.
+pub(crate) async fn dispatch_batch_item(
+    app: AppState,
+    uri: Uri,
+    body: Bytes,
+    pre_admitted: Option<String>,
+) -> Response {
+    dispatch_routed(
+        DispatchRequest {
+            app,
+            client_dialect: Dialect::OpenAi,
+            method: Method::POST,
+            uri,
+            headers: HeaderMap::new(),
+            body: AxumBody::from(body),
+            pre_authorized: true,
+            pre_admitted,
+        },
+        0,
+        None,
+    )
+    .await
+}
+
+/// Authenticate a batch-surface request, returning the refusal to send when it may not run.
+///
+/// The batch surface is OpenAI-shaped, so its refusals are too — including the shape of a 401, which
+/// is what a client that has the wrong key needs to see rather than a routing error.
+pub(crate) fn authorize_batch_request(app: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let presented = presented_key(headers);
+    let outcome = authenticate_request(&app.relay, app.no_key_required, presented.as_deref());
+    if outcome.is_allowed() {
+        None
+    } else {
+        Some(auth_error(&outcome, Dialect::OpenAi))
     }
 }
 
@@ -4210,6 +4640,7 @@ mod tests {
             reasoning_json: Default::default(),
             input_modalities: 1,
             pricing: None,
+            context_length: None,
         }
     }
 
@@ -4240,6 +4671,11 @@ mod tests {
             route_overrides: Default::default(),
             http2: Default::default(),
             prewarm: false,
+            kv_pool_tokens: None,
+            max_context: None,
+            max_concurrent: None,
+            price_per_second: None,
+            cold_start_ttfb_timeout_ms: None,
             steps: Vec::new(),
         }
     }
@@ -6023,6 +6459,22 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
     }
 
     #[test]
+    fn modal_auth_splits_token_id_and_secret_headers() {
+        let mut h = HeaderMap::new();
+        apply_auth(&mut h, &AuthKind::Modal, Some("wk-1234.ws-5678"));
+        assert_eq!(h.get("modal-key").unwrap(), "wk-1234");
+        assert_eq!(h.get("modal-secret").unwrap(), "ws-5678");
+        assert!(!h.contains_key("authorization"));
+    }
+
+    #[test]
+    fn malformed_modal_auth_is_never_sent_as_headers() {
+        let mut h = HeaderMap::new();
+        apply_auth(&mut h, &AuthKind::Modal, Some("wk-1234"));
+        assert!(h.is_empty());
+    }
+
+    #[test]
     fn query_param_auth_is_never_applied() {
         // A credential in a URL ends up in provider logs, intermediary logs and browser history.
         let mut h = HeaderMap::new();
@@ -6183,28 +6635,37 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         use select::CooldownReason;
         // The distinction that decides whether an account can recover on its own.
         assert_eq!(
-            classify_status(StatusCode::UNAUTHORIZED),
+            classify_status(StatusCode::UNAUTHORIZED, false),
             CooldownReason::AuthFailed
         );
         assert_eq!(
-            classify_status(StatusCode::FORBIDDEN),
+            classify_status(StatusCode::FORBIDDEN, false),
             CooldownReason::AuthFailed
         );
         assert_eq!(
-            classify_status(StatusCode::PAYMENT_REQUIRED),
+            classify_status(StatusCode::PAYMENT_REQUIRED, false),
             CooldownReason::QuotaExhausted
         );
         assert_eq!(
-            classify_status(StatusCode::TOO_MANY_REQUESTS),
+            classify_status(StatusCode::TOO_MANY_REQUESTS, false),
             CooldownReason::RateLimited
         );
         assert_eq!(
-            classify_status(StatusCode::BAD_GATEWAY),
+            classify_status(StatusCode::BAD_GATEWAY, false),
             CooldownReason::Backoff
         );
         assert_eq!(
-            classify_status(StatusCode::INTERNAL_SERVER_ERROR),
+            classify_status(StatusCode::INTERNAL_SERVER_ERROR, false),
             CooldownReason::Backoff
+        );
+        assert_eq!(
+            classify_status(StatusCode::SERVICE_UNAVAILABLE, false),
+            CooldownReason::Backoff,
+            "only the self-hosted Modal provider should classify its 503s as cold starts"
+        );
+        assert_eq!(
+            classify_status(StatusCode::SERVICE_UNAVAILABLE, true),
+            CooldownReason::ColdStart
         );
     }
 
@@ -6490,9 +6951,14 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             vault,
             oauth_refreshers: Arc::new(std::collections::HashMap::new()),
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
-            oauth_store: store,
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            // A lane with no disk state and no workers: these tests exercise the request path, and a
+            // lane that recovered the operator's real batches would be both slow and surprising.
+            batch: crate::batch::BatchLane::inert(),
         };
         (state, text_seen, vision_seen)
     }
@@ -6646,9 +7112,14 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             vault,
             oauth_refreshers: Arc::new(std::collections::HashMap::new()),
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
-            oauth_store: store,
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            // A lane with no disk state and no workers: these tests exercise the request path, and a
+            // lane that recovered the operator's real batches would be both slow and surprising.
+            batch: crate::batch::BatchLane::inert(),
         };
         (state, seen)
     }
@@ -6869,9 +7340,14 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             vault: Arc::new(opened),
             oauth_refreshers: Arc::new(std::collections::HashMap::new()),
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
-            oauth_store: store,
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            // A lane with no disk state and no workers: these tests exercise the request path, and a
+            // lane that recovered the operator's real batches would be both slow and surprising.
+            batch: crate::batch::BatchLane::inert(),
         };
         (state, upstream_seen)
     }
@@ -7043,6 +7519,270 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         (format!("http://{addr}"), seen)
     }
 
+    /// A fake upstream that answers every request with a fixed status and body.
+    ///
+    /// Unlike [`delayed_upstream`] the refusal is the point of the fixture, so the status and the
+    /// body are exactly what the test asserts reach the client.
+    async fn refusing_upstream(
+        status: StatusCode,
+        body: &'static str,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let app = Router::new().fallback(any(move |req_body: Bytes| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&req_body).to_string());
+                (
+                    status,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// A relay whose only route is a two-step combo, where the first step is `first_status` and
+    /// the second step always answers.
+    ///
+    /// This is the shape every combo has: a preferred step that is expected to work and a fallback
+    /// that exists for the day it does not. What the first step's *status* must not be able to do is
+    /// cancel the second.
+    async fn failover_state(
+        first_status: StatusCode,
+        first_body: &'static str,
+    ) -> (
+        AppState,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let (first_url, first_seen) = refusing_upstream(first_status, first_body).await;
+        let (second_url, second_seen) = fake_upstream().await;
+
+        let mut combo = mr_core::model::Combo::new(
+            "failover",
+            mr_core::model::ComboStep::new("first", "shared-model"),
+        );
+        combo
+            .steps
+            .push(mr_core::model::ComboStep::new("second", "shared-model"));
+
+        let config = mr_core::config::Config {
+            providers: vec![
+                provider_serving("first", &first_url, "shared-model", &[InputModality::Text]),
+                provider_serving("second", &second_url, "shared-model", &[InputModality::Text]),
+            ],
+            combos: vec![combo],
+            ..Default::default()
+        };
+
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let vault = Arc::new(opened);
+
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+        (state, first_seen, second_seen)
+    }
+
+    /// A request naming the failover combo.
+    fn failover_body() -> String {
+        serde_json::json!({
+            "model": "failover",
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        .to_string()
+    }
+
+    /// A 4xx from one step must advance the combo, not end the request.
+    ///
+    /// Providers reject a request for reasons that say nothing about the *other* steps: a dialect a
+    /// given endpoint does not implement, a model it has retired, a path it has moved. The combo is
+    /// the operator's answer to exactly that, so a refusal at the first step has to fall through to
+    /// the second. When this branch was `Attempt::Fatal` the request died at the first `400`/`404`
+    /// and the client saw an upstream it had never asked for — reported, correctly but uselessly, as
+    /// "the relay refused the test".
+    #[tokio::test]
+    async fn a_client_error_from_one_step_falls_through_to_the_next() {
+        let (state, first_seen, second_seen) = failover_state(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"upstream rejected this request body"}}"#,
+        )
+        .await;
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(failover_body()),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a 4xx from the first step ended the combo instead of falling through"
+        );
+        assert_eq!(first_seen.lock().unwrap().len(), 1, "the first step runs");
+        assert_eq!(
+            second_seen.lock().unwrap().len(),
+            1,
+            "the fallback step was never reached"
+        );
+    }
+
+    /// A `404` is the same class as a `400`: a statement about the request, not about the account.
+    ///
+    /// Asserted separately because `404` is what a placeholder left unsubstituted in a base URL
+    /// produces — a literal `{account_id}` in the path — and the operator's report of a provider
+    /// "refusing the test" was this status all the way down.
+    #[tokio::test]
+    async fn a_not_found_from_one_step_also_falls_through_to_the_next() {
+        let (state, first_seen, second_seen) = failover_state(
+            StatusCode::NOT_FOUND,
+            r#"{"errors":[{"code":7003,"message":"Could not route to an invalid object identifier"}]}"#,
+        )
+        .await;
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(failover_body()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(first_seen.lock().unwrap().len(), 1);
+        assert_eq!(second_seen.lock().unwrap().len(), 1);
+    }
+
+    /// When every step refuses with a 4xx, the client sees the provider's own words.
+    ///
+    /// The failover must not turn a specific upstream explanation into a generic one: the body the
+    /// upstream sent is the only thing that tells the operator *which* of the request's fields it
+    /// disliked, and synthesizing a replacement here would throw that away at the last moment.
+    #[tokio::test]
+    async fn a_refusal_from_every_step_reports_the_upstreams_own_message() {
+        let (first_url, _first_seen) = refusing_upstream(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"the first upstream refused for its own reason"}}"#,
+        )
+        .await;
+        let (second_url, _second_seen) = refusing_upstream(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            r#"{"error":{"message":"the second upstream refused for a different reason"}}"#,
+        )
+        .await;
+
+        let mut combo = mr_core::model::Combo::new(
+            "allfail",
+            mr_core::model::ComboStep::new("first", "shared-model"),
+        );
+        combo
+            .steps
+            .push(mr_core::model::ComboStep::new("second", "shared-model"));
+
+        let config = mr_core::config::Config {
+            providers: vec![
+                provider_serving("first", &first_url, "shared-model", &[InputModality::Text]),
+                provider_serving("second", &second_url, "shared-model", &[InputModality::Text]),
+            ],
+            combos: vec![combo],
+            ..Default::default()
+        };
+
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = mr_core::secret::Vault::open(dir.path()).unwrap();
+        opened.put("test-credential", "sk-not-a-real-key").unwrap();
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault: Arc::new(opened),
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+
+        let response = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            headers(&[]),
+            AxumBody::from(
+                serde_json::json!({
+                    "model": "allfail",
+                    "messages": [{"role": "user", "content": "hello"}],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !status.is_success(),
+            "every step refused, so the request cannot have succeeded: {text}"
+        );
+        // The *last* step's message is the one the sequential chain reports, on the same rule it
+        // uses for every other failure kind.
+        assert!(
+            text.contains("the second upstream refused for a different reason"),
+            "the upstream's own explanation was replaced by a synthesized one: {text}"
+        );
+    }
+
     /// What the race fixture should look like.
     struct RaceSpec {
         /// How long the first (higher-priority) participant takes.
@@ -7128,9 +7868,14 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             vault,
             oauth_refreshers: Arc::new(std::collections::HashMap::new()),
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
-            oauth_store: store,
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            // A lane with no disk state and no workers: these tests exercise the request path, and a
+            // lane that recovered the operator's real batches would be both slow and surprising.
+            batch: crate::batch::BatchLane::inert(),
         };
         (state, first_seen, second_seen)
     }
@@ -7271,9 +8016,14 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             vault: Arc::new(vault),
             oauth_refreshers: Arc::new(std::collections::HashMap::new()),
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
-            oauth_store: store,
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            // A lane with no disk state and no workers: these tests exercise the request path, and a
+            // lane that recovered the operator's real batches would be both slow and surprising.
+            batch: crate::batch::BatchLane::inert(),
         };
 
         // Two requests, each baking its own nonce into the prompt, dispatched together.
@@ -7482,9 +8232,14 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             vault: Arc::new(vault),
             oauth_refreshers: Arc::new(std::collections::HashMap::new()),
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
-            oauth_store: store,
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            // A lane with no disk state and no workers: these tests exercise the request path, and a
+            // lane that recovered the operator's real batches would be both slow and surprising.
+            batch: crate::batch::BatchLane::inert(),
         };
 
         // Deliberately *not* streaming: this is the path that folded the answer into nothing.
@@ -7586,8 +8341,13 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             oauth_refreshers: Arc::new(std::collections::HashMap::new()),
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
             oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            // A lane with no disk state and no workers: these tests exercise the request path, and a
+            // lane that recovered the operator's real batches would be both slow and surprising.
+            batch: crate::batch::BatchLane::inert(),
         };
 
         let response = dispatch(
@@ -7711,8 +8471,13 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             oauth_refreshers: Arc::new(std::collections::HashMap::new()),
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
             oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            // A lane with no disk state and no workers: these tests exercise the request path, and a
+            // lane that recovered the operator's real batches would be both slow and surprising.
+            batch: crate::batch::BatchLane::inert(),
         };
 
         let response = dispatch(
@@ -7935,9 +8700,14 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             vault,
             oauth_refreshers: Arc::new(std::collections::HashMap::new()),
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
-            oauth_store: store,
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            // A lane with no disk state and no workers: these tests exercise the request path, and a
+            // lane that recovered the operator's real batches would be both slow and surprising.
+            batch: crate::batch::BatchLane::inert(),
         }
     }
 
@@ -8368,9 +9138,14 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             vault,
             oauth_refreshers: Arc::new(std::collections::HashMap::new()),
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
-            oauth_store: store,
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            // A lane with no disk state and no workers: these tests exercise the request path, and a
+            // lane that recovered the operator's real batches would be both slow and surprising.
+            batch: crate::batch::BatchLane::inert(),
         };
         (state, winner_seen)
     }
@@ -8789,9 +9564,14 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             vault,
             oauth_refreshers: Arc::new(std::collections::HashMap::new()),
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
-            oauth_store: store,
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            // A lane with no disk state and no workers: these tests exercise the request path, and a
+            // lane that recovered the operator's real batches would be both slow and surprising.
+            batch: crate::batch::BatchLane::inert(),
         };
         (state, seen, dir)
     }
@@ -9076,9 +9856,14 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             vault,
             oauth_refreshers: Arc::new(std::collections::HashMap::new()),
             quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
-            oauth_store: store,
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
             sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
             activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            // A lane with no disk state and no workers: these tests exercise the request path, and a
+            // lane that recovered the operator's real batches would be both slow and surprising.
+            batch: crate::batch::BatchLane::inert(),
         };
         (state, seen)
     }

@@ -42,6 +42,10 @@ pub enum CooldownReason {
     Backoff,
     /// The client's request is malformed (400, 404, 422…). No cooldown — the account is fine.
     InvalidRequest,
+    /// A self-hosted backend is cold and starting up. Uses distinct backoff state.
+    ColdStart,
+    /// Local capacity for the target endpoint is exhausted.
+    KvBudgetExceeded,
 }
 
 impl CooldownReason {
@@ -61,6 +65,8 @@ impl CooldownReason {
             Self::AuthFailed => "auth-failed",
             Self::Backoff => "backoff",
             Self::InvalidRequest => "invalid-request",
+            Self::ColdStart => "cold-start",
+            Self::KvBudgetExceeded => "kv-budget-exceeded",
         }
     }
 }
@@ -827,9 +833,11 @@ pub fn cooldown_until(
     let base = match reason {
         CooldownReason::AuthFailed => config.auth_failure_cooldown_secs.saturating_mul(1000),
         CooldownReason::InvalidRequest => 0,
-        CooldownReason::RateLimited | CooldownReason::QuotaExhausted | CooldownReason::Backoff => {
-            config.default_cooldown_secs.saturating_mul(1000)
-        }
+        CooldownReason::RateLimited
+        | CooldownReason::QuotaExhausted
+        | CooldownReason::Backoff
+        | CooldownReason::ColdStart
+        | CooldownReason::KvBudgetExceeded => config.default_cooldown_secs.saturating_mul(1000),
     };
 
     // A provider's own `retry-after` is knowledge and outranks the configured guess.
@@ -886,6 +894,11 @@ mod tests {
             route_overrides: Default::default(),
             http2: Default::default(),
             prewarm: false,
+            kv_pool_tokens: None,
+            max_context: None,
+            max_concurrent: None,
+            price_per_second: None,
+            cold_start_ttfb_timeout_ms: None,
             steps: Vec::new(),
         }
     }
@@ -908,6 +921,7 @@ mod tests {
             reasoning_json: Default::default(),
             input_modalities: 1,
             pricing: None,
+            context_length: None,
         }
     }
 
