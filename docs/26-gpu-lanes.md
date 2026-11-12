@@ -283,8 +283,10 @@ which opens a form holding exactly the fields that route takes (§10). The submi
 and is cleared only after the attach succeeds, so a failed attach does not make the operator retype
 a secret. The reply is quoted: when the lane reports `remembered: false` the form stays open and
 says the credential is for this process only, because a repaint would discard the one sentence the
-operator must not miss (§12). Kaggle has no form because it has no attach route — it runs through
-the `kaggle` CLI on the host — and the card says that instead. Deploy, run and down still exist only
+operator must not miss (§12). A successful attach closes the form and re-reads the card, and its
+confirmation is held on the view rather than in the form, so the repaint cannot erase the sentence
+that says the credential was kept. Kaggle has no form because it has no attach route — it runs
+through the `kaggle` CLI on the host — and the card says that instead. Deploy, run and down still exist only
 as routes; their cards name the route and fields rather than pretending a button exists.
 
 Saturn's budget is printed only from what the lane reported. An unrecorded ledger shows as

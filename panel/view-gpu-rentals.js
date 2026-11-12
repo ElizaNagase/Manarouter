@@ -512,6 +512,10 @@ async function renderInventory(mount, ctx) {
     cerebriumResult: null,
     cerebriumError: null,
     laneStatuses: null,
+    // One line per platform recording what the last attach answered. It lives on the view rather
+    // than in the form because a successful attach repaints the card, and a sentence that vanished
+    // with the form would leave the operator guessing whether the vault kept the credential.
+    laneNotices: {},
     planBusy: false,
     planResult: null,
   };
@@ -829,6 +833,8 @@ async function renderInventory(mount, ctx) {
       parts.push(h('div', { class: 'gpu-lane-status' }, chip(ready.text, ready.cls)));
       if (detail) parts.push(h('p', { class: 'hint' }, detail));
       if (note) parts.push(h('p', { class: 'hint' }, note));
+      const notice = asString(view.laneNotices[platform]).trim();
+      if (notice) parts.push(h('p', { class: 'hint' }, notice));
 
       // Warnings as plain list (advisory, not errors)
       if (warnings.length) {
@@ -994,6 +1000,7 @@ function laneAttachForm(platform) {
       return;
     }
     setDisabled(submit, true);
+    view.laneNotices[platform] = '';
     note.textContent = 'Attaching…';
     try {
       const result = await api.post(`/api/gpu/lanes/${platform}/attach`, body);
@@ -1007,7 +1014,7 @@ function laneAttachForm(platform) {
         return;
       }
       for (const input of inputs.values()) input.value = '';
-      note.textContent = 'Attached and kept in the vault.';
+      view.laneNotices[platform] = `Attached ${body.account} and kept it in the encrypted vault.`;
       await refreshSingleLane(platform);
     } catch (err) {
       note.textContent = asString(pick(err, 'message')).trim() || 'The attach request failed.';

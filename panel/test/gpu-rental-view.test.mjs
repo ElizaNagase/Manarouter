@@ -1243,3 +1243,44 @@ test('a lane account can be attached from its card, and a vault refusal is not s
     api.post = originalPost;
   }
 });
+
+test('a successful attach says the vault kept the credential, and the card repaint does not erase it', async () => {
+  const handlers = standardHandlers();
+  handlers['/api/gpu/lanes/molab/status'] = {
+    lane: 'molab',
+    warm_lanes: 0,
+    detail: '0 warm lanes, start one',
+    accounts: [],
+  };
+  const { mount, posts } = await mountView({ handlers });
+  // The attach repaints the card, and mountView has already restored the stubs, so both verbs have
+  // to outlive the render for this interaction test.
+  const originalPost = api.post;
+  const originalGet = api.get;
+  api.get = async (path) => handlers[path] ?? Promise.reject(new Error(`test did not expect GET ${path}`));
+  api.post = async (path, body) => {
+    posts.push({ path, body });
+    return { status: 'ok', remembered: true };
+  };
+  try {
+    fire(findButton(mount, 'Attach account'), 'click');
+    const form = mount.querySelector('.gpu-attach');
+    for (const [name, value] of [['account', 'molab-b'], ['url', 'https://molab.example/'], ['token', 's3cret']]) {
+      form.querySelector(`[data-lane-field="${name}"]`).value = value;
+    }
+    fire(findButton(form, 'Attach'), 'click');
+    await new Promise((resolve) => realSetTimeout(resolve, 10));
+
+    assert.deepEqual(posts, [{
+      path: '/api/gpu/lanes/molab/attach',
+      body: { account: 'molab-b', url: 'https://molab.example/', token: 's3cret' },
+    }]);
+    assert.match(textOf(mount), /Attached molab-b and kept it in the encrypted vault\./,
+      'the confirmation survives the repaint, because the form that held it does not');
+    assert.equal(mount.querySelector('.gpu-attach'), null,
+      'a successful attach closes the form and re-reads the card');
+  } finally {
+    api.post = originalPost;
+    api.get = originalGet;
+  }
+});
