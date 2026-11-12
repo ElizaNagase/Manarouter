@@ -320,8 +320,7 @@ account decides.
   probes before registering, so a redirect or a non-JSON answer is refused rather than stored. The
   URL must be the notebook's own endpoint: molab's terms forbid proxying its compute, so the lane
   builds no tunnel.
-* **#12 Saturn Cloud** — five routes: `status`, `attach`, `deploy`-equivalent `attach`, `budget`,
-  `probe`, `down`. Attach takes `{account, host, token}` and expects the operator's SSH tunnel on
+* **#12 Saturn Cloud** — five routes: `status`, `attach`, `budget`, `probe`, `down`. Attach takes `{account, host, token}` and expects the operator's SSH tunnel on
   `127.0.0.1:8000`; the lane never opens one. `budget {"used_secs": N}` records self-reported usage
   against the 150-hour free allowance and is enforced as a refusal when it is exceeded; `null`
   clears the record rather than implying a full allowance.

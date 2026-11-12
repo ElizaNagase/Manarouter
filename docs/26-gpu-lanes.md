@@ -390,6 +390,26 @@ finding is policy, and the lane does not enforce it.
 routes say so in their own words (`detail`, `note`, `notes`), and the panel now prints those words
 instead of reducing every lane to a chip.
 
+## 11. The end-to-end sweep
+
+`scripts/gpu-lanes-e2e.py` asks every lane for its status, reads the account list each lane holds,
+probes Saturn and Cerebrium per account when a probe route exists, and reads the GPU catalogue and
+the deployment list. It exits non-zero unless every lane is ready and every probe that ran
+succeeded, so it can be used as the acceptance check for "all GPU platforms work":
+
+```bash
+scripts/gpu-lanes-e2e.py                 # human-readable table
+scripts/gpu-lanes-e2e.py --json          # machine-readable summary
+scripts/gpu-lanes-e2e.py --no-probe      # status only, no platform calls
+scripts/gpu-lanes-e2e.py --base-url http://127.0.0.1:20998   # a test conductor
+```
+
+`MANAROUTER_ADMIN` sets the base URL when `--base-url` is absent. The sweep starts nothing and spends
+nothing. Kaggle is the exception it cannot cover: it is batch-only, so proving it means submitting a
+kernel, which consumes the operator's weekly GPU allowance and posts a notebook to their account.
+That stays a deliberate manual step. A green Saturn or Cerebrium probe means the control plane
+answered; only a real completion proves inference, which is what `POST …/probe` says in its own note.
+
 ---
 
 ## See also
