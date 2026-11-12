@@ -349,11 +349,23 @@ pub struct ApiError {
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
+/// The conductor's one error envelope: `{"error": {"code", "message", "details"}}`.
+///
+/// `panel/api.js` reads `payload.error.code` and `payload.error.message`. When `error` is a bare
+/// string those reads yield `undefined`, the code degrades to `http-<status>`, and the operator is
+/// shown "Request failed (502)." with the reason discarded — a real fault rendered invisible.
+///
+/// Every error path in the conductor builds its body here rather than with an ad-hoc `json!({...})`,
+/// so the shape cannot drift one module at a time. `details` is a list of machine-readable entries;
+/// a caller with nothing structured to add passes `Vec::new()`.
+pub(crate) fn error_body(code: &str, message: impl Into<String>, details: Vec<Value>) -> Value {
+    let message = message.into();
+    json!({ "error": { "code": code, "message": message, "details": details } })
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = json!({
-            "error": { "code": self.code, "message": self.message, "details": self.details },
-        });
+        let body = error_body(&self.code, self.message, self.details);
         (self.status, Json(body)).into_response()
     }
 }

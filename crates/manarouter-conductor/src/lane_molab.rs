@@ -75,6 +75,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::api::error_body;
 use crate::state::AppState;
 use tracing::{error, info, warn};
 
@@ -306,9 +307,11 @@ async fn attach_for(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": format!("Failed to initialize HTTP client: {}", e),
-                })),
+                Json(error_body(
+                    "http_client_unavailable",
+                    format!("the HTTP client could not be built: {e}"),
+                    Vec::new(),
+                )),
             );
         }
     };
@@ -324,9 +327,11 @@ async fn attach_for(
             let host = url.split(':').next().unwrap_or("<host>");
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!("Failed to connect to endpoint {}: {}", host, e),
-                })),
+                Json(error_body(
+                    "host_unreachable",
+                    format!("the endpoint {host} refused the connection: {e}"),
+                    Vec::new(),
+                )),
             );
         }
     };
@@ -335,19 +340,22 @@ async fn attach_for(
     if (300..400).contains(&response.status) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": format!(
-                    "Redirect ({}) from {} — redirects are not followed. \
-                     The tunnel may have expired or the URL is stale.",
-                    response.status,
-                    url,
-                )
-            })),
+            Json(error_body(
+                "redirect_not_followed",
+                format!(
+                    "the endpoint answered {} — redirects are not followed, so the tunnel may \
+                     have expired or the URL may be stale",
+                    response.status
+                ),
+                vec![json!({ "url": url })],
+            )),
         );
     }
 
     if response.is_success() {
-        let account_key = format!("{}:{}", url, token);
+        // Keyed by account, not by `url:token`: a bearer token in a map key is one stray `{:?}`
+        // log away from disclosure, and the account label is already unique per lane.
+        let account_key = account_label.clone();
         let now = Millis::now();
         let registration = Registration {
             account: account_label.clone(),
@@ -372,9 +380,13 @@ async fn attach_for(
         let body = response.body_str();
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": format!("Endpoint verification failed: {}", body),
-            })),
+            Json(error_body(
+                "endpoint_rejected",
+                "the endpoint answered, but not with a model list this lane can use",
+                // The body is echoed back truncated: it is usually a proxy's HTML error page, and
+                // reproducing a megabyte of it in a toast helps nobody.
+                vec![json!({ "body": body.chars().take(512).collect::<String>() })],
+            )),
         )
     }
 }
@@ -413,9 +425,11 @@ async fn down_for(
     } else {
         (
             StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": format!("Account '{}' not found", account_label),
-            })),
+            Json(error_body(
+                "account_not_registered",
+                format!("no molab lane is registered for the account {account_label:?}"),
+                Vec::new(),
+            )),
         )
     }
 }

@@ -62,6 +62,7 @@ use tokio::process::Command;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::api::error_body;
 use crate::state::AppState;
 use mr_core::lane::kaggle::{FACTS, NOTEBOOK_DOCS, GPU_QUOTA_DOCS, TERMS};
 
@@ -156,6 +157,8 @@ impl KaggleState {
 enum KaggleError {
     CliAbsent,
     DeadlineExceeded,
+    /// A run id this process does not know about.
+    NotFound(String),
     KaggleApi(String),
     Internal(String),
 }
@@ -165,6 +168,7 @@ impl std::fmt::Display for KaggleError {
         match self {
             KaggleError::CliAbsent => write!(f, "kaggle CLI is not available on PATH"),
             KaggleError::DeadlineExceeded => write!(f, "Kaggle session deadline exceeded"),
+            KaggleError::NotFound(msg) => write!(f, "{msg}"),
             KaggleError::KaggleApi(msg) => write!(f, "kaggle API error: {msg}"),
             KaggleError::Internal(msg) => write!(f, "internal error: {msg}"),
         }
@@ -176,10 +180,13 @@ impl IntoResponse for KaggleError {
         let (status, code, message) = match &self {
             KaggleError::CliAbsent => (StatusCode::SERVICE_UNAVAILABLE, "kaggle_cli_absent", "kaggle CLI is not available on PATH"),
             KaggleError::DeadlineExceeded => (StatusCode::GATEWAY_TIMEOUT, "kaggle_deadline_exceeded", "Kaggle session deadline exceeded"),
+            // A run this process never registered is the caller's mistake, not an upstream fault.
+            // Answering 502 for it said "Kaggle broke", which is a different and wrong statement.
+            KaggleError::NotFound(msg) => (StatusCode::NOT_FOUND, "run_not_found", msg.as_str()),
             KaggleError::KaggleApi(msg) => (StatusCode::BAD_GATEWAY, "kaggle_api_error", msg.as_str()),
             KaggleError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", msg.as_str()),
         };
-        (status, Json(json!({ "error": code, "message": message }))).into_response()
+        (status, Json(error_body(code, message, Vec::new()))).into_response()
     }
 }
 
@@ -372,23 +379,27 @@ async fn run_kaggle(
     if deadline_secs > MAX_DEADLINE_SECS {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "deadline_exceeds_cap",
-                "message": format!(
+            Json(error_body(
+                "deadline_exceeds_cap",
+                format!(
                     "deadline_secs ({}) exceeds Kaggle's 12 h session cap (43200 s); we refuse to submit rather than silently clamp",
                     deadline_secs
                 ),
-                "max_allowed": MAX_DEADLINE_SECS,
-            })),
+                vec![json!({ "max_allowed": MAX_DEADLINE_SECS })],
+            )),
         ));
     }
 
     // Check kaggle CLI.
     if let Err(KaggleError::CliAbsent) = check_kaggle_cli().await {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({
-            "error": "kaggle_cli_absent",
-            "message": "kaggle CLI is not available on PATH; cannot submit",
-        }))));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(error_body(
+                "kaggle_cli_absent",
+                "kaggle CLI is not available on PATH; cannot submit",
+                Vec::new(),
+            )),
+        ));
     }
 
     let run_id = Uuid::new_v4().to_string();
@@ -398,7 +409,7 @@ async fn run_kaggle(
     if let Err(e) = fs::create_dir_all(&run_dir) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "internal_error", "message": format!("create run dir: {e}") })),
+            Json(error_body("internal_error", format!("create run dir: {e}"), Vec::new())),
         ));
     }
 
@@ -409,7 +420,7 @@ async fn run_kaggle(
             cleanup_run_dir(&run_dir);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "internal_error", "message": format!("create kaggle config: {e:?}") })),
+                Json(error_body("internal_error", format!("create kaggle config: {e:?}"), Vec::new())),
             ));
         }
     };
@@ -420,7 +431,7 @@ async fn run_kaggle(
         cleanup_run_dir(&run_dir);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "internal_error", "message": format!("write metadata: {e}") })),
+            Json(error_body("internal_error", format!("write metadata: {e}"), Vec::new())),
         ));
     }
 
@@ -430,7 +441,7 @@ async fn run_kaggle(
         cleanup_run_dir(&run_dir);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "internal_error", "message": format!("write script: {e}") })),
+            Json(error_body("internal_error", format!("write script: {e}"), Vec::new())),
         ));
     }
 
@@ -447,7 +458,7 @@ async fn run_kaggle(
             cleanup_run_dir(&run_dir);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "internal_error", "message": format!("kaggle push: {e}") })),
+                Json(error_body("internal_error", format!("kaggle push: {e}"), Vec::new())),
             ));
         }
     };
@@ -492,12 +503,20 @@ async fn run_kaggle(
     if !push_out.status.success() {
         return Err((
             StatusCode::BAD_GATEWAY,
-            Json(json!({
-                "run_id": run_id,
-                "state": "failed",
-                "error": "kaggle_push_failed",
-                "details": status_text.to_string(),
-            })),
+            Json({
+                // The run *was* registered, so the caller still needs its id and its state; only
+                // the reason moves into the standard envelope.
+                let mut body = error_body(
+                    "kaggle_push_failed",
+                    "the kernel was not accepted by the Kaggle CLI",
+                    vec![json!({ "stderr": status_text.to_string() })],
+                );
+                if let Some(object) = body.as_object_mut() {
+                    object.insert("run_id".into(), json!(run_id));
+                    object.insert("state".into(), json!("failed"));
+                }
+                body
+            }),
         ));
     }
 
@@ -519,7 +538,7 @@ async fn get_run_status(
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, KaggleError> {
     let run = app_state.kaggle.registry.get(&run_id).await.ok_or_else(|| {
-        KaggleError::KaggleApi(format!("run {run_id} not found"))
+        KaggleError::NotFound(format!("run {run_id} not found"))
     })?;
 
     let run_dir = &run.result_path;
@@ -561,12 +580,27 @@ async fn get_run_status(
     let status_text = String::from_utf8_lossy(&status_out.stdout);
     let stderr_text = String::from_utf8_lossy(&status_out.stderr);
 
-    // Determine state from status output.
-    let new_state = if status_text.contains("complete") {
+    // A rejected `kaggle kernels status` used to be read from stdout like any other answer. When
+    // the CLI fails, stdout is empty, nothing matched below, and the run was reported as
+    // "submitted" for as long as the deadline allowed — a dead run that looked alive. Say so
+    // instead: the run stays registered, so the caller can fix the cause and poll again.
+    if !status_out.status.success() {
+        return Err(KaggleError::KaggleApi(format!(
+            "`kaggle kernels status` exited {}: {}",
+            status_out.status,
+            stderr_text.trim()
+        )));
+    }
+
+    // Kaggle prints `KernelWorkerStatus.COMPLETE` — upper case. Matching the raw text for
+    // "complete" therefore never fired, and every finished run stalled at Submitted. Compare
+    // case-insensitively so both the real CLI and a lower-case fake are read correctly.
+    let status_lower = status_text.to_lowercase();
+    let new_state = if status_lower.contains("complete") {
         RunStateEnum::Complete
-    } else if status_text.contains("error") || status_text.contains("failed") {
+    } else if status_lower.contains("error") || status_lower.contains("failed") {
         RunStateEnum::Failed
-    } else if status_text.contains("running") {
+    } else if status_lower.contains("running") {
         RunStateEnum::Running
     } else {
         RunStateEnum::Submitted
@@ -605,6 +639,13 @@ async fn get_run_status(
     Ok(Json(json!({
         "run_id": run.run_id,
         "state": serde_json::to_value(&new_state).unwrap_or(json!("unknown")),
+        // Which account and accelerator a run is on is the first thing an operator asks when it
+        // is slow or fails; both were recorded at submission and then never reported.
+        "account": run.account,
+        "accelerator": run.accelerator,
+        "items": run.items.len(),
+        "deadline_secs": run.deadline_secs,
+        "submitted_at": run.submitted_at,
         "results": result,
         "detail": if !stderr_text.is_empty() { Some(stderr_text.to_string()) } else { None },
     })))
