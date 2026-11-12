@@ -226,7 +226,7 @@ and no clock**, so every number is checkable in a unit test with no network and 
 **What has actually been exercised.** `cargo test -p mr-core gpu::cerebrium` is green — 20 passed.
 `node --test panel/test/gpu-setup-model.test.mjs` is green — 116 passed. The workspace lib suite
 is green — 1 696 passed, 0 failed (`cargo test --workspace --lib`) — the panel suite is green
-(334 tests, `node --test panel/test/*.test.mjs`), and — the part that matters most — a second
+(335 tests, `node --test panel/test/*.test.mjs`), and — the part that matters most — a second
 conductor built from this tree was driven over a socket on `127.0.0.1:20999` with its own config and
 state directories, through the real sequence: catalog → probe → create account → create deployment →
 read the rental back. Live captures of four of those responses are committed under
