@@ -86,9 +86,21 @@ def readiness(lane: str, status: dict) -> tuple[bool, str]:
     if lane == "saturn":
         accounts = status.get("accounts") or []
         plan = status.get("plan") or {}
-        if accounts and plan.get("usable"):
-            return True, f"{len(accounts)} account(s), the plan is usable"
+        healthy = [a for a in accounts if isinstance(a, dict) and (a.get("health") == "healthy" or a.get("warm"))]
+        if healthy and plan.get("usable"):
+            return True, f"{len(healthy)} healthy account(s), the plan is usable"
         reasons = [str(r.get("message")) for r in plan.get("refusals") or [] if r.get("message")]
+        if accounts and not healthy:
+            # A registration is not a working endpoint: attach probes once and records the failure.
+            errors = [
+                str(a.get("last_probe_error"))
+                for a in accounts
+                if isinstance(a, dict) and a.get("last_probe_error")
+            ]
+            reasons.append(
+                f"{len(accounts)} account(s) registered but none healthy"
+                + (f" ({errors[0]})" if errors else "")
+            )
         return False, "; ".join(reasons) or "no Saturn account is attached"
     if lane == "cerebrium":
         if status.get("ready"):

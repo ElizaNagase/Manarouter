@@ -298,6 +298,21 @@ async fn attach_lane(
     attach_for(&app.molab, payload).await
 }
 
+/// The authority of an endpoint URL, for an error message that has to name what was dialled.
+///
+/// `url.split(':').next()` answers `http` for `http://127.0.0.1:9/v1`: it names the scheme, not the
+/// host, and an operator reading "the endpoint http refused the connection" learns nothing. The
+/// scheme and the path are noise here; the host and port are the fact.
+fn endpoint_authority(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split('/').next().unwrap_or(rest).trim();
+    if authority.is_empty() {
+        "<host>"
+    } else {
+        authority
+    }
+}
+
 /// The body of [`attach_lane`], taking the registry explicitly.
 async fn attach_for(
     state: &Arc<Mutex<MolabState>>,
@@ -330,12 +345,14 @@ async fn attach_for(
     {
         Ok(r) => r,
         Err(e) => {
-            let host = url.split(':').next().unwrap_or("<host>");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(error_body(
                     "host_unreachable",
-                    format!("the endpoint {host} refused the connection: {e}"),
+                    format!(
+                        "the endpoint {} refused the connection: {e}",
+                        endpoint_authority(&url)
+                    ),
                     Vec::new(),
                 )),
             );
@@ -545,6 +562,16 @@ mod tests {
     use std::time::Duration;
     // `TcpStream`'s write/flush come from the extension traits, not inherent methods.
     use tokio::io::AsyncWriteExt;
+
+    /// An unreachable endpoint is named by its authority, never by its scheme.
+    #[test]
+    fn an_unreachable_endpoint_is_named_by_its_host() {
+        assert_eq!(endpoint_authority("http://127.0.0.1:9/v1"), "127.0.0.1:9");
+        assert_eq!(endpoint_authority("https://molab.example/"), "molab.example");
+        assert_eq!(endpoint_authority("10.0.0.4:8000/v1/models"), "10.0.0.4:8000");
+        assert_eq!(endpoint_authority(""), "<host>");
+        assert_eq!(endpoint_authority("http://"), "<host>");
+    }
 
     /// Run a TCP server that returns a valid `/v1/models` response.
     async fn run_valid_server(addr: SocketAddr) -> std::io::Result<tokio::task::JoinHandle<()>> {

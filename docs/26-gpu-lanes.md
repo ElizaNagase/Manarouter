@@ -404,6 +404,9 @@ scripts/gpu-lanes-e2e.py --no-probe      # status only, no platform calls
 scripts/gpu-lanes-e2e.py --base-url http://127.0.0.1:20998   # a test conductor
 ```
 
+Saturn counts as ready only when at least one registered account is healthy: `attach` probes once
+and records the failure, so a registration alone is not a working endpoint.
+
 `MANAROUTER_ADMIN` sets the base URL when `--base-url` is absent. The sweep starts nothing and spends
 nothing. Kaggle is the exception it cannot cover: it is batch-only, so proving it means submitting a
 kernel, which consumes the operator's weekly GPU allowance and posts a notebook to their account.
