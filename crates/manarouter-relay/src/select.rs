@@ -42,7 +42,11 @@ pub enum CooldownReason {
     Backoff,
     /// The client's request is malformed (400, 404, 422…). No cooldown — the account is fine.
     InvalidRequest,
-    /// A self-hosted backend is cold and starting up. Uses distinct backoff state.
+    /// A self-hosted backend is cold and starting up.
+    ///
+    /// This is the one reason whose wait does **not** grow: a container that is still booting is
+    /// expected to reject the next probe, and doubling the wait on each rejection would schedule the
+    /// retry after the container is already warm. See [`COLD_START_COOLDOWN_MS`].
     ColdStart,
     /// Local capacity for the target endpoint is exhausted.
     KvBudgetExceeded,
@@ -821,6 +825,14 @@ pub fn hedge_decide(
 ///
 /// Returns the instant, so callers do not each reinvent the arithmetic, and so the growing backoff
 /// lives in one place.
+/// How long a cold self-hosted backend is left alone before the next attempt.
+///
+/// A calibrated default, not a measurement. Modal's `scaledown_window` default is 60 s and a vLLM
+/// container that must load weights commonly takes 60-120 s to answer its first request, while the
+/// relay's own ceiling for a `modal_vllm` first byte is 300 s (`cold_start_ttfb_timeout_ms`). 90 s is
+/// the shortest window that outlasts the common boot without spending most of that ceiling asleep.
+pub const COLD_START_COOLDOWN_MS: u64 = 90_000;
+
 pub fn cooldown_until(
     reason: CooldownReason,
     previous_failures: u32,
@@ -833,10 +845,10 @@ pub fn cooldown_until(
     let base = match reason {
         CooldownReason::AuthFailed => config.auth_failure_cooldown_secs.saturating_mul(1000),
         CooldownReason::InvalidRequest => 0,
+        CooldownReason::ColdStart => COLD_START_COOLDOWN_MS,
         CooldownReason::RateLimited
         | CooldownReason::QuotaExhausted
         | CooldownReason::Backoff
-        | CooldownReason::ColdStart
         | CooldownReason::KvBudgetExceeded => config.default_cooldown_secs.saturating_mul(1000),
     };
 
@@ -850,7 +862,14 @@ pub fn cooldown_until(
     // The backoff grows with repetition, because a provider that states the same reset three times
     // and rejects the request each time is not honouring it. Doubling is bounded by two doublings so
     // that a long-running account cannot end up cooling for a week.
-    let growth = 1u64 << previous_failures.min(2);
+    //
+    // A cold start is exempt. Repeated cold-start rejections are not a provider ignoring its own
+    // reset; they are one container still loading weights, and growing the wait would move the retry
+    // past the moment it becomes usable.
+    let growth = match reason {
+        CooldownReason::ColdStart => 1,
+        _ => 1u64 << previous_failures.min(2),
+    };
     now.saturating_add(chosen.saturating_mul(growth))
 }
 
@@ -1255,6 +1274,46 @@ mod tests {
         assert!(third > second);
         assert_eq!(third, tenth, "growth must saturate rather than run away");
         assert!(tenth <= 240_000, "a bounded backoff, not a week");
+    }
+
+    #[test]
+    fn a_cold_start_waits_a_fixed_window_and_never_grows() {
+        let config = mr_core::config::QuotaConfig {
+            default_cooldown_secs: 60,
+            ..Default::default()
+        };
+        // `now_millis` is signed because it is a wall clock; the cooldown arithmetic is not, and a
+        // negative clock would otherwise saturate into a cooldown that never ends.
+        let now = now_millis().max(0) as u64;
+        let first = cooldown_until(CooldownReason::ColdStart, 0, None, &config) - now;
+        let fourth = cooldown_until(CooldownReason::ColdStart, 3, None, &config) - now;
+        // Wall clock moves between the two calls, so the equality is checked with a tolerance that
+        // is small next to the window itself.
+        assert!(
+            first.abs_diff(fourth) < 1_000,
+            "a cold start must not double: {first} vs {fourth}"
+        );
+        assert!(
+            (COLD_START_COOLDOWN_MS as i64 - first as i64).abs() < 1_000,
+            "the cold-start wait is the documented window, got {first}"
+        );
+    }
+
+    #[test]
+    fn a_cold_start_is_not_a_rate_limit() {
+        let config = mr_core::config::QuotaConfig {
+            default_cooldown_secs: 60,
+            ..Default::default()
+        };
+        // `now_millis` is signed because it is a wall clock; the cooldown arithmetic is not, and a
+        // negative clock would otherwise saturate into a cooldown that never ends.
+        let now = now_millis().max(0) as u64;
+        let cold = cooldown_until(CooldownReason::ColdStart, 0, None, &config) - now;
+        let rate = cooldown_until(CooldownReason::RateLimited, 0, None, &config) - now;
+        assert!(
+            cold > rate,
+            "a cold start is not a throttle: cold {cold} vs rate {rate}"
+        );
     }
 
     #[test]
