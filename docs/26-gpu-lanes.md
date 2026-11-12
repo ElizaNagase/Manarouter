@@ -458,6 +458,32 @@ answered; only a real completion proves inference, which is what `POST …/probe
 
 ---
 
+### The 2026-11-12 13:00 sweep
+
+Run on the production conductor (`127.0.0.1:20901`) at 13:00:20 Europe/Madrid:
+
+```
+catalog: 1 platform, 11 GPU ids, HTTP 200
+rentals: 0 accounts, 0 deployments, 0 GPU-seconds, $0.00, HTTP 200
+kaggle   ready:false  the kaggle CLI is not on PATH; no Kaggle credential is configured
+molab    ready:false  0 warm lanes, start one
+saturn   ready:false  Saturn Cloud needs at least one account before it can run anything
+cerebrium ready:false No Cerebrium project is attached.
+ok:false  failures:4  exit 1
+```
+
+The harness is green: every route answered 200, the catalogue is live, and each lane named the one
+thing it is missing rather than failing obscurely. The run is red for one reason only — no lane has a
+credential on this host. Nothing in the router caused these four failures, and nothing in the router
+can clear them without an account. The first green sweep needs, at minimum, one of:
+
+- `kaggle` on `PATH` plus `~/.kaggle/kaggle.json` (or `KAGGLE_USERNAME`/`KAGGLE_KEY`),
+- a molab URL and Google OAuth token,
+- a Saturn host and token, with the operator's tunnel on `127.0.0.1:8000`,
+- a Cerebrium project id, app name, and service-account token.
+
+Attach one from its lane card (or `POST …/attach`), then re-run `scripts/gpu-lanes-e2e.py`.
+
 ## 12. A lane account outlives the process
 
 A registration is a credential plus an endpoint. The endpoint is not a secret; the token is. Both
