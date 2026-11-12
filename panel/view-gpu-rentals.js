@@ -1920,6 +1920,12 @@ function paintSetup(wizard, mount, ctx, stepParam) {
   const body = h('div', { class: 'gpu-step-body' });
 
   for (const desc of listOf(pick(step, 'fields'))) {
+    // A reused account already holds its credential: rendering empty password inputs would ask the
+    // operator to re-enter a secret the vault has, and an empty required field would read as an
+    // error. accountReusePanel carries the explanation instead.
+    const name = asString(pick(desc, 'name')).trim();
+    if (current === 'account' && wizard.draft?.reuseAccount === true
+      && (name === 'tokenId' || name === 'tokenSecret')) continue;
     const fieldEl = fieldRow(wizard, desc);
     if (fieldEl) body.append(fieldEl);
   }
@@ -2375,7 +2381,7 @@ function stepPanels(wizard, stepId) {
   if (stepId === 'account') {
     return [
       wizard.accountError ? failedEndpoint('POST /api/gpu/apply (create-account)', wizard.accountError) : null,
-      planLimitsPanel(wizard), accountsReferencePanel(wizard), accountResultPanel(wizard),
+      accountReusePanel(wizard), planLimitsPanel(wizard), accountsReferencePanel(wizard), accountResultPanel(wizard),
     ];
   }
   if (stepId === 'model') return [probePanel(wizard)];
@@ -2459,14 +2465,60 @@ function accountsReferencePanel(wizard) {
   const rows = accounts.map((a) => h('tr', {},
     h('td', {}, mono(a.id), a.label && a.label !== a.id ? h('div', { class: 'hint' }, a.label) : null),
     h('td', {}, a.plan || '—'),
-    h('td', {}, a.fingerprint ? mono(a.fingerprint) : h('span', { class: 'hint' }, a.hasCredential ? 'stored' : 'not reported'))));
+    h('td', {}, a.fingerprint ? mono(a.fingerprint) : h('span', { class: 'hint' }, a.hasCredential ? 'stored' : 'not reported')),
+    h('td', {}, h('button', {
+      class: 'btn btn-sm btn-ghost',
+      type: 'button',
+      disabled: wizard.busy,
+      'aria-label': `Use account ${a.id} for this deployment`,
+      title: 'Bill this deployment to the credential already stored for this account.',
+      onclick: () => useExistingAccount(wizard, a),
+    }, 'USE'))));
   return h('div', { class: 'gpu-existing' },
     h('h3', {}, 'Accounts already recorded for this platform'),
-    dataTable([{ label: 'Account' }, { label: 'Plan' }, { label: 'Credential' }], rows),
-    richHint('An account id is global to this installation. Reusing one here updates that account through the separate account request before any model is chosen.'));
+    dataTable([{ label: 'Account' }, { label: 'Plan' }, { label: 'Credential' }, { label: '' }], rows),
+    richHint('An account id is global to this installation. “USE” bills the deployment to that account’s stored credential without sending a token; it is the way a second deployment shares a workspace.'));
+}
+
+/** Point the draft at an account that is already in the vault, without re-posting its token. */
+function useExistingAccount(wizard, account) {
+  if (wizard.busy || !account) return;
+  draftSet(wizard.draft, 'accountId', account.id);
+  draftSet(wizard.draft, 'reuseAccount', true);
+  draftSet(wizard.draft, 'tokenId', '');
+  draftSet(wizard.draft, 'tokenSecret', '');
+  wizard.accountError = null;
+  wizard.accountResult = null;
+  wizard.accountSignature = null;
+  paintSetup(wizard, wizard.mount, wizard.ctx, wizard.current);
+}
+
+/**
+ * The account step while it is billing an existing account: no token is asked for, and the copy
+ * says what is and is not happening. The way back to recording a fresh account is a button, not
+ * a hidden state change.
+ */
+function accountReusePanel(wizard) {
+  if (wizard.draft?.reuseAccount !== true) return null;
+  const id = asString(draftGet(wizard.draft, 'accountId')).trim();
+  return h('div', { class: 'gpu-existing' },
+    h('h3', {}, `Billing account: ${id || 'none selected'}`),
+    h('p', { class: 'hint' },
+      'This deployment uses the credential already stored for that account. No token is sent and nothing in the vault is overwritten: the account was recorded before this draft existed.'),
+    h('p', { class: 'hint' },
+      'To bill a different workspace, record a new account with its own id and token.'),
+    h('div', { class: 'gpu-actions' }, ghostButton('Create a new account instead', () => {
+      draftSet(wizard.draft, 'reuseAccount', false);
+      wizard.accountResult = null;
+      wizard.accountSignature = null;
+      paintSetup(wizard, wizard.mount, wizard.ctx, wizard.current);
+    })));
 }
 
 function accountResultPanel(wizard) {
+  // A reused account was stored by an earlier visit; saying "stored" here would imply this draft
+  // sent something. accountReusePanel already says what the deployment bills.
+  if (wizard.draft?.reuseAccount === true) return null;
   if (!wizard.accountResult) return null;
   const result = objectOf(wizard.accountResult) ?? {};
   const account = objectOf(pick(result, 'account')) ?? result;
@@ -2801,6 +2853,22 @@ async function advance(wizard, ctx) {
 }
 
 async function storeAccount(wizard, ctx) {
+  if (wizard.draft?.reuseAccount === true) {
+    const problem = callModel(wizard, 'accountReuseProblem', null, wizard.draft, wizard.accounts);
+    if (typeof problem === 'string' && problem) {
+      wizard.accountError = new Error(problem);
+      paintSetup(wizard, wizard.mount, ctx, wizard.current);
+      return false;
+    }
+    const id = asString(draftGet(wizard.draft, 'accountId')).trim();
+    const stored = wizard.accounts.find((a) => sameText(a.id, id)) ?? { id };
+    // No request: the credential is already in the vault, and the deployment references the account
+    // by id. The signature stops a revisit from taking this path again for a different id.
+    wizard.accountSignature = JSON.stringify(['reuse', id, asString(draftGet(wizard.draft, 'platform')).trim()]);
+    wizard.accountError = null;
+    wizard.accountResult = { account: stored };
+    return true;
+  }
   const payload = objectOf(callModel(wizard, 'accountApplyPayload', null, wizard.draft));
   if (!payload) {
     wizard.accountError = new Error(

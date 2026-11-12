@@ -1006,6 +1006,42 @@ test('the account step posts the vault entry before any model step, and clears n
   assert.ok(!textOf(mount).includes('ws-super-secret-value'), 'the token value is never rendered back');
 });
 
+test('an account that is already recorded can carry a deployment without its token being re-sent', async (t) => {
+  if (!hasSetupModel) return t.skip('panel/gpu-setup-model.js is not present');
+  await resetSetup();
+  const { mount, navigations } = await mountView({ param: 'new/account', handlers: standardHandlers() });
+
+  assert.ok(mount.querySelector('[data-field="tokenId"]'), 'the create path asks for the token half');
+  fire(findButton(mount, 'USE'), 'click');
+  await settle(4);
+
+  assert.equal(mount.querySelector('[data-field="tokenId"]'), null,
+    'a reused account holds its credential, so the token inputs leave the step');
+  assert.equal(mount.querySelector('[data-field="tokenSecret"]'), null);
+  assert.equal(mount.querySelector('[data-field="accountId"]').value, 'mana-modal');
+  const text = textOf(mount);
+  assert.match(text, /Billing account: mana-modal/);
+  assert.match(text, /No token is sent and nothing in the vault is overwritten/);
+  assert.match(text, /Create a new account instead/);
+  assert.ok(!/already exists/i.test(text), 'the reuse path is a choice, not a 409 to be explained away');
+
+  await withPost({ error: { code: 'already_exists' } }, async (posts) => {
+    fire(findButton(mount, 'Continue'), 'click');
+    await settle(6);
+    assert.equal(posts.length, 0, 'reusing an account must not post a second create-account request');
+  });
+  assert.equal(navigations.at(-1), '#/gpu-rentals/new/model');
+
+  // The escape hatch is explicit and returns the token fields rather than leaving the operator
+  // stuck on a read-only summary of someone else's account.
+  navigations.length = 0;
+  fire(findButton(mount, 'Create a new account instead'), 'click');
+  await settle(4);
+  assert.ok(mount.querySelector('[data-field="tokenId"]'), 'creating a new account asks for a token again');
+  assert.equal(mount.querySelector('[data-field="accountId"]').value, 'mana-modal');
+  assert.doesNotMatch(textOf(mount), /Billing account:/);
+});
+
 const setupModelUrl = new URL('../gpu-setup-model.js', import.meta.url);
 const hasSetupModel = existsSync(setupModelUrl);
 

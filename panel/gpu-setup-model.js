@@ -271,6 +271,9 @@ export function emptyDraft(platformId) {
   return {
     platform: typeof platformId === 'string' ? platformId.trim() : '',
     accountId: '',
+    // True when this deployment bills an account that already holds its credential: the account
+    // step then stores nothing and asks for no token. It is a view-only flag, never posted.
+    reuseAccount: false,
     plan: 'unknown',
     tokenId: '',
     tokenSecret: '',
@@ -308,6 +311,7 @@ function normalizeDraft(draft) {
   const merged = { ...emptyDraft(given.platform), ...given };
   merged.platform = text(merged.platform);
   merged.accountId = text(merged.accountId);
+  merged.reuseAccount = merged.reuseAccount === true;
   merged.plan = text(merged.plan) || 'unknown';
   merged.repo = text(merged.repo);
   merged.revision = text(merged.revision);
@@ -2007,6 +2011,9 @@ export function validateStep(draft, stepId, catalog = null) {
     if (!PLAN_IDS.includes(d.plan)) {
       problems.push(problem('plan', `Plan must be one of ${PLAN_IDS.join(', ')}; leave it on unknown rather than guessing.`));
     }
+    // A reused account already carries its plan and its credential: this step stores nothing, so
+    // demanding a token here would ask the operator to re-enter a secret the vault already holds.
+    if (d.reuseAccount) return { ok: problems.length === 0 && errors.length === 0, problems, errors };
     if (!d.tokenId) {
       problems.push(problem('tokenId', 'The Modal proxy token id is required (Modal-Key).'));
     } else if (/^ak-/.test(d.tokenId)) {
@@ -2385,6 +2392,42 @@ export function accountApplyPayload(draft) {
     },
   };
   return payload;
+}
+
+/**
+ * Whether a deployment may bill an account that is already recorded (§5).
+ *
+ * Returns `null` when the draft is not reusing an account, or when the named account is present,
+ * on the same platform, and holds a credential. Otherwise one sentence naming the problem and the
+ * way out. Pure: the caller passes the `accounts` array from `GET /api/gpu/rentals`.
+ *
+ * @param {object} draft
+ * @param {Array<object>} accounts
+ * @returns {string|null}
+ */
+export function accountReuseProblem(draft, accounts) {
+  const d = normalizeDraft(draft);
+  if (!d.reuseAccount) return null;
+  if (!d.accountId) {
+    return 'No rental account is selected. Create one here, or pick one from the accounts listed below.';
+  }
+  const list = asArray(accounts).map((account) => asObject(account));
+  const account = list.find((candidate) => text(candidate.id).trim() === d.accountId);
+  if (!account) {
+    return `No rental account with id \`${d.accountId}\` is recorded. Create it here, or pick one from the accounts listed below.`;
+  }
+  const platform = text(account.platform).trim();
+  if (platform && d.platform && platform !== d.platform) {
+    return `Account \`${d.accountId}\` belongs to platform \`${platform}\`, not \`${d.platform}\`. Pick an account on this platform or create a new one.`;
+  }
+  // The view hands over `normaliseAccount()` rows (`hasCredential`); a raw `GET /api/gpu/rentals`
+  // row spells it `has_credential`. Only an explicit `false` blocks: an older conductor that does
+  // not report the flag must not make every stored account unusable.
+  const hasCredential = hasOwn(account, 'hasCredential') ? account.hasCredential : account.has_credential;
+  if (hasCredential === false) {
+    return `Account \`${d.accountId}\` has no credential stored. Record it with its token before a deployment can bill to it.`;
+  }
+  return null;
 }
 
 /**

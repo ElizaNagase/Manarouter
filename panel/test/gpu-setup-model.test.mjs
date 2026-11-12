@@ -28,6 +28,7 @@ const {
   SCALEDOWN_WINDOW_LIMITS,
   STEP_ORDER,
   accountApplyPayload,
+  accountReuseProblem,
   applyPayload,
   applyProbe,
   applySizing,
@@ -300,6 +301,7 @@ test('emptyDraft fills every documented key and starts on Modal with no plan cla
   assert.deepEqual(d, {
     platform: 'modal',
     accountId: '',
+    reuseAccount: false,
     plan: 'unknown',
     tokenId: '',
     tokenSecret: '',
@@ -1477,4 +1479,40 @@ test('the account payload writes the credentials once, and hf_token is null when
     },
   });
   assert.equal(accountApplyPayload(draft({ hfToken: '' })).account.hf_token, null);
+});
+
+// ---------------------------------------------------------------------------
+// reusing a recorded account
+// ---------------------------------------------------------------------------
+
+test('a fresh draft creates its account and does not claim to reuse one', () => {
+  const d = emptyDraft('modal');
+  assert.equal(d.reuseAccount, false);
+  assert.equal(accountReuseProblem(d, [{ id: 'mana-modal', platform: 'modal', has_credential: true }]), null,
+    'the reuse check has nothing to say about a draft that is not reusing an account');
+});
+
+test('reusing a recorded account needs no token, but still names one that exists', () => {
+  const base = emptyDraft('modal');
+  const reused = { ...base, accountId: 'mana-modal', reuseAccount: true };
+  assert.equal(validateStep(reused, 'account', {}).ok, true,
+    'the credential is in the vault, so the account step must not demand it again');
+  assert.deepEqual(validateStep({ ...base, reuseAccount: true }, 'account', {}).problems.map((p) => p.field),
+    ['accountId'], 'an id is still required: a deployment references the account by id');
+
+  const accounts = [{ id: 'mana-modal', platform: 'modal', has_credential: true }];
+  assert.equal(accountReuseProblem(reused, accounts), null);
+  assert.match(accountReuseProblem({ ...reused, accountId: 'nope' }, accounts), /No rental account with id `nope`/);
+  assert.match(accountReuseProblem(reused, [{ id: 'mana-modal', platform: 'cerebrium', has_credential: true }]),
+    /belongs to platform `cerebrium`, not `modal`/);
+  assert.match(accountReuseProblem(reused, [{ id: 'mana-modal', platform: 'modal', has_credential: false }]),
+    /has no credential stored/);
+  assert.match(accountReuseProblem(reused, []), /No rental account with id/);
+});
+
+test('not reusing an account keeps the token requirement', () => {
+  const d = emptyDraft('modal');
+  const problems = validateStep({ ...d, accountId: 'fresh' }, 'account', {}).problems.map((p) => p.field);
+  assert.deepEqual(problems, ['tokenId', 'tokenSecret'],
+    'the create path still writes the credential, so both halves are required');
 });
