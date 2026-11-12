@@ -853,21 +853,21 @@ pub fn cooldown_until(
     };
 
     // A provider's own `retry-after` is knowledge and outranks the configured guess.
-    let chosen = if config.live_signals_win {
-        retry_after_ms.unwrap_or(base)
-    } else {
-        base
-    };
+    let stated = config.live_signals_win.then_some(retry_after_ms).flatten();
+    let chosen = stated.unwrap_or(base);
 
-    // The backoff grows with repetition, because a provider that states the same reset three times
-    // and rejects the request each time is not honouring it. Doubling is bounded by two doublings so
+    // The backoff grows with repetition, because a provider that states nothing and rejects three
+    // times running is not going to honour a fourth guess. Doubling is bounded by two doublings so
     // that a long-running account cannot end up cooling for a week.
     //
-    // A cold start is exempt. Repeated cold-start rejections are not a provider ignoring its own
-    // reset; they are one container still loading weights, and growing the wait would move the retry
-    // past the moment it becomes usable.
+    // Two reasons are exempt. A cold start's rejections are one container still loading weights, so
+    // growing the wait moves the retry past the moment it becomes usable. And a *stated* recovery
+    // instant is an answer, not a guess: multiplying it turns a provider's "resets in 13h" into two
+    // days of a healthy account sitting idle, which is precisely the opposite of what the statement
+    // is for. If the provider breaks its own promise, the next refusal is free to cool it again.
     let growth = match reason {
         CooldownReason::ColdStart => 1,
+        _ if stated.is_some() => 1,
         _ => 1u64 << previous_failures.min(2),
     };
     now.saturating_add(chosen.saturating_mul(growth))
@@ -1256,6 +1256,24 @@ mod tests {
             until <= now + 5_000 + 50,
             "the measurement wins over the guess"
         );
+    }
+
+    #[test]
+    fn a_stated_recovery_instant_is_not_multiplied_by_repetition() {
+        let config = mr_core::config::QuotaConfig {
+            default_cooldown_secs: 60,
+            live_signals_win: true,
+            ..Default::default()
+        };
+        let now = now_millis().max(0) as u64;
+        let wait = 13 * 3_600_000u64 + 24 * 60_000;
+        for failures in [0, 1, 2, 9] {
+            let until = cooldown_until(CooldownReason::QuotaExhausted, failures, Some(wait), &config);
+            assert!(
+                until <= now + wait + 50,
+                "the provider said {wait} ms; growth on a stated instant parks a healthy account"
+            );
+        }
     }
 
     #[test]

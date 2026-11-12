@@ -68,8 +68,23 @@ reorders only the demoted tail by earliest reset, so the step most likely to wor
 Each account cooling down carries an `until_ms` instant. It comes from, in order of trustworthiness:
 
 1. A `retry-after` header, in either form.
-2. A `reset`/`reset_at` field in the response body, parsed per provider family.
-3. `default_cooldown_secs` from now — **a guess**, used when the provider gives no hint.
+2. A structured reset in the response body (`resets_in_seconds`, `resets_at`) on a recognised
+   quota-exhaustion code.
+3. A recovery instant stated **in words** in the body's message — `Resets every 24 hours`, `It
+   resets in 13h 24m`, `try again in 45 minutes`. The duration is only read when it follows an
+   anchor word (`resets in`, `resets every`, `retry in`, `try again in`, `available in`), because a
+   bare number in an error message is usually a request limit and not a wait. This path exists
+   because a spent daily window whose body names the reset in a sentence was otherwise read as an
+   ordinary one-minute throttle, and the account spent every minute being refused again.
+4. `default_cooldown_secs` from now — **a guess**, used when the provider gives no hint.
+
+The body is read for a `429`, a `402`, a `403` and a `400`. The `400` is not a typo: a spent credit
+balance sometimes arrives as a generic bad-request code with a message like *"You have insufficient
+credits"*. Status `400` normally means the request was malformed — no cooldown, no account switch,
+because another account would reject the same bytes — but a message that names money or a spent
+balance is about the account, so a small fixed vocabulary (`insufficient credit`, `payment required`,
+`quota exceeded`, …) promotes it to a quota cooldown. No reset is stated in those bodies, so the
+guess applies and grows with repetition; the vocabulary names no provider, model or error code.
 
 A step's earliest reset is the **minimum** over its accounts, because any one account becoming usable
 makes the step usable again.
@@ -97,19 +112,23 @@ fail. The router becomes less reliable by having the feature enabled.
 
 Three mechanisms prevent this:
 
-**1. The failure count survives the cooldown.** `failures_before_dead` is meant to count *consecutive*
-failures and reset only on a success, so an account that fails, cools down, fails again is at two
-consecutive failures, not back to zero, and after three it becomes `Dead`, leaves the rotation
-entirely, and stops flapping. The relay does keep a consecutive-failure count on each cooldown entry,
-but **it never reads it back**: no code consults `failures_before_dead` or transitions an account to
-`Dead`, so an account that keeps failing is not yet removed from the rotation.
+**1. The failure count survives the cooldown.** The relay keeps a consecutive-failure count on each
+cooldown entry, resets it on a success, and reads it back to grow the next guess. It does **not** yet
+consult `failures_before_dead` or move an account to `Dead`: an account that keeps failing stays in
+the rotation between cooldowns, and the growth in mechanism 2 is what bounds the damage. The config
+key is documented in [quota tracking](08-quota-tracking.md#failures-before-dead) as intent, not as
+shipped behaviour.
 
-**2. Backoff grows with repetition.** Each consecutive failure is meant to multiply the next cooldown
-rather than restarting it at the provider's stated value. A provider that says "47 seconds" three times
-in a row gets a longer wait on the third, on the reasoning that its stated reset is not being honoured —
-either it is throttling us harder than it says, or the reset instant is wrong. Either way, retrying
-on the same schedule is not working. The doubling exists in `cooldown_until`, but the relay calls it
-with `previous_failures = 0` at every site, so the growth never actually applies today.
+**2. Backoff grows with repetition — for guesses, not for statements.** Each consecutive failure
+multiplies the next cooldown when the provider gave no recovery instant, on the reasoning that a
+provider which rejects the same retry three times is not honouring a minute-long window. The relay
+reads the consecutive failure count back from `Health` and passes it to `cooldown_until`, so the
+doubling applies: two doublings at most, so a bad day cannot park an account for a week.
+
+A wait the provider **stated** is not multiplied. It is an answer rather than a guess, and doubling
+`resets in 13h` into two days takes a healthy account out of rotation precisely when its quota
+returns. If the provider then breaks its own promise, the next refusal cools it again — and that one
+is a guess, so it may grow.
 
 **3. The step is only tried after the healthy group is exhausted.** A demoted step is the last thing
 tried, not the first. So a flapping step costs nothing while any healthy step is working — the
@@ -117,8 +136,9 @@ failure only appears once everything else has already failed, at which point try
 regardless. This part *is* implemented: `order_steps` partitions the steps and places the unavailable
 group last.
 
-Only mechanism 3 is live. Mechanisms 1 and 2 are the intended stabilisers, and until they are wired a
-badly throttled preferred step can still be retried on a fixed schedule.
+Mechanisms 2 and 3 are live. Mechanism 1 is only half live: the count survives and drives the
+growth, but nothing acts on `failures_before_dead`, so an account that keeps failing is throttled
+harder each time rather than removed from rotation.
 
 ## Where the reset is applied
 
@@ -133,11 +153,12 @@ rebuilt from `429`/`401` observations as they happen. Because that state is proc
 memory, a relay restart forgets every cooldown and treats all accounts as healthy again; a conductor
 restart changes nothing about cooldowns, and the conductor being absent does not freeze them.
 
-Two consequences worth stating. The relay currently builds `QuotaConfig::default()` on the request
-path rather than reading `config.quota`, so the documented `default_cooldown_secs` (60),
-`auth_failure_cooldown_secs` (900) and `live_signals_win` values are the ones in force, but editing
-those keys in `config.json` has no effect yet. And nothing about the cooldown is persisted, so the
-panel's live view of it depends on relay-local state, not on `state.sqlite`.
+The request path reads `config.quota` from the relay's live state rather than from a compiled
+constant, and that state is refreshed from `config.json` whenever the routing table is republished.
+Editing `default_cooldown_secs` (60), `auth_failure_cooldown_secs` (900), `live_signals_win` or
+`failures_before_dead` therefore takes effect on the next republish, without a restart. Nothing about
+the cooldown is persisted, so the panel's live view of it depends on relay-local state, not on
+`state.sqlite`.
 
 ## Worked example
 

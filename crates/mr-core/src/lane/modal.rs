@@ -1,4 +1,10 @@
-//! Modal: the one lane that is already implemented end to end.
+//! Modal: the completing lane, whose lifecycle belongs to Modal rather than to the router.
+//!
+//! The submission path is complete — a credential pair, a deploy command, an endpoint — but the
+//! *running* app is not the router's to wake, drain or terminate. Modal publishes no deployment REST
+//! API, so a router that promised to stop a container could not keep that promise; what it can do is
+//! bill the seconds, notice the cold starts and let `scaledown_window` do the shutdown. Read
+//! `docs/research/ARCHITECTURE-gpu-rentals.md` for the line between the two.
 //!
 //! The facts here are the subset of `gpu::catalog` that decides lane eligibility, restated in the
 //! lane vocabulary so that a caller comparing platforms does not have to know that Modal's prices

@@ -222,6 +222,10 @@ hide the one line that matters, and a decade of experience says the operator wil
 
 ## Failures before dead
 
+> **Status.** Declared by the configuration and parsed, but **not yet consulted at selection time**. The
+> relay counts consecutive failures and uses the count to grow a guessed cooldown; nothing marks an
+> account `Dead`. Treat the paragraph below as the intended semantics, not as current behaviour.
+
 `failures_before_dead` (default 3) is the number of consecutive failures — of any kind, after cooldown
 handling — before an account is marked `Dead` rather than `Degraded`.
 

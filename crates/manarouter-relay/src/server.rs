@@ -2391,12 +2391,14 @@ async fn attempt_step(
             let mut named_wait = retry_after_ms(&response.headers);
             // Only a refusal is read, and only a refusal small enough to be a refusal: a provider
             // that answers a 429 or a 402 with a stream is not describing a quota window, and
-            // buffering it would trade this bug for a memory one.
+            // buffering it would trade this bug for a memory one. A 400 is read because some
+            // providers deliver a spent credit balance under a generic bad-request code.
             let refusal_wait = if matches!(
                 response.status,
                 StatusCode::TOO_MANY_REQUESTS
                     | StatusCode::PAYMENT_REQUIRED
                     | StatusCode::FORBIDDEN
+                    | StatusCode::BAD_REQUEST
             ) {
                 response
                     .body
@@ -2428,9 +2430,12 @@ async fn attempt_step(
                 "upstream refused the request"
             );
             let rebuilt = response;
-            // A 4xx client error (400, 404, 422…) is a statement about the *request*, not about
-            // the account: the credential is fine, so the account is not cooled down, and another
-            // account of the same step would receive the same bytes and give the same answer.
+            // A 4xx client error (400, 404, 422…) is normally a statement about the *request*, not
+            // about the account: the credential is fine, so the account is not cooled down, and
+            // another account of the same step would receive the same bytes and give the same
+            // answer. The exception is the one `mentions_a_spent_account` recognises — a 400 that
+            // says the balance is empty is about the account, and it never reaches this branch
+            // because its reason has already been rewritten to `QuotaExhausted`.
             //
             // It is not a statement about the *combo*, though. An upstream can reject a dialect
             // it does not actually implement, or refuse one model of the several a step's
@@ -3271,14 +3276,15 @@ fn exhausted_by_body(body: &[u8]) -> Option<(select::CooldownReason, Option<u64>
     }
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let error = value.get("error").unwrap_or(&value);
-    let kind = error.get("type").or_else(|| error.get("code"))?.as_str()?;
+    let kind = error
+        .get("type")
+        .or_else(|| error.get("code"))
+        .and_then(|kind| kind.as_str())
+        .unwrap_or_default();
     let exhausted = matches!(
         kind,
         "usage_limit_reached" | "rate_limit_reached" | "insufficient_quota"
     );
-    if !exhausted {
-        return None;
-    }
     let seconds = error
         .get("resets_in_seconds")
         .and_then(serde_json::Value::as_u64)
@@ -3295,10 +3301,127 @@ fn exhausted_by_body(body: &[u8]) -> Option<(select::CooldownReason, Option<u64>
                     at.saturating_sub(now)
                 })
         });
+    // A structured reset is the strongest statement, but it is not the only one. A body that says
+    // when the account recovers, in words, is exactly as actionable, and stopping at the field
+    // shape parks a spent account for the configured minute so it can be refused again on the next
+    // request. The prose read is only a *signal* when it carries an anchor word ("resets in", "try
+    // again in"), so an error message that happens to contain a number is not read as a wait.
+    let message = error
+        .get("message")
+        .and_then(|message| message.as_str())
+        .unwrap_or_default();
+    let spoken = seconds.is_none().then(|| stated_wait_ms(message)).flatten();
+    // A refusal that names money rather than shape is about the account even when it arrives as a
+    // 400. Providers do this: a credit balance can run out and come back as a plain `BAD_REQUEST`
+    // with a generic code, which reads as "the request is malformed" and is not cooled down, so a
+    // spent account is re-probed on every single request. The wording is the only signal there is.
+    let spent_account = mentions_a_spent_account(message);
+    if !exhausted && spoken.is_none() && !spent_account {
+        return None;
+    }
     Some((
         select::CooldownReason::QuotaExhausted,
-        seconds.map(|s| s.min(86_400).saturating_mul(1000)),
+        seconds
+            .map(|s| s.min(86_400).saturating_mul(1000))
+            .or(spoken),
     ))
+}
+
+/// Whether a message says the account itself cannot pay, rather than the request being wrong.
+///
+/// The phrases are deliberately about *money and balance* and not about throttling: "rate limit",
+/// "too many requests" and friends are already answered by the status code, and matching them here
+/// would turn an ordinary 429 into a day-long quota park. Nothing in this list names a provider, a
+/// model or an error code — it is the small set of English phrases that mean the credit is gone or
+/// the plan's quota is spent, which is a statement no retry can change until someone tops up or the
+/// window turns over.
+fn mentions_a_spent_account(message: &str) -> bool {
+    const PHRASES: [&str; 11] = [
+        "insufficient credit",
+        "insufficient balance",
+        "out of credit",
+        "no credit",
+        "credit balance",
+        "billing issue",
+        "billing problem",
+        "payment required",
+        "quota exceeded",
+        "quota exhausted",
+        "exceeded your quota",
+    ];
+    let lower = message.to_ascii_lowercase();
+    PHRASES.iter().any(|phrase| lower.contains(phrase))
+}
+
+/// A recovery instant the provider states in words rather than in a field.
+///
+/// Bodies in the wild say `Resets every 24 hours`, `It resets in 13h 24m` and `try again in 30
+/// seconds`. Those are as actionable as `resets_in_seconds`: the account is spent until the named
+/// moment, and a flat one-minute cooldown spends that minute being refused again on every request.
+///
+/// The anchor word is what makes this safe. A duration is read only when it follows a word that
+/// promises recovery, because a bare number in an error message is usually a limit or an offset
+/// (`messages must not exceed 5 per request`) and attaching a day's cooldown to a validation error
+/// would take a healthy account out of rotation.
+fn stated_wait_ms(text: &str) -> Option<u64> {
+    const ANCHORS: [&str; 7] = [
+        "resets in",
+        "reset in",
+        "resets every",
+        "reset every",
+        "retry in",
+        "try again in",
+        "available in",
+    ];
+    let lower = text.to_ascii_lowercase();
+    ANCHORS
+        .iter()
+        .find_map(|anchor| lower.find(anchor).and_then(|at| duration_after(&lower[at + anchor.len()..])))
+}
+
+/// Read a human duration at the start of `rest`: `13h 24m`, `24 hours`, `45 minutes`, `2 days`.
+///
+/// Returns `None` unless at least one number was followed by a unit, so `resets in 3 requests` is
+/// not a wait. Units are matched by their first letter (`s`, `m`, `h`, `d`), with `mo` excluded so
+/// that "months" cannot be read as minutes; the result is clamped to a day by the caller.
+fn duration_after(rest: &str) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut found = false;
+    let mut rest = rest.trim_start_matches([' ', '(', ':']);
+    loop {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            break;
+        }
+        let Ok(amount) = rest[..digits].parse::<u64>() else {
+            break;
+        };
+        rest = rest[digits..].trim_start_matches(' ');
+        let letters = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
+        let unit = &rest[..letters];
+        if unit.starts_with("mo") {
+            break;
+        }
+        let per_unit = match unit.as_bytes().first() {
+            Some(b's') => 1_000,
+            Some(b'm') => 60_000,
+            Some(b'h') => 3_600_000,
+            Some(b'd') => 86_400_000,
+            _ => break,
+        };
+        rest = &rest[letters..];
+        total = total.saturating_add(amount.saturating_mul(per_unit));
+        found = true;
+        if total >= 86_400_000 {
+            break;
+        }
+        let next = rest.trim_start_matches([' ', ',', 'a', 'n', 'd']);
+        if !next.starts_with(|c: char| c.is_ascii_digit()) {
+            break;
+        }
+        rest = next;
+    }
+    found.then(|| total.min(86_400_000)).filter(|ms| *ms > 0)
 }
 
 /// Which cooldown a status code deserves.
@@ -6738,6 +6861,76 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         let body = br#"{"error":{"type":"usage_limit_reached","resets_in_seconds":999999999}}"#;
         let (_, wait) = exhausted_by_body(body).expect("a spent window");
         assert_eq!(wait, Some(86_400_000));
+    }
+
+    #[test]
+    fn a_reset_stated_in_words_is_as_good_as_a_field() {
+        // The exact body a provider returned for a spent daily window, captured live. There is no
+        // `resets_in_seconds` and no `type`/`code` on the error object, so it used to be read as an
+        // ordinary 429: the account came back after the configured minute, was refused again, and
+        // every request in the combo paid for that probe. The sentence says exactly when the account
+        // recovers, and a day's quota deserves a day's cooldown.
+        let body = br#"{"error":{"message":"You've used today's Free usage. It resets in 13h 24m. Add a usage pack or choose a plan to keep going: https://example.invalid/billing","type":"budget_exceeded","code":"budget_exceeded"}}"#;
+        let (reason, wait) = exhausted_by_body(body).expect("a spent window");
+        assert_eq!(reason, select::CooldownReason::QuotaExhausted);
+        assert_eq!(wait, Some(13 * 3_600_000 + 24 * 60_000));
+    }
+
+    #[test]
+    fn a_reset_stated_as_a_period_is_read_once() {
+        // "Resets every 24 hours" names the *period*, not a countdown, and the honest reading is
+        // the same: the account is spent until the period turns over. Parsing it as a repeating
+        // interval would be a lie the cooldown cannot express.
+        let body = br#"{"error":{"message":"Daily quota reached (100%). Resets every 24 hours, or upgrade for more capacity.","limits":{"plan":"free","day":{"percent":100}}}}"#;
+        let (_, wait) = exhausted_by_body(body).expect("a spent window");
+        assert_eq!(wait, Some(86_400_000));
+    }
+
+    #[test]
+    fn a_number_in_a_validation_message_is_not_a_wait() {
+        // The guard that makes the prose read safe: without an anchor word, a number is a limit,
+        // not a recovery instant. Reading it would park a healthy account for an hour.
+        let body = br#"{"error":{"type":"invalid_request_error","message":"messages must not exceed 5 per request"}}"#;
+        assert_eq!(exhausted_by_body(body), None);
+        let body = br#"{"error":{"message":"slow down"}}"#;
+        assert_eq!(exhausted_by_body(body), None);
+    }
+
+    #[test]
+    fn a_bad_request_that_says_the_credit_is_gone_cools_the_account() {
+        // Captured live from a provider whose credit balance was empty. The status is 400 and the
+        // code is the generic `BAD_REQUEST`, so it used to be classified as the client's fault: no
+        // cooldown, no account switch, one useless upstream round trip on every request.
+        let body = br#"{"success":false,"error":{"code":"BAD_REQUEST","status":400,"message":"You have insufficient credits. Please top up your account to continue."}}"#;
+        let (reason, wait) = exhausted_by_body(body).expect("a spent balance");
+        assert_eq!(reason, select::CooldownReason::QuotaExhausted);
+        assert_eq!(wait, None, "no reset was stated, so the default guess applies");
+    }
+
+    #[test]
+    fn a_validation_message_that_mentions_a_quota_is_not_a_spent_account() {
+        // The vocabulary must not swallow ordinary request errors, or one malformed request would
+        // cool every account the step can use.
+        for message in [
+            r#"{"error":{"type":"invalid_request_error","message":"max_tokens must be a positive integer"}}"#,
+            r#"{"error":{"type":"invalid_request_error","message":"messages must not exceed 5 per request"}}"#,
+            r#"{"error":{"type":"rate_limit_error","message":"too many requests, slow down"}}"#,
+        ] {
+            assert_eq!(exhausted_by_body(message.as_bytes()), None, "{message}");
+        }
+    }
+
+    #[test]
+    fn a_human_duration_is_read_in_the_forms_providers_write_it() {
+        assert_eq!(stated_wait_ms("resets in 13h 24m"), Some(13 * 3_600_000 + 24 * 60_000));
+        assert_eq!(stated_wait_ms("Resets every 24 hours"), Some(86_400_000));
+        assert_eq!(stated_wait_ms("try again in 45 minutes"), Some(2_700_000));
+        assert_eq!(stated_wait_ms("retry in 30s"), Some(30_000));
+        assert_eq!(stated_wait_ms("available in 2 days"), Some(86_400_000));
+        assert_eq!(stated_wait_ms("resets in 0 seconds"), None, "a zero wait is no wait");
+        assert_eq!(stated_wait_ms("resets in 2 months"), None, "months are not minutes");
+        assert_eq!(stated_wait_ms("resets in 3 requests"), None);
+        assert_eq!(stated_wait_ms("slow down"), None);
     }
 
     #[test]
