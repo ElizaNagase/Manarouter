@@ -28,10 +28,13 @@
 //!   making round trips lossy.
 //! * [`serve`] — binding the control listener and serving `panel/` static assets; the place
 //!   where a bind failure becomes an actionable error instead of a panic.
+//! * [`gpu_api`] — the GPU-rental surface: the platform/GPU catalog, a checkpoint probe that reads
+//!   Hugging Face without a token, and the accounts and deployments that make up a rental.
 
 pub mod activity_api;
 pub mod api;
 pub mod auth;
+pub mod gpu_api;
 pub mod models_api;
 pub mod oauth_token;
 pub mod quota_api;

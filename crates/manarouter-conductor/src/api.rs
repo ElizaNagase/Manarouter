@@ -71,7 +71,7 @@ use crate::auth::{
     SESSION_TTL,
 };
 use crate::state::{AppState, CommitError, VaultTx};
-use crate::{activity_api, models_api, quota_api};
+use crate::{activity_api, gpu_api, models_api, quota_api};
 
 /// The path prefix an OpenAI-compatible client is pointed at, and the one it should have used
 /// against the relay instead of the control plane. Recorded as a constant so the routes below, the
@@ -176,6 +176,7 @@ pub(crate) fn guarded_router(state: AppState) -> Router<AppState> {
         .merge(quota_api::routes())
         .merge(models_api::routes())
         .merge(activity_api::routes())
+        .merge(gpu_api::routes())
         // --- a client pointed at the wrong port gets told which one to use ---
         //
         // Registered before the `/api/{*rest}` catch-all, and before the panel's static fallback
@@ -363,7 +364,9 @@ impl ApiError {
         }
     }
 
-    fn with_details(mut self, details: Vec<Value>) -> Self {
+    /// Attach a machine-readable list to an error. `pub(crate)` because `gpu_api` reports a
+    /// deployment's per-field problems this way rather than flattening them into one sentence.
+    pub(crate) fn with_details(mut self, details: Vec<Value>) -> Self {
         self.details = details;
         self
     }
@@ -386,7 +389,9 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, "not_found", message)
     }
 
-    fn conflict(message: impl Into<String>) -> Self {
+    /// 409 for a create whose id is already taken. `pub(crate)` because `gpu_api` creates rental
+    /// accounts and providers under ids the operator chooses.
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "already_exists", message)
     }
 
@@ -2365,6 +2370,23 @@ async fn sync_models(
         // OAuth credentials are minted per request by the relay; the conductor has no refresh
         // path for them yet. Try unauthenticated and report honestly if the upstream objects.
         AuthKind::OAuth { .. } => {}
+        AuthKind::Modal => {
+            let Some(secret) = &secret else {
+                return Err(ApiError::bad(
+                    "no_credential",
+                    "this provider authenticates with Modal headers but no account has a \
+                     stored secret; add the key to an account first",
+                ));
+            };
+            let Some((key, token_secret)) = secret.split_once('.') else {
+                return Err(ApiError::bad(
+                    "invalid_credential",
+                    "Modal account secrets must be the Token ID.Token Secret pair",
+                ));
+            };
+            headers.push(("modal-key".to_owned(), key.to_owned()));
+            headers.push(("modal-secret".to_owned(), token_secret.to_owned()));
+        }
     }
 
     let discovered = fetch_model_list(&url, &headers).await?;
@@ -2387,7 +2409,11 @@ async fn sync_models(
     let mut updated = 0usize;
     let mut kept = 0usize;
 
-    for (model_id, context_length, max_output_tokens) in discovered {
+    for (model_id, discovered_context, max_output_tokens) in discovered {
+        let override_context = provider
+            .max_context
+            .and_then(|context| u32::try_from(context).ok());
+        let context_length = override_context.or(discovered_context);
         match provider
             .models
             .iter_mut()
@@ -2412,7 +2438,7 @@ async fn sync_models(
             }
             None => {
                 provider.models.push(ModelEntry {
-                    id: model_id,
+                    id: model_id.clone(),
                     source: ModelSource::Synced,
                     label: None,
                     context_length,

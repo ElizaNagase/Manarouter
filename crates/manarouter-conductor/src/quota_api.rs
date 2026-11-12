@@ -136,6 +136,16 @@ async fn get_usage(
     let mut cached_tokens = 0u64;
     let mut cache_write_tokens = 0u64;
     let mut estimated_requests = 0u64;
+    let mut gpu_requests = 0u64;
+    let mut gpu_seconds = 0.0;
+    let mut gpu_cost_usd = 0.0;
+    let now = mr_core::ids::Millis::now();
+    let month_ago = mr_core::ids::Millis(now.as_millis().saturating_sub(30 * 24 * 60 * 60 * 1000));
+    if let Ok(totals) = state.store.gpu_usage_totals(month_ago, now) {
+        gpu_requests = totals.requests;
+        gpu_seconds = totals.gpu_seconds;
+        gpu_cost_usd = totals.cost_usd;
+    }
 
     for row in rows {
         let view = usage_row(&row);
@@ -159,6 +169,9 @@ async fn get_usage(
             "cached_tokens": cached_tokens,
             "cache_write_tokens": cache_write_tokens,
             "estimated_requests": estimated_requests,
+            "gpu_requests": gpu_requests,
+            "gpu_seconds": gpu_seconds,
+            "gpu_cost_usd": gpu_cost_usd,
         }
     })))
 }
@@ -386,6 +399,12 @@ fn reports_quota(provider: &Provider, account: &Account) -> bool {
     ) else {
         return false;
     };
+    if fetcher.id() == mr_core::quota::modal::Modal::ID {
+        return account
+            .extra
+            .get(mr_core::quota::modal::Modal::CONFIG_KEY)
+            .is_some_and(|value| !value.is_null());
+    }
     if fetcher.id() != mr_core::quota::openai_compat::OpenAiCompat::ID {
         return true;
     }
