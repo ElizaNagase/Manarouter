@@ -370,12 +370,18 @@ fn lanes_body() -> Value {
                 "synchronous": serving.refusals,
                 "batch": batch.refusals,
             });
+            // Warnings are what the platform's terms say; refusals are what the platform cannot do.
+            // They are separate keys because only one of them can stop a lane running.
+            row["warnings"] = json!({
+                "synchronous": serving.warnings,
+                "batch": batch.warnings,
+            });
             row
         })
         .collect();
     json!({
         "lanes": rows,
-        "note": "Policy facts read from each platform's own documents, not live quotas. A \"refusal\" is the platform's rule quoted back, not this router's preference.",
+        "note": "Policy facts read from each platform's own documents, not live quotas. A \"refusal\" is something the platform physically cannot do; a \"warning\" quotes a term the operator should read. Warnings never make a lane unusable, because the deployment shape — several people, one account each — is the operator's decision.",
     })
 }
 

@@ -4,20 +4,30 @@
 //!
 //! The rental work (issue #4) made Modal a real lane: a provider whose lifecycle Manarouter writes
 //! and a relay that can reach it. Issues #10–#13 asked for four more hosts in the same shape, and
-//! research against the platforms' own documents found that two of them cannot be built that way at
-//! all — not for want of an API, but because their terms forbid the use:
+//! research against the platforms' own documents found that two of them carry terms that discourage
+//! exactly what those issues ask for:
 //!
-//! * Kaggle's Terms §3 forbids one person operating more than one account, so the "pool two accounts
-//!   and rotate" design is a ban with extra steps. The submit-and-poll API itself works fine.
+//! * Kaggle's Terms §3 forbids one person operating more than one account, so "pool two accounts and
+//!   rotate" is outside what one operator may do. The submit-and-poll API itself works fine.
 //! * molab names reverse tunnels and non-interactive use as abuse, with termination without notice.
-//!   It also exposes no API token, no job endpoint and no inbound port, so there is nothing to
-//!   automate even if the terms allowed it.
 //!
-//! Writing that in a document is necessary but not sufficient: a document does not stop a future
-//! caller from wiring a tunnel. So the finding is encoded here as [`AccountPolicy::Prohibited`] and
-//! [`LaneShape::Attended`], and [`plan_lane`] refuses the combination **before** anything is
-//! configured. A refusal carries the clause and its URL, so the operator reads the platform's own
-//! words rather than this module's summary of them.
+//! ## Why those findings are warnings and not refusals
+//!
+//! The first version of this module encoded both as [`AccountPolicy::Prohibited`] and
+//! [`LaneShape::Attended`] and had [`plan_lane`] refuse them outright. That was the wrong shape for
+//! this product. Manarouter is deployed for several people and each person brings their own account:
+//! one account per person, pooled by the router. Kaggle's clause forbids one *operator* holding
+//! several, which pooled single-owner accounts do not do, and a router that refused to hold the
+//! accounts its users actually have could not serve them at all.
+//!
+//! Refusing is also not this module's call to make. So the findings are carried as [`Warning`]s
+//! that quote the clause and cite its URL, and the person running the deployment decides. What
+//! remains a [`Refusal`] is only what is *physically* impossible — a lane with no inbound endpoint
+//! cannot answer a request that arrives now, whatever the terms say — because that is a fact about
+//! the platform rather than a judgement about the operator.
+//!
+//! [`LaneShape::Attended`] still describes molab accurately: a person must open the session. It no
+//! longer forbids using the result.
 //!
 //! ## What this module is not
 //!
@@ -30,7 +40,7 @@
 //! |---|---|
 //! | Can traffic reach this lane synchronously? | [`LaneFacts::shape`], [`LaneFacts::inbound`] |
 //! | How is a job started — API, CLI, or a human? | [`LaneFacts::submission`] |
-//! | May the operator run two accounts? | [`LaneFacts::accounts`] |
+//! | May the operator run two accounts? | [`LaneFacts::accounts`] — advisory, see [`Warning`] |
 //! | What stops working and when? | [`LaneFacts::max_session_secs`], [`LaneFacts::quota`] |
 //! | Is this combination allowed at all? | [`plan_lane`] |
 //!
@@ -242,11 +252,15 @@ impl Credential {
 
 /// Whether the platform permits more than one account for one operator.
 ///
-/// This is the field that carries the two stop signs found in research. It is not an opinion about
-/// convenience: `Prohibited` quotes the clause, and [`plan_lane`] turns it into a refusal.
+/// This field carries the two stop signs found in research, and it is deliberately **advisory**:
+/// [`plan_lane`] turns `Prohibited` into a [`Warning`], never into a refusal. The operator's ruling
+/// is that this router is deployed for several people and each person brings their own account, so
+/// pooling accounts is the intended shape rather than a bypass — and a router that refused to hold
+/// the accounts its users actually have would be unable to serve them at all.
 ///
-/// This is the field that carries the two stop signs found in research. It is not an opinion about
-/// convenience: `Prohibited` quotes the clause, and [`plan_lane`] turns it into a refusal.
+/// The clause is still quoted verbatim and still travels with the verdict, because the operator is
+/// entitled to know what the platform wrote before deciding. What changed is who decides: the
+/// person running the deployment, not this module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "verdict")]
 pub enum AccountPolicy {
@@ -262,16 +276,19 @@ pub enum AccountPolicy {
 }
 
 impl AccountPolicy {
+    /// Whether the platform's terms forbid one person holding several accounts.
+    ///
+    /// This decides what the panel *says*, not what the router *does*: no code path refuses a
+    /// second account on the strength of it. See the type's own documentation for why.
     pub fn is_prohibited(self) -> bool {
         matches!(self, AccountPolicy::Prohibited { .. })
     }
 
-    /// How many accounts this policy permits. A refusal is expressed as a ceiling of one rather than
-    /// as a boolean so a caller cannot "allow" it by ignoring a flag.
-    pub fn ceiling(self) -> usize {
+    /// The clause and its source, when the platform wrote one.
+    pub fn clause(self) -> Option<(&'static str, &'static str)> {
         match self {
-            AccountPolicy::Allowed => usize::MAX,
-            AccountPolicy::Prohibited { .. } => 1,
+            AccountPolicy::Allowed => None,
+            AccountPolicy::Prohibited { clause, source } => Some((clause, source)),
         }
     }
 }
@@ -376,10 +393,32 @@ pub struct Refusal {
     pub source: Option<&'static str>,
 }
 
+/// Something the operator should know before running this lane, which is not a reason to refuse it.
+///
+/// The same shape as [`Refusal`] on purpose: a warning quotes the platform's clause and its source
+/// exactly as a refusal would, so a panel renders both through one code path and neither loses the
+/// citation. The difference is only what the caller does with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Warning {
+    /// Stable machine code: `multiple_accounts_forbidden`, `third_party_traffic_restricted`.
+    pub code: &'static str,
+    /// One sentence, naming the lane.
+    pub message: String,
+    /// The platform's own words, where a clause is the reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clause: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
+}
+
 /// The answer to "may I use this lane this way?".
 ///
 /// A list of refusals rather than a `Result`: reporting every problem at once is what lets a panel
 /// show the whole objection instead of one line at a time, and an empty list is the success case.
+///
+/// [`LanePlan::warnings`] carries the platform's terms, which inform the operator without
+/// overriding them. `usable` deliberately ignores warnings: a lane the terms discourage is still a
+/// lane this router must be able to run, because the person deploying it makes that call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LanePlan {
     pub lane: LaneKind,
@@ -389,18 +428,22 @@ pub struct LanePlan {
     pub accounts: usize,
     pub usable: bool,
     pub refusals: Vec<Refusal>,
+    /// Advisory findings. Never affect `usable`.
+    pub warnings: Vec<Warning>,
 }
 
 /// Decide whether a lane may carry the intended traffic with the intended number of accounts.
 ///
-/// This is the function that makes the research binding. It refuses:
+/// It *refuses* only what is physically impossible, because a capability is not a policy:
 ///
 /// * synchronous traffic on a lane with no public inbound endpoint (batch or attended);
-/// * batch traffic on a lane where even that is impossible (attended);
-/// * more than one account where the platform forbids it, quoting the clause;
-/// * third-party serving where the platform restricts use to the operator's own work — reported as
-///   a refusal only when the caller says the traffic is for someone else, because a single operator
-///   routing their own requests is inside Kaggle's licence.
+/// * batch traffic on a lane where even that is impossible (attended).
+///
+/// It *warns*, quoting the clause, where the platform's terms discourage the arrangement — several
+/// accounts, or serving other people. These are findings the operator is entitled to see and not
+/// this module's decision to make: the router is deployed for several people and each brings their
+/// own account, so a hard refusal here would make the product unable to run at all, and a warning
+/// that still cites the platform's own words is the honest form for "the terms say otherwise".
 ///
 /// It does not check quotas against live usage: that needs a clock and a counter, and this module
 /// has neither. A quota-exhausted lane fails at submission, which is the honest place for it.
@@ -466,12 +509,16 @@ pub fn plan_lane(lane: LaneKind, traffic: Traffic, accounts: usize, for_third_pa
         _ => {}
     }
 
-    if accounts > facts.accounts.ceiling() {
-        if let AccountPolicy::Prohibited { clause, source } = facts.accounts {
-            refusals.push(Refusal {
+    let mut warnings = Vec::new();
+
+    if accounts > 1 {
+        if let Some((clause, source)) = facts.accounts.clause() {
+            warnings.push(Warning {
                 code: "multiple_accounts_forbidden",
                 message: format!(
-                    "{} allows one account per person; {} accounts would break the platform's terms",
+                    "{} allows one account per person; {} accounts is more than the platform's terms \
+                     permit one operator, so pool accounts only where each belongs to a different \
+                     person",
                     facts.display, accounts
                 ),
                 clause: Some(clause),
@@ -482,7 +529,7 @@ pub fn plan_lane(lane: LaneKind, traffic: Traffic, accounts: usize, for_third_pa
 
     if for_third_parties {
         if let Some(restriction) = facts.use_scope {
-            refusals.push(Refusal {
+            warnings.push(Warning {
                 code: "third_party_traffic_restricted",
                 message: format!(
                     "{} limits its compute to your own work, so serving other people's requests \
@@ -502,6 +549,7 @@ pub fn plan_lane(lane: LaneKind, traffic: Traffic, accounts: usize, for_third_pa
         accounts,
         usable: refusals.is_empty(),
         refusals,
+        warnings,
     }
 }
 
@@ -583,23 +631,41 @@ mod tests {
     }
 
     #[test]
-    fn a_lane_that_forbids_second_accounts_returns_the_clause_the_platform_wrote() {
+    fn a_lane_that_forbids_second_accounts_warns_with_the_clause_the_platform_wrote() {
         let mut saw_one = false;
         for kind in LaneKind::ALL {
             let facts = kind.facts();
-            let plan = plan_lane(kind, facts.shape_to_traffic(), 2, false);
+            let traffic = facts.shape_to_traffic();
+            let plan = plan_lane(kind, traffic, 2, false);
+            let one = plan_lane(kind, traffic, 1, false);
+
+            // The clause never blocks: a lane whose terms forbid a second account (per person) is
+            // still runnable, because the operator decided pooled accounts are the deployment shape.
+            assert!(
+                plan.refusals.iter().all(|r| r.code != "multiple_accounts_forbidden"),
+                "{kind} refused a second account, but the router must run the accounts it is given"
+            );
+            assert_eq!(
+                plan.usable, one.usable,
+                "{kind} changed usability solely because a second account was added"
+            );
+
             if facts.accounts.is_prohibited() {
                 saw_one = true;
-                let refusal = plan
-                    .refusals
+                let warning = plan
+                    .warnings
                     .iter()
-                    .find(|r| r.code == "multiple_accounts_forbidden")
-                    .unwrap_or_else(|| panic!("{kind} forbids two accounts but allowed them"));
-                assert!(refusal.clause.unwrap().len() > 40, "{kind}'s clause is a summary");
-                assert!(refusal.source.unwrap().starts_with("https://"));
+                    .find(|w| w.code == "multiple_accounts_forbidden")
+                    .unwrap_or_else(|| panic!("{kind} forbids two accounts but said nothing"));
+                assert!(warning.clause.unwrap().len() > 40, "{kind}'s clause is a summary");
+                assert!(warning.source.unwrap().starts_with("https://"));
+                assert!(
+                    one.warnings.iter().all(|w| w.code != "multiple_accounts_forbidden"),
+                    "{kind} warned about a second account when only one was asked for"
+                );
             } else {
                 assert!(
-                    plan.refusals.iter().all(|r| r.code != "multiple_accounts_forbidden"),
+                    plan.warnings.iter().all(|w| w.code != "multiple_accounts_forbidden"),
                     "{kind} allows several accounts"
                 );
             }
@@ -608,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn third_party_traffic_is_refused_only_where_the_platform_restricts_it() {
+    fn third_party_traffic_is_warned_only_where_the_platform_restricts_it() {
         for kind in LaneKind::ALL {
             let facts = kind.facts();
             let traffic = facts.shape_to_traffic();
@@ -616,15 +682,24 @@ mod tests {
             let others = plan_lane(kind, traffic, 1, true);
             if facts.use_scope.is_some() {
                 assert!(
-                    others.refusals.iter().any(|r| r.code == "third_party_traffic_restricted"),
-                    "{kind} restricts use but allowed other people's traffic"
+                    others.warnings.iter().any(|w| w.code == "third_party_traffic_restricted"),
+                    "{kind} restricts use but said nothing about other people's traffic"
+                );
+                assert!(
+                    own.warnings.iter().all(|w| w.code != "third_party_traffic_restricted"),
+                    "{kind} warned about third parties when the work was the operator's own"
                 );
             } else {
                 assert!(own.usable, "{kind} should be usable for the operator's own work");
             }
+            // Traffic scope is the operator's call, so it can never make a lane unusable.
+            assert_eq!(
+                own.usable, others.usable,
+                "{kind}'s usability hung on who the traffic was for"
+            );
             assert!(
-                own.refusals.len() <= others.refusals.len(),
-                "{kind} became more permissive when more people were involved"
+                own.warnings.len() <= others.warnings.len(),
+                "{kind} became quieter when more people were involved"
             );
         }
     }
@@ -646,15 +721,38 @@ mod tests {
         assert_eq!(json["usable"], serde_json::json!(false));
         assert_eq!(json["id"], serde_json::json!("kaggle"));
         assert_eq!(json["traffic"], serde_json::json!("synchronous"));
+
+        // Only the shape is a refusal now: Kaggle has no endpoint a chat request can be answered
+        // from. The terms findings travel separately.
         let refusals = json["refusals"].as_array().unwrap();
-        assert!(refusals.len() >= 3, "batch-only plus multi-account plus scope: got {refusals:?}");
+        assert_eq!(refusals.len(), 1, "only the shape refuses this plan: got {refusals:?}");
         let batch = refusals.iter().find(|r| r["code"] == "lane_is_batch_only").unwrap();
         assert!(batch.get("clause").is_none(), "a shape refusal quotes no clause");
-        let accounts = refusals
+
+        let warnings = json["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 2, "accounts plus scope: got {warnings:?}");
+        let accounts = warnings
             .iter()
-            .find(|r| r["code"] == "multiple_accounts_forbidden")
+            .find(|w| w["code"] == "multiple_accounts_forbidden")
             .expect("Kaggle Terms §3 forbids a second account");
         assert!(accounts["clause"].as_str().unwrap().contains("Kaggle"));
+        assert!(accounts["source"].as_str().unwrap().starts_with("https://"));
+    }
+
+    #[test]
+    fn a_warning_never_makes_a_lane_unusable_and_a_clean_plan_has_no_warning_array_noise() {
+        // Kaggle with one account and the operator's own traffic: the clause still applies to the
+        // platform, but nothing here trips it, so the plan is usable and both lists are empty.
+        let plan = plan_lane(LaneKind::Kaggle, Traffic::Batch, 1, false);
+        assert!(plan.usable, "the batch lane is exactly what Kaggle is for: {:?}", plan.refusals);
+        assert!(plan.refusals.is_empty());
+        assert!(plan.warnings.is_empty(), "nothing applies, so nothing should be said: {:?}", plan.warnings);
+
+        // And a warned plan keeps `usable` true, which is the whole point of the split.
+        let warned = plan_lane(LaneKind::Kaggle, Traffic::Batch, 3, true);
+        assert!(warned.usable, "warnings must not decide usability: {:?}", warned.refusals);
+        assert!(warned.refusals.is_empty());
+        assert_eq!(warned.warnings.len(), 2);
     }
 
     #[test]
