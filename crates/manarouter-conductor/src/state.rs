@@ -210,6 +210,25 @@ impl CommitError {
     }
 }
 
+/// What a successful commit had to say: the advisories it tolerated, and nothing else.
+///
+/// `mr_core::config::is_advisory` spells the problems that are survivable — a provider with no
+/// accounts yet, an account with no credential attached — and the relay, the CLI and now this
+/// commit path all classify them the same way rather than each keeping its own list. A commit
+/// that introduced one of them is a *success with a warning*: the operator deleting the last
+/// account of a provider means it, and refusing the delete would be the panel contradicting the
+/// CLI about the same file.
+///
+/// The wrapper is what carries that warning without pretending the commit failed: a
+/// `Result<CommitOutcome, CommitError>` keeps `?` and the error envelope exactly as they were,
+/// while `Err(CommitError::Validation(_))` still means "refused, nothing written".
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CommitOutcome {
+    /// Advisories introduced by this edit, in `validate()`'s order. Empty is the common case and
+    /// the one whose JSON is unchanged.
+    pub warnings: Vec<String>,
+}
+
 /// Backup journal for the vault writes performed while assembling an edit that may still fail.
 ///
 /// See [`AppState::tx_put`]. Zero fields besides the writes themselves; `Default` is all a
@@ -527,7 +546,30 @@ impl AppState {
     /// provider, no deletions) until they happened to fix it. Only problems this edit *introduces*
     /// are refused. The snapshot is still compiled from the full configuration, so the relay's
     /// guarantee is unchanged; a provider with no accounts simply cannot serve a request.
+    ///
+    /// # Advisories
+    ///
+    /// A *new* problem that `mr_core::config::is_advisory` classifies as advisory is not refused
+    /// either: it is carried out in [`CommitOutcome::warnings`] and logged. This is the ruling the
+    /// relay and the CLI already implement — a configuration may name a provider that has no
+    /// accounts, or an account with no credential attached — and the commit path has to agree with
+    /// them or the panel refuses edits (deleting the last account of a provider) that the CLI and
+    /// the relay are perfectly happy to write and boot. Everything else — a malformed URL, a
+    /// duplicate id, an unknown dialect, a bad regex, a combo with no reachable step — is still
+    /// [`CommitError::Validation`] with the same message as before. Use
+    /// [`Self::commit_traced`] to receive the advisories; this wrapper drops them the way the
+    /// relay's startup does after logging them.
     pub async fn commit(&self, next: Config) -> Result<(), CommitError> {
+        let _mutation = self.mutation_lock.lock().await;
+        self.commit_inner(next).await.map(|_| ())
+    }
+
+    /// [`Self::commit`], returning the advisories the edit introduced instead of discarding them.
+    ///
+    /// The handlers that a *deletion* can leave advisory — deleting the last account of a
+    /// provider is the one the operator hit — call this so they can put the warning in the
+    /// response rather than silently doing what was asked.
+    pub async fn commit_traced(&self, next: Config) -> Result<CommitOutcome, CommitError> {
         let _mutation = self.mutation_lock.lock().await;
         self.commit_inner(next).await
     }
@@ -539,6 +581,11 @@ impl AppState {
     /// one critical section takes the lock itself and calls this. Calling this *without* holding
     /// the lock is a lost-update bug, not a crash, so prefer [`Self::commit`].
     pub async fn commit_locked(&self, next: Config) -> Result<(), CommitError> {
+        self.commit_inner(next).await.map(|_| ())
+    }
+
+    /// [`Self::commit_locked`], returning the advisories the edit introduced.
+    pub async fn commit_locked_traced(&self, next: Config) -> Result<CommitOutcome, CommitError> {
         self.commit_inner(next).await
     }
 
@@ -553,6 +600,19 @@ impl AppState {
         F: FnOnce(&Config) -> Vec<String>,
     {
         let _mutation = self.mutation_lock.lock().await;
+        self.commit_with_inner(next, validate).await.map(|_| ())
+    }
+
+    /// [`Self::commit_with`], returning the advisories the edit introduced.
+    pub async fn commit_with_traced<F>(
+        &self,
+        next: Config,
+        validate: F,
+    ) -> Result<CommitOutcome, CommitError>
+    where
+        F: FnOnce(&Config) -> Vec<String>,
+    {
+        let _mutation = self.mutation_lock.lock().await;
         self.commit_with_inner(next, validate).await
     }
 
@@ -561,10 +621,22 @@ impl AppState {
     where
         F: FnOnce(&Config) -> Vec<String>,
     {
+        self.commit_with_inner(next, validate).await.map(|_| ())
+    }
+
+    /// [`Self::commit_with_locked`], returning the advisories the edit introduced.
+    pub async fn commit_with_locked_traced<F>(
+        &self,
+        next: Config,
+        validate: F,
+    ) -> Result<CommitOutcome, CommitError>
+    where
+        F: FnOnce(&Config) -> Vec<String>,
+    {
         self.commit_with_inner(next, validate).await
     }
 
-    async fn commit_inner(&self, next: Config) -> Result<(), CommitError> {
+    async fn commit_inner(&self, next: Config) -> Result<CommitOutcome, CommitError> {
         let current = self.config.read().await.clone();
         self.commit_with_inner(next, move |cfg| {
             let tolerated: std::collections::HashSet<String> =
@@ -577,15 +649,29 @@ impl AppState {
         .await
     }
 
-    async fn commit_with_inner<F>(&self, next: Config, validate: F) -> Result<(), CommitError>
+    async fn commit_with_inner<F>(
+        &self,
+        next: Config,
+        validate: F,
+    ) -> Result<CommitOutcome, CommitError>
     where
         F: FnOnce(&Config) -> Vec<String>,
     {
         // (1) Validate. `validate` returns every problem, so the operator sees the whole list
-        // in one round trip instead of fixing them one at a time.
+        // in one round trip instead of fixing them one at a time. The list is then split: the
+        // survivable class `mr_core::config::is_advisory` names becomes a warning, and everything
+        // else still refuses the commit exactly as before.
         let problems = validate(&next);
-        if !problems.is_empty() {
-            return Err(CommitError::Validation(problems));
+        let (advisories, fatal): (Vec<String>, Vec<String>) = problems
+            .into_iter()
+            .partition(|problem| mr_core::config::is_advisory(problem));
+        for advisory in &advisories {
+            // Logged here because this is the only place that knows the problem was *introduced*
+            // by this edit rather than already true of the configuration being replaced.
+            tracing::warn!(problem = %advisory, "configuration advisory");
+        }
+        if !fatal.is_empty() {
+            return Err(CommitError::Validation(fatal));
         }
 
         // (2) Compile before writing anything: a config the compiler refuses must behave like
@@ -628,7 +714,9 @@ impl AppState {
         // (6) Record what we just wrote, so the next read does not reload our own save. Without
         // this a commit would be followed by a re-parse of the file it wrote, on every read.
         self.mark_config_seen();
-        Ok(())
+        Ok(CommitOutcome {
+            warnings: advisories,
+        })
     }
 
     /// Write one secret into the vault **on behalf of a pending edit**, remembering what was
@@ -794,15 +882,23 @@ mod tests {
     /// A configuration with one enabled provider, so a reload has something observable to change.
     fn with_provider(label: &str) -> Config {
         let mut config = Config::default();
-        let mut provider = Provider::new("example", Dialect::OpenAi, "https://api.example.test/v1");
-        provider.label = Some(label.to_owned());
-        // A provider with no accounts is refused by `validate`, and these tests commit one, so the
-        // fixture has to be a configuration the router would actually accept.
+        let mut provider = provider("example", label);
+        // A provider with no accounts is an advisory the commit path tolerates (see the tests
+        // below), and these tests are about reloads, so the fixture is a configuration with no
+        // advisory to report at all.
         provider
             .accounts
             .push(mr_core::model::Account::new("test account"));
         config.providers.push(provider);
         config
+    }
+
+    /// One provider, ready to commit: `.accounts` is left for the caller to fill in, because
+    /// whether it has any is the point of several tests below.
+    fn provider(id: &str, label: &str) -> Provider {
+        let mut provider = Provider::new(id, Dialect::OpenAi, "https://api.example.test/v1");
+        provider.label = Some(label.to_owned());
+        provider
     }
 
     #[tokio::test]
@@ -901,5 +997,84 @@ mod tests {
 
         assert!(!state.reload_from_disk().await);
         assert!(state.current_config().await.providers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn removing_the_last_account_commits_and_reports_an_advisory() {
+        // The reported bug: the panel deletes the last account of a provider and gets "Delete
+        // failed", because the delete *introduces* the "has no accounts" problem and only problems
+        // already present in the current configuration were tolerated. The ruling is that this is a
+        // warning, not an error — `mr_core::config::is_advisory` already says so, and the CLI and
+        // the relay already act on it — so the delete must go through and the advisory must come
+        // back as a warning rather than being swallowed.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (state, path) = state_in(dir.path());
+
+        let before = with_provider("only account about to go");
+        assert!(
+            before.validate().is_empty(),
+            "the fixture itself must be clean: {:?}",
+            before.validate()
+        );
+        state.commit(before).await.expect("seed the provider");
+
+        // Exactly what the endpoint does: take the account out and commit.
+        let mut next = state.current_config().await;
+        next.providers[0].accounts.clear();
+
+        let outcome = state
+            .commit_traced(next)
+            .await
+            .expect("an advisory must not refuse the commit");
+        assert_eq!(
+            outcome.warnings.len(),
+            1,
+            "one advisory, and the operator is told about it: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            mr_core::config::is_advisory(&outcome.warnings[0]),
+            "the warning must be the advisory this path tolerates, got {:?}",
+            outcome.warnings
+        );
+
+        // Committed for real: the running configuration and the file on disk both lost the account.
+        let serving = state.current_config().await;
+        assert!(serving.providers[0].accounts.is_empty());
+        let saved = std::fs::read_to_string(&path).expect("read the config back");
+        assert!(
+            !saved.contains("test account"),
+            "the removed account must be gone from disk: {saved}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_fault_is_still_refused_and_reports_no_warning() {
+        // The other half of the rule: tolerating advisories must not have turned the commit path
+        // into one that accepts anything. A structurally broken provider is still a validation
+        // failure, with the same message as before, and nothing is written.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (state, path) = state_in(dir.path());
+        state
+            .commit(with_provider("good"))
+            .await
+            .expect("seed the provider");
+        let before = std::fs::read_to_string(&path).expect("read the config");
+
+        let mut broken = state.current_config().await;
+        broken.providers[0].base_url = "ftp://nope".to_owned();
+
+        match state.commit_traced(broken).await {
+            Err(CommitError::Validation(problems)) => assert!(
+                problems.iter().any(|p| p.contains("base_url")),
+                "expected a base_url problem, got {problems:?}"
+            ),
+            other => panic!("a malformed base_url must still be refused, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read the config"),
+            before,
+            "a refused commit must leave the file exactly as it was"
+        );
     }
 }

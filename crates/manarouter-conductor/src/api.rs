@@ -16,7 +16,11 @@
 //!    [`AppState::commit`] (or [`AppState::commit_with`] for the single waived condition in
 //!    [`create_provider`]), and the vault writes performed while assembling an edit are journaled
 //!    in a [`VaultTx`] so a rejected edit rolls the vault back — a 400 response must never leave
-//!    orphaned or overwritten secrets behind.
+//!    orphaned or overwritten secrets behind. An *advisory* problem
+//!    ([`mr_core::config::is_advisory`]: a provider with no accounts, an account with no credential)
+//!    does not refuse an edit — a handler whose edit can introduce one calls
+//!    [`AppState::commit_traced`] and returns the advisories in the success document under
+//!    `warnings`, which is present only when there is something to say.
 //!
 //! Traps this crate has already stepped on, recorded so nobody repeats them: axum 0.8 path
 //! patterns are `/{id}` and `/{*rest}`, not `/:id` and `/*rest`; `Path` percent-decodes captures,
@@ -1273,14 +1277,14 @@ async fn config_validate(State(state): State<AppState>) -> ApiResult<Json<Value>
 async fn put_config(
     State(state): State<AppState>,
     JsonBody(body): JsonBody,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     commit_config_body(state, body).await
 }
 
 async fn put_config_raw(
     State(state): State<AppState>,
     JsonBody(body): JsonBody,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     commit_config_body(state, body).await
 }
 
@@ -1288,7 +1292,13 @@ async fn put_config_raw(
 ///
 /// On success the redacted document comes back, so the panel's next GET agrees with what was
 /// just stored.
-async fn commit_config_body(state: AppState, mut value: Value) -> ApiResult<Json<Value>> {
+///
+/// A `warnings` key joins that document when — and only when — the commit had to tolerate an
+/// advisory problem (`mr_core::config::is_advisory`): a provider left with no accounts, an account
+/// with no credential attached. The document itself is unchanged and the key is absent from the
+/// ordinary save, so a client that reads the body as the configuration still sees exactly the
+/// configuration; the warning is additional information rather than a field of the document.
+async fn commit_config_body(state: AppState, mut value: Value) -> ApiResult<Response> {
     let current = state.current_config().await;
     let mut tx = VaultTx::default();
 
@@ -1299,10 +1309,13 @@ async fn commit_config_body(state: AppState, mut value: Value) -> ApiResult<Json
             return Err(err);
         }
     };
-    if let Err(err) = state.commit(prepared).await {
-        state.tx_rollback(tx).await;
-        return Err(err.into());
-    }
+    let outcome = match state.commit_traced(prepared).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            state.tx_rollback(tx).await;
+            return Err(err.into());
+        }
+    };
 
     // The password may have been edited through this endpoint (the raw editor is a real editor).
     // A changed hash rebuilds the auth policy — which revokes every session, including this one;
@@ -1320,7 +1333,25 @@ async fn commit_config_body(state: AppState, mut value: Value) -> ApiResult<Json
             .map_err(ApiError::internal)?;
     }
 
-    Ok(Json(redact_config(&final_config)?))
+    let body = redact_config(&final_config)?;
+    Ok(Json(with_warnings(body, &outcome.warnings)).into_response())
+}
+
+/// Add the `warnings` key a successful commit may carry, and nothing else.
+///
+/// A success body that has no advisory to report is returned exactly as it was: the key is added
+/// only when `warnings` is non-empty, so a client asserting on the existing shape keeps working
+/// and an empty list never appears as an unexpected field.
+fn with_warnings(mut body: Value, warnings: &[String]) -> Value {
+    if !warnings.is_empty() {
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "warnings".to_owned(),
+                Value::Array(warnings.iter().cloned().map(Value::String).collect()),
+            );
+        }
+    }
+    body
 }
 
 // ---------------------------------------------------------------------------
@@ -2233,7 +2264,11 @@ async fn delete_account(
         .position(|a| a.id.as_str() == account_id)
         .ok_or_else(|| ApiError::not_found(format!("no account with id {account_id}")))?;
     let removed = provider.accounts.remove(position);
-    state.commit(config).await?;
+    // Deleting the *last* account is the operation that leaves an advisory behind ("provider <id>:
+    // provider has no accounts, so it can never serve a request"). That is a warning, not an
+    // error: the delete is what the operator asked for, and the panel's own provider-creation flow
+    // produces exactly this state. The commit succeeds and the advisory comes back in the body.
+    let outcome = state.commit_traced(config).await?;
 
     // After the commit, so a rejected edit can never have destroyed the credential.
     if let Some(vault_id) = removed.secret_ref {
@@ -2247,7 +2282,10 @@ async fn delete_account(
             state.delete_secret(&record.vault_ref).await;
         }
     }
-    Ok(Json(json!({"deleted": account_id})))
+    Ok(Json(with_warnings(
+        json!({"deleted": account_id}),
+        &outcome.warnings,
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -3314,6 +3352,98 @@ mod tests {
             providers[0]["label"].as_str(),
             Some("written by another process")
         );
+    }
+
+    /// The reported bug, at the level the operator actually hits it.
+    ///
+    /// Deleting the last account of a provider used to answer 400 `validation_failed` — "Delete
+    /// failed" in the panel — because the delete introduces the "has no accounts" problem. That
+    /// problem is one of `mr_core::config::is_advisory`, so it must be a warning: the delete goes
+    /// through, and the advisory travels in the response instead of being swallowed.
+    #[tokio::test]
+    async fn deleting_the_last_account_succeeds_and_carries_the_advisory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (state, _config_path) = state_in(dir.path());
+        let seeded = config_with_provider("only account");
+        let account_id = seeded.providers[0].accounts[0].id.to_string();
+        state.commit(seeded).await.expect("seed the provider");
+
+        let response = router(state.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/providers/example/accounts/{account_id}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router responded");
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).expect("json body");
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the delete must succeed, got {status}: {body}"
+        );
+        assert_eq!(body["deleted"].as_str(), Some(account_id.as_str()));
+        let warnings = body["warnings"].as_array().expect("a warnings array");
+        assert_eq!(warnings.len(), 1, "one advisory: {body}");
+        let warning = warnings[0].as_str().expect("a warning string");
+        assert!(
+            mr_core::config::is_advisory(warning),
+            "the warning must be the advisory class this path tolerates, got {warning:?}"
+        );
+
+        // And it really happened: the provider is still there, without accounts.
+        let config = state.current_config().await;
+        assert_eq!(config.providers.len(), 1);
+        assert!(config.providers[0].accounts.is_empty());
+    }
+
+    /// A successful save with nothing to warn about must not grow the response shape.
+    ///
+    /// The panel and `mr` both read this body as the configuration; a `warnings: []` key on every
+    /// ordinary save would be a shape change for no reason.
+    #[tokio::test]
+    async fn an_ordinary_config_save_gains_no_warnings_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (state, _path) = state_in(dir.path());
+
+        let response = router(state.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::PUT)
+                    .uri("/api/config/raw")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&config_with_provider("no advisory")).expect("body"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("router responded");
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).expect("json body");
+
+        assert_eq!(status, StatusCode::OK, "save must succeed: {body}");
+        assert!(
+            body.get("warnings").is_none(),
+            "a clean save carries no warnings key: {body}"
+        );
+        assert_eq!(body["providers"][0]["label"].as_str(), Some("no advisory"));
     }
 
     async fn get_providers(state: &AppState) -> Value {
