@@ -1284,3 +1284,29 @@ test('a successful attach says the vault kept the credential, and the card repai
     api.get = originalGet;
   }
 });
+
+test('a repaint while the attach form is open does not delete what is being typed', async () => {
+  const handlers = standardHandlers();
+  handlers['/api/gpu/lanes/molab/status'] = {
+    lane: 'molab',
+    warm_lanes: 0,
+    detail: '0 warm lanes, start one',
+    accounts: [],
+  };
+  const { mount } = await mountView({ handlers });
+  const originalGet = api.get;
+  api.get = async (path) => handlers[path] ?? Promise.reject(new Error(`test did not expect GET ${path}`));
+  try {
+    fire(findButton(mount, 'Attach account'), 'click');
+    const form = mount.querySelector('.gpu-attach');
+    const token = form.querySelector('[data-lane-field="token"]');
+    token.value = 'half-typed';
+    const card = form.closest('.gpu-section');
+    fire(findButton(card, 'Refresh'), 'click');
+    await new Promise((resolve) => realSetTimeout(resolve, 10));
+    assert.equal(mount.querySelector('.gpu-attach'), form, 'the form is still the same node');
+    assert.equal(token.value, 'half-typed', 'the token in progress survived the refresh');
+  } finally {
+    api.get = originalGet;
+  }
+});

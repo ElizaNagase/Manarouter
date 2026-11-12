@@ -794,6 +794,10 @@ async function renderInventory(mount, ctx) {
   }
 
   function paintLaneCards() {
+    // The live counters repaint this box on their own interval. An open attach form is operator
+    // input in progress — usually a token — so a repaint here would delete what is being typed.
+    // The data waits; closing the form repaints with whatever arrived meanwhile.
+    if (laneCardsBox.querySelector('.gpu-attach')) return;
     laneCardsBox.replaceChildren();
     if (!view.laneStatuses) return;
 
@@ -892,15 +896,16 @@ async function renderInventory(mount, ctx) {
           'The conductor has no account attached for this platform.'));
         // The lane is attached over its own route, not by creating a rental: a rental deploys a
         // model, while a lane account is the credential and host that serve one. Say which fields
-        // the route takes, because the panel has no form for it yet.
+        // the route takes, and point at the form when this platform has one.
         const attach = {
           kaggle: 'This lane runs through the kaggle CLI on the host and has no attach route; '
             + 'install it and sign in before submitting a kernel.',
           molab: 'POST /api/gpu/lanes/molab/attach {account, url, token} after the notebook '
-            + 'server is up.',
-          saturn: 'POST /api/gpu/lanes/saturn/attach {account, host, token}.',
+            + 'server is up — Attach account above posts the same body.',
+          saturn: 'POST /api/gpu/lanes/saturn/attach {account, host, token} — Attach account above '
+            + 'posts the same body.',
           cerebrium: 'POST /api/gpu/lanes/cerebrium/attach {account, project_id, app_name, token}, '
-            + 'then deploy with a cerebrium.toml.',
+            + 'then deploy with a cerebrium.toml. Attach account above posts the attach half.',
         }[platform];
         if (attach) parts.push(h('p', { class: 'hint' }, attach));
         parts.push(h('p', { class: 'hint' },
@@ -923,6 +928,7 @@ async function renderInventory(mount, ctx) {
           const open = cardEl.querySelector('.gpu-attach');
           if (open) {
             open.remove();
+            paintLaneCards();
             return;
           }
           const form = laneAttachForm(platform);
@@ -1015,6 +1021,7 @@ function laneAttachForm(platform) {
       }
       for (const input of inputs.values()) input.value = '';
       view.laneNotices[platform] = `Attached ${body.account} and kept it in the encrypted vault.`;
+      wrapper.remove();
       await refreshSingleLane(platform);
     } catch (err) {
       note.textContent = asString(pick(err, 'message')).trim() || 'The attach request failed.';
@@ -1028,7 +1035,7 @@ function laneAttachForm(platform) {
     ...rows,
     h('div', { class: 'gpu-actions' },
       submit,
-      ghostButton('Cancel', () => wrapper.remove())),
+      ghostButton('Cancel', () => { wrapper.remove(); paintLaneCards(); })),
     note);
   return wrapper;
 }
