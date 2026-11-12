@@ -85,7 +85,8 @@ use mr_core::lane::{plan_lane, LaneKind, Traffic};
 use mr_core::model::ModelEntry;
 use mr_core::quota::http::{QuotaHttp, QuotaRequest};
 use mr_core::rental::{
-    parse_deployment, RentalAccount, RentalDeployment, RentalMode, RentalPlan, RentalPlatform,
+    parse_deployment, plan_launch, RentalAccount, RentalDeployment, RentalMode, RentalPlan,
+    RentalPlatform, RentalSchedule,
 };
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -170,6 +171,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/gpu/probe", post(post_probe))
         .route("/api/gpu/rentals", get(get_rentals))
         .route("/api/gpu/apply", post(post_apply))
+        .route("/api/gpu/launch-plan", post(post_launch_plan))
         .route("/api/gpu/lanes/cerebrium/bundle", post(post_lane_bundle))
         .route("/api/gpu/lanes/cerebrium/compute", get(get_cerebrium_compute))
 }
@@ -1433,6 +1435,100 @@ fn fit_of(deployment: &RentalDeployment) -> Value {
 /// this build understood.
 fn rental_accounts(config: &Config) -> &[RentalAccount] {
     &config.rental_accounts
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/gpu/launch-plan
+// ---------------------------------------------------------------------------
+
+/// What the `schedule` field accepts, repeated wherever the value is rejected.
+///
+/// A bare `"batched"` is deliberately not accepted. It carries no size, and choosing one on the
+/// operator's behalf would make `"batched"` indistinguishable from `"sequential"` — the two
+/// answers differ by a factor of N in how much money is running at once, so the ambiguity is
+/// handed back rather than resolved by guessing.
+const SCHEDULE_HINT: &str = "the launch plan needs \"schedule\": \"sequential\" for one card at a                              time, or \"batched:N\" for a deliberate group of N cards; a bare                              \"batched\" is refused because it does not say how many";
+
+/// `POST /api/gpu/launch-plan` — order the configured deployments into launch waves.
+///
+/// This is a read: it computes a plan and writes nothing. The relay is not told about it, the
+/// config is not changed, and no card is started. Starting one is a separate, explicit action.
+async fn post_launch_plan(
+    State(state): State<AppState>,
+    JsonBody(body): JsonBody,
+) -> ApiResult<Json<Value>> {
+    let map = object_body(body, "launch plan")?;
+    let Some(raw) = string_field(&map, "schedule") else {
+        return Err(ApiError::bad("invalid_body", SCHEDULE_HINT));
+    };
+    let Some(schedule) = RentalSchedule::parse(&raw) else {
+        return Err(ApiError::bad("invalid_body", SCHEDULE_HINT));
+    };
+    Ok(Json(launch_plan_body(&state, schedule).await))
+}
+
+/// The plan itself, separated from the extractor so it can be called without a router.
+///
+/// Waves carry indices into the `deployments` array rather than copies of each deployment: a plan
+/// is about the *set* the caller already has, and repeating every field inside each wave would let
+/// the two copies drift. The `deployments` array is included so those indices can be read, since
+/// a list of bare integers is not an answer.
+pub async fn launch_plan_body(state: &AppState, schedule: RentalSchedule) -> Value {
+    let config = state.current_config().await;
+    let accounts = rental_accounts(&config);
+
+    let mut deployments: Vec<RentalDeployment> = Vec::new();
+    let mut listed: Vec<Value> = Vec::new();
+    let mut malformed: Vec<Value> = Vec::new();
+    for provider in &config.providers {
+        match parse_deployment(provider.id.as_ref(), &provider.extra) {
+            Ok(Some(deployment)) => {
+                listed.push(json!({
+                    "index": deployments.len(),
+                    "provider": provider.id.as_ref(),
+                    "repo": deployment.repo,
+                    "gpu": deployment.gpu,
+                    "gpu_count": deployment.gpu_count,
+                    "account": deployment.account,
+                }));
+                deployments.push(deployment);
+            }
+            Ok(None) => {}
+            Err(error) => malformed.push(json!({
+                "provider": provider.id.as_ref(),
+                "message": error.to_string(),
+            })),
+        }
+    }
+
+    let plan = plan_launch(schedule, &deployments, accounts);
+    let waves: Vec<Value> = plan
+        .waves
+        .iter()
+        .map(|wave| {
+            json!({
+                "cards": wave.cards,
+                "deployments": wave.deployments,
+            })
+        })
+        .collect();
+    let problems: Vec<Value> = plan
+        .problems
+        .into_iter()
+        .map(|(field, message)| json!({"field": field, "message": message}))
+        .collect();
+
+    json!({
+        "schedule": plan.schedule.as_str(),
+        "max_live": plan.schedule.max_live(),
+        "waves": waves,
+        "problems": problems,
+        // A deployment that does not parse cannot be planned, and silently omitting it would make
+        // the plan look complete. It is reported next to the plan instead.
+        "malformed": malformed,
+        "deployments": listed,
+        "note": "`waves` holds indices into `deployments`. An account's                  `max_concurrent_containers` is reported as a problem, never enforced here,                  because the platform is the authority on its own limit. Nothing is started by                  this route.",
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3447,5 +3543,119 @@ mod tests {
             body["note"].as_str().is_some_and(|s| !s.is_empty()),
             "note must be non-empty"
         );
+    }
+
+    // --- the launch plan ---
+
+    /// Build a provider that carries a rental deployment, which is how the config stores one.
+    fn rental_provider(id: &str, account: &str, repo: &str, gpu: &str) -> mr_core::model::Provider {
+        let deployment = RentalDeployment::new(account, repo, gpu);
+        let mut provider: mr_core::model::Provider = serde_json::from_value(json!({
+            "id": id,
+            "dialect": "open-ai",
+            "base_url": "http://127.0.0.1:1/v1",
+        }))
+        .expect("a minimal provider deserialises");
+        provider.extra.insert(
+            mr_core::rental::RENTAL_EXTRA_KEY.to_owned(),
+            deployment.to_extra_value().expect("the deployment serialises"),
+        );
+        provider
+    }
+
+    #[tokio::test]
+    async fn the_launch_plan_sequences_cards_and_reports_what_it_cannot_place() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = state_in(dir.path());
+        {
+            let mut config = state.config.write().await;
+            config.providers.push(rental_provider(
+                "lane-a",
+                "acct-1",
+                "Qwen/Qwen3.8-27B",
+                "RTX-PRO-6000",
+            ));
+            config.providers.push(rental_provider(
+                "lane-b",
+                "acct-2",
+                "Qwen/Qwen3.8-27B",
+                "RTX-PRO-6000",
+            ));
+        }
+
+        // Sequential: two deployments of one card each cannot share a wave, so there are two.
+        let body = launch_plan_body(&state, RentalSchedule::Sequential).await;
+        assert_eq!(body["schedule"], json!("sequential"));
+        assert_eq!(body["max_live"], json!(1));
+        assert_eq!(body["deployments"].as_array().expect("deployments").len(), 2);
+        let waves = body["waves"].as_array().expect("waves");
+        assert_eq!(waves.len(), 2, "one card per wave: {body}");
+        assert_eq!(waves[0]["cards"], json!(1));
+        assert_eq!(waves[1]["cards"], json!(1));
+        // The waves hold indices, and the deployments array is what makes them readable.
+        assert_eq!(waves[0]["deployments"], json!([0]));
+        assert_eq!(waves[1]["deployments"], json!([1]));
+
+        // Batched with room for both: a single wave, which is the deliberate batching case.
+        let body = launch_plan_body(&state, RentalSchedule::Batched { max_live: 2 }).await;
+        assert_eq!(body["schedule"], json!("batched"));
+        assert_eq!(body["max_live"], json!(2));
+        let waves = body["waves"].as_array().expect("waves");
+        assert_eq!(waves.len(), 1, "both fit in one wave: {body}");
+        assert_eq!(waves[0]["cards"], json!(2));
+        assert_eq!(waves[0]["deployments"], json!([0, 1]));
+
+        // A batch size of zero is a policy error, not something to clamp to one: clamping would
+        // silently turn an impossible request into a billable launch.
+        let body = launch_plan_body(&state, RentalSchedule::Batched { max_live: 0 }).await;
+        assert_eq!(body["waves"].as_array().expect("waves").len(), 0);
+        let problems = body["problems"].as_array().expect("problems");
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0]["field"], json!("schedule"));
+
+        // A deployment that does not parse is reported beside the plan rather than dropped, so a
+        // partial plan cannot look complete.
+        {
+            let mut config = state.config.write().await;
+            let mut broken = rental_provider(
+                "lane-c",
+                "acct-3",
+                "Qwen/Qwen3.8-27B",
+                "RTX-PRO-6000",
+            );
+            broken
+                .extra
+                .insert(mr_core::rental::RENTAL_EXTRA_KEY.to_owned(), json!("not an object"));
+            config.providers.push(broken);
+        }
+        let body = launch_plan_body(&state, RentalSchedule::Sequential).await;
+        assert_eq!(
+            body["malformed"].as_array().expect("malformed").len(),
+            1,
+            "the unparseable deployment is named: {body}"
+        );
+        assert_eq!(body["malformed"][0]["provider"], json!("lane-c"));
+        assert_eq!(body["deployments"].as_array().expect("deployments").len(), 2);
+    }
+
+    #[test]
+    fn the_launch_plan_schedule_hint_refuses_a_bare_batched() {
+        // The route's error text is the only thing telling an operator what to send, so the two
+        // forms it accepts are asserted to parse and the ambiguous one to be refused.
+        assert_eq!(
+            RentalSchedule::parse("sequential"),
+            Some(RentalSchedule::Sequential)
+        );
+        assert_eq!(
+            RentalSchedule::parse("batched:4"),
+            Some(RentalSchedule::Batched { max_live: 4 })
+        );
+        assert_eq!(
+            RentalSchedule::parse("batched"),
+            None,
+            "a batch without a size is ambiguous, not a batch of one"
+        );
+        assert!(SCHEDULE_HINT.contains("batched:N"));
+        assert!(SCHEDULE_HINT.contains("sequential"));
     }
 }

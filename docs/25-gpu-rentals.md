@@ -11,7 +11,7 @@ the panel shows, and what Manarouter will refuse to pretend.
 
 ## API routes
 
-The conductor exposes seven GPU-rental endpoints:
+The conductor exposes eight GPU-rental endpoints:
 
 | Method | Route | Purpose |
 |---|---|---|
@@ -20,6 +20,7 @@ The conductor exposes seven GPU-rental endpoints:
 | `GET` | `/api/gpu/probe` | measure latency / throughput on a GPU |
 | `GET` | `/api/gpu/rentals` | current rentals and their state |
 | `POST` | `/api/gpu/apply` | submit a rental application |
+| `POST` | `/api/gpu/launch-plan` | order the configured deployments into launch waves (§9) |
 | `POST` | `/api/gpu/lanes/cerebrium/bundle` | render `cerebrium.toml` for deployment |
 | `GET` | `/api/gpu/lanes/cerebrium/compute` | accepted Cerebrium compute types — pure read, 13 rows; Modal H100 not accepted |
 
@@ -278,12 +279,69 @@ life scaled to zero, and the panel does not show one.
 - **Claim an exact KV number.** See §5.
 - **Present a fitted constant as a physical one.** `overhead_bytes` is named an assumption in the
   output, every time.
-- **Serve through Kaggle or molab.** Both platforms refuse this in their Terms of Service. The
-  lanes API marks them with `can_serve_requests: false`; the panel will not let them be selected
-  as a serving target.
+- **Serve request/response traffic from Kaggle.** A notebook has no inbound endpoint, so there is
+  nowhere for the relay to send a request. The lanes API marks Kaggle `can_serve_requests: false`
+  for that physical reason, not as a policy judgement, and the panel will not offer it as a serving
+  target. molab is different: it has a live endpoint and is marked with an *attended* shape, which
+  describes the arrangement accurately — a notebook a person is running — without pretending it is
+  an unattended lane. See [26-gpu-lanes.md](26-gpu-lanes.md).
 
 The last five are the same rule stated five ways: where the platform does not publish a fact,
 Manarouter reports *what it does know* and *how it knows it*, and refuses to manufacture the rest.
+
+---
+
+## 9. Launching several deployments without launching them all at once
+
+The requirement behind this section is one sentence: *"gpu rentals should be able to be done in
+sequence so 2 gpus are never running or as batches of multiple GPUs."* Two cards billing at the same
+time by accident is the failure mode; two cards billing at the same time **on purpose** is a feature.
+
+So the operator states a policy and Manarouter orders the work to fit it.
+
+| Schedule | Meaning |
+|---|---|
+| `sequential` | at most one card is live at any moment |
+| `batched:N` | up to `N` cards are live together |
+
+`POST /api/gpu/launch-plan` with `{"schedule": "sequential"}` or `{"schedule": "batched:4"}` returns
+the waves that policy produces for the deployments already in the config. It is a **read**: it writes
+nothing, starts nothing, and tells the relay nothing. Starting a card stays a separate, explicit
+action.
+
+```json
+{
+  "schedule": "batched", "max_live": 4,
+  "waves": [{"cards": 4, "deployments": [0, 1, 2, 3]}, {"cards": 2, "deployments": [4, 5]}],
+  "problems": [], "malformed": [], "deployments": [{"index": 0, "...": "..."}],
+  "note": "…"
+}
+```
+
+Wave entries are **indices into `deployments`**. A list of bare integers is not an answer, so the
+`deployments` array is returned alongside it; a plan whose indices cannot be resolved would be a plan
+nobody can act on.
+
+Four decisions worth stating, because each is a place where a plausible default would be a lie:
+
+- A **bare `"batched"` is refused.** It does not say how many, and choosing one on the operator's
+  behalf would make it indistinguishable from `"sequential"` — the two answers differ by a factor of
+  `N` in how much money is running. The 400 repeats both accepted forms.
+- A **batch size of `0` is refused, never clamped.** Clamping to 1 would turn an impossible request
+  into a billable launch.
+- A deployment whose own `gpu_count` exceeds the ceiling is **excluded and reported**, not silently
+  split. Splitting a multi-GPU deployment would change what the model is being sized for.
+- An account's `max_concurrent_containers` is reported as a **problem, never enforced**, because the
+  platform is the authority on its own limit and that field is populated for one platform and `None`
+  for the rest. Re-planning the operator's work against an unverified number would move real work for
+  no reason.
+
+A deployment that does not parse is listed under `malformed` rather than dropped, so a partial plan
+cannot look complete.
+
+`RentalMode` (`interactive` / `batch`) is **not** this. It labels what a deployment is *for*; the
+schedule says how many may be live at once. Conflating them was the reason `RentalSchedule` got its
+own type.
 
 ---
 
