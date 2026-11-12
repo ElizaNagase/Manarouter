@@ -423,7 +423,23 @@ Saturn counts as ready only when at least one registered account is healthy: `at
 and records the failure, so a registration alone is not a working endpoint.
 
 `MANAROUTER_ADMIN` sets the base URL when `--base-url` is absent. The sweep starts nothing and spends
-nothing. Kaggle is the exception it cannot cover: it is batch-only, so proving it means submitting a
+nothing.
+
+**What has to exist before a sweep can be green.** Each lane is ready for a different reason, so the
+operator supplies a different thing:
+
+| lane | what to attach | where it comes from |
+|---|---|---|
+| Kaggle | the `kaggle` CLI on `PATH` plus a credential file (`~/.kaggle/kaggle.json`, or `KAGGLE_USERNAME`/`KAGGLE_KEY`) | `kaggle.com` account settings; one active account only (§3) |
+| molab | `{account, url, token}` from the panel card or `POST …/molab/attach` | the notebook's own serving endpoint, reachable from this host; molab's terms forbid proxying it elsewhere |
+| Saturn | `{account, host, token}` plus an SSH tunnel the operator runs | `ssh -N -L 8000:<jupyter-host>:8000 <user>@<jupyter-host>`, then attach `host: 127.0.0.1:8000` |
+| Cerebrium | `{account, project_id, app_name, token}` | `rest.cerebrium.ai` service-account token, **not** an inference key |
+
+The ladder is the same for every lane: `GET /api/gpu/catalog` → `POST /api/gpu/probe` →
+`POST …/{lane}/attach` → `GET …/{lane}/status` (the account is present and, where a probe route
+exists, healthy) → `POST /api/gpu/launch-plan` (the deployment is placed) → the real run. A green
+sweep stops after the status and probe rungs: it proves the platform answered, not that a GPU is
+serving tokens, and a lane that has never run inference must not be reported as if it had. Kaggle is the exception it cannot cover: it is batch-only, so proving it means submitting a
 kernel, which consumes the operator's weekly GPU allowance and posts a notebook to their account.
 That stays a deliberate manual step. A green Saturn or Cerebrium probe means the control plane
 answered; only a real completion proves inference, which is what `POST …/probe` says in its own note.
