@@ -1506,4 +1506,28 @@ mod tests {
             "longer than 30"
         );
     }
+    /// The token must never serialize, and a restored account must not claim health.
+    #[tokio::test]
+    async fn a_restored_account_keeps_its_token_out_of_the_view() {
+        let state = CerebriumState::new();
+        restore_for(
+            &state,
+            "team-a".to_owned(),
+            "project-1".to_owned(),
+            "app-1".to_owned(),
+            "t0ken".to_owned(),
+        )
+        .await;
+
+        let registrations = state.lock().await;
+        let registration = registrations.get("team-a").expect("restored");
+        let view = registration.view();
+        assert_eq!(view["account"], "team-a");
+        assert_eq!(view["last_probe_error"], RESTORED_NOT_PROBED);
+        assert_eq!(view["has_app_id"], serde_json::json!(false));
+        assert!(
+            !view.to_string().contains("t0ken"),
+            "the token must not be in the view: {view}"
+        );
+    }
 }

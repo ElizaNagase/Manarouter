@@ -198,7 +198,8 @@ pub struct StatusAccount {
 /// Global state for molab lane registrations.
 #[derive(Debug, Default)]
 pub struct MolabState {
-    /// Keyed by `(url, token)` so one molab account per operator works.
+    /// Keyed by account label: a token used as a map key is one stray debug format away from
+    /// disclosure, and the label is what every route already addresses the account by.
     pub registrations: HashMap<String, Registration>,
 }
 
@@ -952,5 +953,32 @@ mod tests {
         assert_eq!(status, AxumStatusCode::OK);
         assert_eq!(body["detail"], "0 warm lanes, start one");
         assert_eq!(body["lane"], "molab");
+    }
+    /// A restored registration is a remembered fact, not a measurement: it must not claim health.
+    #[tokio::test]
+    async fn a_restored_account_is_registered_but_not_called_healthy() {
+        let state = Arc::new(Mutex::new(MolabState {
+            registrations: HashMap::new(),
+        }));
+        restore_for(
+            &state,
+            "team-a".to_owned(),
+            "https://molab.example/".to_owned(),
+            "t0ken".to_owned(),
+        )
+        .await;
+
+        let molab = state.lock().await;
+        let registration = molab
+            .registrations
+            .get("team-a")
+            .expect("the restored account is registered");
+        assert_eq!(registration.last_probe, None);
+        assert_eq!(
+            registration.last_probe_error.as_deref(),
+            Some(RESTORED_NOT_PROBED)
+        );
+        assert_eq!(registration.failure_count, 0);
+        assert_eq!(registration.url, "https://molab.example/");
     }
 }
