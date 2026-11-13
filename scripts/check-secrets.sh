@@ -70,8 +70,21 @@ ALLOWLIST=(
 # ---------------------------------------------------------------------------------------------
 # Credential shapes. Kept in sync with `mr_core::secret::looks_like_a_credential`, which the
 # runtime uses for the same judgement; if you change one, change the other.
+#
+# A token's prefix has to start a token, not sit inside a longer identifier. `looks_like_
+# credential` gets this for free because it is handed one whole string and tests `starts_with`;
+# a line scanner has to say so itself. Without the left boundary, snake_case prose that happens
+# to contain `sk_` followed by seventeen identifier characters — `..._from_disk_and_never_...`
+# — is reported as an OpenAI key.
 # ---------------------------------------------------------------------------------------------
-PREFIX_PATTERN='(sk-[A-Za-z0-9_-]{17,}|sk-ant-[A-Za-z0-9_-]{17,}|sk_[A-Za-z0-9_-]{17,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|ghu_[A-Za-z0-9]{20,}|ghs_[A-Za-z0-9]{20,}|ghr_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xoxb-[A-Za-z0-9-]{20,}|xoxp-[A-Za-z0-9-]{20,}|AIza[A-Za-z0-9_-]{30,}|ya29\.[A-Za-z0-9_-]{20,}|glpat-[A-Za-z0-9_-]{15,}|hf_[A-Za-z0-9]{30,}|gsk_[A-Za-z0-9]{40,}|pplx-[A-Za-z0-9]{30,})'
+
+# One token, with no assumption about what precedes it.
+PREFIX_TOKEN='(sk-[A-Za-z0-9_-]{17,}|sk-ant-[A-Za-z0-9_-]{17,}|sk_[A-Za-z0-9_-]{17,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|ghu_[A-Za-z0-9]{20,}|ghs_[A-Za-z0-9]{20,}|ghr_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xoxb-[A-Za-z0-9-]{20,}|xoxp-[A-Za-z0-9-]{20,}|AIza[A-Za-z0-9_-]{30,}|ya29\.[A-Za-z0-9_-]{20,}|glpat-[A-Za-z0-9_-]{15,}|hf_[A-Za-z0-9]{30,}|gsk_[A-Za-z0-9]{40,}|pplx-[A-Za-z0-9]{30,})'
+
+# The same token, but only where a token can begin: at the start of the line, or after a byte
+# that could not be part of an identifier. ERE has no lookbehind, so the boundary byte is part
+# of the match; that is harmless because it is only ever used to decide *whether* to report.
+PREFIX_PATTERN="(^|[^A-Za-z0-9_-])${PREFIX_TOKEN}"
 
 # A JWT: header.payload.signature, all base64url, with a non-trivial header and payload.
 JWT_PATTERN='ey[A-Za-z0-9_-]{8,}\.ey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'
@@ -166,7 +179,9 @@ for f in "${FILES[@]}"; do
     echo "  ${f}:${lineno}"
     # Print the match with the value masked, so the check does not itself echo the secret into a
     # CI log that is world-readable on a public repository.
-    echo "      $(printf '%s' "$line" | sed -E "s/(${PREFIX_PATTERN}|${JWT_PATTERN})/<redacted>/g" | cut -c1-160)"
+    # Masked with the bare token shape, so the boundary byte in `PREFIX_PATTERN` is not eaten
+    # along with the value.
+    echo "      $(printf '%s' "$line" | sed -E "s/(${PREFIX_TOKEN}|${JWT_PATTERN})/<redacted>/g" | cut -c1-160)"
     findings=$((findings + 1))
   done < <(grep -nEo ".*(${PREFIX_PATTERN}|${JWT_PATTERN}).*" -- "$f" 2>/dev/null || true)
 done
