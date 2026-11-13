@@ -2076,10 +2076,9 @@ fn dialect_reasoning_fragment(
     }
     let effort = effort_spelling(dialect, level);
     Some(match dialect {
-        // Cursor is in this group only because the match must be total: its wire carries no effort
-        // field, `expressible_reasoning_levels` offers nothing above `none`, and the compiler
-        // therefore never folds a level into this table for it. Grouping it with the dialects that
-        // spell the effort keeps the unreachable arm from inventing a shape of its own.
+        // Cursor is grouped here only because the match must be total: the early return above
+        // answers for it before this table is reached, and reading the effort spelling the other
+        // dialects use is a truer summary of "no field on the wire" than inventing a shape.
         Dialect::OpenAi | Dialect::Copilot | Dialect::CommandCodeGo | Dialect::Cursor => {
             serde_json::json!({ "reasoning_effort": effort })
         }
@@ -2089,9 +2088,6 @@ fn dialect_reasoning_fragment(
         Dialect::Anthropic => serde_json::json!({
             "thinking": { "type": "enabled", "budget_tokens": thinking_budget(level) }
         }),
-        // Unreachable in practice: the early return above catches this dialect for every level the
-        // compiler can offer it, and the arm exists only because the match must be exhaustive.
-        Dialect::Cursor => return None,
         // The AI Studio surface takes a level **or** a budget and refuses a body carrying both —
         // "You can only set only one of thinking budget and thinking level." — and its budget is
         // capped at 65535 where Cloud Code takes 131072. So this dialect is sent the level alone:
