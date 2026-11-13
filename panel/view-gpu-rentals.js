@@ -572,6 +572,7 @@ async function renderInventory(mount, ctx) {
   // one framed table underneath. The primary action lives here rather than on a section title,
   // because "New rental" is the page's action, not the table's.
   const toolbar = h('div', { class: 'toolbar gpu-toolbar' },
+    h('span', { class: 'gpu-toolbar-title' }, 'Your rentals'),
     countEl,
     h('span', { class: 'spacer' }),
     ghostButton('Refresh', () => refresh(false), 'Re-read /api/gpu/rentals and /api/gpu/catalog'),
@@ -587,7 +588,11 @@ async function renderInventory(mount, ctx) {
       + 'needed to rent a GPU.'),
     plansBox, bundleBox, lanesBox, laneCardsBox, planBox);
 
-  mount.replaceChildren(toolbar, statusEl, deploymentsBox, accountsBox, catalogBox, advanced);
+  // The toolbar is the head of the first frame, not a strip floating above three boxes: on the
+  // providers page the counts and the verbs sit inside the same border as the table they describe.
+  mount.replaceChildren(
+    h('section', { class: 'card gpu-list-card' }, toolbar, statusEl, deploymentsBox),
+    accountsBox, catalogBox, advanced);
 
   function setStatus(text) {
     statusEl.textContent = text;
@@ -1225,18 +1230,19 @@ async function renderInventory(mount, ctx) {
 
   function paintDeployments() {
     deploymentsBox.replaceChildren();
-    const card = h('section', { class: 'card gpu-section' }, cardHead('Your rentals'));
+    // No title: the toolbar that carries "Your rentals" sits inside this same frame.
+    const card = h('div', { class: 'gpu-section' });
     if (view.rentalsError) {
-      card.append(failedEndpoint('GET /api/gpu/rentals', view.rentalsError));
+      card.append(h('div', { class: 'gpu-list-pad' }, failedEndpoint('GET /api/gpu/rentals', view.rentalsError)));
       deploymentsBox.append(card);
       return;
     }
     const deployments = listOf(pick(view.rentals, 'deployments')).map(normaliseDeployment);
     if (!deployments.length) {
-      card.append(emptyState('No GPU rentals yet.',
+      card.append(h('div', { class: 'gpu-list-pad' }, emptyState('No GPU rentals yet.',
         'A rental is a GPU on a host, configured as a provider so the relay can route to it. Pick '
         + 'the platform, the account, the model and the card, and the panel writes the app file and '
-        + 'the command that deploys it.'));
+        + 'the command that deploys it.')));
       deploymentsBox.append(card);
       return;
     }

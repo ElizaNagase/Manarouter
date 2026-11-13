@@ -142,7 +142,40 @@
 /* The page opens the way the providers page does: one toolbar line with the counts on the left and
  * the verbs on the right, then the framed table it counts. The counts are text, not chips — a chip
  * per number turned a sentence into three competing buttons. */
-.gpu-rentals .gpu-toolbar { margin: 2px 0 12px; gap: 10px; }
+/* The list is one frame the way the providers table is: the counts and the verbs are the frame's
+ * head row, and the table sits flush inside the same border. A toolbar floating above a separate
+ * box leaves two edges doing one job. */
+.gpu-rentals .gpu-list-card { padding: 0; overflow: hidden; }
+.gpu-rentals .gpu-toolbar {
+  margin: 0;
+  padding: 8px 14px;
+  gap: 10px;
+  border-bottom: 1px solid var(--line);
+}
+.gpu-rentals .gpu-toolbar-title {
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--tx2);
+}
+.gpu-rentals .gpu-list-card .gpu-status {
+  margin: 0;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.gpu-rentals .gpu-list-pad { padding: 14px 16px; }
+.gpu-rentals .gpu-list-card .gpu-section > .hint { margin: 0; padding: 12px 16px 10px; }
+.gpu-rentals .gpu-list-card .gpu-failed { margin: 12px 16px; }
+.gpu-rentals .gpu-list-card .table-scroll {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.gpu-rentals .gpu-list-card .tbl th:first-child,
+.gpu-rentals .gpu-list-card .tbl td:first-child { padding-left: 16px; }
+.gpu-rentals .gpu-list-card .tbl th:last-child,
+.gpu-rentals .gpu-list-card .tbl td:last-child { padding-right: 16px; }
 .gpu-rentals .gpu-toolbar .count {
   background: none;
   border: 0;
