@@ -165,13 +165,25 @@ function markerChip(gpu) {
   return h('span', { class: 'hint', title: marker.provenance }, marker.text);
 }
 
+/** A card id and its label are the same name when only spacing and hyphens differ. */
+function normalName(value) {
+  return asString(value).toLowerCase().replace(/[\s-]+/g, '');
+}
+
+/** The catalogue's billing unit is the second; the table shows the hour because that is the unit
+ *  a person budgets in. The per-second figure stays one hover away rather than in its own column. */
+function secondsTitle(gpu) {
+  const second = pick(gpu, 'price_usd_per_second');
+  return second == null || asNumber(second) === null ? null : `${usd(second)} per second`;
+}
+
 function provenanceCell(item) {
   const source = asString(pick(item, 'source')).trim();
   const checked = asString(pick(item, 'checked_at', 'checkedAt')).trim();
   const url = pick(item, 'source_url', 'sourceUrl');
   const parts = [];
   parts.push(source ? h('span', { class: 'mono' }, source) : h('span', { class: 'hint' }, 'source not reported'));
-  if (checked) parts.push(h('span', { class: 'hint' }, ` · checked ${formatAge(checked)}`));
+  if (checked) parts.push(h('span', { class: 'hint', title: `checked ${checked}` }, ` · ${formatAge(checked)}`));
   const href = safeHref(url);
   if (href) parts.push(h('span', { class: 'hint' }, ' · '), h('a', { href, target: '_blank', rel: 'noopener noreferrer' }, 'source'));
   const notes = asString(pick(item, 'notes')).trim();
@@ -1657,14 +1669,19 @@ function laneAttachForm(platform) {
     const rows = gpus.map((gpu) => {
       const vramGib = asNumber(pick(gpu, 'vram_gib'));
       const vramBytes = pick(gpu, 'vram_bytes');
+      // The id and the label are the same card under two spellings ("T4", "RTX PRO 6000"); print
+      // the readable one, and the id only when it says something the label does not.
+      const id = asString(pick(gpu, 'id')).trim();
+      const label = asString(pick(gpu, 'label')).trim();
+      const sameName = normalName(id) === normalName(label);
       return h('tr', {},
         h('td', {},
-          h('span', { class: 'mono' }, dashes(pick(gpu, 'id'))),
-          h('span', { class: 'hint' }, ` ${dashes(pick(gpu, 'label'))}`)),
+          sameName
+            ? h('span', {}, dashes(label || id))
+            : h('span', {}, dashes(label || id), h('span', { class: 'hint mono' }, ` ${id}`))),
         h('td', { class: 'num', title: vramBytes ? asString(vramBytes) + ' bytes' : null },
           vramGib === null ? gibFromBytes(vramBytes) : `${vramGib} GiB`),
-        h('td', { class: 'num' }, usd(pick(gpu, 'price_usd_per_hour'))),
-        h('td', { class: 'num' }, usd(pick(gpu, 'price_usd_per_second'))),
+        h('td', { class: 'num', title: secondsTitle(gpu) }, usd(pick(gpu, 'price_usd_per_hour'))),
         h('td', {}, markerChip(gpu)),
         h('td', {}, provenanceCell(gpu)));
     });
@@ -1672,7 +1689,6 @@ function laneAttachForm(platform) {
       { label: 'Card' },
       { label: 'VRAM', num: true },
       { label: '$/hour', num: true },
-      { label: '$/second', num: true },
       { label: 'Free plan' },
       { label: 'Source' },
     ], rows));
