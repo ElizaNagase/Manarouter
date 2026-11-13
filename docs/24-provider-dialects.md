@@ -608,6 +608,37 @@ Chat Completions `system` *message* and for `tool_calls` (`commandcode.rs:114-18
 
 ---
 
+## Not a dialect — Cursor
+
+One platform is deliberately absent from the table above, and it is worth writing down why rather
+than rediscovering it: **Cursor**.
+
+Cursor publishes no inference API — only agent-management endpoints and its CLI's own agent
+protocol. That CLI talks to `agent.v1.AgentService` over the Connect protocol, and one turn is not a
+completion:
+
+- the request is an `AgentRunRequest` carrying a *conversation state* and an *action*, not a
+  `messages[]` array;
+- the prompt is assembled server-side from `ConversationStateStructure.root_prompt_messages_json`, a
+  repeated `bytes` field whose writer is not in the shipped client, so a router cannot produce it
+  from a chat history;
+- the traffic is a bidi channel: `RunSSE` streams `AgentServerMessage` frames while client messages
+  arrive on a separate `aiserver.v1.BidiService/BidiAppend` call with their own sequence numbers;
+- the auth is a two-layer API key → JWT exchange (`/auth/exchange_user_api_key`), the same shape as
+  Copilot's minted bearer.
+
+None of that is a dialect. A dialect maps one stateless request onto another stateless request;
+Cursor is an agent loop whose memory lives on the far side. The direction that does work is Cursor
+pointed at Manarouter's OpenAI surface through its own bring-your-own-key setting, which is a client
+configuration rather than a provider entry — and that is why there is no `cursor` row in the
+catalogue.
+
+**Read next.** [Cursor](providers/cursor.md) for the working direction, and
+[the CLI protocol record](research/cursor-cli-inference.md) for the recovered wire format, with every
+claim tagged read, observed, inferred or unknown.
+
+---
+
 ## Client route × upstream dialect
 
 ### The relay decides by dialect, not by route

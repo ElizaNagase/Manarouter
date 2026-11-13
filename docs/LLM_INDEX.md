@@ -61,6 +61,7 @@ measured baseline of an existing Javascript router on the development machine �
 | Change something on the request path | `docs/01-architecture.md`, `docs/16-latency-engineering.md` |
 | Add a provider | `docs/providers/README.md`, `catalog/providers.toml`, `crates/mr-core/src/model.rs` |
 | Add a dialect or translator | `crates/mr-dialects/src/lib.rs`, `docs/24-provider-dialects.md`, `docs/18-api-reference.md` |
+| Connect Cursor, or answer "can we route to Cursor?" | `docs/providers/cursor.md` — Cursor is a client of the relay, not a provider; the protocol record is `docs/research/cursor-cli-inference.md` |
 | Change combo behaviour | `docs/06-combos.md`, `docs/07-hedged-race.md`, `crates/mr-core/src/model.rs` |
 | Work on the hedged race | `docs/07-hedged-race.md` — read all of it; the semantics are counterintuitive |
 | Change account/key selection | `docs/05-key-selection.md`, `crates/mr-core/src/dialect.rs` (`KeyStrategy`) |
@@ -468,6 +469,7 @@ trigger.
     { "path": "docs/providers/codex.md", "purpose": "The Codex provider: OAuth, fingerprint headers and the Responses surface", "read_when": "working on Codex" },
     { "path": "docs/providers/antigravity.md", "purpose": "The Antigravity provider: tiers, Cloud Code onboarding and scopes", "read_when": "working on Antigravity" },
     { "path": "docs/providers/copilot.md", "purpose": "The GitHub Copilot provider: the device flow and the mandatory fingerprint headers", "read_when": "working on Copilot" },
+    { "path": "docs/providers/cursor.md", "purpose": "Cursor as a client of the relay: its OpenAI base-URL override, why the CLI's endpoint is not one, and why Cursor is not a catalogue provider", "read_when": "connecting Cursor, or asked whether Cursor can be routed to" },
     { "path": "docs/local-latency-benchmark.md", "purpose": "The report-only local benchmark method and its caveats", "read_when": "running tests/local_latency_bench.py" },
     { "path": "docs/user/INDEX.md", "purpose": "The operator and agent series: what it covers, in which order to read it, and how the panel serves it", "read_when": "pointing somebody at the user-facing documentation" },
     { "path": "docs/user/00-getting-started.md", "purpose": "From a fresh install to the first request through the gateway", "read_when": "setting Manarouter up" },
@@ -490,7 +492,8 @@ trigger.
     { "path": "docs/research/vllm-sizing-and-quant.md", "purpose": "vLLM's exact KV formula, its quoting-layer and head-dim fallbacks, and the hybrid-attention correction", "read_when": "computing or reviewing a KV footprint" },
     { "path": "docs/research/huggingface-discovery.md", "purpose": "How to detect gating, size and quantisation from the HuggingFace API, including gated repos with no token", "read_when": "inspecting a model repo before renting for it" },
     { "path": "docs/research/hybrid-attention-kv.md", "purpose": "Which vLLM KV-cache code path a hybrid linear/full-attention model takes, quoted file by file, and what the fixed GDN state costs", "read_when": "deciding whether a model's KV footprint grows per token" },
-    { "path": "docs/research/requantize-recipes.md", "purpose": "How to requantise a model locally when a rented card cannot execute the published weights: llm-compressor recipes, verified versions, and the eight things that could not be confirmed", "read_when": "serving a quant a card or repo does not ship" }
+    { "path": "docs/research/requantize-recipes.md", "purpose": "How to requantise a model locally when a rented card cannot execute the published weights: llm-compressor recipes, verified versions, and the eight things that could not be confirmed", "read_when": "serving a quant a card or repo does not ship" },
+    { "path": "docs/research/cursor-cli-inference.md", "purpose": "The recovered Cursor CLI inference protocol: Connect transport, key-to-JWT auth, the AgentService map, the bidi channel split across RunSSE and BidiAppend, prompt-state schemas, and why it is not a dialect", "read_when": "evaluating or working on a Cursor integration" }
   ],
   "machine_readable_state": {
     "compiled_snapshot": "crates/mr-core/src/snapshot.rs",

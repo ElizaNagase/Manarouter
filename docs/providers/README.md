@@ -62,6 +62,11 @@ otherwise would produce a configuration that looks valid and fails at request ti
 genuinely needed, it is an adapter, and
 [adding a platform](../14-oauth-adding-a-platform.md) describes the surrounding work.
 
+[Cursor](cursor.md) is the worked example of the rule refusing to bend: it has no entry here because
+its CLI speaks an agent-loop protocol whose prompt state is materialised on the server, so there is
+no request for a dialect to translate. The usable direction is the reverse one — Cursor's own
+bring-your-own-key setting pointed at the relay.
+
 ### `note` is where uncertainty lives
 
 Entries whose endpoint came from a shipped application rather than a public repository, or whose
