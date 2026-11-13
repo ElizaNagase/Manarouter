@@ -151,7 +151,7 @@ export function buildRedirectPaste(p, ctx, session) {
 // `open-ai`, `parse` wants `openai`. A value here that the backend rejects turns "Add provider"
 // into a save-time error, which is how the pre-rename `command-code` spelling was caught. The Rust
 // test `the_panel_offers_only_dialects_this_binary_deserialises` pins this list.
-const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go', 'modal-vllm'];
+const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go', 'modal-vllm', 'cursor'];
 const KEY_STRATEGIES = ['priority', 'round-robin', 'random', 'least-used'];
 // What a refusal parks: the credential (every model), that model on the credential, or that model
 // on every credential of the provider. Widening past `account` is only right when the upstream

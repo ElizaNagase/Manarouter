@@ -52,6 +52,7 @@ static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 pub mod activity;
 pub mod batch;
 pub mod count_tokens;
+pub mod cursor_transport;
 pub mod egress;
 pub mod kv_budget;
 pub mod model_scan;

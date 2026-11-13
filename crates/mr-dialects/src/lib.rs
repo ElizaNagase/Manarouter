@@ -32,6 +32,7 @@ use mr_core::{Dialect, RouteKind};
 
 pub mod anthropic;
 pub mod commandcode;
+pub mod cursor;
 pub mod google;
 pub mod openai;
 pub mod responses;
@@ -231,6 +232,16 @@ pub fn translate_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Option<T
             responses::from_pivot_request(ctx, body).map(Some)
         }
 
+        // Cursor has no OpenAI-shaped HTTP surface at all: the run request is a protobuf frame on a
+        // bidirectional stream, which the transport builds (`cursor_transport`). What it *does* have
+        // is a single text prompt, and both client dialects can be reduced to one — so an Anthropic
+        // client is translated to the same OpenAI-shaped body an OpenAI client sends and the
+        // transport frames that. Without this arm the response translators below would be dead
+        // code reachable only by an OpenAI client.
+        (Dialect::Anthropic, Dialect::Cursor) => {
+            openai::from_anthropic_request(ctx, body).map(Some)
+        }
+
         (from, to) => Err(TranslateError::Unsupported {
             from: from.as_str(),
             to: to.as_str(),
@@ -256,6 +267,12 @@ pub fn translate_response_body(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<By
         (Dialect::Anthropic, Dialect::Copilot) => openai::to_anthropic_response(ctx, body),
         (Dialect::OpenAi, Dialect::ModalVllm) => Ok(Bytes::copy_from_slice(body)),
         (Dialect::Anthropic, Dialect::ModalVllm) => openai::to_anthropic_response(ctx, body),
+        // Cursor's answer is SSE this crate rendered itself (`cursor::StreamState`), so the
+        // non-streaming fold reads the same bytes the streaming client would have received. The
+        // relay always renders a stream for Cursor because the agent endpoint has no JSON answer,
+        // which is exactly what `to_pivot_response` expects.
+        (Dialect::OpenAi, Dialect::Cursor) => cursor::to_pivot_response(ctx, body),
+        (Dialect::Anthropic, Dialect::Cursor) => cursor::to_anthropic_response(ctx, body),
         // `google::to_pivot_response` unwraps the Cloud Code `{response: {...}, traceId}`
         // envelope when the upstream is Antigravity, so every Gemini pairing answers here.
         (Dialect::OpenAi, Dialect::Google)
@@ -302,6 +319,11 @@ pub fn translate_sse_data(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<Stri
         (Dialect::Anthropic, Dialect::Copilot) => openai::sse_to_anthropic(ctx, data),
         (Dialect::OpenAi, Dialect::ModalVllm) => Ok(vec![data.to_owned()]),
         (Dialect::Anthropic, Dialect::ModalVllm) => openai::sse_to_anthropic(ctx, data),
+        // The Cursor state machine already renders OpenAI Chat Completions chunks, so the OpenAI
+        // half is byte-identical and the Anthropic half is the ordinary OpenAI-to-Anthropic
+        // adapter.
+        (Dialect::OpenAi, Dialect::Cursor) => Ok(vec![data.to_owned()]),
+        (Dialect::Anthropic, Dialect::Cursor) => openai::sse_to_anthropic(ctx, data),
         (Dialect::OpenAi, Dialect::CommandCodeGo)
         | (Dialect::Anthropic, Dialect::CommandCodeGo) => commandcode::sse_to_pivot(ctx, data),
         // Cloud Code's stream frames carry the same `{"response": ...}` wrapper, unwrapped per

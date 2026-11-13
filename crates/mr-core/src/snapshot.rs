@@ -2066,6 +2066,14 @@ fn dialect_reasoning_fragment(
         // and omitting the field is how every one of them expresses "do not reason".
         return None;
     }
+    if dialect == Dialect::Cursor {
+        // The Cursor agent frame carries no reasoning field of any kind: the model is named by id
+        // and the server decides how much to think. `expressible_reasoning_levels` therefore offers
+        // only `none`, and a non-`none` level reaching this point means a hand-built step bypassed
+        // the compiler. Emitting a fragment would be pointless — the relay's Cursor encoder reads
+        // only the model id from this body — so the honest answer is the same one `none` gets.
+        return None;
+    }
     let effort = effort_spelling(dialect, level);
     Some(match dialect {
         Dialect::OpenAi | Dialect::Copilot | Dialect::CommandCodeGo => {
@@ -2077,6 +2085,9 @@ fn dialect_reasoning_fragment(
         Dialect::Anthropic => serde_json::json!({
             "thinking": { "type": "enabled", "budget_tokens": thinking_budget(level) }
         }),
+        // Unreachable in practice: the early return above catches this dialect for every level the
+        // compiler can offer it, and the arm exists only because the match must be exhaustive.
+        Dialect::Cursor => return None,
         // The AI Studio surface takes a level **or** a budget and refuses a body carrying both —
         // "You can only set only one of thinking budget and thinking level." — and its budget is
         // capped at 65535 where Cloud Code takes 131072. So this dialect is sent the level alone:

@@ -47,6 +47,11 @@ rustls-pemfile = "2"
 
 # --- data ---
 bytes = "1"
+# Cursor's agent stream is Connect-RPC over HTTP/2: `reqwest` cannot write a request body
+# without END_STREAM, so the transport drives `h2` directly.
+h2 = "0.4"
+# Connect frames may be gzip-compressed in either direction; the codec owns both.
+flate2 = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 toml = "0.8"
