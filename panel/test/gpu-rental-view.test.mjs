@@ -337,7 +337,6 @@ function rentals() {
         max_num_seqs: 8,
         shutdown_cooldown_secs: 120,
         mode: 'batch',
-        batch_gpu: 'h100',
       },
       sizing: {
         method: 'analytic',
@@ -566,12 +565,12 @@ test('inventory renders the account table with a fingerprint and never the secre
   assert.match(text, /GPU concurrency/);
   assert.match(text, /10 GPUs/, 'the starter concurrency figure is quoted');
   assert.match(text, /Instance usage/, 'the ledger total is shown, and labelled as instance-wide');
-  assert.match(text, /one ledger total for every provider on this instance/);
+  assert.match(text, /Usage is reported as one instance-wide total: the sum of each rental's own account/);
   assert.match(text, /42/, 'live gpu_requests');
   assert.match(text, /1 h 2 m/, 'live gpu_seconds, formatted');
   assert.match(text, /\$12\.50/, 'live cost');
-  assert.match(text, /it is not divided between accounts/,
-    'the table says why it does not attribute the total to an account');
+  assert.match(text, /The accounts are separate; only the reading beside the title above adds them up/,
+    'the table says the total is a sum of separate accounts, not a shared ledger');
 
   assert.ok(!text.includes(TOKEN_SECRET), 'the credential value is never rendered');
   // format.js truncateMiddle() uses U+2026, the panel-wide ellipsis; asserting ASCII dots here
@@ -604,7 +603,7 @@ test('a lane that names what is missing is quoted, and an empty lane says there 
     'the three removed hosts appear nowhere on the inventory, not even quoted from /api/lanes');
 });
 
-test('inventory renders deployments with mode, batch card and the derived sizing', async () => {
+test('inventory renders deployments with their own card, mode and derived sizing', async () => {
   const { mount } = await mountView({ handlers: standardHandlers() });
   const text = textOf(mount);
 
@@ -613,9 +612,9 @@ test('inventory renders deployments with mode, batch card and the derived sizing
   assert.match(text, /Qwen\/Qwen3-32B/);
   assert.match(text, /32\.8 k ctx/);
   assert.match(text, /rtx-pro-6000/);
-  assert.match(text, /batch/);
-  assert.match(text, /→ h100/, 'the batch lane names the card it batches on');
+  assert.match(text, /batch/, 'the mode is a chip on this row, not a second card');
   assert.match(text, /awq/);
+  assert.doesNotMatch(text, /→ h100/, 'batch is a mode, not a second GPU');
   assert.match(text, /fp8/);
   // Assert the two facts in their own cells rather than flattening the row: flattening inserts a
   // separator between `~4` and ` of 8`, so a whitespace-sensitive match on the row would be
@@ -948,16 +947,41 @@ test('requirement 5 in the DOM: the quant selector is blank before a probe and p
   assert.ok(!textOf(quant).includes('none'), 'no synthetic none option is added');
 
   // The catalogue also offers AWQ, which this repository does not ship. That is the §8 case: a
-  // quant the card could run but the checkpoint does not contain. It must be an explained escape
-  // hatch, never a free or instant button.
+  // quant the card could run but the checkpoint does not contain. It is an optional select, and the
+  // page shows one compact sentence rather than a panel per catalog quant.
+  const requantSelect = populatedCard.mount.querySelector('[data-field="requantizeTo"]');
+  assert.ok(requantSelect, 'the requantise escape hatch is its own optional select');
+  assert.equal(requantSelect.value, '', 'it defaults to serving what the repository ships');
+  const requantValues = requantSelect.children.map((option) => option.getAttribute('value'));
+  assert.deepEqual(requantValues[0], '', 'the empty choice is first and says no job is being recorded');
+  assert.ok(requantValues.includes('awq'), 'a quant the repository lacks is offered as a future job');
+  const requantText = textOf(populatedCard.mount);
+  assert.match(requantText, /The repository ships fp8\./);
+  assert.match(requantText, /each is a separate multi-hour GPU job, not something this flow does/);
+  assert.equal(populatedCard.mount.querySelectorAll('.gpu-requant').length, 0,
+    'nothing is chosen, so no recipe panel is drawn');
+
+  setSelect(populatedCard.mount, 'requantizeTo', 'awq');
+  await settle(4);
   const requant = textOf(populatedCard.mount);
   assert.match(requant, /Requantisation: awq is not in the repository/);
   assert.match(requant, /llm-compressor/);
   assert.match(requant, /Estimated time/);
   assert.match(requant, /VRAM needed/);
   assert.match(requant, /not free and not instant/);
-  assert.match(requant, /records the recipe and the command/);
+  assert.match(requant, /shows the recipe and the command/);
   assert.match(requant, /does not run the quantiser for you/);
+  assert.equal(populatedCard.mount.querySelectorAll('.gpu-requant').length, 1,
+    'exactly one recipe panel, for the one quant chosen');
+
+  setSelect(populatedCard.mount, 'requantizeTo', '');
+  await settle(4);
+  assert.equal(populatedCard.mount.querySelectorAll('.gpu-requant').length, 0,
+    'clearing the choice removes the one recipe panel');
+  setSelect(populatedCard.mount, 'requantizeTo', 'awq');
+  await settle(4);
+  assert.equal(populatedCard.mount.querySelectorAll('.gpu-requant').length, 1,
+    'choosing again draws exactly one panel, not a second copy');
 });
 
 test('an unprobed repository can be probed from the card step, where its absence blocks a field', async (t) => {
@@ -1005,13 +1029,14 @@ test('the account step names the write it performs, because the review step come
     'the button that writes a credential to the vault does not read as a plain Continue');
   assert.match(textOf(mount), /Writes this account to the vault now/);
   assert.match(textOf(mount), /The rental itself is saved at the end\./);
+  assert.match(textOf(mount), /Each rental has its own account, credential and vault entry/,
+    'the step says the account is this rental\'s alone');
 
-  // A reused account writes nothing: its credential is already in the vault.
-  fire(findButton(mount, 'USE'), 'click');
-  await settle(4);
-  assert.equal(advanceButton(mount).textContent.trim(), 'Continue',
-    'reusing a stored account posts no request, so its button is a plain Continue');
-  assert.ok(!textOf(mount).includes('Writes this account to the vault now'));
+  // There is no "use an existing account" button: an account already recorded belongs to the
+  // rental it pays for, and offering USE here is what made every rental share one credential.
+  assert.equal(descendants(mount).filter((el) => el.tagName === 'BUTTON'
+    && String(el.textContent ?? '') === 'USE').length, 0);
+  assert.match(textOf(mount), /none can be chosen here/);
 });
 
 test('validation pins every problem to its field and reports all of them at once', async (t) => {
@@ -1054,17 +1079,19 @@ test('the account step posts the vault entry before any model step, and clears n
     .filter((el) => el.tagName === 'A' && el.getAttribute('href') === 'https://modal.com/pricing');
   assert.ok(sourceLinks.length >= 1, 'the plan limits carry a link to their published source');
 
-  setInput(mount, 'accountId', 'mana-modal');
+  setInput(mount, 'accountId', 'mana-modal-2');
+  setInput(mount, 'workspace', 'mana');
   setInput(mount, 'tokenId', 'wk-abc123');
   setInput(mount, 'tokenSecret', 'ws-super-secret-value');
 
-  await withPost({ account: { id: 'mana-modal', secret_fingerprint: TOKEN_FINGERPRINT } }, async (posts) => {
+  await withPost({ account: { id: 'mana-modal-2', secret_fingerprint: TOKEN_FINGERPRINT } }, async (posts) => {
     fire(advanceButton(mount), 'click');
     await settle(6);
     assert.equal(posts.length, 1, 'one account request, before the flow reaches the model step');
     assert.equal(posts[0].path, '/api/gpu/apply');
     assert.equal(posts[0].body.action, 'create-account');
-    assert.equal(posts[0].body.account.id, 'mana-modal');
+    assert.equal(posts[0].body.account.id, 'mana-modal-2');
+    assert.equal(posts[0].body.account.workspace, 'mana', 'the workspace is recorded as a plain field');
     assert.equal(posts[0].body.account.token_id, 'wk-abc123');
     assert.equal(posts[0].body.account.token_secret, 'ws-super-secret-value');
     assert.equal(posts[0].body.account.hf_token, null);
@@ -1075,40 +1102,33 @@ test('the account step posts the vault entry before any model step, and clears n
   assert.ok(!textOf(mount).includes('ws-super-secret-value'), 'the token value is never rendered back');
 });
 
-test('an account that is already recorded can carry a deployment without its token being re-sent', async (t) => {
+test('a recorded account is shown read-only, because it already pays for a rental', async (t) => {
   if (!hasSetupModel) return t.skip('panel/gpu-setup-model.js is not present');
   await resetSetup();
   const { mount, navigations } = await mountView({ param: 'new/account', handlers: standardHandlers() });
 
-  assert.ok(mount.querySelector('[data-field="tokenId"]'), 'the create path asks for the token half');
-  fire(findButton(mount, 'USE'), 'click');
-  await settle(4);
-
-  assert.equal(mount.querySelector('[data-field="tokenId"]'), null,
-    'a reused account holds its credential, so the token inputs leave the step');
-  assert.equal(mount.querySelector('[data-field="tokenSecret"]'), null);
-  assert.equal(mount.querySelector('[data-field="accountId"]').value, 'mana-modal');
   const text = textOf(mount);
-  assert.match(text, /Billing account: mana-modal/);
-  assert.match(text, /No token is sent and nothing in the vault is overwritten/);
-  assert.match(text, /Create a new account instead/);
-  assert.ok(!/already exists/i.test(text), 'the reuse path is a choice, not a 409 to be explained away');
+  assert.match(text, /Accounts already recorded for this platform/);
+  assert.match(text, /none can be chosen here: one rental has one account, one credential and one vault entry/);
+  assert.equal(descendants(mount).filter((el) => el.tagName === 'BUTTON'
+    && String(el.textContent ?? '') === 'USE').length, 0, 'no path turns another rental\'s account into this one');
+  assert.ok(mount.querySelector('[data-field="tokenId"]'),
+    'the only way forward is a new account id, which asks for its own token');
 
-  await withPost({ error: { code: 'already_exists' } }, async (posts) => {
-    fire(findButton(mount, 'Continue'), 'click');
+  setInput(mount, 'accountId', 'mana-modal');
+  setInput(mount, 'workspace', 'mana');
+  setInput(mount, 'tokenId', 'wk-abc123');
+  setInput(mount, 'tokenSecret', 'ws-super-secret-value');
+  await withPost({ error: { code: 'conflict' } }, async (posts) => {
+    fire(advanceButton(mount), 'click');
     await settle(6);
-    assert.equal(posts.length, 0, 'reusing an account must not post a second create-account request');
+    assert.equal(posts.length, 0,
+      'the panel refuses the id before it sends a credential that would collide');
+    assert.equal(navigations.includes('#/gpu-rentals/new/model'), false,
+      'a refused account does not advance');
   });
-  assert.equal(navigations.at(-1), '#/gpu-rentals/new/model');
-
-  // The escape hatch is explicit and returns the token fields rather than leaving the operator
-  // stuck on a read-only summary of someone else's account.
-  navigations.length = 0;
-  fire(findButton(mount, 'Create a new account instead'), 'click');
-  await settle(4);
-  assert.ok(mount.querySelector('[data-field="tokenId"]'), 'creating a new account asks for a token again');
-  assert.equal(mount.querySelector('[data-field="accountId"]').value, 'mana-modal');
-  assert.doesNotMatch(textOf(mount), /Billing account:/);
+  assert.match(textOf(mount), /already pays for another rental/,
+    'the refusal says the account is already some other rental\'s');
 });
 
 const setupModelUrl = new URL('../gpu-setup-model.js', import.meta.url);

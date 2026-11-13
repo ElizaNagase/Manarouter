@@ -240,6 +240,58 @@ function slugify(value) {
     .replace(/^-+|-+$/g, '');
 }
 
+/**
+ * The stable part of the app name: `rental-<account>-<repo-name>`, at most 64 characters.
+ *
+ * Mirrors `mr_core::rental::app_slug`. One string identifies both the provider id (built from it
+ * in the conductor) and the Modal app, so the preview and the deployed name cannot drift.
+ *
+ * @param {string} accountId
+ * @param {string} repo
+ * @returns {string}
+ */
+export function appSlug(accountId, repo) {
+  const name = String(repo ?? '').split('/').filter(Boolean).pop() ?? '';
+  let slug = `rental-${slugify(accountId)}-${slugify(name)}`;
+  if (slug.length > 64) slug = slug.slice(0, 64);
+  return slug.replace(/-+$/, '');
+}
+
+/**
+ * The Modal app name the bundle deploys, `manarouter-<app-slug>`.
+ *
+ * @param {string} accountId
+ * @param {string} repo
+ * @returns {string}
+ */
+export function modalAppName(accountId, repo) {
+  return `manarouter-${appSlug(accountId, repo)}`;
+}
+
+/**
+ * The endpoint URL Modal is expected to publish for this draft.
+ *
+ * `https://<workspace>--<app-name>-<function>.modal.run`, dots in the app name becoming dashes,
+ * with the generated bundle's single web function named `serve`. `null` when a part is missing:
+ * the caller must ask for an explicit URL rather than invent one.
+ *
+ * The same derivation is `mr_core::rental::modal_base_url`; the two are kept in step by a golden
+ * value on each side.
+ *
+ * @param {object} draft
+ * @returns {string|null}
+ */
+export function modalBaseUrl(draft) {
+  const d = normalizeDraft(draft);
+  const workspace = slugify(d.workspace);
+  const account = slugify(d.accountId);
+  const name = slugify((d.repo.split('/').filter(Boolean).pop()) ?? '');
+  if (!workspace || !account || !name) return null;
+  // UNCERTAIN: the URL shape and the `serve` function half are reverse-engineered from Modal's
+  // documented app naming. `modal deploy` prints the real URL, which is authoritative if it differs.
+  return `https://${workspace}--${modalAppName(d.accountId, d.repo).replace(/\./g, '-')}-serve.modal.run`;
+}
+
 /** Quote a JS string as a Python string literal without inventing escapes. */
 function pyString(value) {
   return JSON.stringify(String(value));
@@ -263,9 +315,9 @@ export function emptyDraft(platformId) {
   return {
     platform: typeof platformId === 'string' ? platformId.trim() : '',
     accountId: '',
-    // True when this deployment bills an account that already holds its credential: the account
-    // step then stores nothing and asks for no token. It is a view-only flag, never posted.
-    reuseAccount: false,
+    // The Modal workspace the account's apps deploy into. Not a secret: it is the half of the
+    // endpoint URL the panel can know without deploying anything.
+    workspace: '',
     plan: 'unknown',
     tokenId: '',
     tokenSecret: '',
@@ -280,9 +332,13 @@ export function emptyDraft(platformId) {
     maxModelLen: null,
     maxNumSeqs: null,
     shutdownCooldownSecs: SCALEDOWN_WINDOW_LIMITS.default,
-    mode: 'interactive',
-    batchGpu: null,
+    mode: 'streaming',
+    // A quant the repository does not ship, recorded as a future GPU job. The bundle still serves
+    // what the repository ships; this field is never executed by the wizard.
+    requantizeTo: '',
     gpuMemoryUtilization: DEFAULT_GPU_MEMORY_UTILIZATION,
+    // Empty by default: the URL is derived from the workspace and the app name. An explicit value
+    // here is an override for when `modal deploy` prints something different.
     baseUrl: '',
     sizing: null,
     probe: null,
@@ -290,23 +346,28 @@ export function emptyDraft(platformId) {
 }
 
 /** Fill a partial draft with the documented defaults, without mutating the input. */
-function normalizeDraft(draft) {
+export function normalizeDraft(draft) {
   const given = asObject(draft);
   const merged = { ...emptyDraft(given.platform), ...given };
   merged.platform = text(merged.platform);
   merged.accountId = text(merged.accountId);
-  merged.reuseAccount = merged.reuseAccount === true;
+  merged.workspace = text(merged.workspace);
   merged.plan = text(merged.plan) || 'unknown';
   merged.repo = text(merged.repo);
   merged.revision = text(merged.revision);
   merged.gpu = text(merged.gpu);
   merged.weightQuant = text(merged.weightQuant);
   merged.kvCacheDtype = text(merged.kvCacheDtype) || 'auto';
-  merged.mode = text(merged.mode) || 'interactive';
+  // `interactive` is the pre-fix spelling of `streaming`; an old draft keeps loading, but nothing
+  // new is ever written with it.
+  merged.mode = text(merged.mode) === 'batch' ? 'batch' : 'streaming';
+  merged.requantizeTo = text(merged.requantizeTo);
   merged.baseUrl = text(merged.baseUrl);
+  // A pre-fix draft could name a second card for the batch lane. A rental is one model on one card,
+  // so the stale key is dropped rather than carried around and echoed by some later payload.
+  delete merged.batchGpu;
   if (merged.sizing === undefined) merged.sizing = null;
   if (merged.probe === undefined) merged.probe = null;
-  if (merged.batchGpu === undefined) merged.batchGpu = null;
   if (merged.maxModelLen === undefined) merged.maxModelLen = null;
   if (merged.maxNumSeqs === undefined) merged.maxNumSeqs = null;
   return merged;
@@ -867,7 +928,11 @@ function requantizePlan({ probe, gpuId, catalog, targetId }) {
       requires_extra_vram_bytes: 0,
       steps: [
         `pip install "${text(hardware.tool) || REQUANTIZE_TOOL}"`,
-        `dequantise the ${checkoutId} checkout to a dense BF16 directory (llm-compressor\'s converter; the FP8 source carries weight_block_size/weight_scale_inv, so the dequantiser must be FP8BlockDequantizer and not the generic CompressedTensorsDequantizer)`,
+        checkoutId === 'none'
+          // Nothing is quantised: the checkout already is the dense BF16 directory, so there is
+          // no dequantisation step and naming one would invent work.
+          ? 'stage the unquantised BF16 checkpoint as the dense working directory (it is already dense; no dequantiser is involved)'
+          : `dequantise the ${checkoutId} checkout to a dense BF16 directory (llm-compressor\'s converter; the FP8 source carries weight_block_size/weight_scale_inv, so the dequantiser must be FP8BlockDequantizer and not the generic CompressedTensorsDequantizer)`,
         `run the llm-compressor one-shot AWQ+GPTQ W4A16 recipe on that directory, with a calibration dataset and the offload settings written out explicitly`,
         'stop the deployment first, or use a scratch instance: this job wants the card to itself',
         `push the resulting W4A16 directory and point this deployment at it, then probe again`,
@@ -950,13 +1015,15 @@ function requantizePlan({ probe, gpuId, catalog, targetId }) {
     tool: text(hardware.tool) || REQUANTIZE_TOOL,
     serve_command: serveCommandForRequantized({ probe, hardware, maxLen, kvDtype }),
     serve_command_note: 'Serve the artefact with no --quantization flag derived from the request: the checkpoint declares quant_method "compressed-tensors" and vLLM\'s _verify_quantization raises ValueError when the flag disagrees with it, which is a paid boot that serves nothing.',
-    note: `This is a real offline job on a real GPU: roughly 7.5–8.6 h, ~100 GB of scratch disk, ~69 GB of host RAM, and a quality regression relative to a publisher-native AWQ. Manarouter records the recipe and shows it; it does not run it, and it does not claim to have run it.`,
+    note: `This is a real offline job on a real GPU: roughly 7.5–8.6 h, ~100 GB of scratch disk, ~69 GB of host RAM, and a quality regression relative to a publisher-native AWQ. Manarouter shows the recipe and the command; it does not run it, and it does not claim to have run it.`,
     assumptions: [
       `k_gpu = ${REQUANTIZE_K_GPU} is a CHOSEN margin on llm-compressor's published mem(1 layer) figure (1.0 published for RTN, 2.0 for GPTQ) to leave room for calibration activations, traced intermediates and the vision-tower onload: it has no published equivalent, the same category as the sizing overhead term`,
       `the vision tower (${gib(REQUANTIZE_VISION_TOWER_BYTES)} GiB) is onloaded by the GPU all at once and is not quantised; the research range is 1–4 GiB and is itself [unverified], so the top of that range is used`,
       `fixed_gpu_bytes = ${gib(REQUANTIZE_FIXED_GPU_BYTES)} GiB for the CUDA context, kernels and allocator fragmentation is [reasoned], not published`,
       `requires_vram_bytes is the byte-exact sum rounded to the nearest whole GiB; requires_host_ram_bytes and requires_disk_bytes are rounded to the nearest whole GB`,
-      `requires_disk_bytes counts the ${checkoutId} checkout being pulled (${checkout.bytes_per_param} byte(s)/param)${checkout.bytes_per_param >= 2 ? '' : ' plus the dense BF16 intermediate it is expanded into'}`,
+      checkoutId === 'none'
+        ? 'requires_disk_bytes counts the unquantised checkpoint being pulled (2 bytes/param); it is already dense, so there is no separate expansion step'
+        : `requires_disk_bytes counts the ${checkoutId} checkout being pulled (${checkout.bytes_per_param} byte(s)/param)${checkout.bytes_per_param >= 2 ? '' : ' plus the dense BF16 intermediate it is expanded into'}`,
       ...(targetBppAssumed ? [`the catalog carries no bytes_per_param for ${targetId}, so ${REQUANTIZE_TARGET_BPP_FALLBACK} bytes/param was assumed for a 4-bit target`] : []),
       ...(dense.requires_disk_bytes == null ? ['the parameter count is unknown, so the host RAM and disk terms could not be computed'] : []),
     ],
@@ -1629,6 +1696,15 @@ function selectField({ name, label, hint, optionsSource, required = true, visibl
   };
 }
 
+/** A single-choice control: the view renders one radio card per option, never a select. */
+function choiceField({ name, label, hint, optionsSource, required = true, visible = true, enabled = true, value = null }) {
+  return {
+    name, label, kind: 'choice', hint, required, visible, enabled,
+    options: null, optionsSource, value, placeholder: null, min: null, max: null, step: null,
+    unit: null, readOnly: false, notes: [],
+  };
+}
+
 function textField({ name, label, hint = null, kind = 'text', required = false, visible = true, enabled = true, value = '', placeholder = null }) {
   return {
     name, label, kind, hint, required, visible, enabled,
@@ -1695,9 +1771,10 @@ export function stepList(draft, catalog = null) {
     {
       id: 'account',
       title: 'Account',
-      hint: 'The workspace credentials every rental bills through. Continuing stores this account in the vault: it is not part of the draft, and the panel cannot delete an account later.',
+      hint: 'This rental\'s own account. Each rental has its own account, credential and vault entry: nothing is shared with another rental. Continuing stores it in the vault, and the panel cannot delete an account later.',
       fields: [
-        textField({ name: 'accountId', label: 'Account id', required: true, value: fieldValue(d, 'accountId'), placeholder: 'mana-modal', hint: 'Local identifier used by the deployment and the vault entry.' }),
+        textField({ name: 'accountId', label: 'Account id', required: true, value: fieldValue(d, 'accountId'), placeholder: 'mana-modal', hint: 'Local identifier for this rental\'s vault entry. An id another rental already pays from is refused.' }),
+        textField({ name: 'workspace', label: 'Modal workspace', required: true, value: fieldValue(d, 'workspace'), placeholder: 'mana', hint: 'The workspace this account\'s apps deploy into, for example `mana`. Not a secret: it is the half of the endpoint URL Manarouter can know without deploying.' }),
         selectField({ name: 'plan', label: 'Plan', optionsSource: 'plans', required: true, value: planLabel, hint: 'Unknown is a real answer and is never rendered as free or as paid.' }),
         textField({ name: 'tokenId', label: 'Modal proxy token id', kind: 'password', required: true, value: fieldValue(d, 'tokenId'), placeholder: 'wk-…', hint: 'Half of the Modal proxy token pair: the `wk-…` id the relay sends as `Modal-Key`. Stored in the vault; never rendered back.' }),
         textField({ name: 'tokenSecret', label: 'Modal proxy token secret', kind: 'password', required: true, value: fieldValue(d, 'tokenSecret'), placeholder: 'ws-…', hint: 'The other half: the `ws-…` secret sent as `Modal-Secret`. Both halves are stored as one vault entry, so an account cannot exist half-configured.' }),
@@ -1772,9 +1849,14 @@ export function stepList(draft, catalog = null) {
       fields: [
         selectField({ name: 'gpu', label: 'GPU', optionsSource: 'catalog.gpus', required: true, value: fieldValue(d, 'gpu'), hint: 'From the catalogue. The price, the VRAM ceiling and the legal quantisations on this step all follow from this choice.' }),
         numberField({ name: 'gpuCount', label: 'Cards', value: fieldValue(d, 'gpuCount'), min: 1, max: maxGpuCountFor(d.gpu, catalog), step: 1, required: true, hint: `Cards per container: up to ${GPU_COUNT_LIMIT_DEFAULT}, except A10 at ${MODAL_GPU_COUNT_LIMITS.A10}. More than one card needs tensor parallelism, and the KV pool is then assumed to be sharded evenly.` }),
+        choiceField({
+          name: 'mode', label: 'One card, one job', optionsSource: 'modes', required: true, value: fieldValue(d, 'mode'),
+          hint: 'A deployment is one model on one card doing one thing. Streaming answers requests as they arrive; batch drains a queue in bulk. Exactly one applies here.',
+        }),
         numberField({ name: 'gpuMemoryUtilization', label: 'GPU memory utilization', value: fieldValue(d, 'gpuMemoryUtilization'), min: 0.05, max: 1, step: 0.01, required: true, hint: 'vLLM’s own budget knob (default 0.92). It must cover weights, activations and CUDA graphs, not only the KV cache.' }),
         selectField({ name: 'weightQuant', label: 'Weight quantisation', optionsSource: 'quantOptions', enabled: hasRepo, required: hasRepo, value: fieldValue(d, 'weightQuant'), hint: hasRepo ? 'Only quants this repository ships, filtered by this card.' : 'Paste a model repo first: the quant list is resolved from the probe, not guessed.' }),
         selectField({ name: 'kvCacheDtype', label: 'KV-cache dtype', optionsSource: 'kvDtypesForGpu', enabled: true, required: true, value: fieldValue(d, 'kvCacheDtype'), hint: 'Independent of the weight quantisation: each card has its own legal dtypes.' }),
+        selectField({ name: 'requantizeTo', label: 'Requantise to (optional)', optionsSource: 'requantizeOptions', required: false, enabled: hasRepo, value: fieldValue(d, 'requantizeTo'), hint: 'A quant the repository does not ship. Choosing one plans a future GPU job for this setup; it is not done by the wizard and the bundle still serves what the repository ships.' }),
         readout({
           name: 'gpuPrice', label: 'Price', optionsSource: 'catalog.gpus.price_usd_per_second',
           hint: 'Per second of container life. Modal bills per second, including the cold boot.',
@@ -1795,8 +1877,6 @@ export function stepList(draft, catalog = null) {
         numberField({ name: 'maxModelLen', label: 'Max model length', value: fieldValue(d, 'maxModelLen'), min: 1, step: 1, hint: 'vLLM `--max-model-len`. Defaults to the config’s `max_position_embeddings`; lowering it raises concurrency.' }),
         numberField({ name: 'maxNumSeqs', label: 'Max sequences', value: fieldValue(d, 'maxNumSeqs'), min: 1, step: 1, hint: 'vLLM `--max-num-seqs`: sequences per scheduling step, not simultaneous sessions.' }),
         numberField({ name: 'shutdownCooldownSecs', label: 'Scale-down window (s)', value: fieldValue(d, 'shutdownCooldownSecs'), min: SCALEDOWN_WINDOW_LIMITS.min, max: SCALEDOWN_WINDOW_LIMITS.max, step: 1, hint: 'Modal `scaledown_window`: default 60, range 2–1200.' }),
-        selectField({ name: 'mode', label: 'Mode', optionsSource: 'modes', required: true, value: fieldValue(d, 'mode'), hint: 'Interactive is latency-shaped; batch fills a lane and flushes it when the batch pays for its own boot.' }),
-        selectField({ name: 'batchGpu', label: 'Batch card', optionsSource: 'catalog.gpus', required: d.mode === 'batch', visible: d.mode === 'batch', value: fieldValue(d, 'batchGpu'), hint: 'The second, cheaper-per-token card the batch lane runs on.' }),
         readout({
           name: 'sizingKvBasis', label: 'KV bytes per token', value: sizing.kv_bytes_per_token ?? null,
           visible: sizing.kv_bytes_per_token != null,
@@ -1858,7 +1938,15 @@ export function stepList(draft, catalog = null) {
       title: 'Review',
       hint: 'The bundle is the deployment: Modal publishes no deployment REST API, so this file and its command are what you run.',
       fields: [
-        textField({ name: 'baseUrl', label: 'Endpoint URL', required: true, value: fieldValue(d, 'baseUrl'), placeholder: 'https://workspace--app-fn.modal.run', hint: 'Where the relay will send requests. `modal deploy` prints the real URL; paste it here.' }),
+        readout({
+          name: 'endpointUrl', label: 'Endpoint URL', value: modalBaseUrl(d),
+          notes: ['Derived from the account\'s Modal workspace and the generated app name. Nothing is deployed yet: `modal deploy` prints the real URL, and if it differs, that one wins.'],
+        }),
+        textField({
+          name: 'baseUrl', label: 'Override endpoint URL (optional)', required: false, value: fieldValue(d, 'baseUrl'),
+          placeholder: 'https://workspace--manarouter-rental-….modal.run',
+          hint: 'Leave empty normally. Fill it only when `modal deploy` prints a URL other than the derived one.',
+        }),
         readout({
           name: 'bundleFilename', label: 'Bundle file', value: 'modal_app.py',
           notes: ['Generated from this draft; no credentials are ever embedded in it.'],
@@ -1957,9 +2045,12 @@ function slugLike(value) {
  *
  * @param {object} draft
  * @param {string} stepId
+ * @param {object|null} [catalog]
+ * @param {Array<object>|null} [accounts] The recorded accounts, so an id another rental already
+ *   pays from is refused here instead of by the conductor.
  * @returns {{ok: boolean, problems: Array<{field: string, message: string}>, errors: Array<{code: string, message: string, details: string[]}>}}
  */
-export function validateStep(draft, stepId, catalog = null) {
+export function validateStep(draft, stepId, catalog = null, accounts = null) {
   const d = normalizeDraft(draft);
   const id = text(stepId);
   const problems = [];
@@ -1987,13 +2078,17 @@ export function validateStep(draft, stepId, catalog = null) {
       problems.push(problem('accountId', 'An account id is required: it names the vault entry and the deployment’s billing account.'));
     } else if (!slugLike(d.accountId)) {
       problems.push(problem('accountId', 'Use letters, digits, dot, dash or underscore, starting with a letter or digit.'));
+    } else if (asArray(accounts).some((account) => text(asObject(account).id) === d.accountId)) {
+      problems.push(problem('accountId', `Account "${d.accountId}" already pays for another rental. Each rental has its own account, credential and vault entry, so this one needs a new account id.`));
+    }
+    if (!d.workspace) {
+      problems.push(problem('workspace', 'The Modal workspace is required: it is half of the endpoint URL and the app deploys into it.'));
+    } else if (d.workspace.length > 63 || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(d.workspace)) {
+      problems.push(problem('workspace', 'A Modal workspace is up to 63 lowercase letters, digits or dashes, with no dash at either end (for example `mana`).'));
     }
     if (!PLAN_IDS.includes(d.plan)) {
       problems.push(problem('plan', `Plan must be one of ${PLAN_IDS.join(', ')}; leave it on unknown rather than guessing.`));
     }
-    // A reused account already carries its plan and its credential: this step stores nothing, so
-    // demanding a token here would ask the operator to re-enter a secret the vault already holds.
-    if (d.reuseAccount) return { ok: problems.length === 0 && errors.length === 0, problems, errors };
     if (!d.tokenId) {
       problems.push(problem('tokenId', 'The Modal proxy token id is required (Modal-Key).'));
     } else if (/^ak-/.test(d.tokenId)) {
@@ -2050,6 +2145,14 @@ export function validateStep(draft, stepId, catalog = null) {
       problems.push(problem('weightQuant', 'Paste a model repo on the model step first: the quant list comes from the probe, not from a hardcoded list.'));
     } else if (!d.weightQuant) {
       problems.push(problem('weightQuant', 'Choose a weight quantisation (or "none" for unquantised weights).'));
+    } else if (d.weightQuant !== 'none' && asObject(d.probe).quants != null) {
+      const shipped = asArray(asObject(d.probe).quants).map((q) => text(asObject(q).id));
+      if (shipped.length > 0 && !shipped.includes(d.weightQuant)) {
+        problems.push(problem('weightQuant', `The probed repository ships ${shipped.join(', ')}; "${d.weightQuant}" is not one of them. Choose it under "Requantise to (optional)" as a future GPU job instead.`));
+      }
+    }
+    if (d.mode !== 'streaming' && d.mode !== 'batch') {
+      problems.push(problem('mode', 'Choose exactly one: streaming or batch.'));
     }
     if (!d.kvCacheDtype) {
       problems.push(problem('kvCacheDtype', 'Choose a KV-cache dtype; "auto" follows the model dtype.'));
@@ -2077,28 +2180,16 @@ export function validateStep(draft, stepId, catalog = null) {
     } else if (cooldown < SCALEDOWN_WINDOW_LIMITS.min || cooldown > SCALEDOWN_WINDOW_LIMITS.max) {
       problems.push(problem('shutdownCooldownSecs', `Modal accepts scaledown_window from ${SCALEDOWN_WINDOW_LIMITS.min} to ${SCALEDOWN_WINDOW_LIMITS.max} seconds (default ${SCALEDOWN_WINDOW_LIMITS.default}).`));
     }
-    if (d.mode !== 'interactive' && d.mode !== 'batch') {
-      problems.push(problem('mode', 'Mode must be interactive or batch.'));
-    }
-    if (d.mode === 'batch') {
-      if (!d.batchGpu) {
-        problems.push(problem('batchGpu', 'The batch lane needs its own card: it is a different sizing and a different bill.'));
-      } else if (d.batchGpu === d.gpu) {
-        problems.push(problem('batchGpu', 'The batch card must differ from the interactive card, or the two lanes share one bill and the point of the second lane is lost.'));
-      }
-    }
-    if (d.weightQuant && d.gpu && asObject(d.probe).quants != null) {
-      const shipped = asArray(asObject(d.probe).quants).map((q) => text(asObject(q).id));
-      if (shipped.length > 0 && !shipped.includes(d.weightQuant) && d.weightQuant !== 'none') {
-        problems.push(problem('weightQuant', `The probed repository ships ${shipped.join(', ')}; "${d.weightQuant}" would have to be produced by the requantisation recipe first.`));
-      }
-    }
   }
 
   if (id === 'review') {
     const url = d.baseUrl.trim();
     if (!url) {
-      problems.push(problem('baseUrl', 'The endpoint URL is required: a provider needs a base_url to be routable.'));
+      // Absent override: the conductor derives the URL from the account's workspace and is the
+      // authority on whether that is possible; the panel must not invent one either.
+      if (modalBaseUrl(d) == null) {
+        problems.push(problem('baseUrl', 'No endpoint URL can be derived: record the Modal workspace on the account step, or paste the URL `modal deploy` prints.'));
+      }
     } else {
       let parsed = null;
       try {
@@ -2174,8 +2265,10 @@ export function deploymentBundle(draft, sizing, catalog) {
   const clamp = clampScaledown(d.shutdownCooldownSecs);
   const gated = d.hfTokenNeeded || requiresHfToken(d.probe) || Boolean(d.hfToken);
   const utilization = toNumber(d.gpuMemoryUtilization) ?? DEFAULT_GPU_MEMORY_UTILIZATION;
-  const repoName = d.repo.split('/').filter(Boolean).pop() ?? '';
-  const appName = [slugify(repoName || 'vllm'), slugify(gpuId || 'gpu')].filter(Boolean).join('-').slice(0, 58) || 'vllm-deployment';
+  // The same derivation the conductor records as the provider's base_url, so the app this file
+  // deploys and the URL the panel shows cannot drift apart.
+  const appName = modalAppName(d.accountId, d.repo);
+  const derivedUrl = modalBaseUrl(d);
   const secretName = 'manarouter-hf';
   const volumeName = 'manarouter-hf-cache';
   // What the probed repo actually ships. `null` ids are ignored: a probe that names no quant has
@@ -2329,8 +2422,13 @@ export function deploymentBundle(draft, sizing, catalog) {
     notes.push(`--max-model-len ${d.maxModelLen} is below the config's max_position_embeddings (${asObject(d.probe).arch.max_position_embeddings}); requests longer than this are rejected, which is the intended way to raise concurrency.`);
   }
   notes.push('Modal bills per second of container life, including the cold boot; the catalog carries the per-second rate, and an hour-based figure is not the same number.');
+  if (d.requantizeTo) {
+    notes.push(`A future requantisation to "${d.requantizeTo}" is planned in this setup, as a separate multi-hour GPU job. It is not part of this file, which serves what the repository ships.`);
+  }
   if (d.baseUrl) {
-    notes.push(`The provider's base_url (${d.baseUrl}) must match the URL \`modal deploy\` prints for this app; update it if they differ.`);
+    notes.push(`The endpoint URL is overridden to ${d.baseUrl}. That value wins only if it is what \`modal deploy\` printed; the derived URL for this app would be ${derivedUrl ?? 'unavailable without a workspace'}.`);
+  } else if (derivedUrl) {
+    notes.push(`Manarouter computes the endpoint URL as ${derivedUrl} from the workspace and the app name. \`modal deploy\` prints the authoritative URL; if it differs, override the provider's base_url with the printed one.`);
   }
   if (asObject(sizing ?? d.sizing).method === 'unavailable') {
     notes.push('No KV estimate was available when this bundle was generated, so the provider will need its kv_pool_tokens from vLLM\'s startup line.');
@@ -2366,48 +2464,15 @@ export function accountApplyPayload(draft) {
       label: d.accountId,
       platform: d.platform,
       plan: d.plan,
+      // Not a secret: the Modal workspace the apps deploy into, and the half of the endpoint URL
+      // the conductor can know without deploying.
+      workspace: d.workspace,
       token_id: d.tokenId,
       token_secret: d.tokenSecret,
       hf_token: d.hfToken || null,
     },
   };
   return payload;
-}
-
-/**
- * Whether a deployment may bill an account that is already recorded (§5).
- *
- * Returns `null` when the draft is not reusing an account, or when the named account is present,
- * on the same platform, and holds a credential. Otherwise one sentence naming the problem and the
- * way out. Pure: the caller passes the `accounts` array from `GET /api/gpu/rentals`.
- *
- * @param {object} draft
- * @param {Array<object>} accounts
- * @returns {string|null}
- */
-export function accountReuseProblem(draft, accounts) {
-  const d = normalizeDraft(draft);
-  if (!d.reuseAccount) return null;
-  if (!d.accountId) {
-    return 'No rental account is selected. Create one here, or pick one from the accounts listed below.';
-  }
-  const list = asArray(accounts).map((account) => asObject(account));
-  const account = list.find((candidate) => text(candidate.id).trim() === d.accountId);
-  if (!account) {
-    return `No rental account with id \`${d.accountId}\` is recorded. Create it here, or pick one from the accounts listed below.`;
-  }
-  const platform = text(account.platform).trim();
-  if (platform && d.platform && platform !== d.platform) {
-    return `Account \`${d.accountId}\` belongs to platform \`${platform}\`, not \`${d.platform}\`. Pick an account on this platform or create a new one.`;
-  }
-  // The view hands over `normaliseAccount()` rows (`hasCredential`); a raw `GET /api/gpu/rentals`
-  // row spells it `has_credential`. Only an explicit `false` blocks: an older conductor that does
-  // not report the flag must not make every stored account unusable.
-  const hasCredential = hasOwn(account, 'hasCredential') ? account.hasCredential : account.has_credential;
-  if (hasCredential === false) {
-    return `Account \`${d.accountId}\` has no credential stored. Record it with its token before a deployment can bill to it.`;
-  }
-  return null;
 }
 
 /**
@@ -2447,12 +2512,11 @@ export function applyPayload(draft, sizing) {
     weight_quant: d.weightQuant || 'none',
     kv_cache_dtype: d.kvCacheDtype || 'auto',
     shutdown_cooldown_secs: clampScaledown(d.shutdownCooldownSecs).seconds,
-    mode: d.mode === 'batch' ? 'batch' : 'interactive',
+    mode: d.mode === 'batch' ? 'batch' : 'streaming',
   };
   if (d.revision) deployment.revision = d.revision;
   if (optionalInt(d.maxModelLen) != null) deployment.max_model_len = optionalInt(d.maxModelLen);
   if (optionalInt(d.maxNumSeqs) != null) deployment.max_num_seqs = optionalInt(d.maxNumSeqs);
-  if (d.mode === 'batch' && d.batchGpu) deployment.batch_gpu = d.batchGpu;
   if (d.baseUrl) deployment.base_url = d.baseUrl;
   const wire = wireSizing(d, sizing);
   if (wire) deployment.sizing = wire;

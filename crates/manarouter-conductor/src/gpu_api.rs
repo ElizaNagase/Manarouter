@@ -81,7 +81,7 @@ use mr_core::model::ModelEntry;
 use mr_core::quota::http::{QuotaHttp, QuotaRequest};
 use mr_core::rental::{
     parse_deployment, plan_launch, RentalAccount, RentalDeployment, RentalMode, RentalPlan,
-    RentalPlatform, RentalSchedule,
+    RentalPlatform, RentalSchedule, RequantizePlan,
 };
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -1171,7 +1171,6 @@ pub async fn rentals_body(state: &AppState) -> Value {
                     "max_num_seqs": deployment.max_num_seqs,
                     "shutdown_cooldown_secs": deployment.shutdown_cooldown_secs,
                     "mode": deployment.mode.as_str(),
-                    "batch_gpu": deployment.batch_gpu,
                     "bundle_id": deployment.bundle_id,
                     "sizing": deployment
                         .sizing
@@ -1445,15 +1444,37 @@ async fn create_account(state: &AppState, map: &Map<String, Value>) -> ApiResult
     let plan = match string_field(&account_map, "plan") {
         Some(plan) => match RentalPlan::parse(&plan) {
             Some(plan) => plan,
-            None => return Err(ApiError::bad(
-                "invalid_body",
-                "`plan` must be one of `free`, `paid`, or `unknown`; it is never inferred from \
+            None => {
+                return Err(ApiError::bad(
+                    "invalid_body",
+                    "`plan` must be one of `free`, `paid`, or `unknown`; it is never inferred from \
                      the card, because the card's free-plan state is usually unknown",
-            )),
+                ));
+            }
         },
         // Absent means unknown. Guessing free would be the exact mistake the catalog's three-state
         // free plan exists to prevent.
         None => RentalPlan::Unknown,
+    };
+    let workspace = match string_field(&account_map, "workspace") {
+        Some(workspace) => {
+            if let Some(problem) = workspace_problem(&workspace) {
+                return Err(ApiError::bad("invalid_body", problem));
+            }
+            Some(workspace)
+        }
+        // Only Modal needs a workspace: it is the first half of that platform's derived endpoint
+        // URL. Requiring it from a Kaggle or custom account would record a field that platform
+        // does not have, so an absent workspace stays absent there.
+        None if platform == RentalPlatform::Modal => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "the account needs a `workspace`: the Modal workspace its apps deploy into \
+                 (for example `mana`). It is not a secret, and it is the half of the endpoint URL \
+                 Manarouter can know without deploying.",
+            ));
+        }
+        None => None,
     };
     let token_id = string_field(&account_map, "token_id");
     let token_secret = string_field(&account_map, "token_secret");
@@ -1512,6 +1533,7 @@ async fn create_account(state: &AppState, map: &Map<String, Value>) -> ApiResult
     account.label = label;
     account.platform = platform;
     account.plan = plan;
+    account.workspace = workspace;
     account.max_concurrent_containers = max_concurrent_containers;
     account.note = string_field(&account_map, "note");
     if let Some(limits) = plan_limits {
@@ -1573,6 +1595,7 @@ async fn create_account(state: &AppState, map: &Map<String, Value>) -> ApiResult
             "label": account.label,
             "platform": account.platform.as_str(),
             "plan": account.plan.as_str(),
+            "workspace": account.workspace,
             "has_credential": account.has_credential(),
         },
         "vault": {
@@ -1662,20 +1685,17 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
             format!("`{gpu_id}` is not a GPU id in the catalog; see GET /api/gpu/catalog"),
         ));
     };
-    let base_url =
-        match string_field(&deployment_map, "base_url") {
-            Some(url) => url,
-            None => return Err(ApiError::bad(
+    // Optional. Absent means "derive it from the account's workspace and the app name the bundle
+    // will use"; present is an explicit override, and the value `modal deploy` printed is the one
+    // that should win.
+    let base_url_override = string_field(&deployment_map, "base_url");
+    if let Some(url) = &base_url_override {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(ApiError::bad(
                 "invalid_body",
-                "the deployment needs a `base_url`: the endpoint URL Modal prints when the bundle \
-                 is deployed. It cannot be guessed, because Modal assigns it per app.",
-            )),
-        };
-    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-        return Err(ApiError::bad(
-            "invalid_body",
-            "`base_url` must start with `http://` or `https://`",
-        ));
+                "`base_url` must start with `http://` or `https://`",
+            ));
+        }
     }
 
     let gpu_count = deployment_map
@@ -1703,8 +1723,8 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
             None => {
                 return Err(ApiError::bad(
                     "invalid_body",
-                    "`mode` must be `interactive` or `batch`",
-                ))
+                    "`mode` must be `streaming` or `batch`",
+                ));
             }
         },
         None => RentalMode::default(),
@@ -1713,15 +1733,20 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
         .get("shutdown_cooldown_secs")
         .and_then(Value::as_u64)
         .map(|value| value.min(u64::from(u32::MAX)) as u32);
-    let batch_gpu = string_field(&deployment_map, "batch_gpu");
-    if let Some(batch) = batch_gpu.as_deref() {
-        if gpu_by_id(batch).is_none() {
-            return Err(ApiError::bad(
-                "invalid_body",
-                format!("`batch_gpu` names `{batch}`, which is not a GPU id in the catalog"),
-            ));
-        }
-    }
+    // Optional. A requantisation is a recipe the operator runs separately, never something this
+    // endpoint executes; accepting the plan here only keeps it with the deployment that will serve
+    // the resulting checkpoint, so a supplied plan is never silently dropped.
+    let requantize = match deployment_map.get("requantize") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            serde_json::from_value::<RequantizePlan>(value.clone()).map_err(|err| {
+                ApiError::bad(
+                    "invalid_body",
+                    format!("`requantize` is not a plan this server understands: {err}"),
+                )
+            })?,
+        ),
+    };
 
     // Hardware legality. An `unsupported` verdict is a refusal with the catalog's own reason; an
     // `unverified` one is allowed and carried out as a warning, because "the catalog has not
@@ -1840,6 +1865,53 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
         ));
     }
 
+    // One account, one rental. A second deployment on the same account would share its vault
+    // entry and its usage figures, and neither can be attributed to a single rental.
+    let account_in_use = current.providers.iter().find_map(|provider| {
+        match parse_deployment(provider.id.as_ref(), &provider.extra) {
+            Ok(Some(deployment)) if deployment.account == account_id => {
+                Some(provider.id.to_string())
+            }
+            _ => None,
+        }
+    });
+    if let Some(existing) = account_in_use {
+        return Err(ApiError::conflict(format!(
+            "rental account `{account_id}` already pays for deployment `{existing}`; each rental \
+             has its own account, credential and vault entry, so a second rental needs a new \
+             account id"
+        )));
+    }
+
+    let base_url = match base_url_override {
+        Some(url) => url,
+        None => {
+            let Some(workspace) = account
+                .workspace
+                .as_deref()
+                .map(str::trim)
+                .filter(|workspace| !workspace.is_empty())
+            else {
+                return Err(ApiError::bad(
+                    "invalid_body",
+                    format!(
+                        "rental account `{account_id}` has no recorded workspace, so the endpoint \
+                         URL cannot be derived; record the workspace on the account, or send the \
+                         `base_url` that `modal deploy` prints"
+                    ),
+                ));
+            };
+            let Some(url) = mr_core::rental::modal_base_url(workspace, &account.id, &repo) else {
+                return Err(ApiError::bad(
+                    "invalid_body",
+                    "the endpoint URL could not be derived from that workspace and repository \
+                     name; send the `base_url` that `modal deploy` prints",
+                ));
+            };
+            url
+        }
+    };
+
     let provider_id = provider_id_for(&account.id, &repo);
     if current
         .providers
@@ -1852,9 +1924,9 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
         )));
     }
 
-    // The workspace credential is written once, when the account is created; a deployment only
-    // points at it. Copying it to a per-provider vault id would put one workspace secret in the
-    // vault N times, and every copy would go stale the moment the credential was rotated.
+    // The account's own credential is written once, when the account is created; this deployment
+    // only points at it. The entry belongs to exactly one account and one rental, so there is no
+    // other provider it could be shared with, and no copy that could go stale on rotation.
     let credential_id = account
         .secret_ref
         .clone()
@@ -1883,7 +1955,7 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
         .map(|value| value.min(u64::from(u32::MAX)) as u32);
     deployment.shutdown_cooldown_secs = shutdown_cooldown_secs;
     deployment.mode = mode;
-    deployment.batch_gpu = batch_gpu;
+    deployment.requantize = requantize;
     deployment.sizing = sizing;
     let review = deployment.problems();
     if !review.is_empty() {
@@ -1930,8 +2002,8 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
     };
     provider.models.push(model);
 
-    // One account per provider, all of them pointing at the workspace's single vault entry: the
-    // provider is the deployment, the credential belongs to the workspace.
+    // The provider's sole account references this rental account's own vault entry. Accounts are
+    // not shared between rentals, so no second provider points at that entry.
     let mut account_row = mr_core::Account::new(account.label.clone());
     account_row.secret_ref = Some(credential_id.clone());
     account_row.max_concurrent = 1;
@@ -1968,7 +2040,8 @@ async fn create_deployment(state: &AppState, map: &Map<String, Value>) -> ApiRes
         "provider_id": provider_id,
         "account_id": account.id,
         "vault": {
-            // The workspace's existing entry, referenced — not copied. One credential, N providers.
+            // This account's own entry, referenced — not copied, and not shared with another
+            // rental.
             "secret_id": credential_id,
             "fingerprint": fingerprint,
         },
@@ -2003,7 +2076,9 @@ struct Bundle {
 /// escaped for a Python string literal, and the repository id is validated before it gets this far,
 /// so the file cannot be broken out of by a crafted `repo`.
 fn deployment_bundle(provider_id: &str, deployment: &RentalDeployment, gpu: &GpuSpec) -> Bundle {
-    let app_name = format!("manarouter-{provider_id}");
+    // The same derivation the recorded `base_url` uses, so the URL the panel shows is the URL this
+    // app is deployed under.
+    let app_name = mr_core::rental::modal_app_name(&deployment.account, &deployment.repo);
     let gpu_spec = if deployment.gpu_count > 1 {
         format!("{}:{}", gpu.id, deployment.gpu_count)
     } else {
@@ -2049,8 +2124,11 @@ fn deployment_bundle(provider_id: &str, deployment: &RentalDeployment, gpu: &Gpu
 # Deploy it with:
 #     modal deploy {filename}
 #
-# Modal prints the endpoint URL on deploy. Paste that URL into the provider's base URL in the
-# panel; Manarouter cannot know it in advance because Modal mints it per app.
+# The panel records the endpoint URL this app should answer on, derived from the workspace and the
+# app name:
+#     https://<workspace>--<app name>-serve.modal.run
+# `modal deploy` prints the authoritative URL. If they differ, use the printed one: the panel's
+# base URL is an editable override for exactly that case.
 import subprocess
 
 import modal
@@ -2167,27 +2245,36 @@ fn change_needs_restart(before: &Config, after: &Config) -> Option<&'static str>
 /// A provider id for a deployment: stable, lowercase, and derived from the account and repository
 /// so that applying the same deployment twice collides instead of duplicating.
 fn provider_id_for(account_id: &str, repo: &str) -> String {
-    let name = repo.rsplit('/').next().unwrap_or(repo);
-    let mut id = format!("rental-{}-{}", slug(account_id), slug(name));
-    if id.len() > 64 {
-        id.truncate(64);
-    }
-    while id.ends_with('-') {
-        id.pop();
-    }
-    id
+    // The same helper the panel and the derived URL use, so the provider id and the Modal app name
+    // cannot drift apart.
+    mr_core::rental::app_slug(account_id, repo)
 }
 
-fn slug(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        } else if !out.ends_with('-') {
-            out.push('-');
-        }
+/// Why a value is not usable as a Modal workspace.
+///
+/// A workspace is a DNS label in `https://<workspace>--<app>-serve.modal.run`, so it is validated
+/// as one rather than guessed at; normalising it silently would record a workspace the operator
+/// did not type, and the derived URL with it.
+fn workspace_problem(workspace: &str) -> Option<String> {
+    if workspace.is_empty() {
+        return Some("`workspace` must not be empty".to_owned());
     }
-    out.trim_matches('-').to_owned()
+    if workspace.len() > 63 {
+        return Some("`workspace` must be at most 63 characters".to_owned());
+    }
+    if workspace.starts_with('-') || workspace.ends_with('-') {
+        return Some("`workspace` must not start or end with `-`".to_owned());
+    }
+    if !workspace
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    {
+        return Some(format!(
+            "`workspace` `{workspace}` must be a lowercase workspace slug: letters `a-z`, digits \
+             and `-`, as in `mana`"
+        ));
+    }
+    None
 }
 
 /// Why a value is not usable as an account id.
@@ -3041,31 +3128,24 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_workspace_credential_is_written_once_and_shared_by_every_deployment() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let state = state_in(dir.path());
-        // Shaped like a Modal proxy token so it passes the same check production does, and unique
-        // enough that finding it anywhere in a response is unambiguous.
-        let credential = "wk-test-id-9f3a2c.ws-test-secret-4b8d1e";
-
-        // The operator stores the plan list it confirmed against the provider's pricing page.
+    /// Create a Modal rental account the way the panel does.
+    async fn create_modal_account(state: &AppState, id: &str, workspace: &str, credential: &str) {
         let plan_limits = serde_json::to_value(
             mr_core::gpu::catalog::platform_by_id("modal")
                 .expect("modal is in the catalog")
                 .plan_limits,
         )
         .expect("serialise the plan limits");
-
         let created = apply_body(
-            &state,
+            state,
             json!({
                 "action": "create-account",
                 "account": {
-                    "id": "mana-modal",
-                    "label": "Mana on Modal",
+                    "id": id,
+                    "label": id,
                     "platform": "modal",
                     "plan": "paid",
+                    "workspace": workspace,
                     "token": credential,
                     "max_concurrent_containers": 10,
                 },
@@ -3074,41 +3154,19 @@ mod tests {
         )
         .await
         .expect("create the account");
-        assert_eq!(created["action"], "create-account");
-        assert_eq!(created["account"]["has_credential"], true);
-        assert!(
-            !created.to_string().contains(credential),
-            "the credential must never be echoed"
-        );
+        assert_eq!(created["account"]["workspace"], workspace);
+    }
 
-        // The vault holds the combined string at the id the spec names, as one value.
-        {
-            let vault = state.vault.lock().await;
-            assert_eq!(
-                vault.get("rental:mana-modal").expect("read the vault").as_deref(),
-                Some(credential),
-                "the stored value must be exactly `wk-….ws-….`, because the relay splits it on the dot"
-            );
-        }
+    #[tokio::test]
+    async fn each_rental_account_gets_its_own_credential_and_vault_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = state_in(dir.path());
+        // Shaped like Modal proxy tokens so they pass the same check production does.
+        let first_credential = "wk-test-id-9f3a2c.ws-test-secret-4b8d1e";
+        let second_credential = "wk-second-id-1a2b3c.ws-second-secret-5e6f7a";
 
-        // The account metadata survives a round trip through `config.json`, which is the only
-        // thing `AppState::commit` writes: `Config::extra` keeps the key verbatim.
-        let reloaded = Config::load(dir.path().join("config.json")).expect("reload the config");
-        let accounts = rental_accounts(&reloaded);
-        assert_eq!(
-            accounts.len(),
-            1,
-            "the account must survive a restart: `Config::rental_accounts` is what reads it back"
-        );
-        assert_eq!(accounts[0].id, "mana-modal");
-        assert_eq!(accounts[0].label, "Mana on Modal");
-        assert_eq!(accounts[0].plan.as_str(), "paid");
-        assert_eq!(accounts[0].secret_ref.as_deref(), Some("rental:mana-modal"));
-        assert_eq!(
-            accounts[0].extra["plan_limits"][0]["id"], "free",
-            "the plan list survives verbatim: {accounts:?}"
-        );
-        assert_eq!(accounts[0].extra["plan_limits"][1]["id"], "paid");
+        create_modal_account(&state, "mana-modal", "mana", first_credential).await;
+        create_modal_account(&state, "second-rental", "mana", second_credential).await;
 
         let first = apply_body(
             &state,
@@ -3119,96 +3177,281 @@ mod tests {
                     "repo": "Qwen/Qwen3-8B",
                     "gpu": "H100",
                     "gpu_count": 1,
-                    "base_url": "https://mana--qwen3-8b.modal.run",
                     "max_model_len": 32768,
                 },
             }),
         )
         .await
         .expect("create the first deployment");
-        assert_eq!(first["action"], "create-deployment");
         assert_eq!(first["account_id"], "mana-modal");
-        // A provider is adopted from the routing snapshot, so adding one is live without a restart.
-        assert_eq!(first["applies_on"], "immediately");
-        assert!(!first.to_string().contains(credential));
+        assert!(!first.to_string().contains(first_credential));
+        assert!(!first.to_string().contains(second_credential));
 
-        let config = state.current_config().await;
-        assert_eq!(config.providers.len(), 1);
-        let provider = &config.providers[0];
-        assert_eq!(provider.dialect, Dialect::ModalVllm);
-        assert_eq!(provider.base_url, "https://mana--qwen3-8b.modal.run");
-        assert_eq!(
-            provider.accounts[0].secret_ref.as_deref(),
-            Some("rental:mana-modal"),
-            "the provider references the workspace's entry; it does not get a copy of its own"
-        );
-        let rental = &provider.extra[mr_core::rental::RENTAL_EXTRA_KEY];
-        assert_eq!(rental["account"], "mana-modal");
-        assert_eq!(rental["repo"], "Qwen/Qwen3-8B");
-
-        // A second deployment for the same workspace reuses the credential rather than duplicating
-        // it: `Vault::put` is not ref-counted, so a per-provider copy would be a second copy to rot.
-        apply_body(
+        let second = apply_body(
             &state,
             json!({
                 "action": "create-deployment",
-                "account_id": "mana-modal",
+                "account_id": "second-rental",
                 "deployment": {
                     "repo": "Qwen/Qwen3-14B",
                     "gpu": "H100",
                     "gpu_count": 1,
-                    "base_url": "https://mana--qwen3-14b.modal.run",
                     "max_model_len": 32768,
                 },
             }),
         )
         .await
         .expect("create the second deployment");
+        assert_eq!(second["account_id"], "second-rental");
+        assert!(!second.to_string().contains(first_credential));
+        assert!(!second.to_string().contains(second_credential));
 
+        // Two accounts, two vault entries: neither can be reached through the other.
         {
             let vault = state.vault.lock().await;
-            let rental_ids: Vec<String> = vault
+            let mut rental_ids: Vec<String> = vault
                 .ids()
                 .into_iter()
                 .filter(|id| id.starts_with("rental:"))
                 .collect();
+            rental_ids.sort();
             assert_eq!(
                 rental_ids,
-                vec!["rental:mana-modal".to_owned()],
-                "one workspace, one credential entry, however many deployments"
+                vec![
+                    "rental:mana-modal".to_owned(),
+                    "rental:second-rental".to_owned()
+                ],
+                "one entry per account, not one per workspace"
             );
             assert_eq!(
                 vault
                     .get("rental:mana-modal")
                     .expect("read the vault")
                     .as_deref(),
-                Some(credential)
+                Some(first_credential)
+            );
+            assert_eq!(
+                vault
+                    .get("rental:second-rental")
+                    .expect("read the vault")
+                    .as_deref(),
+                Some(second_credential)
             );
         }
 
-        let body = rentals_body(&state).await;
-        assert_eq!(body["accounts"].as_array().expect("accounts").len(), 1);
-        let account = &body["accounts"][0];
-        assert_eq!(account["id"], "mana-modal");
-        assert_eq!(account["has_credential"], true);
-        assert!(
-            account["credential_fingerprint"].is_string(),
-            "a fingerprint, not the value: {account}"
+        let config = state.current_config().await;
+        assert_eq!(config.providers.len(), 2);
+        let mut by_account: Vec<(String, String)> = config
+            .providers
+            .iter()
+            .map(|provider| {
+                let deployment = parse_deployment(provider.id.as_ref(), &provider.extra)
+                    .expect("read the deployment")
+                    .expect("a rental deployment");
+                let reference = provider.accounts[0]
+                    .secret_ref
+                    .clone()
+                    .expect("the provider references its account's entry");
+                (deployment.account, reference)
+            })
+            .collect();
+        by_account.sort();
+        assert_eq!(
+            by_account,
+            vec![
+                ("mana-modal".to_owned(), "rental:mana-modal".to_owned()),
+                (
+                    "second-rental".to_owned(),
+                    "rental:second-rental".to_owned()
+                ),
+            ],
+            "each account's entry is referenced by exactly one provider"
         );
+        // A third rental on an account that already pays for one is refused by name.
+        let refused = apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "mana-modal",
+                "deployment": {
+                    "repo": "Qwen/Qwen3-32B",
+                    "gpu": "H100",
+                    "gpu_count": 1,
+                },
+            }),
+        )
+        .await;
+        let message = refused.expect_err("an account may not be shared");
+        assert!(
+            message.contains("already pays for deployment"),
+            "the refusal must say the account is taken: {message}"
+        );
+        assert_eq!(state.current_config().await.providers.len(), 2);
+
+        let body = rentals_body(&state).await;
+        assert_eq!(body["accounts"].as_array().expect("accounts").len(), 2);
         assert_eq!(
             body["deployments"].as_array().expect("deployments").len(),
             2
         );
-        assert_eq!(body["deployments"][1]["account"], "mana-modal");
+        assert!(!body.to_string().contains(first_credential));
+        assert!(!body.to_string().contains(second_credential));
+    }
+
+    #[tokio::test]
+    async fn a_deployment_derives_its_url_unless_the_operator_overrides_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = state_in(dir.path());
+        create_modal_account(
+            &state,
+            "mana-modal",
+            "mana",
+            "wk-derive-id-0a1b2c.ws-derive-3d4e5f",
+        )
+        .await;
+
+        // Absent base_url: derived from the workspace and the generated app name.
+        apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "mana-modal",
+                "deployment": {"repo": "Qwen/Qwen3-8B", "gpu": "H100", "gpu_count": 1},
+            }),
+        )
+        .await
+        .expect("create the derived deployment");
+        let config = state.current_config().await;
         assert_eq!(
-            body["errors"],
-            json!([]),
-            "nothing should have been dropped: {body}"
+            config.providers[0].base_url,
+            "https://mana--manarouter-rental-mana-modal-qwen3-8b-serve.modal.run"
         );
+        let extra = &config.providers[0].extra[mr_core::rental::RENTAL_EXTRA_KEY];
+        assert_eq!(extra["mode"], "streaming");
         assert!(
-            !body.to_string().contains(credential),
-            "the credential must never be echoed"
+            extra.get("batch_gpu").is_none(),
+            "the shared batch card is gone: {extra}"
         );
+
+        // Present base_url: an explicit override, because `modal deploy`'s printed URL wins.
+        create_modal_account(
+            &state,
+            "override",
+            "mana",
+            "wk-override-id-6g7h8i.ws-override-9j0k1l",
+        )
+        .await;
+        apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "override",
+                "deployment": {
+                    "repo": "Qwen/Qwen3-8B",
+                    "gpu": "H100",
+                    "gpu_count": 1,
+                    "base_url": "https://mana--printed-by-modal.modal.run",
+                },
+            }),
+        )
+        .await
+        .expect("create the overridden deployment");
+        assert!(state
+            .current_config()
+            .await
+            .providers
+            .iter()
+            .any(|provider| provider.base_url == "https://mana--printed-by-modal.modal.run"));
+    }
+
+    #[tokio::test]
+    async fn a_supplied_requantisation_plan_is_kept_with_the_deployment() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = state_in(dir.path());
+        create_modal_account(
+            &state,
+            "mana-modal",
+            "mana",
+            "wk-requant-id-8s9t0u.ws-requant-1v2w3x",
+        )
+        .await;
+
+        // A complete plan, shaped by the same type the config reads back. The endpoint must keep it
+        // verbatim: this is a recorded recipe the operator runs themselves, never an action.
+        let plan = mr_core::gpu::requantize::plan_requantize(&Default::default());
+        assert!(plan.runs_remotely);
+        apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "mana-modal",
+                "deployment": {
+                    "repo": "Qwen/Qwen3-8B",
+                    "gpu": "H100",
+                    "gpu_count": 1,
+                    "requantize": serde_json::to_value(&plan).expect("serialise the plan"),
+                },
+            }),
+        )
+        .await
+        .expect("record the deployment with its requantisation plan");
+
+        let config = state.current_config().await;
+        let extra = &config.providers[0].extra[mr_core::rental::RENTAL_EXTRA_KEY];
+        let stored: RequantizePlan = serde_json::from_value(extra["requantize"].clone())
+            .expect("the plan must round-trip through the provider's extra map");
+        assert_eq!(stored, plan);
+    }
+
+    #[tokio::test]
+    async fn an_account_without_a_workspace_needs_an_explicit_url() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = state_in(dir.path());
+        create_modal_account(
+            &state,
+            "mana-modal",
+            "mana",
+            "wk-legacy-id-2m3n4o.ws-legacy-5p6q7r",
+        )
+        .await;
+
+        // Simulate a config written before workspaces were recorded.
+        let mut account = rental_accounts(&state.current_config().await)[0].clone();
+        account.workspace = None;
+        let next = with_account(&state.current_config().await, &account);
+        state.commit(next).await.expect("commit the legacy account");
+
+        let refused = apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "mana-modal",
+                "deployment": {"repo": "Qwen/Qwen3-8B", "gpu": "H100", "gpu_count": 1},
+            }),
+        )
+        .await;
+        let message = refused.expect_err("no workspace means no derived URL");
+        assert!(
+            message.contains("no recorded workspace"),
+            "the refusal must say why: {message}"
+        );
+
+        // The account is otherwise usable: an explicit URL is accepted.
+        apply_body(
+            &state,
+            json!({
+                "action": "create-deployment",
+                "account_id": "mana-modal",
+                "deployment": {
+                    "repo": "Qwen/Qwen3-8B",
+                    "gpu": "H100",
+                    "gpu_count": 1,
+                    "base_url": "https://mana--printed-by-modal.modal.run",
+                },
+            }),
+        )
+        .await
+        .expect("an explicit URL stands in for the missing workspace");
     }
 
     #[tokio::test]
@@ -3220,7 +3463,7 @@ mod tests {
             &state,
             json!({
                 "action": "create-account",
-                "account": {"id": "mana-modal", "plan": "unknown"},
+                "account": {"id": "mana-modal", "plan": "unknown", "workspace": "mana"},
             }),
         )
         .await

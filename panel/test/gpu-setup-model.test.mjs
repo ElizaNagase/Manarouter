@@ -28,7 +28,6 @@ const {
   SCALEDOWN_WINDOW_LIMITS,
   STEP_ORDER,
   accountApplyPayload,
-  accountReuseProblem,
   applyPayload,
   applyProbe,
   applySizing,
@@ -37,7 +36,9 @@ const {
   emptyDraft,
   kvDtypesForGpu,
   maxGpuCountFor,
+  modalBaseUrl,
   nextStep,
+  normalizeDraft,
   parseModelNameSize,
   planMarker,
   planMarkerForGpu,
@@ -159,6 +160,7 @@ function draft(overrides = {}, catalog = CATALOG) {
     ...emptyDraft('modal'),
     platform: 'modal',
     accountId: 'mana-modal',
+    workspace: 'mana',
     plan: 'paid',
     tokenId: 'wk-x',
     tokenSecret: 'ws-y',
@@ -170,7 +172,6 @@ function draft(overrides = {}, catalog = CATALOG) {
     kvCacheDtype: 'fp8',
     maxModelLen: 262144,
     maxNumSeqs: 54,
-    baseUrl: 'https://mana--x.modal.run',
     probe,
     ...overrides,
   };
@@ -301,7 +302,7 @@ test('emptyDraft fills every documented key and starts on Modal with no plan cla
   assert.deepEqual(d, {
     platform: 'modal',
     accountId: '',
-    reuseAccount: false,
+    workspace: '',
     plan: 'unknown',
     tokenId: '',
     tokenSecret: '',
@@ -316,8 +317,8 @@ test('emptyDraft fills every documented key and starts on Modal with no plan cla
     maxModelLen: null,
     maxNumSeqs: null,
     shutdownCooldownSecs: 60,
-    mode: 'interactive',
-    batchGpu: null,
+    mode: 'streaming',
+    requantizeTo: '',
     gpuMemoryUtilization: 0.92,
     baseUrl: '',
     sizing: null,
@@ -364,7 +365,7 @@ test('every field carries the same shape, so the panel can render one loop', () 
       assert.deepEqual(Object.keys(field).sort(), [...shape].sort(), `${step.id}.${field.name}`);
       assert.ok(Array.isArray(field.notes), `${step.id}.${field.name}.notes must be an array`);
       assert.equal(typeof field.name, 'string');
-      assert.ok(['text', 'password', 'number', 'select', 'readout', 'toggle', 'textarea'].includes(field.kind),
+      assert.ok(['text', 'password', 'number', 'select', 'choice', 'readout', 'toggle', 'textarea'].includes(field.kind),
         `${step.id}.${field.name} has an unexpected kind ${field.kind}`);
     }
   }
@@ -376,15 +377,15 @@ test('stepList field inventory is stable per step', () => {
   );
   assert.deepEqual(inventory, {
     platform: ['platform', 'platformDeployment'],
-    account: ['accountId', 'plan', 'tokenId', 'tokenSecret', 'planMarker', 'accountCredentialNote'],
+    account: ['accountId', 'workspace', 'plan', 'tokenId', 'tokenSecret', 'planMarker', 'accountCredentialNote'],
     model: ['repo', 'revision', 'hfToken', 'probeGated', 'probeParams', 'probeArch', 'probeQuants', 'probeWarnings'],
-    card: ['gpu', 'gpuCount', 'gpuMemoryUtilization', 'weightQuant', 'kvCacheDtype', 'gpuPrice', 'cardPlanMarker'],
+    card: ['gpu', 'gpuCount', 'mode', 'gpuMemoryUtilization', 'weightQuant', 'kvCacheDtype', 'requantizeTo', 'gpuPrice', 'cardPlanMarker'],
     sizing: [
-      'maxModelLen', 'maxNumSeqs', 'shutdownCooldownSecs', 'mode', 'batchGpu',
+      'maxModelLen', 'maxNumSeqs', 'shutdownCooldownSecs',
       'sizingKvBasis', 'sizingKvPool', 'sizingMeasured', 'sizingCalibration',
       'sizingAssumptions', 'sizingUnavailable', 'sizingWarnings',
     ],
-    review: ['baseUrl', 'bundleFilename', 'bundleCommand', 'bundleNotes', 'bundleWarnings', 'sizingDelta'],
+    review: ['endpointUrl', 'baseUrl', 'bundleFilename', 'bundleCommand', 'bundleNotes', 'bundleWarnings', 'sizingDelta'],
   });
 });
 
@@ -396,10 +397,17 @@ test('the model step hides the HF token until the probe says the repo is gated',
   assert.equal(fields(gated).find((f) => f.name === 'hfToken').kind, 'password');
 });
 
-test('the batch card field only appears once the batch lane is selected', () => {
-  const field = (d) => stepList(d, CATALOG).find((s) => s.id === 'sizing').fields.find((f) => f.name === 'batchGpu');
-  assert.equal(field(draft()).visible, false);
-  assert.equal(field(draft({ mode: 'batch' })).visible, true);
+test('the card step offers one mode axis, and batch is a choice not a second card', () => {
+  const fields = (d) => stepList(d, CATALOG).find((s) => s.id === 'card').fields;
+  const mode = fields(draft()).find((f) => f.name === 'mode');
+  assert.equal(mode.kind, 'choice', 'two modes are radio cards, not a select and a second GPU field');
+  assert.equal(mode.optionsSource, 'modes');
+  assert.equal(mode.value, 'streaming');
+  assert.equal(fields(draft({ mode: 'batch' })).find((f) => f.name === 'mode').value, 'batch');
+  for (const step of stepList(draft(), CATALOG)) {
+    assert.ok(!step.fields.some((f) => /batch.?gpu/i.test(f.name)),
+      `${step.id} must carry no second-card field: one card, one job`);
+  }
 });
 
 test('credentials are password fields and the bundle is read-only', () => {
@@ -541,31 +549,36 @@ test('scaledown_window is clamped to Modal’s 2–1200 s', () => {
   }
 });
 
-test('the batch lane needs its own card and cannot share the interactive one', () => {
-  assert.deepEqual(problemsOf(draft({ mode: 'batch', batchGpu: null }), 'sizing'), [
-    { field: 'batchGpu', message: 'The batch lane needs its own card: it is a different sizing and a different bill.' },
-  ]);
-  assert.deepEqual(problemsOf(draft({ mode: 'batch', batchGpu: 'RTX-PRO-6000' }), 'sizing'), [
-    {
-      field: 'batchGpu',
-      message: 'The batch card must differ from the interactive card, or the two lanes share one bill and the point of the second lane is lost.',
-    },
-  ]);
-  assert.deepEqual(problemsOf(draft({ mode: 'batch', batchGpu: 'L40S' }), 'sizing'), []);
-  assert.deepEqual(problemsOf(draft({ mode: 'interactive', batchGpu: null }), 'sizing'), []);
+test('mode is exactly one of streaming or batch, and the legacy spelling never survives a draft', () => {
+  assert.equal(normalizeDraft(draft({ mode: 'batch' })).mode, 'batch');
+  assert.equal(normalizeDraft(draft({ mode: 'streaming' })).mode, 'streaming');
+  assert.equal(normalizeDraft(draft({ mode: 'interactive' })).mode, 'streaming',
+    'older drafts said interactive; streaming is that same single mode under its wire name');
+  assert.equal(normalizeDraft(draft({ mode: 'nonsense' })).mode, 'streaming');
+  assert.equal(applyPayload(draft({ mode: 'batch' }), null).deployment.mode, 'batch');
+  assert.equal(applyPayload(draft({ mode: 'interactive' }), null).deployment.mode, 'streaming');
 });
 
-test('the endpoint URL must be https and on the *.modal.run host the deploy prints', () => {
+test('the endpoint URL is derived from the workspace and app name, and only an override is validated', () => {
+  const derived = modalBaseUrl(draft());
+  assert.equal(derived, 'https://mana--manarouter-rental-mana-modal-qwen3-8-27b-serve.modal.run');
+  assert.deepEqual(problemsOf(draft({ baseUrl: '' }), 'review'), [],
+    'the normal path pastes nothing: the workspace and app name are enough');
+  assert.deepEqual(problemsOf(draft({ workspace: '', baseUrl: '' }), 'review'), [
+    { field: 'baseUrl', message: 'No endpoint URL can be derived: record the Modal workspace on the account step, or paste the URL `modal deploy` prints.' },
+  ]);
   assert.deepEqual(problemsOf(draft({ baseUrl: 'http://mana--x.modal.run' }), 'review'), [
     { field: 'baseUrl', message: 'Use https://: the relay sends proxy-token headers, and they must not travel in clear text.' },
   ]);
   assert.deepEqual(problemsOf(draft({ baseUrl: 'https://mana.example.com' }), 'review'), [
     { field: 'baseUrl', message: '"mana.example.com" is not a *.modal.run host. `modal deploy` prints the app\'s real URL.' },
   ]);
-  assert.deepEqual(problemsOf(draft({ baseUrl: '' }), 'review'), [
-    { field: 'baseUrl', message: 'The endpoint URL is required: a provider needs a base_url to be routable.' },
-  ]);
   assert.deepEqual(problemsOf(draft({ baseUrl: 'https://other--app.modal.run' }), 'review'), []);
+  const review = stepList(draft(), CATALOG).find((s) => s.id === 'review').fields;
+  const field = review.find((f) => f.name === 'baseUrl');
+  assert.equal(field.required, false, 'an override is optional; the derived URL is the default');
+  assert.equal(review.find((f) => f.name === 'endpointUrl').value, derived,
+    'the review shows the derived URL, not a blank readout waiting for a paste');
 });
 
 test('an API token in the proxy-token slot is rejected with the reason', () => {
@@ -614,11 +627,23 @@ test('numeric fields accept the strings a form actually produces', () => {
   }
 });
 
-test('weightQuant and kvCacheDtype are not checked against the catalog (documented gap)', () => {
-  // The module has no catalog-level vocabulary for a quant the *repo* does not ship: `quantOptions`
-  // answers that, and it needs a probe. Recorded here so the omission is a decision, not a surprise.
-  assert.equal(validateStep(draft({ weightQuant: 'zzz' }), 'card', CATALOG).ok, true);
-  assert.equal(validateStep(draft({ kvCacheDtype: 'zzz' }), 'card', CATALOG).ok, true);
+test('a weight quant must be one the probed repository ships; re-quantising is a separate choice', () => {
+  assert.deepEqual(problemsOf(draft({ weightQuant: 'zzz' }), 'card'), [{
+    field: 'weightQuant',
+    message: 'The probed repository ships fp8; "zzz" is not one of them. Choose it under "Requantise to (optional)" as a future GPU job instead.',
+  }]);
+  assert.deepEqual(problemsOf(draft({ weightQuant: 'awq' }), 'card'), [{
+    field: 'weightQuant',
+    message: 'The probed repository ships fp8; "awq" is not one of them. Choose it under "Requantise to (optional)" as a future GPU job instead.',
+  }]);
+  assert.deepEqual(problemsOf(draft({ weightQuant: 'fp8' }), 'card'), []);
+  // Choosing a target in the requantise field is valid recorded intent, not a validation failure.
+  assert.deepEqual(problemsOf(draft({ weightQuant: 'awq', requantizeTo: 'awq' }), 'card'), [{
+    field: 'weightQuant',
+    message: 'The probed repository ships fp8; "awq" is not one of them. Choose it under "Requantise to (optional)" as a future GPU job instead.',
+  }], 'the requantise field does not make awq the weight quant this deployment serves');
+  // The KV dtype has no repo-level vocabulary in the catalog, so it stays unchecked (documented gap).
+  assert.deepEqual(problemsOf(draft({ kvCacheDtype: 'zzz' }), 'card'), []);
 });
 
 // ---------------------------------------------------------------------------
@@ -888,6 +913,17 @@ test('quantOptions on a missing probe or catalog answers empty rather than guess
   const noProbe = quantOptions(null, 'RTX-PRO-6000', CATALOG);
   assert.deepEqual(noProbe.available, []);
   assert.deepEqual(noProbe.unavailable.map((u) => u.id), ['fp8', 'awq', 'bf16', 'none']);
+});
+
+test('a quant the repository already ships is not offered as a requantisation job', () => {
+  const options = quantOptions(publicProbe(), 'RTX-PRO-6000', CATALOG);
+  assert.deepEqual(options.available.map((entry) => entry.id), ['fp8'],
+    'the shipped quant is the one the deployment can serve');
+  const jobs = options.unavailable.filter((entry) => entry.requantize);
+  assert.deepEqual(jobs.map((entry) => entry.id), ['awq', 'bf16', 'none'],
+    'only artefacts the repository lacks are future GPU jobs');
+  assert.ok(!jobs.some((entry) => entry.id === 'fp8'),
+    'requantising to a quant already present would be a job that produces nothing');
 });
 
 test('an unavailable quant carries the requantisation recipe with the recorded §8 figures', () => {
@@ -1237,7 +1273,8 @@ test('the bundle is a complete runnable modal_app.py plus the command that deplo
   assert.equal(bundle.command, 'modal deploy modal_app.py');
   assert.match(bundle.text, /^"""modal_app\.py/);
   assert.match(bundle.text, /import modal/);
-  assert.match(bundle.text, /app = modal\.App\("qwen3-8-27b-rtx-pro-6000"\)/);
+  assert.match(bundle.text, /app = modal\.App\("manarouter-rental-mana-modal-qwen3-8-27b"\)/,
+    'the app name is the one the derived endpoint URL is built from');
   assert.match(bundle.text, /gpu="RTX-PRO-6000"/);
   assert.match(bundle.text, /scaledown_window=60/);
   assert.match(bundle.text, /@modal\.web_server\(port=8000/);
@@ -1418,10 +1455,13 @@ test('an unknown card is named in the notes instead of being silently deployed',
   assert.match(bundle.notes.join('\n'), /"V100" is not in the catalog/);
 });
 
-test('the bundle echoes the endpoint the deploy prints, not a guessed one', () => {
-  const d = draft({ baseUrl: 'https://mana--x.modal.run' });
-  const bundle = deploymentBundle(d, d.sizing, CATALOG);
-  assert.match(bundle.notes.join('\n'), /modal deploy` prints for this app/);
+test('the bundle says the endpoint is derived, and the printed one wins if it differs', () => {
+  const derived = deploymentBundle(draft(), draft().sizing, CATALOG);
+  assert.match(derived.notes.join('\n'),
+    /Manarouter computes the endpoint URL as https:\/\/mana--manarouter-rental-mana-modal-qwen3-8-27b-serve\.modal\.run/);
+  assert.match(derived.notes.join('\n'), /`modal deploy` prints the authoritative URL; if it differs, override/);
+  const overridden = deploymentBundle(draft({ baseUrl: 'https://printed--by-modal.modal.run' }), draft().sizing, CATALOG);
+  assert.match(overridden.notes.join('\n'), /overridden to https:\/\/printed--by-modal\.modal\.run/);
 });
 
 // ---------------------------------------------------------------------------
@@ -1442,11 +1482,10 @@ test('the deployment payload carries no credential, only the sizing estimate', (
       weight_quant: 'fp8',
       kv_cache_dtype: 'fp8',
       shutdown_cooldown_secs: 60,
-      mode: 'interactive',
+      mode: 'streaming',
       revision: 'b32584cc',
       max_model_len: 262144,
       max_num_seqs: 54,
-      base_url: 'https://mana--x.modal.run',
       sizing: undefined,
     },
   );
@@ -1454,6 +1493,15 @@ test('the deployment payload carries no credential, only the sizing estimate', (
   const text = JSON.stringify(payload);
   assert.ok(!/wk-x|ws-y/.test(text), 'proxy credentials must not travel in the deployment payload');
   assert.ok(!/token_id|token_secret|hf_token/.test(text));
+});
+
+test('no payload carries a second card, even from a draft written before the mode axis existed', () => {
+  const d = draft({ batchGpu: 'h100' });
+  assert.ok(!('batchGpu' in normalizeDraft(d)), 'the legacy field is dropped when a draft is read');
+  const payload = applyPayload(d, d.sizing);
+  assert.ok(!('batch_gpu' in payload.deployment),
+    'a rental is one model on one card; the batch lane is a mode, not another GPU');
+  assert.ok(!JSON.stringify(payload).includes('batch_gpu'));
 });
 
 test('the account payload writes the credentials once, and hf_token is null when unused', () => {
@@ -1465,6 +1513,7 @@ test('the account payload writes the credentials once, and hf_token is null when
       label: 'mana-modal',
       platform: 'modal',
       plan: 'paid',
+      workspace: 'mana',
       token_id: 'wk-x',
       token_secret: 'ws-y',
       hf_token: 'hf_placeholder',
@@ -1474,37 +1523,35 @@ test('the account payload writes the credentials once, and hf_token is null when
 });
 
 // ---------------------------------------------------------------------------
-// reusing a recorded account
+// one account per rental
 // ---------------------------------------------------------------------------
 
-test('a fresh draft creates its account and does not claim to reuse one', () => {
-  const d = emptyDraft('modal');
-  assert.equal(d.reuseAccount, false);
-  assert.equal(accountReuseProblem(d, [{ id: 'mana-modal', platform: 'modal', has_credential: true }]), null,
-    'the reuse check has nothing to say about a draft that is not reusing an account');
+test('an account id another rental already pays from is refused, and says why', () => {
+  const d = draft();
+  const accounts = [{ id: 'mana-modal', platform: 'modal', workspace: 'mana', has_credential: true }];
+  const result = validateStep(d, 'account', CATALOG, accounts);
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.problems, [{
+    field: 'accountId',
+    message: 'Account "mana-modal" already pays for another rental. Each rental has its own account, '
+      + 'credential and vault entry, so this one needs a new account id.',
+  }]);
+  assert.deepEqual(validateStep(draft({ accountId: 'mana-modal-2' }), 'account', CATALOG, accounts).problems, []);
+  assert.deepEqual(validateStep(d, 'account', CATALOG, []).problems, [],
+    'with no recorded accounts there is nothing to collide with');
 });
 
-test('reusing a recorded account needs no token, but still names one that exists', () => {
-  const base = emptyDraft('modal');
-  const reused = { ...base, accountId: 'mana-modal', reuseAccount: true };
-  assert.equal(validateStep(reused, 'account', {}).ok, true,
-    'the credential is in the vault, so the account step must not demand it again');
-  assert.deepEqual(validateStep({ ...base, reuseAccount: true }, 'account', {}).problems.map((p) => p.field),
-    ['accountId'], 'an id is still required: a deployment references the account by id');
-
-  const accounts = [{ id: 'mana-modal', platform: 'modal', has_credential: true }];
-  assert.equal(accountReuseProblem(reused, accounts), null);
-  assert.match(accountReuseProblem({ ...reused, accountId: 'nope' }, accounts), /No rental account with id `nope`/);
-  assert.match(accountReuseProblem(reused, [{ id: 'mana-modal', platform: 'cerebrium', has_credential: true }]),
-    /belongs to platform `cerebrium`, not `modal`/);
-  assert.match(accountReuseProblem(reused, [{ id: 'mana-modal', platform: 'modal', has_credential: false }]),
-    /has no credential stored/);
-  assert.match(accountReuseProblem(reused, []), /No rental account with id/);
-});
-
-test('not reusing an account keeps the token requirement', () => {
+test('the account step always writes its own credential, so both halves are required', () => {
   const d = emptyDraft('modal');
   const problems = validateStep({ ...d, accountId: 'fresh' }, 'account', {}).problems.map((p) => p.field);
-  assert.deepEqual(problems, ['tokenId', 'tokenSecret'],
-    'the create path still writes the credential, so both halves are required');
+  assert.deepEqual(problems, ['workspace', 'tokenId', 'tokenSecret'],
+    'the create path writes the credential and the workspace, so all three are required');
+});
+
+test('the account payload carries the Modal workspace as a non-secret field', () => {
+  const payload = accountApplyPayload(draft({ workspace: 'mana-team' }));
+  assert.equal(payload.account.workspace, 'mana-team');
+  assert.equal(payload.account.token_secret, 'ws-y');
+  assert.ok(!JSON.stringify(payload.account.workspace).includes('ws-y'),
+    'the workspace is not the secret and must not be confused with one');
 });

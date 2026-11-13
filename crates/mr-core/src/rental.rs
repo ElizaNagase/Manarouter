@@ -2,11 +2,14 @@
 //!
 //! ## Why two entities and not one
 //!
-//! The operator's requirement 8 is explicit: *"Multiple models may be hosted under the same
-//! account; account creation should be separate from model setup."* So a [`RentalAccount`] is a
-//! workspace credential with no model attached, and many deployments may share it. Creating the
-//! credential and choosing the model are two different acts, made at two different times, and
-//! the types keep them apart.
+//! Account creation is separate from model setup: a [`RentalAccount`] is a workspace credential
+//! with no model attached, and choosing the credential and choosing the model are two different
+//! acts, made at two different times. The types keep them apart.
+//!
+//! The account is **not** shared between rentals. The credential, the vault entry and the usage
+//! belong to exactly one deployment. A second deployment needs its own account, because sharing
+//! one would make the vault entry, and every usage figure read against it, describe work that one
+//! account did not do.
 //!
 //! ## Why an account is not a [`crate::model::Provider`]
 //!
@@ -55,6 +58,68 @@ use crate::gpu::sizing::SizingResult;
 
 /// The key a [`RentalDeployment`] is stored under inside `Provider.extra`.
 pub const RENTAL_EXTRA_KEY: &str = "rental";
+
+/// The `modal.App` name a deployment's generated bundle uses.
+///
+/// Derived from the account and the repository, so the same deployment always gets the same app
+/// name — and therefore the same URL — and applying it twice collides instead of deploying a
+/// second app. Shared with the panel model, which mirrors this function, so the URL the wizard
+/// previews is the URL the bundle is deployed under.
+pub fn modal_app_name(account_id: &str, repo: &str) -> String {
+    format!("manarouter-{}", app_slug(account_id, repo))
+}
+
+/// The stable part of the app name: `rental-<account>-<repo-name>`, at most 64 characters.
+///
+/// Provider ids use this shape too (`Provider::id` is built from it in the conductor), so one
+/// string identifies both the provider and the Modal app.
+pub fn app_slug(account_id: &str, repo: &str) -> String {
+    let name = repo.rsplit('/').next().unwrap_or(repo);
+    let mut slug = format!("rental-{}-{}", slugify(account_id), slugify(name));
+    if slug.len() > 64 {
+        slug.truncate(64);
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    slug
+}
+
+/// The endpoint URL Modal is expected to publish for this deployment.
+///
+/// Modal's shape is `https://<workspace>--<app-name>-<function-name>.modal.run`, with dots in the
+/// app name replaced by dashes. The generated bundle exposes one web function named `serve`, so
+/// that is the function half.
+///
+/// `None` when a part is missing: an account with no recorded workspace, or an app name that would
+/// be empty. The caller must then ask for an explicit URL rather than invent one.
+// UNCERTAIN: the URL shape and the `serve` function half are reverse-engineered from Modal's
+// documented app naming; `modal deploy` prints the real URL, which is authoritative if it differs.
+pub fn modal_base_url(workspace: &str, account_id: &str, repo: &str) -> Option<String> {
+    let workspace = slugify(workspace);
+    let account = slugify(account_id);
+    let name = slugify(repo.rsplit('/').next().unwrap_or(repo));
+    if workspace.is_empty() || account.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "https://{workspace}--{}-serve.modal.run",
+        modal_app_name(account_id, repo).replace('.', "-")
+    ))
+}
+
+/// Lowercase ASCII slug: runs of anything else become one dash, ends trimmed.
+fn slugify(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_owned()
+}
 
 /// Which platform a rental account bills against.
 ///
@@ -217,6 +282,14 @@ pub struct RentalAccount {
     /// invoice.
     #[serde(default)]
     pub plan: RentalPlan,
+    /// The Modal workspace the account's apps are deployed into, for example `mana`.
+    ///
+    /// Not a secret, and not a credential: it is the half of the app URL that Manarouter can know
+    /// in advance. Optional because accounts written before the field existed, and accounts on a
+    /// platform with no workspace concept, must still load — a deployment built on such an account
+    /// then needs an explicit `base_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     /// Vault entry id holding the platform's one combined credential string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<String>,
@@ -249,6 +322,7 @@ impl RentalAccount {
             label: String::new(),
             platform: RentalPlatform::Modal,
             plan: RentalPlan::Unknown,
+            workspace: None,
             secret_ref: None,
             hf_secret_ref: None,
             max_concurrent_containers: None,
@@ -309,18 +383,20 @@ impl RentalAccount {
 
 /// How a deployment is meant to be used.
 ///
-/// The distinction is requirement 9: one request on a chosen GPU, *or* batching when requests pile
-/// up on another, cheaper one. It is recorded because the two modes want different cards, different
-/// `scaledown_window` values and different cost arithmetic — a batch lane wants the card that is
-/// cheapest per *token*, which the operator's own measurements show is not the one with the lowest
-/// hourly rate.
+/// One choice, on the deployment's **one** card: either a live endpoint an operator can reach, or a
+/// queue drained in bulk. There is no second card to choose, because a deployment is one model on
+/// one GPU; the mode changes how that card is fed, not which card it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RentalMode {
-    /// A live endpoint an interactive request can reach.
+    /// A live endpoint a request can reach while it waits.
+    ///
+    /// `interactive` is an alias, not a second variant: deployments written before the rename
+    /// stored that spelling, and a stored config must keep loading after an upgrade.
     #[default]
-    Interactive,
-    /// A lane that fills up with queued work and is drained in bulk.
+    #[serde(alias = "interactive")]
+    Streaming,
+    /// A queue that is filled and then drained in bulk.
     Batch,
 }
 
@@ -328,15 +404,19 @@ impl RentalMode {
     /// The stable identifier written to config.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Interactive => "interactive",
+            Self::Streaming => "streaming",
             Self::Batch => "batch",
         }
     }
 
     /// Parse a mode identifier.
+    ///
+    /// `interactive` is accepted as the legacy spelling of [`Self::Streaming`]: configs and API
+    /// bodies written before the mode was renamed to describe one card still say it, and a value
+    /// that used to mean "a live endpoint" must keep meaning exactly that. It is never emitted.
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "interactive" => Some(Self::Interactive),
+            "streaming" | "interactive" => Some(Self::Streaming),
             "batch" => Some(Self::Batch),
             _ => None,
         }
@@ -390,12 +470,9 @@ pub struct RentalDeployment {
     /// platform would reject at deploy time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shutdown_cooldown_secs: Option<u32>,
-    /// Interactive or batch lane.
+    /// `streaming` for a live endpoint, `batch` for a queue drained in bulk.
     #[serde(default)]
     pub mode: RentalMode,
-    /// Requirement 9: the second, cheaper card the batch lane runs on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub batch_gpu: Option<String>,
     /// Identifier of the generated deployment bundle, once one has been produced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_id: Option<String>,
@@ -440,8 +517,7 @@ impl RentalDeployment {
             max_model_len: None,
             max_num_seqs: None,
             shutdown_cooldown_secs: None,
-            mode: RentalMode::Interactive,
-            batch_gpu: None,
+            mode: RentalMode::Streaming,
             bundle_id: None,
             requantize: None,
             architecture: None,
@@ -495,14 +571,6 @@ impl RentalDeployment {
                 "gpu".to_string(),
                 format!("unknown GPU id {:?}; see GET /api/gpu/catalog", self.gpu),
             ));
-        }
-        if let Some(batch) = self.batch_gpu.as_deref() {
-            if crate::gpu::catalog::gpu_by_id(batch).is_none() {
-                out.push((
-                    "batch_gpu".to_string(),
-                    format!("unknown GPU id {batch:?}; see GET /api/gpu/catalog"),
-                ));
-            }
         }
         if self.gpu_count == 0 {
             out.push((
@@ -580,23 +648,6 @@ impl RentalDeployment {
                             verdict.reason
                         ),
                     ));
-                }
-            }
-        }
-        if let Some(batch) = self.batch_gpu.as_deref() {
-            if let Some(gpu) = crate::gpu::catalog::gpu_by_id(batch) {
-                if let Some(method) = crate::gpu::catalog::quant_method_by_id(&self.weight_quant) {
-                    if let Some(verdict) = crate::gpu::catalog::resolve_quant_for(gpu, method.id) {
-                        if !verdict.runnable() {
-                            out.push((
-                                "batch_gpu".to_string(),
-                                format!(
-                                    "batch card {} cannot run {}: {}",
-                                    gpu.label, method.label, verdict.reason
-                                ),
-                            ));
-                        }
-                    }
                 }
             }
         }
@@ -991,11 +1042,11 @@ mod tests {
     }
 
     #[test]
-    fn deployment_defaults_are_single_card_unquantised_interactive() {
+    fn deployment_defaults_are_single_card_unquantised_streaming() {
         let d = RentalDeployment::new("a", "org/repo", "L40S");
         assert_eq!(d.gpu_count, 1);
         assert!(!d.is_multi_gpu());
-        assert_eq!(d.mode, RentalMode::Interactive);
+        assert_eq!(d.mode, RentalMode::Streaming);
         assert_eq!(d.weight_quant, "none");
         assert_eq!(d.kv_cache_dtype, "auto");
         assert!(d.problems().is_empty(), "{:?}", d.problems());
@@ -1056,17 +1107,6 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_card_that_cannot_run_the_quant_is_reported_against_that_field() {
-        let mut d = RentalDeployment::new("a", "org/repo", "L40S");
-        d.weight_quant = "fp8".to_string();
-        d.mode = RentalMode::Batch;
-        d.batch_gpu = Some("T4".to_string());
-        let hardware = d.hardware_problems();
-        assert_eq!(hardware.len(), 1);
-        assert_eq!(hardware[0].0, "batch_gpu");
-    }
-
-    #[test]
     fn total_vram_and_price_scale_with_the_card_count() {
         let mut d = RentalDeployment::new("a", "org/repo", "H100");
         let one = d.total_vram_bytes().unwrap();
@@ -1115,7 +1155,6 @@ mod tests {
         d.max_num_seqs = Some(64);
         d.shutdown_cooldown_secs = Some(60);
         d.mode = RentalMode::Batch;
-        d.batch_gpu = Some("L40S".to_string());
         d.requantize = Some(crate::gpu::requantize::plan_requantize(
             &crate::gpu::requantize::RecipeRequest::default(),
         ));
@@ -1139,11 +1178,76 @@ mod tests {
 
     #[test]
     fn a_mode_round_trips_through_its_config_spelling() {
-        for mode in [RentalMode::Interactive, RentalMode::Batch] {
+        for mode in [RentalMode::Streaming, RentalMode::Batch] {
             assert_eq!(RentalMode::parse(mode.as_str()), Some(mode));
         }
         assert_eq!(RentalMode::parse("batch"), Some(RentalMode::Batch));
-        assert_eq!(RentalMode::parse("streaming"), None);
+        assert_eq!(RentalMode::Streaming.as_str(), "streaming");
+        assert_eq!(
+            serde_json::to_string(&RentalMode::Streaming).unwrap(),
+            "\"streaming\""
+        );
+        // The old spelling parses to the same single mode, and is never emitted.
+        assert_eq!(
+            RentalMode::parse("interactive"),
+            Some(RentalMode::Streaming)
+        );
+        // Parsing is not the only way a stored mode arrives: `parse_deployment` reads it through
+        // serde, so the alias has to sit on the enum or an upgraded config fails to load.
+        assert_eq!(
+            serde_json::from_str::<RentalMode>("\"interactive\"").unwrap(),
+            RentalMode::Streaming
+        );
+        let deployment = RentalDeployment::new("mana-modal", "Qwen/Qwen3-8B", "rtx-pro-6000");
+        let mut stored = deployment.to_extra_value().unwrap();
+        stored["mode"] = serde_json::json!("interactive");
+        assert_eq!(
+            parse_deployment(
+                "modal-qwen3-8b",
+                &BTreeMap::from([(RENTAL_EXTRA_KEY.to_owned(), stored)])
+            )
+            .unwrap()
+            .unwrap()
+            .mode,
+            RentalMode::Streaming
+        );
+    }
+
+    #[test]
+    fn a_workspace_derives_one_shared_modal_url() {
+        // Golden value: the panel model mirrors this function, so both sides preview and record the
+        // same string for the same account and repo.
+        assert_eq!(
+            modal_base_url("mana", "mana-modal", "Qwen/Qwen3-8B").as_deref(),
+            Some("https://mana--manarouter-rental-mana-modal-qwen3-8b-serve.modal.run")
+        );
+        assert_eq!(
+            modal_app_name("mana-modal", "Qwen/Qwen3-8B"),
+            "manarouter-rental-mana-modal-qwen3-8b"
+        );
+        // The workspace and the account id are normalised, not trusted verbatim.
+        assert_eq!(
+            modal_base_url("Mana_Team", "Mana Modal", "org/Qwen3.8").as_deref(),
+            Some("https://mana-team--manarouter-rental-mana-modal-qwen3-8-serve.modal.run")
+        );
+        // No workspace means no invented URL.
+        assert_eq!(modal_base_url("", "a", "org/repo"), None);
+        assert_eq!(modal_base_url("   ", "a", "org/repo"), None);
+        assert_eq!(modal_base_url("mana", "", "org/repo"), None);
+        assert_eq!(modal_base_url("mana", "a", ""), None);
+    }
+
+    #[test]
+    fn an_account_carries_a_workspace_and_older_files_still_load() {
+        let mut account = RentalAccount::new("a");
+        assert_eq!(account.workspace, None);
+        account.workspace = Some("mana".to_string());
+        let back: RentalAccount =
+            serde_json::from_str(&serde_json::to_string(&account).unwrap()).unwrap();
+        assert_eq!(back.workspace.as_deref(), Some("mana"));
+
+        let old: RentalAccount = serde_json::from_str(r#"{"id":"old","label":"Old"}"#).unwrap();
+        assert_eq!(old.workspace, None);
     }
 
     #[test]

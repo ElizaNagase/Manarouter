@@ -26,6 +26,10 @@ How they were captured: a second conductor instance on `127.0.0.1:20999` with it
 The vault stores the combined string, so what a response can echo is a masked fingerprint
 (`wk…0001`) and nothing more — `gpu-apply-response-live.json` shows exactly that and no secret.
 
+These captures predate the one-account-per-rental / one-card fixes: `batch_gpu` and any
+`"mode": "interactive"` in them are historical wire shapes, not the current contract. They are kept
+verbatim because a capture edited to match today's code would no longer be evidence.
+
 Notes on what these files prove, beyond being fixtures:
 
 - `gpu-rentals-live.json` → `deployments[0].fit` reports `kv_pool_tokens: 1784064` and

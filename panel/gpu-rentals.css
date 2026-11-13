@@ -604,6 +604,33 @@
 
 .gpu-rentals .gpu-unit { margin-left: 2px; font-size: 11.5px; }
 
+/* One axis, one answer: the mode is two radio cards rather than a select so the trade-off is
+ * visible before it is committed. The native input keeps keyboard and screen-reader behaviour; the
+ * label is the hit target, so clicking anywhere on the card chooses it. */
+.gpu-rentals .gpu-choice-field { max-width: 720px; }
+
+.gpu-rentals .gpu-choices { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+
+.gpu-rentals .gpu-choice {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 2px 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.gpu-rentals .gpu-choice:hover { border-color: var(--line2); }
+
+.gpu-rentals .gpu-choice-current { border-color: var(--pink); background: var(--bg3); }
+
+.gpu-rentals .gpu-choice-input { grid-row: 1 / span 2; margin: 2px 0 0; align-self: start; }
+
+.gpu-rentals .gpu-choice-title { font-weight: 600; }
+
+.gpu-rentals .gpu-choice-hint { color: var(--tx3); font-size: 12px; }
+
 /* ---------- setup: the sizing panel ---------- */
 
 .gpu-rentals .gpu-plans, .gpu-rentals .gpu-existing { margin-top: 14px; }

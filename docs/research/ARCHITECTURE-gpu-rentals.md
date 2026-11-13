@@ -131,7 +131,9 @@ That fixes the model to two entities.
 ### 3.1 Rental account — a platform credential, no model attached
 
 A rental account is a **workspace credential for a platform**. It is created on its own, before any
-model is chosen, and many deployments share it.
+model is chosen, and it belongs to exactly **one** rental deployment. An account id another rental
+already pays from is refused: one rental has one account, one credential and one vault entry, and
+nothing is shared with another rental.
 
 ```rust
 // crates/mr-core/src/rental.rs
@@ -140,7 +142,8 @@ pub struct RentalAccount {
     pub label: String,
     pub platform: RentalPlatform,      // "modal" | "kaggle" | "custom:<x>"
     pub plan: RentalPlan,              // "free" | "paid" | "unknown"
-    pub secret_ref: Option<String>,    // vault entry id holding the platform's combined credential
+    pub workspace: Option<String>,     // Modal workspace slug; not a secret, half of the derived URL
+    pub secret_ref: Option<String>,    // vault entry id holding this account's own credential
     pub hf_secret_ref: Option<String>, // vault entry id holding a HuggingFace token, when needed
     pub max_concurrent_containers: Option<u32>, // platform-side ceiling (Modal Starter: 10) [facts]
     pub note: Option<String>,
@@ -170,8 +173,7 @@ pub struct RentalDeployment {
     pub max_model_len: Option<u64>,
     pub max_num_seqs: Option<u32>,
     pub shutdown_cooldown_secs: Option<u32>,
-    pub mode: RentalMode,            // "interactive" | "batch"
-    pub batch_gpu: Option<String>,   // requirement 9: the second, cheaper card for the batch lane
+    pub mode: RentalMode,            // "streaming" | "batch"; legacy "interactive" loads as streaming
     pub bundle_id: Option<String>,
     pub requantize: Option<RequantizePlan>,
 }
@@ -186,6 +188,19 @@ would be a `SNAPSHOT_VERSION` bump for no runtime benefit — the relay never re
 `RentalDeployment` is still a typed struct in Rust: storage is flexible, the code that reads it is
 not. `Provider.extra["rental"]` is deserialised on demand and a malformed value is a validation
 error, not a silent default.
+
+`mode` is one axis with two values, not two GPUs: a rental is one model on one card. `streaming` is a
+live endpoint a request can reach; `batch` is a queue drained in bulk. `batch_gpu` is gone — batching
+changes how the one card is scheduled, never which or how many cards it is. The wire value is
+`streaming`; older files that say `interactive` are still parsed as that same mode, but nothing new
+is written with the old spelling.
+
+`base_url` is **derived**, never pasted in the normal path. The account records the Modal workspace
+and the deployment's generated app name is deterministic, so
+`https://<workspace>--<modal-app-name>-serve.modal.run` is computed by one shared derivation used by
+both the panel preview and `POST /api/gpu/apply`. Modal publishes no deployment REST API, so this is
+a derived prediction, not a confirmed URL: `modal deploy` prints the authoritative one, and an
+explicit `base_url` in the request overrides the derived value when they differ.
 
 ### 3.3 Why not `RentalAccount` as a provider
 
@@ -232,13 +247,15 @@ secret or find none.
 **A storage qualification, verified from source:** `Vault::put` takes
 `&mut self` and is **not reference-counted** (`crates/mr-core/src/secret.rs:237`), and
 `Account.secret_ref` is a free-form `Option<String>` with no validation against a naming scheme
-(`model.rs:275`). So several rental deployments in one workspace may legitimately point their
-accounts at the *same* vault id, but the entry must be written exactly **once**, at account
-creation. Writing it twice clobbers it, and deleting it while any provider still references the id
-silently breaks every one of them. Neither behaviour is guarded by the type system, so it is a rule
-the conductor has to keep rather than one it can rely on the compiler to enforce. `Vault::ids()`,
-`contains()` and `fingerprint_of()` (`secret.rs:356-366`) are what let the panel list accounts by
-fingerprint without ever reading a secret back out.
+(`model.rs:275`), so the one-account-per-rental rule is the conductor's to keep rather than the
+compiler's. Each account writes its own vault entry (`rental:<account-id>`, plus
+`rental:<account-id>:hf` when a gated repository needs a HuggingFace token) exactly once, at account
+creation, and no two accounts may point at one entry. Writing an id twice clobbers it, and deleting
+it while its rental still references it silently breaks that rental. The conductor rejects a
+deployment whose account id already pays for another rental instead of letting the second write
+overwrite the first credential. `Vault::ids()`, `contains()` and `fingerprint_of()`
+(`secret.rs:356-366`) are what let the panel list accounts by fingerprint without ever reading a
+secret back out.
 
 ## 5. Conductor API — `/api/gpu/*`
 
@@ -390,15 +407,24 @@ One endpoint, two actions, because account creation and deployment creation are 
 
 ```json
 {"action": "create-account", "account": {"id": "mana-modal", "label": "...", "platform": "modal",
-   "plan": "paid", "token_id": "...", "token_secret": "...", "hf_token": null}}
+   "plan": "paid", "workspace": "mana", "token_id": "...", "token_secret": "...", "hf_token": null}}
 ```
 
 ```json
 {"action": "create-deployment", "account_id": "mana-modal",
  "deployment": {"repo": "...", "gpu": "RTX-PRO-6000", "gpu_count": 1, "weight_quant": "fp8",
    "kv_cache_dtype": "fp8", "max_model_len": 262144, "max_num_seqs": 64,
-   "shutdown_cooldown_secs": 60, "mode": "batch", "batch_gpu": "L40S",
-   "base_url": "https://mana--qwen-38-27b-serve.modal.run", "sizing": {...}}}
+   "shutdown_cooldown_secs": 60, "mode": "streaming", "sizing": {...}}}
+```
+
+`base_url` may be omitted: the conductor derives
+`https://<workspace>--<generated-app-name>-serve.modal.run` from the account's recorded workspace.
+When present it is an explicit override for the URL `modal deploy` printed.
+
+```json
+{"action": "create-deployment", "account_id": "mana-modal",
+ "deployment": {"repo": "...", "mode": "streaming",
+   "base_url": "https://mana--printed-by-modal.modal.run", "sizing": {...}}}
 ```
 
 `create-deployment` writes a `modal-vllm` provider with `auth: {"type":"modal"}`, the account's
@@ -806,22 +832,25 @@ official example for this exact architecture; `path: "model-free"` is proven on 
 layerwise no-disk path needs the real decoder-layer class name and could not be confirmed with the
 vision tower present, so it is **not shipped**.
 
-## 9. Requirement 9 — two lanes, two cards
+## 9. Requirement 9 — one card, one job: streaming XOR batch
 
-`mode: "interactive"` runs a single request pinned to the chosen GPU and is latency-shaped:
-`max_num_seqs` small, `shutdown_cooldown_secs` short, `cold_start_ttfb_timeout_ms` long enough to
-survive a cold boot (the observed boots are 110–181 s, so the existing default is checked against
-that and raised if it is shorter).
+A rental is one model on one card. `mode` says what that card is doing, and it is a single-choice
+axis: `streaming` or `batch`, never both. `streaming` runs a live endpoint a request can reach and
+is latency-shaped (`max_num_seqs` small, `shutdown_cooldown_secs` short,
+`cold_start_ttfb_timeout_ms` long enough to survive a cold boot — the observed boots are 110–181 s,
+so the existing default is checked against that and raised if it is shorter).
 
-`mode: "batch"` accumulates *n* requests on `batch_gpu`, a **separate** chosen card, and flushes when
-the batch is worth a cold start. The issue's own arithmetic makes this concrete [observed]: a boot
-costs 180 s at $3.03/h = **$0.1516** on the 6000 and 110 s at $1.95/h = **$0.0596** on the L40S, and
-the more expensive card is **40 % cheaper per token** on decode-bound batches ($1.26/M vs $2.08/M at
-2K/64). So the scheduler's job is to hold a batch that is too small to pay for its own boot, and the
-planner's job is to not pick from the hourly rate alone.
+`batch` accumulates requests on the *same* card and flushes when the batch is worth a cold start.
+The issue's own arithmetic still explains why the card choice matters to the planner [observed]: a
+boot costs 180 s at $3.03/h = **$0.1516** on the 6000 and 110 s at $1.95/h = **$0.0596** on the
+L40S, and the more expensive card is **40 % cheaper per token** on decode-bound batches ($1.26/M vs
+$2.08/M at 2K/64). It does **not** justify a second card: a batch lane on `batch_gpu` was the defect.
+The scheduler's job is to hold a batch that is too small to pay for its own boot, and the planner's
+job is to compare cards by workload cost rather than by hourly rate alone.
 
 Both lanes are the same provider shape with different budget fields; the mode is recorded in
-`extra.rental.mode` and is what the panel renders.
+`extra.rental.mode` and is what the panel renders. There is no `batch_gpu`, and no path produces a
+deployment that is both streaming and batch.
 
 ## 10. Panel work
 

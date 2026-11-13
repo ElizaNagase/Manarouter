@@ -265,7 +265,7 @@ export function quantGate(draft) {
 const REQUIRED_SETUP_EXPORTS = Object.freeze([
   'stepList', 'stepById', 'nextStep', 'prevStep', 'validateStep', 'emptyDraft', 'catalogIndex',
   'quantsForGpu', 'kvDtypesForGpu', 'planMarker', 'requiresHfToken', 'quantOptions', 'applyProbe',
-  'applySizing', 'deploymentBundle', 'applyPayload',
+  'applySizing', 'deploymentBundle', 'applyPayload', 'modalBaseUrl',
 ]);
 
 function missingSetupModelBlock(err, missing = null) {
@@ -490,6 +490,8 @@ function normaliseAccount(raw) {
     label: asString(pick(raw, 'label', 'name')).trim() || id || '(unnamed account)',
     platform: asString(pick(raw, 'platform', 'platform_id')).trim(),
     plan: asString(pick(raw, 'plan', 'plan_id')).trim(),
+    // The non-secret Modal workspace the account's apps deploy into: half of the derived endpoint URL.
+    workspace: asString(pick(raw, 'workspace')).trim(),
     // The conductor reports whether the plan was actually recorded, as distinct from the plan
     // string it defaults to. Keep that distinction so an unknown plan is not read as a paid one.
     planKnown: asBool(pick(raw, 'plan_is_known', 'planKnown')),
@@ -522,7 +524,6 @@ function normaliseDeployment(raw) {
     weightQuant: asString(pick(deployment, 'weight_quant', 'quant')).trim(),
     kvCacheDtype: asString(pick(deployment, 'kv_cache_dtype', 'kv_dtype')).trim(),
     mode: asString(pick(deployment, 'mode')).trim(),
-    batchGpu: asString(pick(deployment, 'batch_gpu')).trim(),
     maxModelLen: asNumber(pick(deployment, 'max_model_len')),
     maxNumSeqs: asNumber(pick(deployment, 'max_num_seqs')),
     enabled: asBool(pick(raw, 'enabled')),
@@ -1097,8 +1098,9 @@ async function renderInventory(mount, ctx) {
 
   // -- the numbers -------------------------------------------------------------
 
-  // The conductor's ledger has one instance-wide aggregate and no per-account column, so the total
-  // is stated once, beside the account table it belongs to, rather than split across the accounts.
+  // The conductor reports one instance-wide total and no per-account column. The accounts are
+  // separate, so the figure is the sum of them, stated once rather than pretending to be a shared
+  // ledger.
   function paintNumbers() {
     if (view.rentalsError) {
       countEl.textContent = '—';
@@ -1126,7 +1128,8 @@ async function renderInventory(mount, ctx) {
     usageEl.textContent = `Instance usage ${cost === null ? '—' : usd(cost)}`
       + (requestsPart ? ` ${requestsPart}` : '')
       + ` · GPU time ${seconds === null ? '—' : formatUptime(seconds)}`;
-    usageEl.title = usageError || 'One ledger total for every provider on this instance.';
+    usageEl.title = usageError
+      || 'One total for this instance: the sum of every rental\'s own account, not a shared ledger.';
   }
 
   // -- rental accounts ---------------------------------------------------------
@@ -1144,13 +1147,15 @@ async function renderInventory(mount, ctx) {
     }
     const accounts = listOf(pick(view.rentals, 'accounts')).map(normaliseAccount);
     card.append(hint(
-      'One account is one platform credential, stored under one vault id, plus a HuggingFace token '
-      + 'when a gated repository needs it. The secret is never rendered — only a fingerprint, which '
-      + 'is what tells two keys apart.'));
+      'Each rental has its own account: one platform credential under one vault id, plus a '
+      + 'HuggingFace token when a gated repository needs it. Nothing is shared between rentals — not '
+      + 'the credential, not the vault entry, not the billing account. The secret is never rendered, '
+      + 'only a fingerprint, which is what tells two keys apart.'));
     if (!accounts.length) {
       card.append(emptyState('No rental accounts yet.',
-        'A rental account is a platform credential (Modal: a token id and its secret). Add one here; '
-        + 'every deployment on that platform can share it.'));
+        'A rental account is a platform credential (Modal: a token id and its secret) plus the Modal '
+        + 'workspace its apps deploy into. Add one per rental: an account already used by another '
+        + 'rental is refused, because each rental bills separately.'));
       accountsBox.append(card);
       return;
     }
@@ -1187,6 +1192,7 @@ async function renderInventory(mount, ctx) {
           account.id && account.id !== account.label ? h('span', { class: 'hint mono' }, account.id) : null),
         h('td', {}, mono(account.platform)),
         h('td', {}, h('span', {}, dashes(account.plan)), h('span', { class: 'hint', title: planNote }, ` · ${planNote}`)),
+        h('td', {}, mono(account.workspace)),
         h('td', {}, ...credential),
         h('td', { class: 'num' },
           account.maxContainers === null ? '—' : String(account.maxContainers)),
@@ -1203,6 +1209,7 @@ async function renderInventory(mount, ctx) {
       { label: 'Account' },
       { label: 'Platform' },
       { label: 'Plan' },
+      { label: 'Workspace' },
       { label: 'Credential' },
       { label: 'Container ceiling', num: true },
       ...(perAccount ? [
@@ -1212,8 +1219,8 @@ async function renderInventory(mount, ctx) {
       ] : []),
     ], rows));
     if (!perAccount) {
-      card.append(hint('Usage is one ledger total for every provider on this instance, so it is not '
-        + 'divided between accounts: the reading beside the title above is the whole of it.'));
+      card.append(hint('Usage is reported as one instance-wide total: the sum of each rental\'s own '
+        + 'account. The accounts are separate; only the reading beside the title above adds them up.'));
     }
     accountsBox.append(card);
   }
@@ -1274,11 +1281,7 @@ async function renderInventory(mount, ctx) {
       h('td', {},
         h('span', { class: 'mono' }, dashes(dep.gpu)),
         dep.gpuCount && dep.gpuCount !== 1 ? h('span', { class: 'hint' }, ` ×${dep.gpuCount}`) : null),
-      h('td', {},
-        chip(dashes(dep.mode), 'chip-neutral'),
-        dep.mode === 'batch' && dep.batchGpu
-          ? h('span', { class: 'hint mono' }, ` → ${dep.batchGpu}`)
-          : null),
+      h('td', {}, chip(dashes(dep.mode), 'chip-neutral')),
       h('td', {}, mono(dep.weightQuant)),
       h('td', {}, mono(dep.kvCacheDtype)),
       h('td', { class: 'num', title: 'Derived from the sizing estimate; the vLLM startup line is authoritative' },
@@ -1303,8 +1306,9 @@ async function renderInventory(mount, ctx) {
 
       return row;
     });
-    card.append(hint('One row per rented GPU. Select a row to see the app file and the command that '
-      + 'deploys it.'));
+    card.append(hint('One row per rental: one model on its own card, with its own mode and sizing. '
+      + 'The card belongs to that row, never to the page. Select a row to see the app file and the '
+      + 'command that deploys it; changing a card means a new deployment record, not a page-wide setting.'));
     card.append(dataTable([
       { label: 'Provider' },
       { label: 'Account' },
@@ -1996,12 +2000,6 @@ function paintSetup(wizard, mount, ctx, stepParam) {
   const body = h('div', { class: 'gpu-step-body' });
 
   for (const desc of listOf(pick(step, 'fields'))) {
-    // A reused account already holds its credential: rendering empty password inputs would ask the
-    // operator to re-enter a secret the vault has, and an empty required field would read as an
-    // error. accountReusePanel carries the explanation instead.
-    const name = asString(pick(desc, 'name')).trim();
-    if (current === 'account' && wizard.draft?.reuseAccount === true
-      && (name === 'tokenId' || name === 'tokenSecret')) continue;
     const fieldEl = fieldRow(wizard, desc);
     if (fieldEl) body.append(fieldEl);
   }
@@ -2017,7 +2015,7 @@ function paintSetup(wizard, mount, ctx, stepParam) {
 
   // The account step is the flow's one write before the end, and it has already happened by the
   // time the review step exists. A button that says "Continue" while it stores a credential is a trap.
-  const storesAccount = current === 'account' && wizard.draft?.reuseAccount !== true && !wizard.accountResult;
+  const storesAccount = current === 'account' && !wizard.accountResult;
   const forwardLabel = wizard.busy ? 'Working…'
     : current === 'review' ? 'Save rental'
       : storesAccount ? 'Save account'
@@ -2123,6 +2121,67 @@ function selectRow(wizard, desc) {
   return row;
 }
 
+/**
+ * A single-choice control as radio cards, not a select: the two answers to "what does this card
+ * do" are a real decision, and a dropdown hides one of them behind a click. The group is a
+ * radiogroup so exactly one answer is expressible, which is the point of the axis.
+ */
+function choiceRow(wizard, desc) {
+  const name = asString(desc.name);
+  const label = asString(desc.label) || name;
+  const choices = listOf(chooseOptions(wizard, desc));
+  const current = asString(desc.value ?? draftGet(wizard.draft, name)).trim();
+
+  if (!choices.length) {
+    const row = h('div', { class: 'field gpu-field-off' },
+      h('div', { class: 'gpu-inline-label' }, label),
+      h('p', { class: 'hint' }, 'The setup model offers no choice for this field, so it stays blank rather than guessed.'));
+    return row;
+  }
+
+  const group = h('div', { class: 'gpu-choices', role: 'radiogroup', 'aria-label': label });
+  for (const choice of choices) {
+    const value = asString(choice.value);
+    const input = fieldData(h('input', {
+      class: 'gpu-choice-input',
+      type: 'radio',
+      name: `gpu-${name}`,
+      value,
+      checked: value === current ? '' : null,
+    }), name);
+    if (desc.required) input.setAttribute('aria-required', 'true');
+    if (desc.enabled === false) setDisabled(input, true);
+
+    const pick = () => {
+      commitField(wizard, name, value);
+      paintSetup(wizard, wizard.mount, wizard.ctx, wizard.current);
+    };
+    input.addEventListener('change', pick);
+    const choiceLabel = h('label', {
+      class: `gpu-choice${value === current ? ' gpu-choice-current' : ''}`,
+      onclick: (ev) => {
+        // A real label click checks the radio before this fires; a test stub fires the click here.
+        // Only the unchecked case needs work, which keeps one commit per interaction.
+        if (input.checked) return;
+        ev.preventDefault();
+        input.checked = true;
+        pick();
+      },
+    },
+    input,
+    h('span', { class: 'gpu-choice-title' }, asString(choice.label) || value),
+    asString(choice.hint).trim() ? h('span', { class: 'gpu-choice-hint' }, asString(choice.hint)) : null);
+    group.append(choiceLabel);
+  }
+
+  const row = h('div', { class: 'field gpu-choice-field' },
+    h('div', { class: 'gpu-inline-label' }, label), group);
+  if (desc.hint) row.append(richHint(desc.hint));
+  const notes = notesList(desc.notes);
+  if (notes) row.append(notes);
+  return row;
+}
+
 function inputRow(wizard, desc) {
   const name = asString(desc.name);
   const raw = desc.value ?? draftGet(wizard.draft, name);
@@ -2206,6 +2265,7 @@ function fieldRow(wizard, desc) {
   if (VIEW_OWNED_READOUTS.has(name)) return null;
   if (desc.kind === 'readout') return readoutRow(desc);
   if (desc.kind === 'select') return selectRow(wizard, desc);
+  if (desc.kind === 'choice') return choiceRow(wizard, desc);
   return inputRow(wizard, desc);
 }
 
@@ -2241,9 +2301,11 @@ function chooseOptions(wizard, desc) {
       }));
   }
   if (source === 'modes') {
+    // One axis, one answer. Legacy drafts say `interactive`; the model normalises that to
+    // `streaming`, and the wire value is `streaming`, so no path can produce both lanes at once.
     return [
-      { value: 'interactive', label: 'Interactive — one serving container per session' },
-      { value: 'batch', label: 'Batch — offline jobs, flushed when the batch pays for its boot' },
+      { value: 'streaming', label: 'Streaming — a live endpoint a request can reach', hint: 'The relay routes requests here as they arrive.' },
+      { value: 'batch', label: 'Batch — a queue drained in bulk', hint: 'Offline jobs, flushed when a batch pays for its own boot.' },
     ];
   }
   if (source === 'catalog.gpus.price_usd_per_second' || source === 'catalog.deployment'
@@ -2261,6 +2323,31 @@ function resolveOptions(wizard, desc) {
     if (!state.ready) return { options: [], reason: state.reason };
     if (!state.choices.length) return { options: [], reason: state.reason ?? 'No quant is available for this card.' };
     return { options: state.choices, reason: null };
+  }
+  if (source === 'requantizeOptions') {
+    const state = quantState(wizard);
+    if (!state.ready) return { options: [], reason: state.reason };
+    // Only quants the repository does not ship are candidates: requantising to an artefact it
+    // already contains is not a job, and re-doing one it ships but this card cannot run is still
+    // the same illegal artefact. Each remaining entry carries its own recipe.
+    const jobs = (wizard.quantResult?.unavailable ?? [])
+      .filter((entry) => objectOf(pick(entry, 'requantize')));
+    if (!jobs.length) {
+      return {
+        options: [],
+        reason: 'The probe names no other catalog quantisation that requantisation could produce, so there is nothing to choose here.',
+      };
+    }
+    return {
+      options: [
+        { value: '', label: 'No — serve what the repository ships' },
+        ...jobs.map((entry) => ({
+          value: asString(pick(entry, 'id')),
+          label: `${asString(pick(entry, 'id'))} — ${asString(pick(entry, 'reason'), 'a separate GPU job')}`,
+        })),
+      ],
+      reason: null,
+    };
   }
   if (source === 'kvDtypesForGpu') {
     const gpuId = asString(draftGet(wizard.draft, 'gpu')).trim();
@@ -2357,7 +2444,6 @@ function commitField(wizard, name, value) {
 
   if (name === 'platform') {
     draftSet(wizard.draft, 'gpu', '');
-    draftSet(wizard.draft, 'batchGpu', null);
     wizard.probe = null;
     wizard.sizing = null;
     wizard.probeError = null;
@@ -2375,14 +2461,11 @@ function commitField(wizard, name, value) {
   if (name === 'gpu') {
     wizard.sizing = null;
   }
-  if (name === 'accountId' || name === 'plan' || name === 'tokenId' || name === 'tokenSecret') {
+  if (name === 'accountId' || name === 'plan' || name === 'workspace' || name === 'tokenId' || name === 'tokenSecret') {
     // The stored result describes the account that was written. Editing an identity field makes it
     // stale, and the next Continue posts again — so the button and the panel must agree with that.
     wizard.accountSignature = null;
     wizard.accountResult = null;
-  }
-  if (name === 'mode' && asString(value).trim() !== 'batch') {
-    draftSet(wizard.draft, 'batchGpu', null);
   }
   if (name === 'weightQuant' || name === 'kvCacheDtype' || name === 'gpuCount'
     || name === 'gpuMemoryUtilization') {
@@ -2414,7 +2497,7 @@ function normalizeValidation(result) {
 }
 
 function validateCurrent(wizard) {
-  const result = callModel(wizard, 'validateStep', { ok: false, problems: [], errors: [] }, wizard.draft, wizard.current, wizard.catalog);
+  const result = callModel(wizard, 'validateStep', { ok: false, problems: [], errors: [] }, wizard.draft, wizard.current, wizard.catalog, wizard.accounts);
   wizard.validation = normalizeValidation(result);
   if (!wizard.validation.ok) paintSetup(wizard, wizard.mount, wizard.ctx, wizard.current);
   return Boolean(wizard.validation.ok);
@@ -2481,7 +2564,7 @@ function stepPanels(wizard, stepId) {
   if (stepId === 'account') {
     return [
       wizard.accountError ? failedEndpoint('POST /api/gpu/apply (create-account)', wizard.accountError) : null,
-      accountReusePanel(wizard), planLimitsPanel(wizard), accountsReferencePanel(wizard), accountResultPanel(wizard),
+      planLimitsPanel(wizard), accountsReferencePanel(wizard), accountResultPanel(wizard),
     ];
   }
   if (stepId === 'model') return [probePanel(wizard)];
@@ -2576,63 +2659,21 @@ function accountsReferencePanel(wizard) {
         ? `GET /api/gpu/rentals could not be read, so existing accounts are unknown: ${errorMessage(wizard.rentalsError)}`
         : 'No account on this platform has been recorded yet. The account you create here is stored in the vault before any model is chosen.'));
   }
+  // Read-only on purpose. An account already pays for one rental; offering "USE" here is what made
+  // every rental share a credential. The only way in is a new id with its own token.
   const rows = accounts.map((a) => h('tr', {},
     h('td', {}, mono(a.id), a.label && a.label !== a.id ? h('div', { class: 'hint' }, a.label) : null),
     h('td', {}, a.plan || '—'),
-    h('td', {}, a.fingerprint ? mono(a.fingerprint) : h('span', { class: 'hint' }, a.hasCredential ? 'stored' : 'not reported')),
-    h('td', {}, h('button', {
-      class: 'btn btn-sm btn-ghost',
-      type: 'button',
-      disabled: wizard.busy,
-      'aria-label': `Use account ${a.id} for this deployment`,
-      title: 'Bill this deployment to the credential already stored for this account.',
-      onclick: () => useExistingAccount(wizard, a),
-    }, 'USE'))));
+    h('td', {}, mono(a.workspace) || h('span', { class: 'hint' }, 'not recorded')),
+    h('td', {}, a.fingerprint ? mono(a.fingerprint) : h('span', { class: 'hint' }, a.hasCredential ? 'stored' : 'not reported'))));
   return h('div', { class: 'gpu-existing' },
     h('h3', {}, 'Accounts already recorded for this platform'),
-    dataTable([{ label: 'Account' }, { label: 'Plan' }, { label: 'Credential' }, { label: '' }], rows),
-    richHint('An account id is global to this installation. “USE” bills the deployment to that account’s stored credential without sending a token; it is the way a second deployment shares a workspace.'));
-}
-
-/** Point the draft at an account that is already in the vault, without re-posting its token. */
-function useExistingAccount(wizard, account) {
-  if (wizard.busy || !account) return;
-  draftSet(wizard.draft, 'accountId', account.id);
-  draftSet(wizard.draft, 'reuseAccount', true);
-  draftSet(wizard.draft, 'tokenId', '');
-  draftSet(wizard.draft, 'tokenSecret', '');
-  wizard.accountError = null;
-  wizard.accountResult = null;
-  wizard.accountSignature = null;
-  paintSetup(wizard, wizard.mount, wizard.ctx, wizard.current);
-}
-
-/**
- * The account step while it is billing an existing account: no token is asked for, and the copy
- * says what is and is not happening. The way back to recording a fresh account is a button, not
- * a hidden state change.
- */
-function accountReusePanel(wizard) {
-  if (wizard.draft?.reuseAccount !== true) return null;
-  const id = asString(draftGet(wizard.draft, 'accountId')).trim();
-  return h('div', { class: 'gpu-existing' },
-    h('h3', {}, `Billing account: ${id || 'none selected'}`),
-    h('p', { class: 'hint' },
-      'This deployment uses the credential already stored for that account. No token is sent and nothing in the vault is overwritten: the account was recorded before this draft existed.'),
-    h('p', { class: 'hint' },
-      'To bill a different workspace, record a new account with its own id and token.'),
-    h('div', { class: 'gpu-actions' }, ghostButton('Create a new account instead', () => {
-      draftSet(wizard.draft, 'reuseAccount', false);
-      wizard.accountResult = null;
-      wizard.accountSignature = null;
-      paintSetup(wizard, wizard.mount, wizard.ctx, wizard.current);
-    })));
+    dataTable([{ label: 'Account' }, { label: 'Plan' }, { label: 'Workspace' }, { label: 'Credential' }], rows),
+    richHint('Each of these already pays for a rental, so none can be chosen here: one rental has one '
+      + 'account, one credential and one vault entry. Record a new account id for this rental.'));
 }
 
 function accountResultPanel(wizard) {
-  // A reused account was stored by an earlier visit; saying "stored" here would imply this draft
-  // sent something. accountReusePanel already says what the deployment bills.
-  if (wizard.draft?.reuseAccount === true) return null;
   if (!wizard.accountResult) return null;
   const result = objectOf(wizard.accountResult) ?? {};
   const account = objectOf(pick(result, 'account')) ?? result;
@@ -2740,14 +2781,34 @@ function cardPanel(wizard) {
     parts.push(h('p', { class: 'hint' }, 'Choose a card to see its published VRAM, its hourly and per-second rate, and whether it is available on the free plan.'));
   }
 
-  const unavailable = listOf(wizard.quantResult?.unavailable).map(objectOf).filter(Boolean);
-  for (const item of unavailable) {
+  const state = objectOf(wizard.quantResult) ?? {};
+  const unavailable = listOf(pick(state, 'unavailable')).map(objectOf).filter(Boolean);
+  const shipped = listOf(pick(state, 'available')).map(objectOf).filter(Boolean)
+    .map((entry) => asString(pick(entry, 'id'))).filter(Boolean);
+  const requested = asString(draftGet(wizard.draft, 'requantizeTo')).trim();
+  if (requested) {
+    const item = unavailable.find((entry) => asString(pick(entry, 'id')) === requested) ?? null;
     const plan = objectOf(pick(item, 'requantize'));
     if (plan) {
-      parts.push(requantizePanel(plan, gpuId, asString(pick(item, 'id'))));
+      parts.push(requantizePanel(plan, gpuId, requested));
     } else {
       parts.push(h('p', { class: 'hint' },
-        `${asString(pick(item, 'id'))} is unavailable on this card: ${asString(pick(item, 'reason'), 'no reason was reported')}.`));
+        `Requantisation to ${requested} is selected, but the setup model reports no recipe for it on this card. Nothing is run by the wizard either way.`));
+    }
+  } else if (unavailable.length) {
+    // One sentence, not one card per catalog quant: the wall of plans was the defect.
+    const jobs = unavailable.filter((entry) => objectOf(pick(entry, 'requantize')));
+    const illegal = unavailable.filter((entry) => !objectOf(pick(entry, 'requantize')));
+    const shippedText = shipped.length
+      ? `The repository ships ${shipped.join(', ')}.`
+      : 'The probe has not named a quant the repository ships.';
+    const jobText = jobs.length
+      ? `The catalog names ${jobs.length} other quantisation${jobs.length === 1 ? '' : 's'} the repository does not ship; each is a separate multi-hour GPU job, not something this flow does. Choose one under "Requantise to (optional)" above to see its recipe.`
+      : 'No other catalog quantisation can be produced by requantisation here.';
+    parts.push(h('p', { class: 'hint' }, `${shippedText} ${jobText}`));
+    if (illegal.length) {
+      parts.push(h('p', { class: 'hint' },
+        `${illegal.map((entry) => asString(pick(entry, 'id'))).join(', ')} ${illegal.length === 1 ? 'is shipped but cannot run on this card' : 'are shipped but cannot run on this card'}, so requantising to the same id would not help.`));
     }
   }
   if (!parts.length) return null;
@@ -2781,7 +2842,7 @@ function requantizePanel(plan, gpuId, requestedId) {
     reason ? richHint(reason) : null,
     kv(facts),
     richHint('This is not free and not instant: it is a separate GPU run that produces a new checkpoint. '
-      + 'Manarouter records the recipe and the command; it does not run the quantiser for you.'),
+      + 'Manarouter shows the recipe and the command; it does not run the quantiser for you.'),
   ];
 
   const notes = listOfStrings(pick(plan, 'note'));
@@ -2914,7 +2975,7 @@ function reviewPanel(wizard) {
       ['Weight quant', asString(pick(dep, 'weight_quant')) || '—'],
       ['KV cache dtype', asString(pick(dep, 'kv_cache_dtype')) || '—'],
       ['Mode', asString(pick(dep, 'mode')) || '—'],
-      ['Base URL', asString(pick(dep, 'base_url')) || '—'],
+      ['Endpoint URL', asString(pick(dep, 'base_url')) || '—'],
     ]));
     parts.push(richHint('The account token is not part of this request: the account was stored separately before any model was chosen.'));
   }
@@ -2968,22 +3029,6 @@ async function advance(wizard, ctx) {
 }
 
 async function storeAccount(wizard, ctx) {
-  if (wizard.draft?.reuseAccount === true) {
-    const problem = callModel(wizard, 'accountReuseProblem', null, wizard.draft, wizard.accounts);
-    if (typeof problem === 'string' && problem) {
-      wizard.accountError = new Error(problem);
-      paintSetup(wizard, wizard.mount, ctx, wizard.current);
-      return false;
-    }
-    const id = asString(draftGet(wizard.draft, 'accountId')).trim();
-    const stored = wizard.accounts.find((a) => sameText(a.id, id)) ?? { id };
-    // No request: the credential is already in the vault, and the deployment references the account
-    // by id. The signature stops a revisit from taking this path again for a different id.
-    wizard.accountSignature = JSON.stringify(['reuse', id, asString(draftGet(wizard.draft, 'platform')).trim()]);
-    wizard.accountError = null;
-    wizard.accountResult = { account: stored };
-    return true;
-  }
   const payload = objectOf(callModel(wizard, 'accountApplyPayload', null, wizard.draft));
   if (!payload) {
     wizard.accountError = new Error(
@@ -2999,6 +3044,7 @@ async function storeAccount(wizard, ctx) {
     asString(pick(account, 'token_id')).trim(),
     asString(pick(account, 'token_secret')),
     asString(pick(account, 'hf_token')),
+    asString(pick(account, 'workspace')),
   ]);
   if (wizard.accountSignature === signature) return true;
 
