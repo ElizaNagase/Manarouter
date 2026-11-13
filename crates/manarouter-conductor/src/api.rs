@@ -997,6 +997,54 @@ async fn prepare_provider(
     })
 }
 
+/// Refuse a provider whose OAuth login could never start.
+///
+/// `auth = oauth` is a promise that the panel's Connect button can open a login on some platform
+/// and store the credential that comes back. Naming no platform — or one no registered platform
+/// answers to — makes that promise empty in a way that reads as a broken router: the provider
+/// saves, the drawer offers Connect, and the login request goes to a platform id that does not
+/// exist. The panel fills the platform in from its presets now, but the rule belongs here, where
+/// every client meets it: a form that forgets, a curl body, a future UI.
+fn refuse_unusable_oauth(provider: &mr_core::Provider) -> ApiResult<()> {
+    let AuthKind::OAuth { platform } = &provider.auth else {
+        return Ok(());
+    };
+    let platform = platform.trim();
+    if platform.is_empty() {
+        let known: Vec<&str> = mr_core::oauth::platforms().iter().map(|p| p.id()).collect();
+        return Err(ApiError::bad(
+            "oauth_platform_missing",
+            format!(
+                "provider {} authenticates with OAuth but names no platform, so no sign-in can \
+                 ever obtain its credential; set auth.platform to one of: {}",
+                provider.id,
+                known.join(", ")
+            ),
+        )
+        .with_details(vec![json!({
+            "field": "auth",
+            "message": "Choose the OAuth platform this provider signs in through.",
+        })]));
+    }
+    if mr_core::oauth::platform(platform).is_none() {
+        let known: Vec<&str> = mr_core::oauth::platforms().iter().map(|p| p.id()).collect();
+        return Err(ApiError::bad(
+            "oauth_platform_unknown",
+            format!(
+                "provider {} names OAuth platform {platform:?}, which this build does not \
+                 implement; known platforms: {}",
+                provider.id,
+                known.join(", ")
+            ),
+        )
+        .with_details(vec![json!({
+            "field": "auth",
+            "message": format!("Unknown OAuth platform {platform:?}."),
+        })]));
+    }
+    Ok(())
+}
+
 /// Heal a whole configuration body and parse it: control password, format version, provider
 /// header placeholders, account secrets, client keys — in that order.
 ///
@@ -2024,6 +2072,11 @@ async fn create_provider(
         }
     };
 
+    if let Err(err) = refuse_unusable_oauth(&prepared) {
+        state.tx_rollback(tx).await;
+        return Err(err);
+    }
+
     // Keep the pre-edit configuration: the validator tolerates problems that were already there,
     // so a second provider can be created while the first still has no account.
     let previous = current.clone();
@@ -2107,6 +2160,11 @@ async fn update_provider(
             return Err(err);
         }
     };
+
+    if let Err(err) = refuse_unusable_oauth(&prepared) {
+        state.tx_rollback(tx).await;
+        return Err(err);
+    }
 
     // Any account the edit dropped takes its vault secret with it — but only once the new
     // configuration is safely committed; a rejected edit must not have deleted anything.
@@ -3311,6 +3369,112 @@ mod tests {
             problems.iter().any(|p| p.contains("base_url")),
             "expected a base_url problem, got {problems:?}"
         );
+    }
+
+    /// An OAuth provider whose login can never start is refused, with the reason pinned to the
+    /// auth field.
+    ///
+    /// This is the bug as the operator met it: the panel filled the auth kind in from a preset but
+    /// not the platform, the API accepted the body, and the router then answered "Connect" with a
+    /// login for a platform id that does not exist. Refusing to save is the only answer that does
+    /// not leave a provider behind which looks configured and cannot work.
+    #[tokio::test]
+    async fn an_oauth_provider_without_a_registered_platform_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (state, _config_path) = state_in(dir.path());
+        let cases = [
+            (json!({"type": "oauth"}), "oauth_platform_missing"),
+            (
+                json!({"type": "oauth", "platform": ""}),
+                "oauth_platform_missing",
+            ),
+            (
+                json!({"type": "oauth", "platform": "   "}),
+                "oauth_platform_missing",
+            ),
+            (
+                json!({"type": "oauth", "platform": "definitely-not-a-platform"}),
+                "oauth_platform_unknown",
+            ),
+        ];
+        for (auth, expected) in cases {
+            let body = json!({
+                "id": "cursor",
+                "label": "Cursor",
+                "dialect": "cursor",
+                "base_url": "https://api2.cursor.sh",
+                "capabilities": ["chat"],
+                "auth": auth,
+            });
+            let response = router(state.clone())
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(Method::POST)
+                        .uri("/api/providers")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .expect("request"),
+                )
+                .await
+                .expect("router responded");
+            let status = response.status();
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).expect("json body");
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "expected a refusal, got {status}: {body}"
+            );
+            assert_eq!(body["error"]["code"], expected, "unexpected code: {body}");
+            assert_eq!(
+                body["error"]["details"][0]["field"], "auth",
+                "the panel pins this next to the auth picker: {body}"
+            );
+            assert!(
+                body["error"]["details"][0]["message"]
+                    .as_str()
+                    .is_some_and(|m| !m.is_empty()),
+                "a field error with no message cannot be shown: {body}"
+            );
+        }
+        assert_eq!(
+            state.current_config().await.providers.len(),
+            0,
+            "a refused create must not have saved anything"
+        );
+
+        // The same body with the platform the panel now fills in is accepted, so the rule cannot
+        // be passing by refusing everything.
+        let body = json!({
+            "id": "cursor",
+            "label": "Cursor",
+            "dialect": "cursor",
+            "base_url": "https://api2.cursor.sh",
+            "capabilities": ["chat"],
+            "auth": {"type": "oauth", "platform": "cursor"},
+        });
+        let response = router(state.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/providers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("router responded");
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "a provider naming a registered platform must be accepted"
+        );
+        assert_eq!(state.current_config().await.providers.len(), 1);
     }
 
     #[test]

@@ -73,6 +73,15 @@ const authKinds = vm
   .map(([kind]) => kind);
 
 const all = [...presets.providers, ...presets.platforms];
+// The panel fills the dialect's login in from the presets, so a preset missing its `platform`
+// silently produces a provider that can never be connected. The panel's own dialect map is
+// derived from this table; the assertion below pins that it stays derived rather than becoming a
+// second hand-kept copy.
+const oauthPlatforms = Object.fromEntries(
+  presets.platforms
+    .filter((preset) => preset.auth === 'oauth' && preset.platform)
+    .map((preset) => [preset.dialect, preset.platform]),
+);
 
 test('every preset dialect is one the panel offers', () => {
   for (const preset of all) {
@@ -91,6 +100,52 @@ test('every preset is complete and its auth kind is offered', () => {
     assert.ok(preset.name.length > 0, 'a preset has an empty name');
     assert.ok(preset.hint.length > 0, `${preset.name} has no hint`);
     assert.ok(authKinds.includes(preset.auth), `${preset.name} uses unknown auth ${preset.auth}`);
+  }
+});
+
+test('every OAuth preset names the platform its dialect signs in through', () => {
+  const oauth = all.filter((preset) => preset.auth === 'oauth');
+  assert.ok(oauth.length >= 4, 'the OAuth presets went missing');
+  for (const preset of oauth) {
+    assert.equal(
+      typeof preset.platform,
+      'string',
+      `${preset.name} is an OAuth preset with no platform, so Connect would have no login to start`,
+    );
+    assert.match(preset.platform, /^[a-z][a-z0-9-]*$/, `${preset.name} has a malformed platform id`);
+    assert.equal(
+      oauthPlatforms[preset.dialect],
+      preset.platform,
+      `dialect ${preset.dialect} maps to platform ${oauthPlatforms[preset.dialect]}, but ${preset.name} names ${preset.platform}`,
+    );
+  }
+  assert.match(
+    source,
+    /const DIALECT_OAUTH_PLATFORMS = Object\.freeze\(Object\.fromEntries\(\s*PROVIDER_PRESETS\.platforms/,
+    'DIALECT_OAUTH_PLATFORMS must be derived from the presets, not written out a second time',
+  );
+  // The map exists to decide the auth kind when the dialect is chosen, so a dialect it lists as
+  // OAuth-only must not also be offered with a bearer path by some other preset.
+  for (const dialect of Object.keys(oauthPlatforms)) {
+    const bearer = all.filter((preset) => preset.dialect === dialect && preset.auth !== 'oauth');
+    assert.deepEqual(bearer.map((preset) => preset.name), [], `dialect ${dialect} has a non-OAuth preset`);
+  }
+});
+
+test('each OAuth preset platform is the one the catalog signs in with', () => {
+  const toml = readFileSync(join(repo, 'catalog/providers.toml'), 'utf8');
+  const byDialect = new Map();
+  for (const block of toml.split('[[providers]]').slice(1)) {
+    const dialect = block.match(/^dialect = "([^"]*)"/m);
+    const auth = block.match(/^auth = \{ type = "oauth", platform = "([^"]*)" \}/m);
+    if (dialect && auth) byDialect.set(dialect[1], auth[1]);
+  }
+  for (const preset of all.filter((item) => item.auth === 'oauth')) {
+    assert.equal(
+      byDialect.get(preset.dialect),
+      preset.platform,
+      `catalog/providers.toml gives dialect ${preset.dialect} platform ${byDialect.get(preset.dialect)}, but the panel names ${preset.platform}`,
+    );
   }
 });
 

@@ -951,7 +951,40 @@ impl Provider {
         // A capability the dialect cannot serve only surfaces as a failed request otherwise:
         // correct-looking configuration, opaque upstream error.
         problems.extend(self.dialect_capability_mismatches());
+        problems.extend(self.oauth_platform_problems());
         problems
+    }
+
+    /// Problems with the OAuth platform this provider names, if it asks for OAuth at all.
+    ///
+    /// Only an *empty* platform is reported here. An `oauth` provider with no platform has no
+    /// login to start, so it can never hold a credential: the panel draws a Connect button whose
+    /// only outcome is an error. The control plane refuses to *save* that; this reports it for a
+    /// configuration that acquired the shape some other way (a hand edit, an import, an older
+    /// panel), because a file in that state must still **load** — the operator has to be able to
+    /// open the panel to repair it, so the problem is advisory rather than fatal.
+    ///
+    /// An *unregistered* platform is deliberately not reported. The catalogue ships entries whose
+    /// platform this build does not implement yet and says so in their note (`cline`), so a
+    /// provider module cannot distinguish a documented migration target from a typo. The
+    /// control plane, which is where an operator types an id by hand, refuses those instead.
+    pub fn oauth_platform_problems(&self) -> Vec<String> {
+        let AuthKind::OAuth { platform } = &self.auth else {
+            return Vec::new();
+        };
+        if !platform.trim().is_empty() {
+            return Vec::new();
+        }
+        vec![format!(
+            "provider {:?} has no OAuth platform, so it has no login to start and can never \
+             hold a credential; set auth.platform to one of: {}",
+            self.id.as_str(),
+            crate::oauth::platforms()
+                .iter()
+                .map(|p| p.id())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )]
     }
 
     /// Which of the client routes this provider claims but cannot actually serve, given its
@@ -2073,6 +2106,43 @@ mod tests {
             .dialect_capability_mismatches()
             .iter()
             .any(|s| s.contains("images.generations")));
+    }
+
+    #[test]
+    fn an_oauth_provider_without_a_usable_platform_is_flagged() {
+        // The shape the buggy panel used to send: `oauth` with the platform box left empty.
+        let mut p = Provider::new("cursor", Dialect::Cursor, "https://api2.cursor.sh");
+        p.accounts.push(Account::new("default"));
+        p.auth = AuthKind::OAuth {
+            platform: String::new(),
+        };
+        let problems = p.validate();
+        assert!(
+            problems.iter().any(|s| s.contains("has no OAuth platform")),
+            "an OAuth provider with no platform must be flagged: {problems:?}"
+        );
+
+        // An unregistered id is *not* a provider-level problem: the catalogue ships platforms
+        // this build does not implement yet (`cline`) and documents them as such, so the provider
+        // cannot tell a migration target from a typo. The control plane refuses those instead.
+        p.auth = AuthKind::OAuth {
+            platform: "not-a-platform".into(),
+        };
+        assert!(
+            p.validate().iter().all(|s| !s.contains("OAuth platform")),
+            "an unregistered platform must not be flagged here: {:?}",
+            p.validate()
+        );
+
+        // A registered platform is accepted, so the check cannot fire on every OAuth provider.
+        p.auth = AuthKind::OAuth {
+            platform: "cursor".into(),
+        };
+        assert!(
+            p.validate().iter().all(|s| !s.contains("OAuth platform")),
+            "a registered platform must not be flagged: {:?}",
+            p.validate()
+        );
     }
 
     #[test]

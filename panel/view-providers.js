@@ -274,10 +274,10 @@ const PROVIDER_PRESETS = {
   // visually separated from the standard LLM APIs above.
   platforms: [
     { name: 'NVIDIA NIM', dialect: 'open-ai', baseUrl: 'https://integrate.api.nvidia.com/v1', auth: 'bearer', hint: 'NVIDIA NIM inference endpoints. Add your NVIDIA API key as an account secret after saving.' },
-    { name: 'Codex', dialect: 'codex', baseUrl: 'https://chatgpt.com/backend-api/codex', auth: 'oauth', hint: 'OpenAI Codex — OAuth sign-in from the panel.' },
-    { name: 'Copilot', dialect: 'copilot', baseUrl: 'https://api.githubcopilot.com', auth: 'oauth', hint: 'GitHub Copilot — OAuth sign-in from the panel.' },
-    { name: 'Antigravity', dialect: 'antigravity', baseUrl: 'https://cloudcode-pa.googleapis.com', auth: 'oauth', hint: 'Google Antigravity / Cloud Code — OAuth sign-in from the panel.' },
-    { name: 'Cursor', dialect: 'cursor', baseUrl: 'https://api2.cursor.sh', auth: 'oauth', hint: 'Cursor — OAuth sign-in from the panel. The sign-in finishes in Cursor’s own tab and the panel learns of it by polling, so nothing is ever pasted back here.' },
+    { name: 'Codex', dialect: 'codex', baseUrl: 'https://chatgpt.com/backend-api/codex', auth: 'oauth', platform: 'openai-codex', hint: 'OpenAI Codex — OAuth sign-in from the panel.' },
+    { name: 'Copilot', dialect: 'copilot', baseUrl: 'https://api.githubcopilot.com', auth: 'oauth', platform: 'github-copilot', hint: 'GitHub Copilot — OAuth sign-in from the panel.' },
+    { name: 'Antigravity', dialect: 'antigravity', baseUrl: 'https://cloudcode-pa.googleapis.com', auth: 'oauth', platform: 'antigravity', hint: 'Google Antigravity / Cloud Code — OAuth sign-in from the panel.' },
+    { name: 'Cursor', dialect: 'cursor', baseUrl: 'https://api2.cursor.sh', auth: 'oauth', platform: 'cursor', hint: 'Cursor — OAuth sign-in from the panel. The sign-in finishes in Cursor’s own tab and the panel learns of it by polling, so nothing is ever pasted back here.' },
     { name: 'Command Code', dialect: 'command-code-go', baseUrl: 'https://api.commandcode.ai', auth: 'bearer', hint: 'Command Code — bearer auth.' },
     { name: 'Modal vLLM', dialect: 'modal-vllm', baseUrl: '', auth: 'modal', hint: 'Enter your Modal app’s HTTPS public URL (for example https://your-app--serve.modal.run). Add the Modal Token ID.Token Secret as the account secret after saving; the panel sends it as Modal-Key and Modal-Secret headers.' },
     { name: 'OpenCode Zen', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/v1', auth: 'bearer', hint: 'OpenCode Console, pay-as-you-go. Needs a funded key: the free models are refused outside the OpenCode client, so they cannot be routed from here.' },
@@ -295,6 +295,22 @@ const DIALECT_BASE_URLS = {
   copilot: 'https://api.githubcopilot.com',
   cursor: 'https://api2.cursor.sh',
 };
+// The dialects that have no API-key path: their request builders expect the header an OAuth
+// login produces, and the Cursor transport refuses a turn before opening a socket when no such
+// header is present. The panel used to fill in only the base URL when a dialect was chosen, so a
+// provider created that way was stored with `auth: bearer` and could never reach the Connect
+// button — it saved cleanly and then failed every request. Naming the platform next to the
+// dialect lets choosing one choose the other.
+//
+// Derived from the preset table rather than written out again: two hand-kept copies of the same
+// four pairs is exactly how the panel and the registry drift apart. The platform ids are the ones
+// `/api/oauth` answers to (`openai-codex`, `github-copilot`), not the dialect spellings.
+const DIALECT_OAUTH_PLATFORMS = Object.freeze(Object.fromEntries(
+  PROVIDER_PRESETS.platforms
+    .filter((preset) => preset.auth === 'oauth' && preset.platform)
+    .map((preset) => [preset.dialect, preset.platform]),
+));
+
 const AUTH_KINDS = [
   ['bearer', 'Authorization: Bearer'],
   ['api-key-header', 'API key header (x-api-key)'],
@@ -2795,7 +2811,31 @@ export async function renderProviders(mount, ctx) {
     const authParam = h('input', { class: 'input mono', type: 'text', 'data-field': 'param', value: auth.param ?? 'key' });
     const authPlatform = h('input', { class: 'input mono', type: 'text', 'data-field': 'platform', value: auth.platform ?? '' });
     const authBox = h('div', {});
+    const authWarn = h('div', {});
     authSel.addEventListener('change', () => renderAuthParams());
+
+    // A dialect with only an OAuth path must not be saved with any other auth kind. The value is
+    // whatever an older form (or the CLI) stored, so this warns and offers the switch rather than
+    // rewriting a field the operator is looking at: a silent change would be indistinguishable
+    // from the panel losing the edit, and the warning names why it matters.
+    function renderAuthWarn() {
+      authWarn.replaceChildren();
+      const platform = DIALECT_OAUTH_PLATFORMS[dialectIn.value];
+      if (!platform || authSel.value === 'oauth') return;
+      const fix = h('button', { class: 'btn', type: 'button' }, `Switch to the ${platform} OAuth login`);
+      fix.addEventListener('click', () => {
+        authSel.value = 'oauth';
+        authPlatform.value = platform;
+        renderAuthParams();
+      });
+      authWarn.append(
+        h('p', { class: 'hint', style: 'color:var(--warn, #c98a00);' },
+          `Dialect ${dialectIn.value} has no API-key path: it signs in through the ${platform} OAuth platform. ` +
+          `With auth ${authSel.value} this provider saves, and then refuses every request for having no credential the endpoint will read.`),
+        fix,
+      );
+    }
+
     function renderAuthParams() {
       const t = authSel.value;
       authBox.replaceChildren();
@@ -2803,7 +2843,10 @@ export async function renderProviders(mount, ctx) {
       else if (t === 'header') authBox.append(h('div', { class: 'grid-fields' },
         field('Header name', authName), field('Prefix (optional)', authPrefix, { hint: 'e.g. “Bearer ”' })));
       else if (t === 'query-param') authBox.append(field('Query parameter', authParam));
-      else if (t === 'oauth') authBox.append(field('Platform', authPlatform, { hint: 'OAuth platform id, e.g. codex.' }));
+      else if (t === 'oauth') authBox.append(field('Platform', authPlatform, {
+        hint: 'OAuth platform id — codex, copilot, antigravity or cursor. The Connect button starts this platform’s login; an empty or unknown id leaves the provider with no way to obtain a credential.',
+      }));
+      renderAuthWarn();
     }
     renderAuthParams();
 
@@ -2821,6 +2864,10 @@ export async function renderProviders(mount, ctx) {
         dialectIn.value = preset.dialect;
         baseUrl.value = preset.baseUrl;
         authSel.value = preset.auth;
+        // The platform is part of what the preset knows. Filling only the auth kind is what made
+        // a preset-created Cursor provider unconnectable: `oauth` with an empty platform is not a
+        // login, it is a promise the panel cannot keep.
+        if (preset.platform) authPlatform.value = preset.platform;
         if (preset.authHeader) authHeader.value = preset.authHeader;
         renderAuthParams();
       }
@@ -2874,6 +2921,16 @@ export async function renderProviders(mount, ctx) {
     baseUrl.addEventListener('input', () => { baseUrlDirty = true; });
     const baseUrlSuggestion = h('p', { class: 'hint' });
     dialectIn.addEventListener('change', () => {
+      // One-way implication, in both create and edit: a dialect with a single supported login
+      // sets that kind and platform. Moving to a dialect that accepts an API key leaves the auth
+      // as it stands, because `oauth` is still a valid choice there and rewriting it would throw
+      // away a working sign-in.
+      const platform = DIALECT_OAUTH_PLATFORMS[dialectIn.value];
+      if (platform && authSel.value !== 'oauth') {
+        authSel.value = 'oauth';
+        authPlatform.value = platform;
+      }
+      renderAuthParams();
       const suggestion = DIALECT_BASE_URLS[dialectIn.value];
       const current = baseUrl.value.trim();
       if (!suggestion || baseUrlDirty || (current && current !== lastSuggestedBaseUrl)) return;
@@ -2904,7 +2961,7 @@ export async function renderProviders(mount, ctx) {
       })),
       field('Base URL', baseUrl),
       baseUrlSuggestion,
-      h('fieldset', { class: 'plain' }, h('legend', {}, 'Auth'), authSel, authBox),
+      h('fieldset', { class: 'plain' }, h('legend', {}, 'Auth'), authSel, authBox, authWarn),
       h('fieldset', { class: 'plain' }, h('legend', {}, 'Timeouts'), timeouts),
       budgetSettings,
       prewarmToggle.row,
@@ -2920,6 +2977,19 @@ export async function renderProviders(mount, ctx) {
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       clearFieldErrors(form);
+      // Refused here as well as in the conductor, on purpose: the server's refusal is the rule,
+      // and this is the version that can pin the reason under the field instead of a toast about
+      // a provider that was never created.
+      if (authSel.value === 'oauth' && !authPlatform.value.trim()) {
+        applyFieldErrors(form, {
+          details: [{
+            field: 'platform',
+            message: 'Name the OAuth platform this provider signs in through (codex, copilot, antigravity, cursor). ' +
+              'Without it there is no login to start, so the provider can never hold a credential.',
+          }],
+        });
+        return;
+      }
       save.disabled = true;
       save.textContent = 'Saving…';
       const payload = isEdit

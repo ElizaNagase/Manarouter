@@ -557,6 +557,13 @@ pub enum AuthKind {
     #[serde(rename = "oauth")]
     OAuth {
         /// Which registered OAuth platform handles this account.
+        ///
+        /// `#[serde(default)]` so that an empty platform is *representable*. Refusing it at
+        /// deserialisation time turns one bad provider into a configuration that will not load at
+        /// all — the panel and the relay both come up empty with a serde error, which is harder to
+        /// repair than the provider is worth. Validation names the missing id instead, and the
+        /// control plane refuses to save one.
+        #[serde(default)]
         platform: String,
     },
 }

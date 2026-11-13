@@ -1618,11 +1618,19 @@ pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
 ///   it will not boot.
 /// - **An account with no credential attached** (non-Bearer auth). Worth telling the operator
 ///   about, but one broken provider must not take the whole gateway down.
+/// - **An OAuth provider with no platform.** Such a provider cannot log in, but it also cannot do
+///   any harm, and the control plane already refuses to create one. A configuration that acquired
+///   the problem another way — a hand edit, an import — has to load, because the panel the operator
+///   would repair it in is served by this same process. (An *unregistered* platform is not
+///   advisory here because it is not a provider-level problem at all; see
+///   [`crate::Provider::oauth_platform_problems`].)
 ///
 /// Everything else — an unknown provider, a duplicate id, a bad base URL, a combo with no enabled
 /// steps — is a reason not to start, and a reason not to save.
 pub fn is_advisory(problem: &str) -> bool {
-    problem.contains("has no accounts") || problem.contains("has no credential attached")
+    problem.contains("has no accounts")
+        || problem.contains("has no credential attached")
+        || problem.contains("has no OAuth platform")
 }
 
 #[cfg(test)]
@@ -1679,6 +1687,29 @@ mod tests {
     #[test]
     fn a_default_config_is_valid() {
         assert!(Config::default().validate().is_empty());
+    }
+
+    /// A provider that cannot log in must not stop the gateway from starting: the panel that
+    /// repairs it is served by the same process, so failing the boot would remove the fix.
+    #[test]
+    fn a_missing_oauth_platform_is_advisory_rather_than_fatal() {
+        let mut config = Config::default();
+        let mut empty = servable_provider("cursor");
+        empty.auth = crate::AuthKind::OAuth {
+            platform: String::new(),
+        };
+        config.providers.push(empty);
+
+        let problems = config.validate();
+        assert!(
+            problems.iter().any(|p| p.contains("has no OAuth platform")),
+            "the empty platform must be reported: {problems:?}"
+        );
+        assert!(
+            config.validate_fatal().is_empty(),
+            "it must not be fatal: {:?}",
+            config.validate_fatal()
+        );
     }
 
     #[test]
