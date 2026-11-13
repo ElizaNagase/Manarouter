@@ -185,6 +185,10 @@ export function describePortChange(ports) {
  * Where a reachability probe for the relay should be aimed. Listen hosts like "0.0.0.0" or "::"
  * mean "all interfaces"; a browser cannot dial those, so probe loopback instead. Returns null
  * when there is no port to probe (the caller then shows an honest unknown state).
+ *
+ * The path is `/healthz`, the relay's unauthenticated liveness route, rather than the root: the
+ * root has no handler, so probing it logged a 404 on every visit to the overview and answered a
+ * different question ("is something listening") than the one the panel asks ("is the relay up").
  */
 export function relayProbeUrl(relay, pageHost) {
   if (!relay || typeof relay !== 'object') return null;
@@ -201,7 +205,7 @@ export function relayProbeUrl(relay, pageHost) {
     pageHost !== '127.0.0.1' && pageHost !== 'localhost' && pageHost !== '[::1]';
   if (wildcard || (loopback && pageIsRemote)) host = pageIsRemote ? pageHost : '127.0.0.1';
   if (host.includes(':') && !(host.startsWith('[') && host.endsWith(']'))) host = `[${host}]`;
-  return `http://${host}:${port}/`;
+  return `http://${host}:${port}/healthz`;
 }
 
 // ---------- combo mechanics ----------
