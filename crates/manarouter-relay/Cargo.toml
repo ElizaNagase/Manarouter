@@ -26,6 +26,7 @@ hyper-util = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
+h2 = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 futures-util = { workspace = true }

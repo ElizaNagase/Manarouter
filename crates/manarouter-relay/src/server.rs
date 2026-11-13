@@ -2385,50 +2385,162 @@ async fn attempt_step(
         None
     };
 
+    // --- Cursor: a bidirectional stream, not a request/response pair. ---
+    //
+    // Every other dialect can be expressed as "send these bytes, read that response", which is what
+    // the pooled client below does. Cursor's agent endpoint keeps the request side *open* so the
+    // server can ask this client questions while the answer is written — what tools it has, what a
+    // blob it wrote in an earlier turn held — and a client that half-closes the stream never gets an
+    // answer at all. So `cursor_transport` owns the exchange, and this branch only decides whether
+    // the turn can be attempted at all.
+    //
+    // The request is shaped here, before a socket is opened, so a body that cannot be expressed
+    // fails as a client error instead of as a provider one: the difference decides whether the
+    // operator's account gets cooled down for a request this router was never able to send.
+    let mut cursor_prepared = if step.dialect == Dialect::Cursor {
+        if proxy_endpoint.is_some() {
+            // Not a limitation of the request but of the transport underneath it, and silence would
+            // be worse than refusal: going direct here would quietly defeat an egress policy the
+            // operator configured on purpose.
+            return Attempt::Fatal {
+                response: error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    client_dialect,
+                    "server_error",
+                    "this Cursor provider has a proxy configured, and the Cursor transport speaks \
+                     HTTP/2 directly: a proxied bidirectional stream is not implemented, so the \
+                     turn was refused rather than sent around your egress policy. Remove the proxy \
+                     from this provider, or route to Cursor without one.",
+                ),
+            };
+        }
+        // Reuse the one place that decides how a credential becomes a header, so a Cursor provider
+        // configured with any other auth kind is refused here instead of being sent a header the
+        // agent endpoint will not read.
+        let mut auth_headers = HeaderMap::new();
+        apply_auth(&mut auth_headers, &step.auth, credential.as_deref());
+        let authorization = auth_headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
+        match authorization {
+            None => {
+                return Attempt::Fatal {
+                    response: error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        client_dialect,
+                        "server_error",
+                        "the Cursor agent endpoint is authenticated with a bearer credential, and \
+                         this provider's account has none: attach one with `mr account add` and set \
+                         the provider's auth to `bearer`.",
+                    ),
+                };
+            }
+            Some(authorization) => {
+                match crate::cursor_transport::prepare(
+                    &ctx,
+                    &outgoing,
+                    authorization,
+                    crate::cursor_transport::GHOST_MODE_DEFAULT,
+                    Some(step.base_url.as_str()),
+                ) {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        // A body this router cannot turn into a run is the client's problem (400);
+                        // a transport that cannot be built is ours (503).
+                        let (status, kind) = match error {
+                            crate::cursor_transport::Error::Request(_) => {
+                                (StatusCode::BAD_REQUEST, "invalid_request_error")
+                            }
+                            _ => (StatusCode::SERVICE_UNAVAILABLE, "server_error"),
+                        };
+                        return Attempt::Fatal {
+                            response: error_response(
+                                status,
+                                client_dialect,
+                                kind,
+                                &error.to_string(),
+                            ),
+                        };
+                    }
+                }
+            }
+        }
+    } else {
+        None
+    };
+
     let initial_body = outgoing.clone();
     let mut current_body = outgoing;
     let mut reconciled_once = false;
 
     let response = loop {
-        let request = UpstreamRequest {
-            method: method.clone(),
-            url: url.clone(),
-            headers: upstream_headers(
-                provider,
-                step,
-                credential.as_deref(),
-                headers,
-                &head,
-                force_stream,
-                dialect_content_type,
-                &oauth_headers,
-            ),
-            proxy: proxy_endpoint.clone(),
-            body: current_body.clone(),
-            http2: provider.http2,
-            connect_timeout: Duration::from_millis(
-                provider
-                    .cold_start_ttfb_timeout_ms
-                    .map(|_| step.connect_timeout_ms.max(300_000))
-                    .unwrap_or(step.connect_timeout_ms),
-            ),
-            ttfb_timeout: Duration::from_millis(
-                provider
-                    .cold_start_ttfb_timeout_ms
-                    .unwrap_or(step.ttfb_timeout_ms),
-            ),
-            total_timeout: (step.total_timeout_ms > 0).then(|| {
-                Duration::from_millis(
-                    step.total_timeout_ms
-                        .max(provider.cold_start_ttfb_timeout_ms.unwrap_or(0)),
+        let sent = match cursor_prepared.take() {
+            // The ordinary path: one request, one response, through the pooled client.
+            None => {
+                let request = UpstreamRequest {
+                    method: method.clone(),
+                    url: url.clone(),
+                    headers: upstream_headers(
+                        provider,
+                        step,
+                        credential.as_deref(),
+                        headers,
+                        &head,
+                        force_stream,
+                        dialect_content_type,
+                        &oauth_headers,
+                    ),
+                    proxy: proxy_endpoint.clone(),
+                    body: current_body.clone(),
+                    http2: provider.http2,
+                    connect_timeout: Duration::from_millis(
+                        provider
+                            .cold_start_ttfb_timeout_ms
+                            .map(|_| step.connect_timeout_ms.max(300_000))
+                            .unwrap_or(step.connect_timeout_ms),
+                    ),
+                    ttfb_timeout: Duration::from_millis(
+                        provider
+                            .cold_start_ttfb_timeout_ms
+                            .unwrap_or(step.ttfb_timeout_ms),
+                    ),
+                    total_timeout: (step.total_timeout_ms > 0).then(|| {
+                        Duration::from_millis(
+                            step.total_timeout_ms
+                                .max(provider.cold_start_ttfb_timeout_ms.unwrap_or(0)),
+                        )
+                    }),
+                };
+                app.relay.upstream().send(request).await
+            }
+            // The Cursor path: the transport owns the exchange and returns a response whose body
+            // streams the rendered answer. Everything downstream — rendering, the usage tap, the
+            // quota lease, health and sticky bookkeeping — is the ordinary code.
+            //
+            // A failure is reported as a connect failure so the existing arms treat it as a
+            // provider failure: cool the account down, try the next step, keep the sticky
+            // preference cleared. Inventing a special case here would mean a Cursor outage no
+            // longer fails over the way every other provider's does.
+            Some(prepared) => match crate::cursor_transport::default_exchange() {
+                Ok(exchange) => crate::cursor_transport::run(
+                    exchange,
+                    prepared,
+                    crate::cursor_transport::TOTAL_TIMEOUT,
                 )
-            }),
+                .await
+                .map_err(|error| UpstreamError::Connect(error.to_string())),
+                Err(error) => Err(UpstreamError::Tls(error.to_string())),
+            },
         };
 
-        match app.relay.upstream().send(request).await {
+        match sent {
             Ok(resp) if resp.status.is_success() => break Ok(resp),
             Ok(resp)
                 if !reconciled_once
+                    // The reconcile retry rewrites the upstream body as a *JSON* request, which a
+                    // Cursor turn is not: continuing here would send that JSON to the agent
+                    // endpoint as a second run. A refused Cursor turn is simply refused.
+                    && step.dialect != Dialect::Cursor
                     && resp.status.is_client_error()
                     && resp.status != StatusCode::UNAUTHORIZED
                     && resp.status != StatusCode::FORBIDDEN
@@ -2493,8 +2605,13 @@ async fn attempt_step(
                 total_us = started.elapsed().as_micros() as u64,
                 "served"
             );
+            // A Cursor turn is always an event stream on the wire, whatever the client asked for,
+            // so the response half is always a translation — including for an OpenAI client, whose
+            // request needed none. Reporting `false` here would hand a non-streaming client raw
+            // `data:` frames instead of the one document it asked for.
+            let response_translated = translated_body || step.dialect == Dialect::Cursor;
             let client_response =
-                build_client_response(ctx, translated_body, response, ticket).await;
+                build_client_response(ctx, response_translated, response, ticket).await;
             Attempt::Answer(match budget_lease {
                 Some(mut lease) => {
                     lease.mark_success();
@@ -3819,8 +3936,9 @@ fn dialect_version(dialect: Dialect) -> Option<&'static str> {
         Dialect::Copilot => None,
         Dialect::CommandCodeGo => None,
         Dialect::ModalVllm => None,
-        // The Connect path's version is inside the service name (`agent.v1.AgentService`), so it is
-        // not a segment that could be swapped for a base URL's.
+        // Cursor's base URL is an *origin*, not a path prefix, and the RPC path is absolute
+        // (`/agent.v1.AgentService/Run`). Nothing is ever appended to it, so there is no version
+        // segment to add — and adding one would produce a path the server does not serve.
         Dialect::Cursor => None,
     }
 }
@@ -3967,8 +4085,10 @@ fn default_path(dialect: Dialect, route: RouteKind) -> &'static str {
         Dialect::Copilot => "/chat/completions",
         Dialect::CommandCodeGo => "/alpha/generate",
         Dialect::ModalVllm => "/v1/chat/completions",
-        // A Connect method, not a REST path: the body is a protobuf frame stream and the exchange is
-        // driven by the dialect's own transport rather than the generic JSON forwarder.
+        // Not reachable in practice: a Cursor attempt is opened by `cursor_transport`, which builds
+        // its own request and never asks this function for a path. It is named here rather than
+        // defaulted to a chat path because a chat path does not exist on that host, and a wrong
+        // path in an error message sends the operator looking in the wrong place.
         Dialect::Cursor => "/agent.v1.AgentService/Run",
     }
 }

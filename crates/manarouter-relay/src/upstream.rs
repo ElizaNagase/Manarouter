@@ -140,8 +140,55 @@ pub enum Body {
     /// A complete body already in memory. Used for synthesized responses such as a locally generated
     /// routing error, never for an upstream's answer.
     Complete(Bytes),
+    /// A body a task writes into, for a provider the pooled client cannot express.
+    ///
+    /// The Cursor agent endpoint is a bidirectional HTTP/2 stream: the server asks questions while
+    /// the answer is being written, so the relay writes a request body without closing the stream.
+    /// `hyper`'s client cannot do that, so that transport opens its own `h2` stream and hands back a
+    /// channel here instead. The response is otherwise ordinary — same renderer, same tap, same
+    /// quota accounting — which is the point of adapting at the body rather than at the server.
+    Channel(ChannelBody),
     /// No body.
     Empty,
+}
+
+/// A response body fed by an `mpsc` channel.
+///
+/// Infallible by construction: a provider failure mid-stream is rendered *into* the stream by the
+/// driver that owns the exchange (an SSE `error` frame, which an OpenAI client already knows how to
+/// read), because a body error would make the relay treat the whole response as failed and drop the
+/// partial answer the client has already received.
+#[derive(Debug)]
+pub struct ChannelBody {
+    rx: tokio::sync::mpsc::Receiver<Bytes>,
+}
+
+impl ChannelBody {
+    /// Wrap the receiving end of a channel a driver task writes into.
+    pub fn new(rx: tokio::sync::mpsc::Receiver<Bytes>) -> Self {
+        Self { rx }
+    }
+}
+
+impl http_body::Body for ChannelBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<http_body::Frame<Bytes>, Self::Error>>> {
+        // `Receiver` is `Unpin`, so the pin is a formality imposed by the trait.
+        match self.rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(bytes)) => {
+                std::task::Poll::Ready(Some(Ok(http_body::Frame::data(bytes))))
+            }
+            // The sender being dropped is the end of the body: the driver has finished, or the
+            // client went away and the task was cancelled.
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
 }
 
 impl Body {
@@ -162,7 +209,9 @@ impl Body {
         match self {
             Body::Complete(bytes) => Some(bytes),
             Body::Streaming { first, .. } => first.as_ref().and_then(|f| f.data_ref()),
-            Body::Empty => None,
+            // A channel's bytes are written by another task at a time this caller cannot know, so
+            // there is no first frame to read without consuming it.
+            Body::Channel(_) | Body::Empty => None,
         }
     }
 }
@@ -199,6 +248,12 @@ impl http_body::Body for Body {
                 // `is_end_stream`.
                 std::task::Poll::Ready(Some(Ok(http_body::Frame::data(std::mem::take(bytes)))))
             }
+            Body::Channel(channel) => match std::pin::Pin::new(channel).poll_frame(cx) {
+                std::task::Poll::Ready(Some(Ok(frame))) => std::task::Poll::Ready(Some(Ok(frame))),
+                std::task::Poll::Ready(Some(Err(never))) => match never {},
+                std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            },
             Body::Empty => std::task::Poll::Ready(None),
         }
     }
@@ -210,6 +265,9 @@ impl http_body::Body for Body {
             // extra poll and cannot lose data.
             Body::Streaming { first, rest } => first.is_none() && rest.is_none(),
             Body::Complete(b) => b.is_empty(),
+            // Knowable only by polling: the driver may have written nothing yet and still be about
+            // to. Claiming the end here would truncate the answer.
+            Body::Channel(_) => false,
             Body::Empty => true,
         }
     }
@@ -219,7 +277,9 @@ impl http_body::Body for Body {
             Body::Complete(b) => http_body::SizeHint::with_exact(b.len() as u64),
             // A streamed upstream response has no declared length in the common case: providers use
             // chunked transfer encoding precisely because they cannot know the length up front.
-            Body::Streaming { .. } | Body::Empty => http_body::SizeHint::default(),
+            Body::Streaming { .. } | Body::Channel(_) | Body::Empty => {
+                http_body::SizeHint::default()
+            }
         }
     }
 }
@@ -598,7 +658,8 @@ impl Upstream {
                     Ok(bytes)
                 };
             }
-            Body::Streaming { .. } => {}
+            // A channel body streams like `Streaming`; only its producer is different.
+            Body::Streaming { .. } | Body::Channel(_) => {}
         }
 
         let mut out: Vec<u8> = Vec::new();
