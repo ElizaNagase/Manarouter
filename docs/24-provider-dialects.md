@@ -14,7 +14,7 @@ grouped by dialect because translation is only required when the client's dialec
 upstream's, and two providers that share a dialect share every code path
 (`crates/mr-core/src/dialect.rs:10-13`).
 
-The set is closed and small — seven members (`dialect.rs:17-45`, and `Dialect::ALL` at
+The set is closed and small — ten members (`dialect.rs:17-45`, and `Dialect::ALL` at
 `dialect.rs:137-145`):
 
 | `Dialect` | Canonical id (`Dialect::as_str`, `dialect.rs:94-104`) | Serde id (what a `config.json` or `catalog/providers.toml` entry carries) | Templates in `catalog/providers.toml` |
@@ -28,6 +28,7 @@ The set is closed and small — seven members (`dialect.rs:17-45`, and `Dialect:
 | `Antigravity` | `antigravity` | `antigravity` | 1 |
 | `CommandCodeGo` | `command-code-go` | `command-code-go` | 1 |
 | `ModalVllm` | `modal-vllm` | `modal-vllm` | 0 |
+| `Cursor` | `cursor` | `cursor` | 1 |
 
 Two spellings exist for a reason, and they differ for one member. `as_str` is the permissive,
 human-facing id; `serde`'s `kebab-case` rename is the strict wire form, and the two differ exactly
@@ -168,8 +169,10 @@ the endpoint that belongs to it:
 The Anthropic dialect has two: `/v1/messages` for the Messages route and
 `/v1/messages/count_tokens` for the token-counting route. The other dialects have one each
 (`/v1beta/models:generateContent` for both Gemini dialects, `/v1internal:generateContent`,
-`/responses`, `/chat/completions`, `/alpha/generate`), and the Gemini dialects and Antigravity are
-always translator-named, because their path carries the model id or the Cloud Code method.
+`/responses`, `/chat/completions`, `/alpha/generate`, and Cursor's `/agent.v1.AgentService/Run`),
+and the Gemini dialects and Antigravity are always translator-named, because their path carries the
+model id or the Cloud Code method. Cursor's path is not REST at all: it names a Connect method whose
+version lives inside the service name, which is why it has no version segment to replace.
 
 A provider that serves a route the convention does not name still has to say so in its
 `route_overrides` — for example an OpenAI-compatible service whose responses endpoint is not
@@ -797,4 +800,4 @@ both dialects, rather than forwarding a body the upstream will reject with a con
 | How a dialect becomes a route on the wire | [The routing snapshot](04-routing-snapshot.md) |
 | The relay's overall shape | [Architecture](01-architecture.md) |
 | Reasoning levels and model naming | [API reference](18-api-reference.md#model-addressing) |
-| OAuth for the OAuth-only dialects | [OAuth overview](10-oauth-overview.md), [Codex](11-oauth-codex.md), [Antigravity](12-oauth-antigravity.md), [Copilot](13-oauth-copilot.md) |
+| OAuth for the OAuth-only dialects | [OAuth overview](10-oauth-overview.md), [Codex](11-oauth-codex.md), [Antigravity](12-oauth-antigravity.md), [Copilot](13-oauth-copilot.md), [Cursor](28-oauth-cursor.md) |

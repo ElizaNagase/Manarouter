@@ -57,7 +57,10 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as LegacyClient;
 use hyper_util::rt::TokioExecutor;
 use mr_core::config::Config;
-use mr_core::oauth::{platform as oauth_platform, session::PollResult};
+use mr_core::oauth::{
+    platform as oauth_platform,
+    session::{BindingError, PollResult},
+};
 use mr_core::secret::{
     account_secret_id, client_key_secret_id, fingerprint, looks_like_a_credential,
 };
@@ -135,6 +138,7 @@ pub(crate) fn guarded_router(state: AppState) -> Router<AppState> {
         .route("/api/oauth", get(oauth_platforms))
         .route("/api/oauth/{platform}/authorize", post(oauth_authorize))
         .route("/api/oauth/{platform}/device-code", post(oauth_device_code))
+        .route("/api/oauth/{platform}/screen", post(oauth_screen_start))
         .route("/api/oauth/sessions/{id}/poll", post(oauth_poll))
         .route("/api/oauth/sessions/{id}/complete", post(oauth_complete))
         .route(
@@ -1509,11 +1513,23 @@ async fn oauth_platforms() -> Json<Value> {
             if p.supports_device_flow() {
                 flows.push("device");
             }
+            if p.begins_with_screen_login() {
+                // No redirect reaches this router and there is no code to retype: the provider's
+                // own page finishes the login and this router polls to learn of it.
+                flows.push("screen");
+            }
+            let flow = if p.begins_with_screen_login() {
+                "screen"
+            } else if p.begins_with_loopback() {
+                "browser"
+            } else {
+                "device"
+            };
             json!({
                 "id": p.id(),
                 "label": p.label(),
                 "description": p.description(),
-                "flow": if p.begins_with_loopback() { "browser" } else { "device" },
+                "flow": flow,
                 "flows": flows,
             })
         })
@@ -1568,6 +1584,51 @@ async fn oauth_device_code(
         json!({"session_id": id, "user_code": authorization.user_code, "verification_uri": authorization.verification_uri,
         "verification_uri_complete": authorization.verification_uri_complete, "expires_in_seconds": authorization.expires_in.as_secs(), "interval_seconds": authorization.interval.as_secs()}),
     ))
+}
+
+/// Start a login that finishes on the provider's own page.
+///
+/// Returns the page to open and the session id the panel then polls. This is deliberately not an
+/// alias for `/authorize`: that one blocks on a loopback callback, which for this flow never
+/// arrives, so reporting it as a redirect would leave the drawer waiting forever.
+async fn oauth_screen_start(
+    State(state): State<AppState>,
+    Path(platform): Path<String>,
+    JsonBody(body): JsonBody,
+) -> ApiResult<Json<Value>> {
+    let body = object_body(body, "OAuth screen start")?;
+    let provider_id = body
+        .get("provider_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad("missing_provider", "provider_id is required"))?
+        .to_owned();
+    validate_oauth_provider(&state, &provider_id, &platform).await?;
+    let platform = oauth_platform(&platform)
+        .ok_or_else(|| ApiError::not_found("unknown or unavailable OAuth platform"))?;
+    let (id, login_url) = state
+        .oauth_sessions
+        .start_screen(platform, provider_id)
+        .await
+        .map_err(ApiError::bad_gateway)?;
+    Ok(Json(json!({"session_id": id, "login_url": login_url})))
+}
+
+/// Answer a session-binding failure with the status the panel behaves correctly on: a session that
+/// is gone is final, one that is busy is retried, and a mismatched binding is a request that can
+/// never succeed but is not the caller's fault to fix.
+fn binding_error(why: BindingError) -> ApiError {
+    match why {
+        BindingError::Gone => ApiError::not_found("OAuth session not found or expired"),
+        BindingError::Busy => ApiError::new(
+            StatusCode::CONFLICT,
+            "oauth_session_busy",
+            "OAuth session operation already in progress",
+        ),
+        BindingError::Mismatch => ApiError::bad(
+            "oauth_session_mismatch",
+            "OAuth session provider binding does not match",
+        ),
+    }
 }
 
 async fn validate_oauth_provider(
@@ -1679,7 +1740,7 @@ async fn oauth_complete(
         .oauth_sessions
         .validate_binding(&id, &body.provider_id, platform)
         .await
-        .map_err(|message| ApiError::bad("oauth_session_mismatch", message))?;
+        .map_err(binding_error)?;
     let (tokens, identity) = state
         .oauth_sessions
         .finish_browser(&id, &body.provider_id)
@@ -1742,13 +1803,24 @@ async fn oauth_poll(
         .oauth_sessions
         .validate_binding(&id, &body.provider_id, platform)
         .await
-        .map_err(|message| ApiError::bad("oauth_session_mismatch", message))?;
-    match state
-        .oauth_sessions
-        .poll_device(&id, &body.provider_id)
-        .await
-        .map_err(ApiError::bad_gateway)?
-    {
+        .map_err(binding_error)?;
+    // Which poll to run is decided by the platform, not by the caller: a session belongs to the
+    // platform its provider is configured with, so the two cannot disagree.
+    let polled = match oauth_platform(platform) {
+        Some(p) if p.begins_with_screen_login() => {
+            state
+                .oauth_sessions
+                .poll_screen(&id, &body.provider_id)
+                .await
+        }
+        _ => {
+            state
+                .oauth_sessions
+                .poll_device(&id, &body.provider_id)
+                .await
+        }
+    };
+    match polled.map_err(ApiError::bad_gateway)? {
         PollResult::Pending {
             retry_after_seconds,
         } => Ok(Json(

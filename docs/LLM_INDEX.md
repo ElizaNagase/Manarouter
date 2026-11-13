@@ -446,6 +446,7 @@ trigger.
     { "path": "docs/11-oauth-codex.md", "purpose": "The OpenAI Codex login and inference fingerprint", "read_when": "working on Codex" },
     { "path": "docs/12-oauth-antigravity.md", "purpose": "The Antigravity login, project onboarding and Cloud Code inference", "read_when": "working on Antigravity" },
     { "path": "docs/13-oauth-copilot.md", "purpose": "The GitHub Copilot device flow and mandatory headers", "read_when": "working on Copilot" },
+    { "path": "docs/28-oauth-cursor.md", "purpose": "The Cursor page login, its poll protocol, refresh and identity", "read_when": "working on Cursor login or its token refresh" },
     { "path": "docs/14-oauth-adding-a-platform.md", "purpose": "A worked example of adding a new OAuth platform", "read_when": "adding a platform" },
     { "path": "docs/omniroute-reference.md", "purpose": "Reference notes on the author's own OmniRoute install: the provider-flow inventory the catalogue was built from, and the client-key rotation scope", "read_when": "reading a catalogue note's provenance or the client-key rotation scope" },
     { "path": "docs/15-web-panel.md", "purpose": "The panel: views, API, port editor, design language", "read_when": "touching the UI" },

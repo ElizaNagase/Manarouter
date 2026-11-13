@@ -2068,7 +2068,11 @@ fn dialect_reasoning_fragment(
     }
     let effort = effort_spelling(dialect, level);
     Some(match dialect {
-        Dialect::OpenAi | Dialect::Copilot | Dialect::CommandCodeGo => {
+        // Cursor is in this group only because the match must be total: its wire carries no effort
+        // field, `expressible_reasoning_levels` offers nothing above `none`, and the compiler
+        // therefore never folds a level into this table for it. Grouping it with the dialects that
+        // spell the effort keeps the unreachable arm from inventing a shape of its own.
+        Dialect::OpenAi | Dialect::Copilot | Dialect::CommandCodeGo | Dialect::Cursor => {
             serde_json::json!({ "reasoning_effort": effort })
         }
         Dialect::Codex => {

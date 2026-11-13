@@ -151,7 +151,7 @@ export function buildRedirectPaste(p, ctx, session) {
 // `open-ai`, `parse` wants `openai`. A value here that the backend rejects turns "Add provider"
 // into a save-time error, which is how the pre-rename `command-code` spelling was caught. The Rust
 // test `the_panel_offers_only_dialects_this_binary_deserialises` pins this list.
-const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go', 'modal-vllm'];
+const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go', 'modal-vllm', 'cursor'];
 const KEY_STRATEGIES = ['priority', 'round-robin', 'random', 'least-used'];
 // What a refusal parks: the credential (every model), that model on the credential, or that model
 // on every credential of the provider. Widening past `account` is only right when the upstream
@@ -277,6 +277,7 @@ const PROVIDER_PRESETS = {
     { name: 'Codex', dialect: 'codex', baseUrl: 'https://chatgpt.com/backend-api/codex', auth: 'oauth', hint: 'OpenAI Codex — OAuth sign-in from the panel.' },
     { name: 'Copilot', dialect: 'copilot', baseUrl: 'https://api.githubcopilot.com', auth: 'oauth', hint: 'GitHub Copilot — OAuth sign-in from the panel.' },
     { name: 'Antigravity', dialect: 'antigravity', baseUrl: 'https://cloudcode-pa.googleapis.com', auth: 'oauth', hint: 'Google Antigravity / Cloud Code — OAuth sign-in from the panel.' },
+    { name: 'Cursor', dialect: 'cursor', baseUrl: 'https://api2.cursor.sh', auth: 'oauth', hint: 'Cursor — OAuth sign-in from the panel. The sign-in finishes in Cursor’s own tab and the panel learns of it by polling, so nothing is ever pasted back here.' },
     { name: 'Command Code', dialect: 'command-code-go', baseUrl: 'https://api.commandcode.ai', auth: 'bearer', hint: 'Command Code — bearer auth.' },
     { name: 'Modal vLLM', dialect: 'modal-vllm', baseUrl: '', auth: 'modal', hint: 'Enter your Modal app’s HTTPS public URL (for example https://your-app--serve.modal.run). Add the Modal Token ID.Token Secret as the account secret after saving; the panel sends it as Modal-Key and Modal-Secret headers.' },
     { name: 'OpenCode Zen', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/v1', auth: 'bearer', hint: 'OpenCode Console, pay-as-you-go. Needs a funded key: the free models are refused outside the OpenCode client, so they cannot be routed from here.' },
@@ -292,6 +293,7 @@ const DIALECT_BASE_URLS = {
   antigravity: 'https://cloudcode-pa.googleapis.com',
   'command-code-go': 'https://api.commandcode.ai',
   copilot: 'https://api.githubcopilot.com',
+  cursor: 'https://api2.cursor.sh',
 };
 const AUTH_KINDS = [
   ['bearer', 'Authorization: Bearer'],
@@ -301,6 +303,206 @@ const AUTH_KINDS = [
   ['oauth', 'OAuth (platform-managed)'],
   ['modal', 'Modal-Key + Modal-Secret'],
 ];
+
+export function buildOAuthAccountForm(p, ctx, onConnected, isDrawerOpen = () => true) {
+  const status = h('p', { class: 'muted' }, 'OAuth credentials are stored only in the encrypted local vault.');
+  const progress = h('p', { class: 'muted' });
+  const actions = h('div', { class: 'toolbar', style: 'padding:0;border:0;background:none;' });
+  // /authorize fills the session id in here; the paste block below reads the same box, so it can
+  // exist (hidden) before a session does and appear the instant the browser tab opens.
+  const session = { id: null };
+  const redirectPaste = buildRedirectPaste(p, ctx, session);
+  const form = h('div', {}, status, actions, progress, redirectPaste.block);
+
+  // One-click: the Connect button appears immediately. Discovery runs in the background only
+  // to learn whether a device-code fallback is offered; it never blocks the button.
+  const connect = h('button', { class: 'btn btn-primary', type: 'button', 'aria-label': 'Connect (opens provider sign-in in a new window)' }, 'Connect');
+  actions.append(connect);
+
+  let details = null;
+  (async () => {
+    try {
+      const { platforms = [] } = await api.get('/api/oauth');
+      details = platforms.find((x) => x.id === p.auth.platform) || null;
+    } catch { details = null; }
+    if (!details) return;
+    const flows = Array.isArray(details.flows) && details.flows.length ? details.flows : [details.flow];
+    // If this platform only supports device code, relabel the primary button.
+    if (!flows.includes('browser') && flows.includes('device')) {
+      connect.textContent = 'Connect with a device code';
+    }
+  })();
+
+  connect.addEventListener('click', () => {
+    connect.disabled = true;
+    startFlow()
+      .catch((err) => {
+        connect.disabled = false;
+        ctx.toast.error('OAuth sign-in failed', err);
+        progress.replaceChildren(errorBlock(err));
+      });
+  });
+
+  async function startFlow() {
+    // details.id is the same platform id stored on the provider (p.auth.platform), so we don't
+    // need to wait for discovery to start the browser flow.
+    const platformId = (details && details.id) || p.auth.platform;
+    let flows;
+    if (details) {
+      flows = Array.isArray(details.flows) && details.flows.length ? details.flows : [details.flow];
+      if (flows.includes('screen')) return runScreen(platformId);
+      if (flows.includes('browser')) return runBrowser(platformId);
+      if (flows.includes('device')) return runDevice(platformId);
+      throw new Error('No OAuth flow available for this platform.');
+    }
+    // Discovery hasn't answered yet: try browser, then device code, then the provider-page
+    // flow. Each refuses immediately when it does not apply, so the cost of guessing is two
+    // rejected requests rather than a wrong tab left open.
+    try { return await runBrowser(platformId); }
+    catch {
+      try { return await runDevice(platformId); }
+      catch { return await runScreen(platformId); }
+    }
+  }
+
+  /// Open the provider's page, then wait for the loopback callback.
+  ///
+  /// The completion call is issued *after* the tab is opened and blocks until the browser comes
+  /// back, which is what makes this a single click: the operator approves in the tab and this
+  /// resolves on its own. The window is opened before the await so the browser does not treat it
+  /// as a popup triggered by nothing.
+  async function runBrowser(platformId) {
+    const start = await api.post(`/api/oauth/${encodeURIComponent(platformId)}/authorize`, { provider_id: p.id });
+    session.id = start.session_id;
+    const authorizeUrl = httpUrl(start.authorization_url);
+    if (!authorizeUrl) {
+      // No URL to open means the browser flow cannot proceed. Fail fast instead of waiting
+      // forever for a /complete that will never arrive.
+      session.id = null;
+      throw new Error('The provider did not return a sign-in URL. Try again, or use a device code if available.');
+    }
+    window.open(authorizeUrl, '_blank', 'noopener,noreferrer');
+    // Immediate, not after a timeout: the person who knows the capture failed can act now. The
+    // /complete call below is already queued and will resolve once the pasted URL is accepted.
+    let redirectUri = null;
+    try {
+      redirectUri = new URL(authorizeUrl).searchParams.get('redirect_uri');
+    } catch { redirectUri = null; }
+    redirectPaste.show(redirectUri);
+    progress.replaceChildren(
+      h('span', {}, 'Waiting for you to finish signing in… '),
+      h('a', { href: authorizeUrl, target: '_blank', rel: 'noopener noreferrer' }, 'Reopen the page'),
+    );
+    try {
+      const done = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/complete`, { provider_id: p.id });
+      await reportConnected(done);
+    } finally {
+      // Success, failure or a flow abandoned by closing the drawer: no stale paste form is left
+      // behind, and a later attempt starts from a clean block.
+      session.id = null;
+      redirectPaste.hide();
+    }
+  }
+
+  async function runDevice(platformId) {
+    const start = await api.post(`/api/oauth/${encodeURIComponent(platformId)}/device-code`, { provider_id: p.id });
+    const verificationUrl = httpUrl(start.verification_uri);
+    progress.replaceChildren(
+      h('span', {}, 'Open '),
+      verificationUrl
+        ? h('a', { href: verificationUrl, target: '_blank', rel: 'noopener noreferrer' }, start.verification_uri)
+        : h('span', { class: 'muted' }, start.verification_uri),
+      h('span', {}, ' and enter this code: '),
+      h('strong', { class: 'mono', style: 'letter-spacing:2px;font-size:15px;' }, start.user_code),
+    );
+    if (verificationUrl) window.open(verificationUrl, '_blank', 'noopener,noreferrer');
+    const ttl = Number(start.expires_in_seconds);
+    const deadline = Date.now() + (Number.isFinite(ttl) && ttl > 0 ? ttl * 1000 : 300000);
+    let intervalMs = Math.max(1000, Number(start.interval_seconds) * 1000 || 1000);
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      const result = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/poll`, { provider_id: p.id });
+      if (result.status === 'complete') {
+        await reportConnected(result);
+        return;
+      }
+      if (result.status === 'failed') throw new Error(result.message);
+      if (result.interval_seconds) intervalMs = Math.max(intervalMs, Number(result.interval_seconds) * 1000 || 0);
+      if (result.retry_after_seconds) intervalMs = Math.max(intervalMs, Number(result.retry_after_seconds) * 1000 || 0);
+    }
+    throw new Error('The device code expired before it was approved. Start again.');
+  }
+
+  /// Open the provider's own page and watch it until the login is finished there.
+  ///
+  /// This flow has no redirect and no code: the page does the whole sign-in, and the only way to
+  /// learn that it worked is to ask. The tab is opened before the first await for the same reason
+  /// as the browser flow — a window opened afterwards is treated as a popup and blocked.
+  async function runScreen(platformId) {
+    const start = await api.post(`/api/oauth/${encodeURIComponent(platformId)}/screen`, { provider_id: p.id });
+    session.id = start.session_id;
+    const loginUrl = httpUrl(start.login_url);
+    if (!loginUrl) {
+      // No page to open means nothing can be finished. Fail now instead of polling a session the
+      // operator cannot possibly complete.
+      session.id = null;
+      throw new Error('The provider did not return a sign-in page. Try again.');
+    }
+    window.open(loginUrl, '_blank', 'noopener,noreferrer');
+    progress.replaceChildren(
+      h('span', {}, 'Waiting for you to finish signing in… '),
+      h('a', { href: loginUrl, target: '_blank', rel: 'noopener noreferrer' }, 'Reopen the page'),
+    );
+    // The server owns the cadence and the deadline; this bound only stops a browser left open
+    // overnight from polling forever. It is comfortably longer than the session it polls.
+    const deadline = Date.now() + 15 * 60 * 1000;
+    let intervalMs = 1000;
+    try {
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+        let result;
+        try {
+          result = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/poll`, { provider_id: p.id });
+        } catch (err) {
+          // The server splits these cleanly: a session that has expired or vanished (404/410) is
+          // gone, and a request it refuses (400) — or the right to poll it being denied (403) — is
+          // not going to start working. Both end the flow. A busy session (409), a rate limit (429)
+          // and any server-side fault are worth one more poll rather than a whole restart.
+          const status = Number(err?.status) || 0;
+          if (status >= 400 && status < 500 && status !== 409 && status !== 429) throw err;
+          continue;
+        }
+        if (result.status === 'complete') {
+          await reportConnected(result);
+          return;
+        }
+        if (result.status === 'failed') throw new Error(result.message);
+        if (result.retry_after_seconds) intervalMs = Math.max(1000, Number(result.retry_after_seconds) * 1000 || 0);
+        if (result.interval_seconds) intervalMs = Math.max(intervalMs, Number(result.interval_seconds) * 1000 || 0);
+      }
+      throw new Error('The sign-in page expired before it was finished. Start again.');
+    } finally {
+      session.id = null;
+    }
+  }
+
+  /// The single success path for all three flows.
+  ///
+  /// It lives in one place because the copies drift: the browser flow reported the account label
+  /// while the device flow did not, so the same success read differently depending on how the
+  /// operator got there.
+  async function reportConnected(result) {
+    progress.replaceChildren(h('span', {}, 'Connected.'));
+    ctx.toast.success(`Connected ${result.account?.label || 'OAuth account'}.`);
+    // If the drawer was closed mid-flow, don't reopen it or navigate — the user explicitly
+    // dismissed it. Otherwise hand off to the single navigation helper.
+    if (isDrawerOpen() && onConnected) {
+      try { await onConnected(); } catch { /* afterAccountConnected reports its own failures */ }
+    }
+  }
+
+  return form;
+}
 
 export async function renderProviders(mount, ctx) {
   let providers = [];
@@ -2345,7 +2547,11 @@ export async function renderProviders(mount, ctx) {
   // ------------------------------------------------------------------ forms
 
   function buildAccountForm(p, onConnected, describedBy) {
-    if (p.auth?.type === 'oauth') return buildOAuthAccountForm(p, onConnected);
+    if (p.auth?.type === 'oauth') {
+      // The drawer can be closed while the operator finishes the sign-in in the provider's tab.
+      // Read it lazily: the form outlives this call, so a captured boolean would go stale.
+      return buildOAuthAccountForm(p, ctx, onConnected, () => drawerOpen);
+    }
     const label = h('input', { class: 'input', type: 'text', 'data-field': 'label' });
     const identity = h('input', { class: 'input mono', type: 'text', 'data-field': 'identity', placeholder: 'e.g. work@account' });
     const secret = h('input', { class: 'input mono', type: 'password', 'data-field': 'secret', autocomplete: 'new-password', ...(describedBy ? { 'aria-describedby': describedBy } : {}) });
@@ -2452,142 +2658,6 @@ export async function renderProviders(mount, ctx) {
   /// The device code exists for the cases where a redirect cannot work at all: a headless server, a
   /// container, or a browser on a different host. Offering only the redirect would make those
   /// deployments impossible to log in from the panel.
-  function buildOAuthAccountForm(p, onConnected) {
-    const status = h('p', { class: 'muted' }, 'OAuth credentials are stored only in the encrypted local vault.');
-    const progress = h('p', { class: 'muted' });
-    const actions = h('div', { class: 'toolbar', style: 'padding:0;border:0;background:none;' });
-    // /authorize fills the session id in here; the paste block below reads the same box, so it can
-    // exist (hidden) before a session does and appear the instant the browser tab opens.
-    const session = { id: null };
-    const redirectPaste = buildRedirectPaste(p, ctx, session);
-    const form = h('div', {}, status, actions, progress, redirectPaste.block);
-
-    // One-click: the Connect button appears immediately. Discovery runs in the background only
-    // to learn whether a device-code fallback is offered; it never blocks the button.
-    const connect = h('button', { class: 'btn btn-primary', type: 'button', 'aria-label': 'Connect (opens provider sign-in in a new window)' }, 'Connect');
-    actions.append(connect);
-
-    let details = null;
-    (async () => {
-      try {
-        const { platforms = [] } = await api.get('/api/oauth');
-        details = platforms.find((x) => x.id === p.auth.platform) || null;
-      } catch { details = null; }
-      if (!details) return;
-      const flows = Array.isArray(details.flows) && details.flows.length ? details.flows : [details.flow];
-      // If this platform only supports device code, relabel the primary button.
-      if (!flows.includes('browser') && flows.includes('device')) {
-        connect.textContent = 'Connect with a device code';
-      }
-    })();
-
-    connect.addEventListener('click', () => {
-      connect.disabled = true;
-      startFlow()
-        .catch((err) => {
-          connect.disabled = false;
-          ctx.toast.error('OAuth sign-in failed', err);
-          progress.replaceChildren(errorBlock(err));
-        });
-    });
-
-    async function startFlow() {
-      // details.id is the same platform id stored on the provider (p.auth.platform), so we don't
-      // need to wait for discovery to start the browser flow.
-      const platformId = (details && details.id) || p.auth.platform;
-      let flows;
-      if (details) {
-        flows = Array.isArray(details.flows) && details.flows.length ? details.flows : [details.flow];
-        if (flows.includes('browser')) return runBrowser(platformId);
-        if (flows.includes('device')) return runDevice(platformId);
-        throw new Error('No OAuth flow available for this platform.');
-      }
-      // Discovery hasn't answered yet: try browser first, fall back to device code on error.
-      try { return await runBrowser(platformId); }
-      catch { return await runDevice(platformId); }
-    }
-
-    /// Open the provider's page, then wait for the loopback callback.
-    ///
-    /// The completion call is issued *after* the tab is opened and blocks until the browser comes
-    /// back, which is what makes this a single click: the operator approves in the tab and this
-    /// resolves on its own. The window is opened before the await so the browser does not treat it
-    /// as a popup triggered by nothing.
-    async function runBrowser(platformId) {
-      const start = await api.post(`/api/oauth/${encodeURIComponent(platformId)}/authorize`, { provider_id: p.id });
-      session.id = start.session_id;
-      const authorizeUrl = httpUrl(start.authorization_url);
-      if (!authorizeUrl) {
-        // No URL to open means the browser flow cannot proceed. Fail fast instead of waiting
-        // forever for a /complete that will never arrive.
-        session.id = null;
-        throw new Error('The provider did not return a sign-in URL. Try again, or use a device code if available.');
-      }
-      window.open(authorizeUrl, '_blank', 'noopener,noreferrer');
-      // Immediate, not after a timeout: the person who knows the capture failed can act now. The
-      // /complete call below is already queued and will resolve once the pasted URL is accepted.
-      let redirectUri = null;
-      try {
-        redirectUri = new URL(authorizeUrl).searchParams.get('redirect_uri');
-      } catch { redirectUri = null; }
-      redirectPaste.show(redirectUri);
-      progress.replaceChildren(
-        h('span', {}, 'Waiting for you to finish signing in… '),
-        h('a', { href: authorizeUrl, target: '_blank', rel: 'noopener noreferrer' }, 'Reopen the page'),
-      );
-      try {
-        const done = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/complete`, { provider_id: p.id });
-        progress.replaceChildren(h('span', {}, 'Connected.'));
-        ctx.toast.success(`Connected ${done.account?.label || 'OAuth account'}.`);
-        // If the drawer was closed mid-flow, don't reopen it or navigate — the user explicitly
-        // dismissed it. Otherwise hand off to the single navigation helper.
-        if (drawerOpen && onConnected) {
-          try { await onConnected(); } catch { /* afterAccountConnected reports its own failures */ }
-        }
-      } finally {
-        // Success, failure or a flow abandoned by closing the drawer: no stale paste form is left
-        // behind, and a later attempt starts from a clean block.
-        session.id = null;
-        redirectPaste.hide();
-      }
-    }
-
-    async function runDevice(platformId) {
-      const start = await api.post(`/api/oauth/${encodeURIComponent(platformId)}/device-code`, { provider_id: p.id });
-      const verificationUrl = httpUrl(start.verification_uri);
-      progress.replaceChildren(
-        h('span', {}, 'Open '),
-        verificationUrl
-          ? h('a', { href: verificationUrl, target: '_blank', rel: 'noopener noreferrer' }, start.verification_uri)
-          : h('span', { class: 'muted' }, start.verification_uri),
-        h('span', {}, ' and enter this code: '),
-        h('strong', { class: 'mono', style: 'letter-spacing:2px;font-size:15px;' }, start.user_code),
-      );
-      if (verificationUrl) window.open(verificationUrl, '_blank', 'noopener,noreferrer');
-      const ttl = Number(start.expires_in_seconds);
-      const deadline = Date.now() + (Number.isFinite(ttl) && ttl > 0 ? ttl * 1000 : 300000);
-      let intervalMs = Math.max(1000, Number(start.interval_seconds) * 1000 || 1000);
-      while (Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, intervalMs));
-        const result = await api.post(`/api/oauth/sessions/${encodeURIComponent(start.session_id)}/poll`, { provider_id: p.id });
-        if (result.status === 'complete') {
-          progress.replaceChildren(h('span', {}, 'Connected.'));
-          ctx.toast.success(`Connected ${result.account?.label || 'OAuth account'}.`);
-          if (drawerOpen && onConnected) {
-            try { await onConnected(); } catch { /* afterAccountConnected reports its own failures */ }
-          }
-          return;
-        }
-        if (result.status === 'failed') throw new Error(result.message);
-        if (result.interval_seconds) intervalMs = Math.max(intervalMs, Number(result.interval_seconds) * 1000 || 0);
-        if (result.retry_after_seconds) intervalMs = Math.max(intervalMs, Number(result.retry_after_seconds) * 1000 || 0);
-      }
-      throw new Error('The device code expired before it was approved. Start again.');
-    }
-
-    return form;
-  }
-
   function buildModelForm(p) {
     const id = h('input', { class: 'input mono', type: 'text', required: true, 'data-field': 'id', placeholder: 'upstream-model-id' });
     const ctxLen = h('input', { class: 'input', type: 'number', min: '0', 'data-field': 'context_length' });
