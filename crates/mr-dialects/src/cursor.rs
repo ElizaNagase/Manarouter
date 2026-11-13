@@ -2196,6 +2196,34 @@ mod tests {
     }
 
     #[test]
+    fn an_openai_client_reaches_a_run_request_without_a_rewrite() {
+        // The request half of the OpenAI pairing is a *non*-translation: `prepare_run` reads the
+        // Chat Completions shape, which is what an OpenAI client sends. The arm that says so was
+        // missing, so the relay refused every OpenAI client with "no translation from openai to
+        // cursor for route chat.completions" before opening a socket. Asserting `None` rather than
+        // merely "not an error" is the point: inventing a translation here would re-serialise the
+        // body and lose whatever the client sent that this crate does not know about.
+        let ctx = TranslateCtx {
+            route: RouteKind::ChatCompletions,
+            client_dialect: Dialect::OpenAi,
+            upstream_dialect: Dialect::Cursor,
+            upstream_model: "grok-4.7",
+            client_streaming: false,
+            session_id: None,
+        };
+        let body = br#"{"model":"grok-4.7","messages":[{"role":"user","content":"what is in this file"}]}"#;
+        assert!(
+            crate::translate_request(&ctx, body)
+                .expect("the OpenAI pairing must not be unsupported")
+                .is_none(),
+            "an OpenAI chat body is already what the run frame reads"
+        );
+        let run = prepare_run(&ctx, body, "message-openai").expect("a run");
+        assert_eq!(run.model, "grok-4.7");
+        assert_eq!(run.text, "what is in this file");
+    }
+
+    #[test]
     fn the_system_prompt_reaches_the_model_in_the_user_text_as_well_as_the_digest() {
         // `conversation_state` carries a digest the server is observed not to apply, so the prompt
         // itself has to travel in the one text field the frame has. Losing it here would silently

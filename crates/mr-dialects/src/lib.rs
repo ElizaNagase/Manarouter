@@ -236,11 +236,18 @@ pub fn translate_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Option<T
         // bidirectional stream, which the transport builds (`cursor_transport`). What it *does* have
         // is a single text prompt, and both client dialects can be reduced to one — so an Anthropic
         // client is translated to the same OpenAI-shaped body an OpenAI client sends and the
-        // transport frames that. Without this arm the response translators below would be dead
-        // code reachable only by an OpenAI client.
+        // transport frames that. Without the Anthropic arm the response translators below would be
+        // dead code reachable only by an OpenAI client.
         (Dialect::Anthropic, Dialect::Cursor) => {
             openai::from_anthropic_request(ctx, body).map(Some)
         }
+        // An OpenAI client's chat body is *already* the shape `cursor::prepare_run` reads, so there
+        // is nothing to rewrite and the bytes ride through, exactly as they do for Copilot and
+        // Modal. Only the Anthropic half needed a conversion. This arm was missing, so every
+        // OpenAI client — the ordinary case, and the route the panel's own test buttons use — was
+        // refused with "no translation from openai to cursor for route chat.completions" before a
+        // socket opened, even though the transport would have accepted the body unchanged.
+        (Dialect::OpenAi, Dialect::Cursor) => Ok(None),
 
         (from, to) => Err(TranslateError::Unsupported {
             from: from.as_str(),
