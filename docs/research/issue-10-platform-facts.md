@@ -1,5 +1,10 @@
 # Cerebrium platform facts (issue #10)
 
+> **Historical (2026-11-13).** This document specifies Cerebrium. The Cerebrium lane, its routes
+> and its `cerebrium.toml` generator were removed from Manarouter on 2026-11-13, so nothing below
+> is implemented any more. It is kept as the research and design record; the lane surface that is
+> live today is [../26-gpu-lanes.md](../26-gpu-lanes.md).
+
 Verified against primary sources on **2026-11-12**. `web_fetch` is unavailable in this
 environment, so every source below was fetched with `curl -sS -m 20 -L` and returned HTTP 200.
 Docs base is `https://cerebrium.ai/docs/`: a source cell reading `hardware/using-gpus` means

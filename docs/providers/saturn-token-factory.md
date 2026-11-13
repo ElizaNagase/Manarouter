@@ -1,5 +1,10 @@
 # Saturn Token Factory — provider doc (bare minimum)
 
+> **Note (2026-11-13).** This is a *provider* page: a Saturn Token Factory endpoint is an
+> OpenAI-compatible upstream, which the router still treats like any other. The Saturn Cloud **lane**
+> — its routes, its SSH-tunnel budget and its vault entry — was removed; only this provider path
+> remains.
+
 Manarouter can route to a **Saturn Cloud Token Factory inference endpoint**:
 a managed, OpenAI-compatible endpoint created and started entirely over the
 platform REST API. There is no tunnel, no generator image, and no supervisor

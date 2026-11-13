@@ -67,14 +67,8 @@ pub const RENTAL_EXTRA_KEY: &str = "rental";
 pub enum RentalPlatform {
     /// Modal — the platform this feature was researched against.
     Modal,
-    /// Cerebrium.
-    Cerebrium,
     /// Kaggle notebooks.
     Kaggle,
-    /// Saturn Cloud.
-    Saturn,
-    /// molab.
-    Molab,
     /// Any other platform, by its own slug.
     #[serde(untagged)]
     Custom(String),
@@ -85,10 +79,7 @@ impl RentalPlatform {
     pub fn as_str(&self) -> String {
         match self {
             Self::Modal => "modal".to_string(),
-            Self::Cerebrium => "cerebrium".to_string(),
             Self::Kaggle => "kaggle".to_string(),
-            Self::Saturn => "saturn".to_string(),
-            Self::Molab => "molab".to_string(),
             Self::Custom(name) => format!("custom:{name}"),
         }
     }
@@ -99,10 +90,7 @@ impl RentalPlatform {
         let lower = trimmed.to_ascii_lowercase();
         match lower.as_str() {
             "modal" => Self::Modal,
-            "cerebrium" => Self::Cerebrium,
             "kaggle" => Self::Kaggle,
-            "saturn" => Self::Saturn,
-            "molab" => Self::Molab,
             _ => match lower.strip_prefix("custom:") {
                 Some(rest) => Self::Custom(rest.to_string()),
                 None => Self::Custom(trimmed.to_string()),
@@ -111,7 +99,7 @@ impl RentalPlatform {
     }
 
     /// Every platform this build knows by name, for a panel's dropdown.
-    pub const KNOWN: [&'static str; 5] = ["modal", "cerebrium", "kaggle", "saturn", "molab"];
+    pub const KNOWN: [&'static str; 2] = ["modal", "kaggle"];
 }
 
 /// What an account is expected to cost.
@@ -932,10 +920,7 @@ mod tests {
     fn custom_platforms_round_trip_through_the_custom_prefix() {
         for platform in [
             RentalPlatform::Modal,
-            RentalPlatform::Cerebrium,
             RentalPlatform::Kaggle,
-            RentalPlatform::Saturn,
-            RentalPlatform::Molab,
             RentalPlatform::Custom("runpod".to_string()),
         ] {
             assert_eq!(RentalPlatform::parse(&platform.as_str()), platform);
@@ -962,10 +947,10 @@ mod tests {
             serde_json::to_string(&RentalPlan::Unknown).unwrap(),
             "\"unknown\""
         );
-        // kebab-case, so the acronym-heavy platforms do not come back as `cerebri-um`.
+        // kebab-case, so a multi-word platform id does not come back with capitals.
         assert_eq!(
-            serde_json::to_string(&RentalPlatform::Cerebrium).unwrap(),
-            "\"cerebrium\""
+            serde_json::to_string(&RentalPlatform::Kaggle).unwrap(),
+            "\"kaggle\""
         );
     }
 

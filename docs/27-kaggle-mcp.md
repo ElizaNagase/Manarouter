@@ -71,7 +71,7 @@ care about:
 
 | Tool | What it is for |
 |---|---|
-| `get_accelerator_quota` | the account's weekly GPU/TPU quota usage |
+| `get_accelerator_quota` | the account's GPU and TPU budget: used, reserved, allowed, and when it refreshes |
 | `create_notebook_session` | start a notebook session (language, kernel type, machine shape, internet toggle…) |
 | `get_notebook_session_status` | whether a session is running, completed or failed |
 | `cancel_notebook_session` | stop one |
@@ -79,8 +79,8 @@ care about:
 | `get_notebook_info` | notebook metadata, source included |
 | `list_notebook_files` / `download_notebook_output` | notebook contents and results |
 
-The quota call is worth quoting exactly, because it is the number the Kaggle lane wants to report and
-it matches the documented 30 h/week ceiling without any scraping:
+The quota call is worth quoting exactly, because it is the number the Kaggle lane wants to report, and
+it comes back without any scraping:
 
 ```json
 {"quota_refresh_time":"2026-11-14T00:00:00Z",
@@ -91,14 +91,34 @@ it matches the documented 30 h/week ceiling without any scraping:
 `108000 s` is 30 h. The refresh instant is a real timestamp, so a reset-aware lane can carry it
 instead of guessing.
 
+Two cautions before anybody turns that into a constant.
+
+First, **the same figure comes back for both accelerator families.** `tpu_quota` reports 108 000 s
+exactly as `gpu_quota` does, while the published TPU figures are lower — in the region of 20 TPU hours
+a week, with sessions a little under nine hours on `v5litepod-8` (secondary sources, and §9 below).
+`https://www.kaggle.com/docs/tpu` is client-rendered — a fetch of it measured earlier returned an HTTP
+200 shell of about 5.5 KB containing no occurrence of "hour" — so the published page could not be read
+first-hand here, and this document does not resolve which figure is current.
+[26-gpu-lanes.md](26-gpu-lanes.md) §3 records the same split.
+
+Second, **the period is not stated.** `total_time_allowed` is what this account is actually granted
+*now*, next to a `quota_refresh_time`; the reply does not say the allowance is a per-week rate, and
+the plan and the accelerator family both move it.
+
+The rule that follows: **read the API, never hardcode a ceiling.** A lane that reports a budget reads
+`total_time_allowed` and `time_used` at submission time and reports the refresh instant beside them.
+Writing 30 h, or 20 h, or 9 h into the lane as a constant makes it wrong the moment the account, the
+accelerator or the plan changes — and wrong in the direction that burns quota.
+
 ## 5. Why this matters here
 
 The Kaggle lane currently reports `kaggle_cli_present: false` and `credential_configured: false` on
-this host (see [26-gpu-lanes.md](26-gpu-lanes.md) §9): driving Kaggle was assumed to need the `kaggle`
-CLI, which is not installed. MCP removes that assumption — it is plain HTTPS, one token, no binary,
-and it exposes exactly the session verbs a lane needs (create, status, cancel) together with the
-weekly quota. Whether to move the lane onto it is a product decision, and this document is the
-research for it: **nothing in the lane has been changed to use MCP.**
+this host (see [26-gpu-lanes.md](26-gpu-lanes.md) §3, and the sweep recorded in its §11): driving
+Kaggle was assumed to need the `kaggle` CLI, which is not installed. MCP removes that assumption — it
+is plain HTTPS, one token, no binary, and it exposes exactly the session verbs a lane needs (create,
+status, cancel) together with the accelerator budget and its refresh instant. Whether to move the lane
+onto it is a product decision, and this document is the research for it: **nothing in the lane has
+been changed to use MCP.**
 
 ## 6. A community pattern for vLLM on Kaggle, reviewed
 
@@ -115,8 +135,11 @@ the shape works; not usable as-is:
 * it says nothing about Kaggle's session limit, idle timeout or restart, and states no Kaggle
   Terms-of-Service position on running a persistent public server.
 
-Our own Kaggle lane (§3 of [26-gpu-lanes.md](26-gpu-lanes.md)) is batch-only, written around the
-12 h session and 30 h weekly ceilings, and does not assume ingress at all.
+Our own Kaggle lane (§3 of [26-gpu-lanes.md](26-gpu-lanes.md)) is batch-only, written around a 12 h
+session bound (`deadline_secs`) and carrying no quota constant at all — it does not read the account
+budget today, and its status route reports no quota figure. A route that does report one must read it
+from `get_accelerator_quota` (§4) rather than assume either published ceiling, and the lane does not
+assume ingress at all.
 
 ## 7. Where a scheduled run gets its credentials — Kaggle Secrets, and why not to rely on them
 
@@ -185,3 +208,55 @@ their replies **anonymously**, with no token. The same nesting applies to `list_
 (`{"request":{"topicId":…}}`). A flat call to the wrong endpoint shape is also what produced the
 earlier `HTTP 406 Not Acceptable`: the `Accept: application/json, text/event-stream` header is
 required, not optional.
+
+## 9. Serving a model from Kaggle's *own* TPU session — `ARahim3/kaggle-tpu-lab`, reviewed
+
+Every pattern above is about *submitting work* to Kaggle. [`ARahim3/kaggle-tpu-lab`](https://github.com/ARahim3/kaggle-tpu-lab)
+(MIT, ~795 stars) is about the opposite direction: publishing an OpenAI-compatible endpoint from a
+Kaggle notebook's own accelerator, on Kaggle's **free** TPU quota. It is the most complete
+implementation of that idea found so far, and it is worth reading before anyone repeats the attempt.
+
+What it does, in its own terms:
+
+* **Two paths, one server.** (a) run a notebook on a free `v5litepod-8` (eight TPU chips) whose *last
+  cell is the server* — `vllm-tpu` plus a local patch, weights pulled from a public dataset; the cell
+  prints a URL and an API key and then holds the session; (b) `gcp/` runs the same server on a rented
+  TPU VM (`v5litepod-8` or `v6e-8`), which is faster and has "no queue, no nine-hour cap", reaches the
+  outside through `gcloud compute tpus tpu-vm ssh ... -N -L 8000:localhost:8000`, and bills while it
+  exists (spot instances were preempted "several times a day").
+* **Both surfaces.** The server answers OpenAI `/v1/chat/completions` **and** Anthropic `/v1/messages`,
+  which is why the README's client wiring sets `ANTHROPIC_BASE_URL` to the tunnel plus
+  `ANTHROPIC_AUTH_TOKEN` (not `ANTHROPIC_API_KEY`) and a large context window to match the model.
+* **Ingress is a Cloudflare quick tunnel** (`cloudflared --url http://127.0.0.1:8000`, downloaded at
+  runtime from GitHub `latest`, three attempts) yielding `https://<name>.trycloudflare.com`, with 15 s
+  keep-alive pings because "Cloudflare closes a response that stays silent for ~100 s". If the tunnel
+  fails, the server is reachable only inside the kernel.
+* **Its own quota discipline.** The key is generated in-session and printed once, never committed; a
+  `keepalive_min` self-shutdown guard (480 min by default, 90 min in the notebook) stops a forgotten
+  run from burning the allowance.
+* **It restates a session figure (secondary, quoted from its README, not from Kaggle):** sessions run
+  "to Kaggle's limit, a little under nine hours" on the free TPU path, after which a re-run yields a
+  new URL — that, not the 30 h in the quota API, is the number to plan a *session* around. Neither
+  figure is settled: §4 records what the API actually reported and what the published page would have
+  to be read to confirm.
+
+What is worth borrowing, and what is not:
+
+1. **Borrow** the in-session self-shutdown guard and the once-printed, in-session-generated key. Both
+   fit our lane's design directly (a run must never outlive its usefulness).
+2. **Borrow** the keep-alive cadence as a *fact*: any ingress we use has to tolerate an idle period it
+   does not control, and a lane that says nothing about idle teardown will report a tunnel as live
+   after it has silently died.
+3. **Do not borrow** the unpinned `cloudflared` download from GitHub `latest`, or unauthenticated
+   ingress generally: our own rule is that a public surface is deliberate, authenticated and
+   per-tenant, not a convenience.
+4. **Do not borrow** the licensing posture: its draft model is CC BY-NC-ND 4.0 ("research use only"),
+   which cannot be shipped as part of a product. Check the licence of any weights a lane serves.
+5. **Do not borrow** free-tier Kaggle quota marketed as a persistent endpoint. A nine-hour-at-best,
+   queue-backed, quota-metered session is a *rental*, which is exactly how our lane already models it.
+
+**Consequence for our lane: unchanged.** It stays batch-only (§3 of
+[26-gpu-lanes.md](26-gpu-lanes.md)) and gains one requirement from this review: if a session-based
+route is ever added, the session's own quota and idle behaviour must be read from the platform
+(`get_accelerator_quota`, §4) rather than assumed from either published ceiling, and its ingress must
+be ours, not a third party's quick tunnel.

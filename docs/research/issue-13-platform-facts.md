@@ -1,5 +1,10 @@
 # molab platform facts (issue 13)
 
+> **Historical (2026-11-13).** This document specifies molab. The molab lane, its routes and its
+> vault entry were removed from Manarouter on 2026-11-13, so nothing below is implemented any
+> more. It is kept as the research and design record; the lane surface that is live today is
+> [../26-gpu-lanes.md](../26-gpu-lanes.md).
+
 Verified against primary sources on **2026-11-12** with `curl`. Sources are molab's own
 pages, `docs.marimo.io`, marimo's blog, and molab's live Clerk auth configuration
 (`https://clerk.marimo.io/v1/environment`, the auth backend molab's frontend uses).

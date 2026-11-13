@@ -1,5 +1,10 @@
 # Saturn Cloud — platform facts for the Saturn lane (issue 12)
 
+> **Historical (2026-11-13).** This document specifies Saturn Cloud. The Saturn lane, its routes,
+> its SSH-tunnel budget route and its vault entry were removed from Manarouter on 2026-11-13, so
+> nothing below is implemented any more. It is kept as the research and design record; the lane
+> surface that is live today is [../26-gpu-lanes.md](../26-gpu-lanes.md).
+
 Retrieval date **2026-11-12**. Every value below was copied from the cited page in that session; no price,
 hour count or limit is inferred. Pages were fetched as HTML with `curl` (no JS execution), so anything the
 site renders client-side is marked UNVERIFIED. API facts are taken from the versioned OpenAPI document

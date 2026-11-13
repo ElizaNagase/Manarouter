@@ -3,38 +3,34 @@
 //! ## Why this exists
 //!
 //! The rental work (issue #4) made Modal a real lane: a provider whose lifecycle Manarouter writes
-//! and a relay that can reach it. Issues #10–#13 asked for four more hosts in the same shape, and
-//! research against the platforms' own documents found that two of them carry terms that discourage
-//! exactly what those issues ask for:
+//! and a relay that can reach it. Kaggle joined it as the batch lane: kernel push, poll, fetch
+//! files, no inbound socket. Saturn Cloud, molab and Cerebrium were removed as lanes; the enum
+//! below is the whole set this router supports.
 //!
-//! * Kaggle's Terms §3 forbids one person operating more than one account, so "pool two accounts and
-//!   rotate" is outside what one operator may do. The submit-and-poll API itself works fine.
-//! * molab names reverse tunnels and non-interactive use as abuse, with termination without notice.
+//! Kaggle's Terms §3 forbid one person operating more than one account, so "pool two accounts and
+//! rotate" is outside what one operator may do. The submit-and-poll API itself works fine.
 //!
-//! ## Why those findings are warnings and not refusals
+//! ## Why that finding is a warning and not a refusal
 //!
-//! The first version of this module encoded both as [`AccountPolicy::Prohibited`] and
-//! [`LaneShape::Attended`] and had [`plan_lane`] refuse them outright. That was the wrong shape for
-//! this product. Manarouter is deployed for several people and each person brings their own account:
-//! one account per person, pooled by the router. Kaggle's clause forbids one *operator* holding
-//! several, which pooled single-owner accounts do not do, and a router that refused to hold the
-//! accounts its users actually have could not serve them at all.
+//! The first version of this module encoded it as [`AccountPolicy::Prohibited`] and had
+//! [`plan_lane`] refuse a second account outright. That was the wrong shape for this product.
+//! Manarouter is deployed for several people and each person brings their own account: one account
+//! per person, pooled by the router. Kaggle's clause forbids one *operator* holding several, which
+//! pooled single-owner accounts do not do, and a router that refused to hold the accounts its users
+//! actually have could not serve them at all.
 //!
-//! Refusing is also not this module's call to make. So the findings are carried as [`Warning`]s
-//! that quote the clause and cite its URL, and the person running the deployment decides. What
-//! remains a [`Refusal`] is only what is *physically* impossible — a lane with no inbound endpoint
-//! cannot answer a request that arrives now, whatever the terms say — because that is a fact about
-//! the platform rather than a judgement about the operator.
-//!
-//! [`LaneShape::Attended`] still describes molab accurately: a person must open the session. It no
-//! longer forbids using the result.
+//! Refusing is also not this module's call to make. So the finding is carried as a [`Warning`] that
+//! quotes the clause and cites its URL, and the person running the deployment decides. What remains
+//! a [`Refusal`] is only what is *physically* impossible — a lane with no inbound endpoint cannot
+//! answer a request that arrives now, whatever the terms say — because that is a fact about the
+//! platform rather than a judgement about the operator.
 //!
 //! ## What this module is not
 //!
 //! It is not a network client and not a deployment mechanism. It holds the facts that decide whether
 //! a lane may be used for a given traffic shape, and it answers that question with no I/O. The
-//! per-platform detail — Modal's generated app, Cerebrium's `cerebrium.toml` — lives in the sibling
-//! modules and in the conductor's `gpu_api`.
+//! per-platform detail — Modal's generated app — lives in the sibling modules and in the conductor's
+//! `gpu_api`.
 //!
 //! | Question | Answer |
 //! |---|---|
@@ -53,11 +49,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub mod cerebrium;
 pub mod kaggle;
 pub mod modal;
-pub mod molab;
-pub mod saturn;
 
 /// A GPU host Manarouter knows how to talk about.
 ///
@@ -68,26 +61,17 @@ pub mod saturn;
 pub enum LaneKind {
     /// Modal: proxy-token auth, a generated `modal_app.py`, `modal deploy` by hand.
     Modal = 0,
-    /// Cerebrium: a REST deploy endpoint, path passthrough, OpenAI-shaped inference.
-    Cerebrium = 1,
     /// Kaggle Notebooks: kernel push, poll, fetch files. No inbound socket.
+    ///
+    /// The discriminant is 2 because 1 belonged to Cerebrium, which was removed; the numbers are
+    /// stable identifiers and are never renumbered.
     Kaggle = 2,
-    /// Saturn Cloud: SSH-tunnelled Jupyter on the free plan, managed deployments on Hosted Pro.
-    Saturn = 3,
-    /// molab: an interactive marimo notebook on a GPU. Attended by design.
-    Molab = 4,
 }
 
 impl LaneKind {
     /// Every lane, in discriminant order. Used by the catalogue route and by the tests that assert
     /// no lane is missing a descriptor.
-    pub const ALL: [LaneKind; 5] = [
-        LaneKind::Modal,
-        LaneKind::Cerebrium,
-        LaneKind::Kaggle,
-        LaneKind::Saturn,
-        LaneKind::Molab,
-    ];
+    pub const ALL: [LaneKind; 2] = [LaneKind::Modal, LaneKind::Kaggle];
 
     /// The wire id. Matches `#[serde(rename_all = "kebab-case")]`, and is what a URL or a config file
     /// carries. Kept as an explicit function because it is also used in error messages and in the
@@ -95,10 +79,7 @@ impl LaneKind {
     pub fn as_str(self) -> &'static str {
         match self {
             LaneKind::Modal => "modal",
-            LaneKind::Cerebrium => "cerebrium",
             LaneKind::Kaggle => "kaggle",
-            LaneKind::Saturn => "saturn",
-            LaneKind::Molab => "molab",
         }
     }
 
@@ -119,10 +100,7 @@ impl LaneKind {
     pub fn facts(self) -> &'static LaneFacts {
         match self {
             LaneKind::Modal => &modal::FACTS,
-            LaneKind::Cerebrium => &cerebrium::FACTS,
             LaneKind::Kaggle => &kaggle::FACTS,
-            LaneKind::Saturn => &saturn::FACTS,
-            LaneKind::Molab => &molab::FACTS,
         }
     }
 }
@@ -134,9 +112,7 @@ impl fmt::Display for LaneKind {
 }
 
 /// How traffic can reach a lane. This is the field that decides whether a lane can be a provider at
-/// all, and it is deliberately three-valued: collapsing `Batch` into `Attended` would hide that
-/// Kaggle can run unattended jobs, and collapsing `Batch` into `Serving` would promise a request
-/// path that does not exist.
+/// all: collapsing `Batch` into `Serving` would promise Kaggle a request path that does not exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LaneShape {
@@ -144,8 +120,6 @@ pub enum LaneShape {
     Serving,
     /// Work is submitted, runs to completion unattended, and is collected as files.
     Batch,
-    /// A human must open the session; nothing can be submitted to it programmatically.
-    Attended,
 }
 
 impl LaneShape {
@@ -153,7 +127,6 @@ impl LaneShape {
         match self {
             LaneShape::Serving => "serving",
             LaneShape::Batch => "batch",
-            LaneShape::Attended => "attended",
         }
     }
 
@@ -164,16 +137,12 @@ impl LaneShape {
 }
 
 /// Where a running session can be reached from. Separate from [`LaneShape`] because a serving lane
-/// can still be owner-only: SatoSaturn's free plan reaches Jupyter over SSH, which serves requests
-/// but not to the relay.
+/// could still be owner-only in principle: it serves requests, but not to the relay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Inbound {
     /// A public HTTPS endpoint with path passthrough: the relay can call it directly.
     PublicEndpoint,
-    /// Reachable only through a tunnel or an owner-authenticated session. Usable by a person at the
-    /// keyboard, not by a router.
-    OwnerSessionOnly,
     /// No inbound socket at all. Results come back as files.
     None,
 }
@@ -182,72 +151,47 @@ impl Inbound {
     pub fn as_str(self) -> &'static str {
         match self {
             Inbound::PublicEndpoint => "public-endpoint",
-            Inbound::OwnerSessionOnly => "owner-session-only",
             Inbound::None => "none",
         }
     }
 }
 
-/// How a run is started. `Manual` is not a defect: for molab it is the only true answer, and saying
-/// so is what keeps the router from pretending.
+/// How a run is started. Every kind here can be driven by a process: a lane a person has to open by
+/// hand is not a lane this router can offer, so the vocabulary does not pretend otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Submission {
-    /// A documented HTTP API that creates and updates the deployment.
-    RestApi,
     /// A CLI that a process can drive unattended with a token in the environment.
     Cli,
     /// A notebook/kernel push that runs server-side.
     KernelPush,
-    /// A person, in a browser. No API token exists to replace them.
-    Manual,
 }
 
 impl Submission {
     pub fn as_str(self) -> &'static str {
         match self {
-            Submission::RestApi => "rest-api",
             Submission::Cli => "cli",
             Submission::KernelPush => "kernel-push",
-            Submission::Manual => "manual",
         }
-    }
-
-    /// Whether a process could start work without a human.
-    pub fn is_automatable(self) -> bool {
-        !matches!(self, Submission::Manual)
     }
 }
 
-/// The credential a lane's control plane wants. Named because the same platform often wants two
-/// different ones — Cerebrium's service-account token deploys, its project API key infers — and
-/// confusing them produces a 401 that looks like a wrong key.
+/// The credential a lane's control plane wants, so a setup flow asks for the right thing and a
+/// wrong kind produces a named mismatch rather than a 401 that looks like a bad key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Credential {
     /// Two-part proxy token, sent as platform-specific headers.
     ProxyTokenPair,
-    /// One bearer token for the control plane.
-    ServiceAccountToken,
-    /// One bearer token for inference.
-    ApiKey,
     /// A personal API token, bearer.
     ApiToken,
-    /// Username and key, HTTP Basic.
-    BasicPair,
-    /// Nothing portable: the session lives in a browser profile.
-    None,
 }
 
 impl Credential {
     pub fn as_str(self) -> &'static str {
         match self {
             Credential::ProxyTokenPair => "proxy-token-pair",
-            Credential::ServiceAccountToken => "service-account-token",
-            Credential::ApiKey => "api-key",
             Credential::ApiToken => "api-token",
-            Credential::BasicPair => "basic-pair",
-            Credential::None => "none",
         }
     }
 }
@@ -352,11 +296,6 @@ impl LaneFacts {
     pub fn serves_traffic(&self) -> bool {
         self.shape.answers_requests() && matches!(self.inbound, Inbound::PublicEndpoint)
     }
-
-    /// Whether a process can start work without a person.
-    pub fn automatable(&self) -> bool {
-        self.submission.is_automatable()
-    }
 }
 
 /// The traffic a caller intends to send. Asked of the caller because the same lane can be acceptable
@@ -383,8 +322,7 @@ impl Traffic {
 /// can check it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Refusal {
-    /// Stable machine code: `lane_cannot_serve`, `lane_is_attended`, `multiple_accounts_forbidden`,
-    /// `lane_is_batch_only`, `third_party_traffic_restricted`.
+    /// Stable machine code: `no_account`, `lane_is_batch_only`, `lane_is_owner_only`.
     pub code: &'static str,
     /// One sentence, naming the lane.
     pub message: String,
@@ -438,8 +376,7 @@ pub struct LanePlan {
 ///
 /// It *refuses* only what is physically impossible, because a capability is not a policy:
 ///
-/// * synchronous traffic on a lane with no public inbound endpoint (batch or attended);
-/// * batch traffic on a lane where even that is impossible (attended).
+/// * synchronous traffic on a lane with no public inbound endpoint.
 ///
 /// It *warns*, quoting the clause, where the platform's terms discourage the arrangement — several
 /// accounts, or serving other people. These are findings the operator is entitled to see and not
@@ -470,53 +407,28 @@ pub fn plan_lane(
         });
     }
 
-    match traffic {
-        Traffic::Synchronous if !facts.serves_traffic() => {
-            refusals.push(match facts.shape {
-                LaneShape::Batch => Refusal {
-                    code: "lane_is_batch_only",
-                    message: format!(
-                        "{} runs submitted jobs and returns files; it has no endpoint a chat request \
-                         can be answered from",
-                        facts.display
-                    ),
-                    clause: None,
-                    source: Some(facts.sources[0]),
-                },
-                LaneShape::Attended => Refusal {
-                    code: "lane_is_attended",
-                    message: format!(
-                        "{} needs a person to open the session, so it cannot answer a request that \
-                         arrives while nobody is watching",
-                        facts.display
-                    ),
-                    clause: None,
-                    source: Some(facts.sources[0]),
-                },
-                LaneShape::Serving => Refusal {
-                    code: "lane_is_owner_only",
-                    message: format!(
-                        "{} is reachable only from your own machine or a tunnel you open by hand",
-                        facts.display
-                    ),
-                    clause: None,
-                    source: Some(facts.sources[0]),
-                },
-            });
-        }
-        Traffic::Batch if facts.shape == LaneShape::Attended => {
-            refusals.push(Refusal {
-                code: "lane_is_attended",
+    if traffic == Traffic::Synchronous && !facts.serves_traffic() {
+        refusals.push(match facts.shape {
+            LaneShape::Batch => Refusal {
+                code: "lane_is_batch_only",
                 message: format!(
-                    "{} has no job API: work is started by hand and returns files, so it cannot be \
-                     queued",
+                    "{} runs submitted jobs and returns files; it has no endpoint a chat request \
+                     can be answered from",
                     facts.display
                 ),
                 clause: None,
                 source: Some(facts.sources[0]),
-            });
-        }
-        _ => {}
+            },
+            LaneShape::Serving => Refusal {
+                code: "lane_is_owner_only",
+                message: format!(
+                    "{} is reachable only from your own machine or a tunnel you open by hand",
+                    facts.display
+                ),
+                clause: None,
+                source: Some(facts.sources[0]),
+            },
+        });
     }
 
     let mut warnings = Vec::new();
@@ -637,7 +549,6 @@ mod tests {
             let code = plan.refusals[0].code;
             let expected = match facts.shape {
                 LaneShape::Batch => "lane_is_batch_only",
-                LaneShape::Attended => "lane_is_attended",
                 LaneShape::Serving => "lane_is_owner_only",
             };
             assert_eq!(code, expected, "{kind}");
@@ -645,21 +556,6 @@ mod tests {
                 plan.refusals[0].source.is_some(),
                 "{kind} refused without a citation"
             );
-        }
-    }
-
-    #[test]
-    fn an_attended_lane_cannot_be_given_batch_work_either() {
-        for kind in LaneKind::ALL {
-            if kind.facts().shape != LaneShape::Attended {
-                continue;
-            }
-            let plan = plan_lane(kind, Traffic::Batch, 1, false);
-            assert!(
-                !plan.usable,
-                "{kind} is attended, so even batch work cannot be queued"
-            );
-            assert_eq!(plan.refusals[0].code, "lane_is_attended");
         }
     }
 
@@ -863,10 +759,7 @@ mod tests {
     fn every_lane_and_traffic_has_a_usable_or_refused_verdict() {
         let known = [
             (LaneKind::Modal, true, true),
-            (LaneKind::Cerebrium, true, true),
-            (LaneKind::Saturn, true, true),
             (LaneKind::Kaggle, false, true),
-            (LaneKind::Molab, false, false),
         ];
         for (lane, sync_ok, batch_ok) in known {
             let sync = plan_lane(lane, Traffic::Synchronous, 1, false);

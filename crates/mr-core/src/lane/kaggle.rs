@@ -13,12 +13,12 @@
 //!
 //! 1. **The API works headlessly.** Once a `KGAT_` token is in the subprocess environment — made
 //!    once in a browser at `kaggle.com/settings/api` — push, status and output need no browser and
-//!    no interactive session. That is why the submission is [`Submission::KernelPush`] and
-//!    [`LaneFacts::automatable`] is true. It is a queued job, not an endpoint: queueing, image pull,
+//!    no interactive session. That is why the submission is [`Submission::KernelPush`]. It is a
+//!    queued job, not an endpoint: queueing, image pull,
 //!    weight download and model load put a floor of minutes under every call.
 //! 2. **The account model is forbidden.** Kaggle's Terms §3 prohibit more than one active account
 //!    per person, so the "pool two accounts and rotate" design is a ban with extra steps.
-//!    [`AccountPolicy::Prohibited`] records the clause and [`crate::lane::plan_lane`] refuses a
+//!    [`AccountPolicy::Prohibited`] records the clause and [`crate::lane::plan_lane`] warns on a
 //!    second account. One account per deployment; no identity failover.
 //!
 //! ## Credentials
@@ -173,8 +173,9 @@ mod tests {
             !FACTS.serves_traffic(),
             "there is no inbound socket to answer a request"
         );
-        assert!(
-            FACTS.automatable(),
+        assert_eq!(
+            FACTS.submission,
+            crate::lane::Submission::KernelPush,
             "push, status and output run without a browser"
         );
         assert_eq!(

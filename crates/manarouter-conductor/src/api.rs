@@ -75,10 +75,7 @@ use crate::auth::{
     SESSION_TTL,
 };
 use crate::state::{AppState, CommitError, VaultTx};
-use crate::{
-    activity_api, gpu_api, lane_cerebrium, lane_kaggle, lane_molab, lane_saturn, models_api,
-    quota_api,
-};
+use crate::{activity_api, gpu_api, lane_kaggle, models_api, quota_api};
 
 /// The path prefix an OpenAI-compatible client is pointed at, and the one it should have used
 /// against the relay instead of the control plane. Recorded as a constant so the routes below, the
@@ -184,10 +181,7 @@ pub(crate) fn guarded_router(state: AppState) -> Router<AppState> {
         .merge(models_api::routes())
         .merge(activity_api::routes())
         .merge(gpu_api::routes())
-        .merge(lane_cerebrium::routes())
         .merge(lane_kaggle::routes())
-        .merge(lane_molab::routes())
-        .merge(lane_saturn::routes())
         // --- a client pointed at the wrong port gets told which one to use ---
         //
         // Registered before the `/api/{*rest}` catch-all, and before the panel's static fallback

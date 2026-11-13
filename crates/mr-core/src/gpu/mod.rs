@@ -30,7 +30,6 @@
 
 pub mod arch;
 pub mod catalog;
-pub mod cerebrium;
 pub mod requantize;
 pub mod sizing;
 

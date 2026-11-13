@@ -146,16 +146,6 @@ pub struct AppState {
     pub config_seen: Arc<StdMutex<Option<(SystemTime, u64)>>>,
     /// Kaggle lane state: the run registry and optional credential path.
     pub kaggle: crate::lane_kaggle::KaggleState,
-    /// Molab lane state: the attached-endpoint registry.
-    ///
-    /// Behind its own lock rather than an `ArcSwap` because the attach/down routes are rare writes
-    /// and the probe supervisor holds the lock across a network probe — the registry is a handful of
-    /// entries, so contention is not a concern and a plain mutex keeps the ordering obvious.
-    pub molab: Arc<tokio::sync::Mutex<crate::lane_molab::MolabState>>,
-    /// The Saturn Cloud lane's registrations and tunnel supervision.
-    pub saturn: std::sync::Arc<crate::lane_saturn::SaturnState>,
-    /// The Cerebrium lane's app registrations.
-    pub cerebrium: std::sync::Arc<crate::lane_cerebrium::CerebriumState>,
 }
 
 /// The ports this process believes are live.
@@ -329,11 +319,6 @@ impl AppState {
             started_at: Instant::now(),
             config_seen: Arc::new(StdMutex::new(None)),
             kaggle: crate::lane_kaggle::KaggleState::new(),
-            molab: Arc::new(tokio::sync::Mutex::new(
-                crate::lane_molab::MolabState::default(),
-            )),
-            saturn: std::sync::Arc::new(crate::lane_saturn::SaturnState::new()),
-            cerebrium: std::sync::Arc::new(crate::lane_cerebrium::CerebriumState::new()),
         };
         // Seed the fingerprint with what we just loaded, so the first read after startup does not
         // mistake the file we started from for an external edit.

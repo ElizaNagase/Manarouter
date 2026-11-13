@@ -1,5 +1,11 @@
 # Issues #10–#13: what each lane can honestly be
 
+> **Historical (2026-11-13).** The disposition reasoning below led to three lanes being built and
+> then removed: Saturn Cloud, molab and Cerebrium are gone from the router, with their routes and
+> vault entries. Kaggle is the lane that remains. Kept as the record of how each platform was judged
+> and why; the live surface is [../26-gpu-lanes.md](../26-gpu-lanes.md).
+
+
 Four issues ask for the same thing in four flavours: make another GPU host a first-class lane beside
 the Modal one, with per-account quota switching. Each was researched against primary sources before
 any code was written (`issue-10-platform-facts.md` … `issue-13-platform-facts.md`, next to this file).

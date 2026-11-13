@@ -1,6 +1,11 @@
 # ISSUE 12: Deploy Saturn Cloud as an inference lane: SSH-tunnelled Jupyter server on the free plan, managed Deployment on Hosted Pro
 # Deploy Saturn Cloud as an inference lane: SSH-tunnelled Jupyter server on the free plan, managed Deployment on Hosted Pro
 
+> **Historical (2026-11-13).** This document specifies Saturn Cloud. The Saturn lane, its routes,
+> its SSH-tunnel budget route and its vault entry were removed from Manarouter on 2026-11-13, so
+> nothing below is implemented any more. It is kept as the research and design record; the lane
+> surface that is live today is [../26-gpu-lanes.md](../26-gpu-lanes.md).
+
 Supersedes #8, which treated Saturn as a "GPU jobs control plane" — recipes and jobs, no serving, no
 account story. Saturn can serve inference, but *where* depends on the plan, so this issue specifies
 both lanes and makes the plan a capability flag rather than an assumption.

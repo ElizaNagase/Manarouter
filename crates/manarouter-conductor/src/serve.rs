@@ -33,9 +33,6 @@ use crate::state::AppState;
 /// and the operating system's reason, and asks the question the operator actually has to answer
 /// (is something else already on this port?).
 pub async fn serve(state: AppState) -> Result<(), String> {
-    // Before the listener exists, and before anything can ask a lane for its status: an account
-    // attached in an earlier process is still attached to this one.
-    crate::lane_vault::restore_all(&state).await;
     let (host, port) = {
         let config = state.current_config().await;
         (config.control.host.clone(), config.control.port)
@@ -54,11 +51,6 @@ pub async fn serve(state: AppState) -> Result<(), String> {
         .local_addr()
         .map_err(|e| format!("the control listener has no local address: {e}"))?
         .port();
-
-    // The molab lane's health supervisor: it probes every attached endpoint and drops the ones that
-    // stop answering. Spawned here, after a bind succeeded, so a failed start does not leave a timer
-    // running against a process that is about to exit.
-    tokio::spawn(crate::lane_molab::start_supervisor(state.molab.clone()));
 
     // Record the real bound port (it differs from `port` when the config says 0) before serving,
     // so even the first `GET /api/ports` and the origin check see the truth.

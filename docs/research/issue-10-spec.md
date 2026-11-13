@@ -1,6 +1,11 @@
 # ISSUE 10: Deploy Cerebrium as a first-class serverless inference provider, with multi-account switching
 # Deploy Cerebrium as a first-class serverless inference provider, with multi-account switching
 
+> **Historical (2026-11-13).** This document specifies Cerebrium. The Cerebrium lane, its routes
+> and its `cerebrium.toml` generator were removed from Manarouter on 2026-11-13, so nothing below
+> is implemented any more. It is kept as the research and design record; the lane surface that is
+> live today is [../26-gpu-lanes.md](../26-gpu-lanes.md).
+
 Supersedes #6, which framed Cerebrium as "a provider entry". That is not enough: the endpoint does
 not exist until an app is deployed, the account is a *project + service-account token* pair, and the
 free plan caps how many apps and concurrent GPUs one account may hold. This issue covers deploying

@@ -3,27 +3,25 @@
 
 What this checks
 ---------------
-For each lane the conductor exposes — Kaggle, molab, Saturn Cloud and Cerebrium — this asks the
-lane's own status route, decides readiness from the fields that lane publishes (never from a guess
-about the platform), lists the accounts the lane holds, and, where the lane has a probe route,
-probes each account so the platform gets a chance to disagree. It also reads the GPU catalogue and
-the deployment list, because a lane that is ready but has no deployment is not serving anything.
+For each lane the conductor exposes — Kaggle — this asks the lane's own status route, decides
+readiness from the fields that lane publishes (never from a guess about the platform), and lists the
+accounts the lane holds. It also reads the GPU catalogue and the deployment list, because a lane
+that is ready but has no deployment is not serving anything.
 
 What it does not do
 -------------------
 It starts nothing and spends nothing. Kaggle is batch-only: proving it end to end means submitting a
 kernel, which consumes the operator's weekly GPU allowance and posts a notebook to their account, so
-that stays a deliberate manual step (see `docs/26-gpu-lanes.md`). A green Saturn or Cerebrium probe
-means the platform answered the control-plane call; only a real completion proves inference.
+that stays a deliberate manual step (see `docs/26-gpu-lanes.md`). A green status means the
+conductor has a CLI and a credential; only a real completion proves inference.
 
-Exit status is 0 only when every lane is ready and every probe that ran succeeded. Anything less is
-a failure with the reason printed, because a test that always passes tests nothing.
+Exit status is 0 only when the lane is ready. Anything less is a failure with the reason printed,
+because a test that always passes tests nothing.
 
 Usage
 -----
     scripts/gpu-lanes-e2e.py                 # human-readable table
     scripts/gpu-lanes-e2e.py --json          # machine-readable summary
-    scripts/gpu-lanes-e2e.py --no-probe      # status only, no platform calls
     scripts/gpu-lanes-e2e.py --base-url http://127.0.0.1:20998   # a test conductor
 
 `MANAROUTER_ADMIN` sets the base URL when `--base-url` is absent.
@@ -38,7 +36,7 @@ import sys
 import urllib.error
 import urllib.request
 
-LANES = ("kaggle", "molab", "saturn", "cerebrium")
+LANES = ("kaggle",)
 
 
 def request(base: str, path: str, body: dict | None, timeout: float) -> tuple[int, object]:
@@ -65,8 +63,8 @@ def request(base: str, path: str, body: dict | None, timeout: float) -> tuple[in
 def readiness(lane: str, status: dict) -> tuple[bool, str]:
     """Whether a lane can run, and the lane's own sentence about why not.
 
-    Each platform publishes a different shape, so each is read on its own terms. Nothing is
-    inferred: `ready` is used where the lane publishes it, and otherwise the fields it does publish.
+    Kaggle publishes its prerequisites rather than a single `ready` flag, so the two fields are read
+    on their own terms. Nothing is inferred.
     """
     if lane == "kaggle":
         ready = bool(status.get("kaggle_cli_present")) and bool(status.get("credential_configured"))
@@ -78,34 +76,6 @@ def readiness(lane: str, status: dict) -> tuple[bool, str]:
         if not status.get("credential_configured"):
             missing.append("no Kaggle credential is configured")
         return False, "; ".join(missing)
-    if lane == "molab":
-        warm = int(status.get("warm_lanes") or 0)
-        if warm:
-            return True, f"{warm} warm lane(s)"
-        return False, str(status.get("detail") or "no warm lane")
-    if lane == "saturn":
-        accounts = status.get("accounts") or []
-        plan = status.get("plan") or {}
-        healthy = [a for a in accounts if isinstance(a, dict) and (a.get("health") == "healthy" or a.get("warm"))]
-        if healthy and plan.get("usable"):
-            return True, f"{len(healthy)} healthy account(s), the plan is usable"
-        reasons = [str(r.get("message")) for r in plan.get("refusals") or [] if r.get("message")]
-        if accounts and not healthy:
-            # A registration is not a working endpoint: attach probes once and records the failure.
-            errors = [
-                str(a.get("last_probe_error"))
-                for a in accounts
-                if isinstance(a, dict) and a.get("last_probe_error")
-            ]
-            reasons.append(
-                f"{len(accounts)} account(s) registered but none healthy"
-                + (f" ({errors[0]})" if errors else "")
-            )
-        return False, "; ".join(reasons) or "no Saturn account is attached"
-    if lane == "cerebrium":
-        if status.get("ready"):
-            return True, f"{len(status.get('accounts') or [])} project(s) attached"
-        return False, str(status.get("detail") or "no Cerebrium project is attached")
     return False, f"unknown lane {lane}"
 
 
@@ -139,7 +109,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base-url", default=os.environ.get("MANAROUTER_ADMIN", "http://127.0.0.1:20901"))
     parser.add_argument("--json", action="store_true", help="print a machine-readable summary")
-    parser.add_argument("--no-probe", action="store_true", help="do not call the platforms")
     parser.add_argument("--timeout", type=float, default=30.0)
     args = parser.parse_args()
     base = args.base_url.rstrip("/")
@@ -158,17 +127,6 @@ def main() -> int:
             continue
         ready, why = readiness(lane, status)
         entry.update({"ready": ready, "detail": why, "accounts": accounts_of(status), "words": lane_words(lane, status)})
-        probes = []
-        if ready and not args.no_probe and lane in ("saturn", "cerebrium"):
-            for account in accounts_of(status):
-                probe_code, probe_body = request(
-                    base, f"/api/gpu/lanes/{lane}/probe", {"account": account}, args.timeout
-                )
-                ok = probe_code == 200 and not (isinstance(probe_body, dict) and probe_body.get("error"))
-                probes.append({"account": account, "http_status": probe_code, "ok": ok, "body": probe_body})
-                if not ok:
-                    failures += 1
-        entry["probes"] = probes
         if not ready:
             failures += 1
         summary["lanes"][lane] = entry
@@ -209,9 +167,6 @@ def main() -> int:
             for word in entry.get("words") or []:
                 if word != entry.get("detail"):
                     print(f"           {word}")
-            for probe in entry.get("probes") or []:
-                state = "ok  " if probe["ok"] else "FAIL"
-                print(f"           [{state}] probe {probe['account']}: http {probe['http_status']}")
         catalog = summary["catalog"]
         rentals = summary["rentals"]
         print(
@@ -223,7 +178,7 @@ def main() -> int:
             f"{rentals.get('deployments')} deployment(s), {rentals.get('gpu_seconds')} GPU-second(s), "
             f"${rentals.get('cost_usd')}"
         )
-        print("verdict:", "every lane is ready" if summary["ok"] else f"{failures} failure(s)")
+        print("verdict:", "the lane is ready" if summary["ok"] else f"{failures} failure(s)")
 
     return 0 if summary["ok"] else 1
 

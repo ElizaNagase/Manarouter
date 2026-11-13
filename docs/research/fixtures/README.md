@@ -11,6 +11,10 @@ payload met a real server; these files are the record of what that server said.
 | `gpu-probe-live.json` | `POST /api/gpu/probe` for `orcarouter/Qwen3.8-27B-Uncensored-FP8` on `RTX-PRO-6000` |
 | `gpu-apply-response-live.json` | `POST /api/gpu/apply` `action: "create-deployment"`, HTTP 200 |
 | `gpu-rentals-live.json` | `GET /api/gpu/rentals` after that apply |
+| `lanes-live.json` | `GET /api/lanes`, trimmed to the two lanes that remain (Modal, Kaggle) |
+
+The captures of the Cerebrium bundle and compute routes were deleted with those routes: they
+documented a lane this router no longer offers, and nothing read them.
 
 How they were captured: a second conductor instance on `127.0.0.1:20999` with its own
 `MANAROUTER_CONFIG_DIR` / `MANAROUTER_STATE_DIR` under `/tmp`, addressed with `python3 -c` +

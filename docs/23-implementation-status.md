@@ -201,35 +201,30 @@ in the conductor, presentation in the panel, and the request path in the relay.
 * `crates/mr-core/src/gpu/requantize.rs` — the "this quant does not exist, here is how to make it"
   planner.
 * `crates/mr-core/src/rental.rs` — the persisted account and deployment shapes.
-* `crates/mr-core/src/gpu/cerebrium.rs` — a `cerebrium.toml` generator (issue #10): a **pure,
-  side-effect-free** function from a request to the file text, the deploy command and the base URL —
-  it writes no config, no vault, and no filesystem artefact. A test posts the body through the real
-  router and asserts the config bytes and snapshot bytes are **unchanged** (20 tests).
 * `crates/mr-core/src/lane/` — one descriptor per host, with the platform's own words for what the
   host will not let you do; no HTTP, no clock, no verdicts beyond the ones quoted.
-* `crates/manarouter-conductor/src/gpu_api.rs` — **seven routes**: `GET /api/gpu/catalog`,
-  `POST /api/gpu/probe`, `GET /api/gpu/rentals`, `POST /api/gpu/apply`,
-  `POST /api/gpu/launch-plan`, `POST /api/gpu/lanes/cerebrium/bundle`, and
-  `GET /api/gpu/lanes/cerebrium/compute`. `apply` is create-only: there is no update or delete route
+* `crates/manarouter-conductor/src/gpu_api.rs` — **six routes**: `GET /api/gpu/catalog`,
+  `GET /api/gpu/lanes`, `POST /api/gpu/probe`, `GET /api/gpu/rentals`, `POST /api/gpu/apply` and
+  `POST /api/gpu/launch-plan`. `apply` is create-only: there is no update or delete route
   for an account or a deployment, which is why the panel's account step offers an already-stored
   account (id + stored credential) instead of pretending to edit it.
+* `crates/manarouter-conductor/src/lane_kaggle.rs` — **four lane routes** for the one lane that
+  remains: `status`, `run`, `run/{id}`, `runs`. Kaggle is batch only and has no attach route.
 * `panel/gpu-setup-model.js` (pure) and `panel/view-gpu-rentals.js` (the two-mode view).
-* The panel's Cerebrium bundle button is implemented, not pending:
-  `grep -c cerebrium panel/view-gpu-rentals.js` returns 29 matches. Lane cards for molab, saturn and
-  cerebrium attach an account inline (`POST /api/gpu/lanes/{platform}/attach`); Kaggle has no form
-  because it has no attach route.
+* The panel's lane surface is one Kaggle card. `grep -c -i cerebrium panel/view-gpu-rentals.js`
+  returns 2, both inside the comment recording that the lane was removed; there is no bundle button
+  and no attach form left to implement, because neither route exists.
 * `crates/manarouter-relay/src/batch.rs` — the durable batch lane that mode B dispatches through.
 
 `crates/mr-core/src/gpu/mod.rs` states the split: that tree contains **no HTTP, no filesystem access
 and no clock**, so every number is checkable in a unit test with no network and no GPU.
 
-**What has actually been exercised.** `cargo test -p mr-core gpu::cerebrium` is green — 20 passed.
-`node --test panel/test/gpu-setup-model.test.mjs` is green — 116 passed. The workspace lib suite
-is green — 1 696 passed, 0 failed (`cargo test --workspace --lib`) — the panel suite is green
-(336 tests, `node --test panel/test/*.test.mjs`), and — the part that matters most — a second
+**What has actually been exercised.** The workspace lib suite is green — 1 661 passed, 0 failed
+(`cargo test --workspace --lib`) — the panel suite is green (334 tests, `node --test
+panel/test/*.test.mjs`), and — the part that matters most — a second
 conductor built from this tree was driven over a socket on `127.0.0.1:20999` with its own config and
 state directories, through the real sequence: catalog → probe → create account → create deployment →
-read the rental back. Live captures of four of those responses are committed under
+read the rental back. Live captures of those responses are committed under
 `docs/research/fixtures/` so that the next change is checked against the real wire shape rather than a
 remembered one.
 
@@ -295,60 +290,41 @@ have for any card; inventing one is the guess the module refuses to make.
 Still not verified: no batch has been submitted to a real GPU and observed to complete, so every
 figure in the lane is a computation over a recorded measurement rather than a fresh observation.
 
-**The other four hosts (issues #10–#13) are implemented as lane routes, and none has been driven
-against the real platform from this host.** The catalogue answers two different questions
+**One lane is implemented (issue #11, Kaggle), and it has not been driven against the real
+platform from this host.** The catalogue answers two different questions
 separately, because they have different answers per host: *what hardware exists*
 (`GET /api/gpu/catalog`) and *what may I do with it* (`GET /api/lanes`). The second route reports,
-per host, the shape of the lane (serving / batch / attended), whether a request can be answered
+per host, the shape of the lane (serving / batch), whether a request can be answered
 while it is open, how a job is submitted, which credential kind is needed, session and idle limits,
 the published quota rules, and a `Warning` with the platform's own clause and URL when the platform
 restricts the feature that was requested. A warning never blocks: the operator's ruling is one
 account per person, so a policy finding travels with its citation and the person who owns the
 account decides.
 
-* **#10 Cerebrium** — five routes: `status`, `attach`, `deploy`, `down`, `probe`, plus the
-  side-effect-free `bundle` route that renders `cerebrium.toml` and the deterministic base URL
-  `https://api.cerebrium.ai/v4/{project}/{app}/v1` (a test asserts the config and snapshot bytes are
-  unchanged). Attach takes the **service-account** token for the control plane; inference needs the
-  project API key, and the lane refuses to treat one as the other. `deploy` requires an explicit
-  `disable_auth`, because Cerebrium defaults it to `true` and would otherwise publish an
-  unauthenticated endpoint.
 * **#11 Kaggle** — four routes: `status`, `run`, `run/{id}`, `runs`, batch only. It has no attach
   route: it drives the `kaggle` CLI on this host under the operator's own login, and `status`
   reports `kaggle_cli_present` and `credential_configured` without contacting Kaggle. A run posts a
   kernel and returns files; it cannot answer in-line. The Terms §3 one-active-account finding is a
   warning, not an enforcement, per the operator's ruling.
-* **#13 molab** — three routes: `status`, `attach`, `down`. Attach takes `{account, url, token}` and
-  probes before registering, so a redirect or a non-JSON answer is refused rather than stored. The
-  URL must be the notebook's own endpoint: molab's terms forbid proxying its compute, so the lane
-  builds no tunnel.
-* **#12 Saturn Cloud** — five routes: `status`, `attach`, `budget`, `probe`, `down`. Attach takes `{account, host, token}` and expects the operator's SSH tunnel on
-  `127.0.0.1:8000`; the lane never opens one. `budget {"used_secs": N}` records self-reported usage
-  against the 150-hour free allowance and is enforced as a refusal when it is exceeded; `null`
-  clears the record rather than implying a full allowance.
 
 Two honesty constraints carried into the UI: a `(Paid)` per-card badge is only shown where the
-platform really does gate card types by plan (Cerebrium, enforced at deploy time), not on Modal,
-which documents no such gating; and the panel invents no facts — it renders the route's rows,
+platform really does gate card types by plan (none of the remaining platforms does), and the panel
+invents no facts — it renders the route's rows,
 including the warnings and the lane's own `detail`/`note`/`notes` text.
 
-The panel is a **read-only** lane surface: it renders one status card per host from the four
-`GET …/status` routes and states the attach route and its fields, but attach, deploy, run and down
-exist only as HTTP routes. `POST /api/gpu/lanes/cerebrium/bundle` is the one lane route with a panel
-control.
+The panel is a **read-only** lane surface: it renders one Kaggle status card from
+`GET /api/gpu/lanes/kaggle/status`. There is no attach route to document, and deploy, run and down
+exist only as HTTP routes, so the card names no button it cannot offer.
 
-**Lane registrations survive a conductor restart.** Saturn, molab and Cerebrium write the credential
-they were given to the encrypted vault under `lane:<platform>:<account>`, and the conductor
-re-registers those accounts before it binds the listener. A restored account is not probed at
-startup, and its status says `restored from the vault; not probed since this process started` until
-a probe replaces it — remembering an endpoint is not the same as measuring it. Attaching returns
-`remembered: true|false` so an operator learns immediately when the vault refused. Kaggle is
-unaffected: its credential is the `kaggle` CLI's own login, not a lane secret.
-[26-gpu-lanes.md](26-gpu-lanes.md) §12 describes the scheme.
+**Nothing survives a restart, and nothing needs to.** Saturn Cloud, molab and Cerebrium used to
+write the credential they were given to the encrypted vault under `lane:<platform>:<account>` so the
+accounts came back; those lanes and the shared `lane_vault.rs` helper were removed with them. Kaggle
+never used it — its credential is the `kaggle` CLI's own login, not a lane secret — so no lane
+credential is stored today. [26-gpu-lanes.md](26-gpu-lanes.md) §9 records the removal.
 
-Test totals: `cargo test -p manarouter-conductor` → 25 `gpu_api` tests, 11 Kaggle, 7 molab, 13
-Saturn, 18 Cerebrium, 6 lane-vault (all passing). `cargo test --workspace --lib` → 1 694 passing.
-`node --test panel/test/*.test.mjs` → 332 passing.
+Test totals: `cargo test -p manarouter-conductor --lib` → 23 `gpu_api` tests, 11 Kaggle (all
+passing). `cargo test --workspace --lib` → 1 661 passing. `node --test panel/test/*.test.mjs` → 334
+passing.
 
 ## 5. Claims that remain unverified or false
 

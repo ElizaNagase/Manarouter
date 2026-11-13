@@ -1,6 +1,11 @@
 # ISSUE 13: Deploy molab as an attended inference lane with multi-account endpoint switching
 # Deploy molab as an attended inference lane with multi-account endpoint switching
 
+> **Historical (2026-11-13).** This document specifies molab. The molab lane, its routes and its
+> vault entry were removed from Manarouter on 2026-11-13, so nothing below is implemented any
+> more. It is kept as the research and design record; the lane surface that is live today is
+> [../26-gpu-lanes.md](../26-gpu-lanes.md).
+
 Supersedes #9 ("Do not automate molab; document and add a manual GitHub handoff instead"). That issue
 was right that molab cannot be *provisioned* by software, and wrong to stop there: provisioning is
 attended, but **attachment, health checking, failover and account switching are all automatable**, and

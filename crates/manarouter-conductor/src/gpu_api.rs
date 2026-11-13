@@ -7,8 +7,7 @@
 //! * `POST /api/gpu/probe`    — read a Hugging Face repository and say what it would take to serve it;
 //! * `GET  /api/gpu/rentals`  — the configured rental accounts and the providers derived from them;
 //! * `POST /api/gpu/apply`    — create a rental account, or turn one into a serving provider;
-//! * `GET  /api/gpu/lanes/cerebrium/compute` — the accepted Cerebrium compute ids;
-//! * `POST /api/gpu/lanes/cerebrium/bundle`  — render the Cerebrium deployment file.
+//! * `POST /api/gpu/launch-plan` — what starting this checkpoint on this lane would cost and need.
 //!
 //! # What this module will not say
 //!
@@ -75,10 +74,6 @@ use mr_core::gpu::catalog::{
     resolve_kv_dtype_for, resolve_quant_for, ComputeCapability, GpuSpec, QuantSupport,
     CATALOG_CHECKED_AT, CUDA_GPUS_URL, ISSUE_4_URL, MODAL_GPU_DOCS_URL, MODAL_PRICING_URL,
     VLLM_KV_CACHE_URL, VLLM_QUANT_MATRIX_URL,
-};
-use mr_core::gpu::cerebrium::{
-    artefact as cerebrium_artefact, compute_by_id as cerebrium_compute_by_id,
-    Tuning as CerebriumTuning, COMPUTE_TYPES as cerebrium_compute_types,
 };
 use mr_core::gpu::sizing::{size_deployment, SizingRequest, SizingResult};
 use mr_core::lane::{plan_lane, LaneKind, Traffic};
@@ -172,11 +167,6 @@ pub fn routes() -> Router<AppState> {
         .route("/api/gpu/rentals", get(get_rentals))
         .route("/api/gpu/apply", post(post_apply))
         .route("/api/gpu/launch-plan", post(post_launch_plan))
-        .route("/api/gpu/lanes/cerebrium/bundle", post(post_lane_bundle))
-        .route(
-            "/api/gpu/lanes/cerebrium/compute",
-            get(get_cerebrium_compute),
-        )
 }
 
 // ---------------------------------------------------------------------------
@@ -387,153 +377,6 @@ fn lanes_body() -> Value {
     json!({
         "lanes": rows,
         "note": "Policy facts read from each platform's own documents, not live quotas. A \"refusal\" is something the platform physically cannot do; a \"warning\" quotes a term the operator should read. Warnings never make a lane unusable, because the deployment shape — several people, one account each — is the operator's decision.",
-    })
-}
-
-// ---------------------------------------------------------------------------
-// POST /api/gpu/lanes/cerebrium/bundle
-// ---------------------------------------------------------------------------
-
-/// Render the `cerebrium.toml` for a deployment, writing nothing.
-///
-/// Every other route in this module either reads a catalogue or commits a deployment, and a commit
-/// needs a stored credential. That makes a lane whose credential has not been bought yet impossible
-/// to try at all: the operator would have to sign up, read four documentation pages, and hand-write
-/// the TOML before discovering that `compute = "H100"` is Modal's spelling and not Cerebrium's. This
-/// route is a pure function of its body, so that discovery costs one request.
-///
-/// It exists for Cerebrium and not for Modal because Modal's artefact embeds an account-bound
-/// provider id and is already emitted by `POST /api/gpu/apply`, while Cerebrium's artefact depends
-/// on nothing this process knows: the app name determines the URL, so the file and the base URL are
-/// both computable before anything is deployed.
-///
-/// `cpu` and `memory` are **required rather than defaulted**. `gpu::sizing` answers "how much VRAM
-/// does the checkpoint leave for KV cache"; it has no estimate of host RAM, and a fabricated figure
-/// would produce a container that dies inside the loader with nothing in the log to explain it. The
-/// platform requires both keys, so the caller states both and the error says why.
-async fn post_lane_bundle(JsonBody(body): JsonBody) -> ApiResult<Json<Value>> {
-    let map = object_body(body, "bundle")?;
-    let required_text = |key: &str| -> ApiResult<String> {
-        string_field(&map, key).ok_or_else(|| {
-            ApiError::bad(
-                "invalid_body",
-                format!("the bundle body needs a non-empty `{key}`"),
-            )
-        })
-    };
-    let required_number = |key: &str| -> ApiResult<f64> {
-        match map.get(key).and_then(Value::as_f64) {
-            Some(value) => Ok(value),
-            None => Err(ApiError::bad(
-                "invalid_body",
-                format!(
-                    "the bundle body needs `{key}` as a number; Cerebrium requires it and this \
-                     router does not compute it"
-                ),
-            )),
-        }
-    };
-
-    let app = required_text("app")?;
-    let repo = required_text("repo")?;
-    if let Some(problem) = repo_problem(&repo) {
-        return Err(ApiError::bad("invalid_body", problem));
-    }
-    let compute = required_text("compute")?;
-    // Reject an id the platform does not accept here, where the message can list the ones it does,
-    // rather than at deploy time, where it names neither the field nor the accepted set.
-    if cerebrium_compute_by_id(&compute).is_none() {
-        let problem = mr_core::gpu::cerebrium::Problem::UnknownCompute(compute.clone());
-        return Err(ApiError::bad(problem.code(), problem.to_string()));
-    }
-    let cpu = required_number("cpu")?;
-    let memory_gb = required_number("memory_gb")?;
-
-    let gpu_count = field_u32(&map, "gpu_count")?.unwrap_or(1);
-    let max_num_seqs = field_u32(&map, "max_num_seqs")?;
-    let max_replicas = field_u32(&map, "max_replicas")?.unwrap_or(1);
-    let cooldown_secs = field_u32(&map, "cooldown_secs")?.unwrap_or(10);
-
-    let tuning = CerebriumTuning {
-        app,
-        project: string_field(&map, "project"),
-        repo,
-        revision: string_field(&map, "revision"),
-        compute,
-        gpu_count,
-        cpu,
-        memory_gb,
-        max_model_len: map.get("max_model_len").and_then(Value::as_u64),
-        max_num_seqs,
-        kv_cache_dtype: string_field(&map, "kv_cache_dtype").unwrap_or_else(|| "auto".to_owned()),
-        weight_quant: string_field(&map, "weight_quant").unwrap_or_else(|| "none".to_owned()),
-        cooldown_secs,
-        max_replicas,
-        vllm_pin: string_field(&map, "vllm_pin"),
-    };
-
-    let artefact = cerebrium_artefact(&tuning)
-        .map_err(|problem| ApiError::bad(problem.code(), problem.to_string()))?;
-
-    Ok(Json(json!({
-        "lane": "cerebrium",
-        "app": tuning.app,
-        "filename": artefact.filename,
-        "text": artefact.text,
-        "command": artefact.command,
-        "base_url": artefact.base_url,
-        "warnings": artefact.warnings,
-        "applies_on": "nothing",
-        "applies_on_note": "this route writes no config, stores no credential and deploys nothing; \
-                            it renders the file you would otherwise assemble by hand. Run the \
-                            command from a directory containing this file.",
-    })))
-}
-
-/// An optional unsigned integer field, reported as `invalid_body` when present but not one.
-fn field_u32(map: &Map<String, Value>, key: &str) -> ApiResult<Option<u32>> {
-    match map.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => match value.as_u64().and_then(|n| u32::try_from(n).ok()) {
-            Some(number) => Ok(Some(number)),
-            None => Err(ApiError::bad(
-                "invalid_body",
-                format!("`{key}` must be a whole number between 0 and {}", u32::MAX),
-            )),
-        },
-    }
-}
-
-// ---------------------------------------------------------------------------
-// GET /api/gpu/lanes/cerebrium/compute
-// ---------------------------------------------------------------------------
-
-async fn get_cerebrium_compute() -> Json<Value> {
-    Json(compute_body())
-}
-
-/// The accepted `compute` ids for the Cerebrium lane, returned as a flat list.
-///
-/// The body is a pure read from the `mr_core` constant and never touches the vault or the
-/// configuration, so there is nothing to commit and no credentials to worry about.
-pub fn compute_body() -> Value {
-    let rows: Vec<Value> = cerebrium_compute_types
-        .iter()
-        .map(|compute| {
-            json!({
-                "id": compute.id,
-                "label": compute.label,
-                "vram_gb": compute.vram_gb.map(|v| v as i64),
-                "usd_per_second": compute.usd_per_second,
-                "max_gpu_count": compute.max_gpu_count,
-                "plan": compute.plan,
-            })
-        })
-        .collect();
-    json!({
-        "lane": "cerebrium",
-        "compute": rows,
-        "note": "These are the only `compute =` ids accepted by this router; Modal's `H100` is not one of them.",
     })
 }
 
@@ -3460,25 +3303,22 @@ mod tests {
                 .clone()
         };
 
-        // Three hosts answer a request while it is open. Kaggle collects files. molab needs a human.
-        for id in ["modal", "cerebrium", "saturn"] {
-            assert_eq!(
-                row(id)["can_serve_requests"],
-                json!(true),
-                "{id} should serve requests"
-            );
-        }
+        // Modal answers a request while it is open. Kaggle collects files and has no endpoint.
+        assert_eq!(
+            row("modal")["can_serve_requests"],
+            json!(true),
+            "modal should serve requests"
+        );
+        assert_eq!(
+            row("modal")["can_run_batch"],
+            json!(true),
+            "modal can also run a job"
+        );
         assert_eq!(row("kaggle")["can_serve_requests"], json!(false));
         assert_eq!(
             row("kaggle")["can_run_batch"],
             json!(true),
             "a kernel push is unattended"
-        );
-        assert_eq!(row("molab")["can_serve_requests"], json!(false));
-        assert_eq!(
-            row("molab")["can_run_batch"],
-            json!(false),
-            "molab has no job API"
         );
 
         // A refusal must quote the platform, not the router's opinion.
@@ -3503,161 +3343,6 @@ mod tests {
             assert!(row["headline"].as_str().unwrap().len() > 20);
         }
         assert!(body["note"].as_str().unwrap().contains("not live quotas"));
-    }
-
-    // --- the Cerebrium artefact route ---
-
-    use axum::http::StatusCode;
-
-    fn cerebrium_body(compute: &str) -> Value {
-        json!({
-            "app": "manarouter-demo",
-            "project": "p-abc123",
-            "repo": "Qwen/Qwen3.8-27B",
-            "compute": compute,
-            "cpu": 8,
-            "memory_gb": 64,
-            "max_model_len": 32768,
-            "max_num_seqs": 64,
-            "kv_cache_dtype": "fp8",
-            "cooldown_secs": 120,
-        })
-    }
-
-    /// Post one bundle request through the real router, so the path and the extractor are exercised
-    /// rather than only the handler.
-    async fn post_bundle(state: &AppState, body: Value) -> (StatusCode, Value) {
-        use axum::body::Body;
-        use axum::http::{Method, Request as HttpRequest};
-        use http_body_util::BodyExt;
-        use tower::ServiceExt;
-
-        let response = crate::api::router(state.clone())
-            .oneshot(
-                HttpRequest::builder()
-                    .method(Method::POST)
-                    .uri("/api/gpu/lanes/cerebrium/bundle")
-                    .header("content-type", "application/json")
-                    .header("origin", "http://127.0.0.1:20901")
-                    .body(Body::from(body.to_string()))
-                    .expect("request"),
-            )
-            .await
-            .expect("router responded");
-        let status = response.status();
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .expect("body")
-            .to_bytes();
-        let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        (status, json)
-    }
-
-    #[tokio::test]
-    async fn the_cerebrium_bundle_route_renders_a_deployable_file_and_writes_nothing() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let state = state_in(dir.path());
-        let before = std::fs::read(dir.path().join("config.json")).expect("the saved config");
-        let before_snapshot = std::fs::read(dir.path().join("routes.snapshot")).ok();
-
-        let (status, body) = post_bundle(&state, cerebrium_body("HOPPER_H100")).await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "the bundle route should answer: {body}"
-        );
-
-        let text = body["text"].as_str().expect("the file text");
-        assert_eq!(body["filename"], json!("cerebrium.toml"));
-        assert_eq!(body["command"], json!("cerebrium deploy -y --detach"));
-        assert_eq!(
-            body["base_url"],
-            json!("https://api.cerebrium.ai/v4/p-abc123/manarouter-demo/v1"),
-            "the URL is computable before the deploy"
-        );
-        // The two keys whose platform defaults would silently break a vLLM app.
-        assert!(text.contains("disable_auth = false"), "{text}");
-        assert!(text.contains("replica_concurrency = 64"), "{text}");
-        assert!(text.contains("compute = \"HOPPER_H100\""), "{text}");
-        assert!(body["warnings"].as_array().expect("warnings").len() >= 3);
-
-        // Nothing was written: not the config, not the snapshot, not the vault.
-        let after = std::fs::read(dir.path().join("config.json")).expect("the saved config");
-        assert_eq!(before, after, "the bundle route must not touch the config");
-        assert_eq!(
-            before_snapshot,
-            std::fs::read(dir.path().join("routes.snapshot")).ok(),
-            "the bundle route must not recompile the snapshot"
-        );
-        assert_eq!(
-            state.config.read().await.rental_accounts.len(),
-            0,
-            "the bundle route must not add a rental account"
-        );
-
-        // A Modal compute id is not a Cerebrium one, and the refusal names the ones that are.
-        let (status, body) = post_bundle(&state, cerebrium_body("H100")).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["code"], json!("unknown_compute"));
-        let message = body["error"]["message"].as_str().expect("a message");
-        assert!(message.contains("HOPPER_H100"), "got: {message}");
-
-        // Hardware figures are required, and the refusal says why rather than defaulting them.
-        let mut without_memory = cerebrium_body("HOPPER_H100");
-        without_memory
-            .as_object_mut()
-            .expect("object")
-            .remove("memory_gb");
-        let (status, body) = post_bundle(&state, without_memory).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["code"], json!("invalid_body"));
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .expect("a message")
-                .contains("does not compute it"),
-            "got: {body}"
-        );
-    }
-
-    #[test]
-    fn the_cerebrium_compute_route_returns_all_accepted_compute_types() {
-        let body = compute_body();
-        assert_eq!(body["lane"], "cerebrium");
-
-        let rows = body["compute"].as_array().expect("compute is an array");
-        assert_eq!(rows.len(), 13, "the platform publishes 13 accepted ids");
-
-        let ids: Vec<&str> = rows
-            .iter()
-            .map(|r| r["id"].as_str().expect("id is a string"))
-            .collect();
-        assert!(
-            ids.contains(&"BLACKWELL_RTX6000"),
-            "must include BLACKWELL_RTX6000; got: {ids:?}"
-        );
-        assert!(
-            !ids.contains(&"H100"),
-            "Modal's bare H100 must not be present; got: {ids:?}"
-        );
-
-        for (i, row) in rows.iter().enumerate() {
-            assert!(
-                row["label"].as_str().is_some_and(|s| !s.is_empty()),
-                "row {i} is missing a non-empty label: {row}"
-            );
-            assert!(
-                row["plan"].as_str().is_some_and(|s| !s.is_empty()),
-                "row {i} is missing a non-empty plan: {row}"
-            );
-        }
-
-        assert!(
-            body["note"].as_str().is_some_and(|s| !s.is_empty()),
-            "note must be non-empty"
-        );
     }
 
     // --- the launch plan ---

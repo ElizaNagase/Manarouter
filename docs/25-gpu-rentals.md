@@ -11,7 +11,8 @@ the panel shows, and what Manarouter will refuse to pretend.
 
 ## API routes
 
-The conductor exposes eight GPU-rental endpoints:
+The conductor exposes six GPU-rental endpoints, plus the lane routes in
+[26-gpu-lanes.md](26-gpu-lanes.md):
 
 | Method | Route | Purpose |
 |---|---|---|
@@ -21,8 +22,6 @@ The conductor exposes eight GPU-rental endpoints:
 | `GET` | `/api/gpu/rentals` | current rentals and their state |
 | `POST` | `/api/gpu/apply` | submit a rental application |
 | `POST` | `/api/gpu/launch-plan` | order the configured deployments into launch waves (§9) |
-| `POST` | `/api/gpu/lanes/cerebrium/bundle` | render `cerebrium.toml` for deployment |
-| `GET` | `/api/gpu/lanes/cerebrium/compute` | accepted Cerebrium compute types — pure read, 13 rows; Modal H100 not accepted |
 
 > **Status.** Read [23-implementation-status.md](23-implementation-status.md) before relying on any
 > behaviour described here. This document describes the intended contract; the status note there says
@@ -64,9 +63,11 @@ confidence, and hands the irreversible platform action to the human.
 
 | Platform | Flow |
 |---|---|
-| **Cerebrium** | `POST /api/gpu/lanes/cerebrium/bundle` returns the `cerebrium.toml` file, the exact `cerebrium deploy -y --detach` command, and a **deterministic base URL** at `https://api.cerebrium.ai/v4/{project}/{app}/v1` — the operator runs the command and Manarouter uses the URL directly. Before choosing, `GET /api/gpu/lanes/cerebrium/compute` lists the accepted compute types (pure read, 13 rows; Modal H100 not accepted). |
-| **Saturn** | A provider row is created pointing at the deployed endpoint; token factory docs are pending (no provider doc yet). |
-| **Kaggle / molab** | Serving is **refused by each platform's Terms of Service**. Manarouter marks both with `can_serve_requests: false` and will not present them as viable serving targets. |
+| **Kaggle** | Serving is **not possible**: a notebook has no inbound endpoint, so Manarouter marks Kaggle `can_serve_requests: false` and will not present it as a viable serving target. Work is submitted as a kernel and collected as files ([26-gpu-lanes.md](26-gpu-lanes.md) §3). |
+
+Cerebrium, Saturn Cloud and molab were also listed here as deployment paths. Their lanes were removed
+from the router — with their routes, their generator and their vault entries — so this document no
+longer describes them. What remains for these platforms is the record under `docs/research/`.
 
 ---
 
@@ -282,9 +283,7 @@ life scaled to zero, and the panel does not show one.
 - **Serve request/response traffic from Kaggle.** A notebook has no inbound endpoint, so there is
   nowhere for the relay to send a request. The lanes API marks Kaggle `can_serve_requests: false`
   for that physical reason, not as a policy judgement, and the panel will not offer it as a serving
-  target. molab is different: it has a live endpoint and is marked with an *attended* shape, which
-  describes the arrangement accurately — a notebook a person is running — without pretending it is
-  an unattended lane. See [26-gpu-lanes.md](26-gpu-lanes.md).
+  target. See [26-gpu-lanes.md](26-gpu-lanes.md).
 
 The last five are the same rule stated five ways: where the platform does not publish a fact,
 Manarouter reports *what it does know* and *how it knows it*, and refuses to manufacture the rest.
@@ -349,8 +348,8 @@ own type.
 
 - [research/ARCHITECTURE-gpu-rentals.md](research/ARCHITECTURE-gpu-rentals.md) — the frozen interface:
   object model, config schema, conductor API, catalogues, and the platform facts with sources.
-- [26-gpu-lanes.md](26-gpu-lanes.md) — the four lane surfaces on the conductor: routes, request and
-  error shapes, and which platform can hold an endpoint open at all.
+- [26-gpu-lanes.md](26-gpu-lanes.md) — the remaining lane surface on the conductor (Kaggle): routes,
+  request and error shapes, and why no batch platform can hold an endpoint open at all.
 - [providers/modal-vllm.md](providers/modal-vllm.md) — the `modal-vllm` dialect on the wire.
 - [research/modal-platform.md](research/modal-platform.md) — the verified Modal facts: GPU ids,
   prices, plans, proxy tokens, `scaledown_window`.

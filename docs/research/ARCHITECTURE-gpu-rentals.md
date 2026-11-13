@@ -4,6 +4,11 @@ Status: **authoritative interface spec** for the work in progress (2026-11-12).
 Every agent working on this feature reads this file first. Do not change a wire name,
 a file path, or a JSON key in this document without saying so explicitly in your report.
 
+> **Amended 2026-11-13.** Saturn Cloud, molab and Cerebrium were removed from the router: their lane
+> modules, routes and vault entries are gone, and `RentalPlatform` now lists only `modal` and
+> `kaggle`. References to them below are kept as the record of what was designed and why it changed;
+> for the surface that is live today read [../26-gpu-lanes.md](../26-gpu-lanes.md).
+
 Provenance marker used throughout: **[facts]** = verified against primary documentation and
 recorded in this directory's research files; **[observed]** = measured by the operator and recorded
 in `issue-4-spec.md`; **[inferred]** = derived by us and clearly labelled as an estimate in the UI.
@@ -18,14 +23,14 @@ differ, the contract is the intent and this list is the truth.
 * `crates/mr-core/src/rental.rs` — the account and deployment shapes, `RentalSchedule`
   (`sequential` by default, `batched:N`), and launch-wave planning, all unit-tested.
 * `crates/manarouter-conductor/src/gpu_api.rs` — seven routes: the five in §5 plus
-  `POST /api/gpu/launch-plan` and `GET /api/gpu/lanes/cerebrium/compute`. `apply` creates, and
+  `POST /api/gpu/launch-plan` and `GET /api/gpu/lanes`. `apply` creates, and
   answers `409 already_exists` for a taken id or an existing vault entry; there is no update or
   delete route.
-* Bundle generation — `modal_app.py` and its `modal deploy` command, and the Cerebrium
-  `cerebrium.toml` and its deploy command.
+* Bundle generation — `modal_app.py` and its `modal deploy` command. (The Cerebrium `cerebrium.toml`
+  generator went with issue #10's lane, removed 2026-11-13.)
 * The panel setup flow (catalog → account → model → sizing → bundle), including reuse of an account
   that is already stored: `USE` points a second deployment at the same id and sends no credential.
-* Four lanes held in conductor memory: Kaggle, Molab, Saturn, Cerebrium.
+* One lane held in conductor memory: Kaggle. (Molab, Saturn and Cerebrium were removed 2026-11-13.)
 
 **Not implemented, and not claimed by the panel**
 
@@ -33,9 +38,9 @@ differ, the contract is the intent and this list is the truth.
   container starts when the operator runs the bundle's command.
 * A per-batch dollar cap. `RentalDeployment` has no budget field; the panel reports measured cost
   after the fact and derives nothing it did not measure.
-* Lane credential persistence. An attach keeps its token in process memory, so a conductor restart
-  empties every lane (`docs/26-gpu-lanes.md`).
-* A Saturn tunnel owned by the process. The operator runs `ssh`; the lane starts no child process.
+* Lane credential persistence. The lanes that remembered an attach (Saturn, molab, Cerebrium) wrote
+  it to the vault; those lanes were removed together with `lane_vault.rs`, so no lane credential is
+  stored today (`docs/26-gpu-lanes.md` §9).
 
 ---
 
@@ -133,7 +138,7 @@ model is chosen, and many deployments share it.
 pub struct RentalAccount {
     pub id: String,                    // slug, operator-visible, unique
     pub label: String,
-    pub platform: RentalPlatform,      // "modal" | "cerebrium" | "kaggle" | "saturn" | "molab" | "custom:<x>"
+    pub platform: RentalPlatform,      // "modal" | "kaggle" | "custom:<x>"
     pub plan: RentalPlan,              // "free" | "paid" | "unknown"
     pub secret_ref: Option<String>,    // vault entry id holding the platform's combined credential
     pub hf_secret_ref: Option<String>, // vault entry id holding a HuggingFace token, when needed
@@ -874,8 +879,8 @@ Recorded here deliberately, so the gap is visible rather than silently absorbed.
   See §7.
 * **Requirement 6's requantisation is a recipe, not an action.** Manarouter records the recipe and
   shows the command; it does not run a multi-hour GPU job. See §8.
-* **Issues #10–#13 are not addressed here.** The seam (`RentalPlatform`) is built so they can be, but
-  Cerebrium, Kaggle, Saturn Cloud and molab are not implemented by this workstream.
+* **Issues #10, #12 and #13 are not addressed here, and their lanes were removed on 2026-11-13.**
+  The seam (`RentalPlatform`) is built so others can be added, but only Modal and Kaggle remain.
 
 ### 11.2 Open questions the requantisation recipes could not close
 

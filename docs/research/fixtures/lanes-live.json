@@ -1,268 +1,113 @@
 {
-    "lanes": [
+  "lanes": [
+    {
+      "kind": "modal",
+      "id": "modal",
+      "display": "Modal",
+      "shape": "serving",
+      "inbound": "public-endpoint",
+      "submission": "cli",
+      "credentials": [
+        "proxy-token-pair"
+      ],
+      "accounts": {
+        "verdict": "allowed"
+      },
+      "max_session_secs": null,
+      "idle_shutdown_secs": 60,
+      "quota": [
         {
-            "kind": "modal",
-            "id": "modal",
-            "display": "Modal",
-            "shape": "serving",
-            "inbound": "public-endpoint",
-            "submission": "cli",
-            "credentials": [
-                "proxy-token-pair"
-            ],
-            "accounts": {
-                "verdict": "allowed"
-            },
-            "max_session_secs": null,
-            "idle_shutdown_secs": 60,
-            "quota": [
-                {
-                    "what": "gpu-concurrency",
-                    "limit": "10 GPUs on Starter, 50 on Team",
-                    "reset": null,
-                    "source": "https://modal.com/pricing"
-                },
-                {
-                    "what": "containers",
-                    "limit": "100 containers on Starter, 5000 on Team",
-                    "reset": null,
-                    "source": "https://modal.com/pricing"
-                }
-            ],
-            "use_scope": null,
-            "headline": "Serverless GPUs behind proxy tokens; a cold start per container and a 60 s idle shutdown by default.",
-            "sources": [
-                "https://modal.com/docs/guide/gpu.md",
-                "https://modal.com/pricing",
-                "https://modal.com/docs/guide/cold-start",
-                "https://modal.com/docs/guide/webhook-urls"
-            ],
-            "can_serve_requests": true,
-            "can_run_batch": true,
-            "refusals": {
-                "synchronous": [],
-                "batch": []
-            }
+          "what": "gpu-concurrency",
+          "limit": "10 GPUs on Starter, 50 on Team",
+          "reset": null,
+          "source": "https://modal.com/pricing"
         },
         {
-            "kind": "cerebrium",
-            "id": "cerebrium",
-            "display": "Cerebrium",
-            "shape": "serving",
-            "inbound": "public-endpoint",
-            "submission": "rest-api",
-            "credentials": [
-                "service-account-token",
-                "api-key"
-            ],
-            "accounts": {
-                "verdict": "allowed"
-            },
-            "max_session_secs": null,
-            "idle_shutdown_secs": 10,
-            "quota": [
-                {
-                    "what": "apps",
-                    "limit": "Up to 3 deployed apps on Hobby; unlimited on Standard and Enterprise",
-                    "reset": null,
-                    "source": "https://cerebrium.ai/pricing"
-                },
-                {
-                    "what": "gpu-types",
-                    "limit": "A100, H100, H200, B200 and RTX PRO 6000 require Standard or Enterprise; a compute type outside the project's plan is rejected at deploy time",
-                    "reset": null,
-                    "source": "https://cerebrium.ai/docs/hardware/using-gpus"
-                }
-            ],
-            "use_scope": null,
-            "headline": "REST-deployed serverless GPUs with OpenAI path passthrough; every card worth running vLLM on is Standard or above.",
-            "sources": [
-                "https://cerebrium.ai/pricing",
-                "https://cerebrium.ai/docs/hardware/using-gpus",
-                "https://cerebrium.ai/docs/scaling/scaling-apps",
-                "https://cerebrium.ai/docs/toml-reference/toml-reference",
-                "https://cerebrium.ai/docs/endpoints/inference-api",
-                "https://cerebrium.ai/docs/v4/examples/gpt-oss",
-                "https://s3.eu-west-1.amazonaws.com/www.cerebrium.ai/openapi_spec.json",
-                "https://raw.githubusercontent.com/CerebriumAI/cerebrium/main/internal/api/client.go",
-                "https://cerebrium.ai/terms-of-service"
-            ],
-            "can_serve_requests": true,
-            "can_run_batch": true,
-            "refusals": {
-                "synchronous": [],
-                "batch": []
-            }
-        },
-        {
-            "kind": "kaggle",
-            "id": "kaggle",
-            "display": "Kaggle Notebooks",
-            "shape": "batch",
-            "inbound": "none",
-            "submission": "kernel-push",
-            "credentials": [
-                "api-token"
-            ],
-            "accounts": {
-                "verdict": "prohibited",
-                "clause": "You also may not have, control, or operate under more than one active Kaggle account or Kaggle User ID",
-                "source": "https://www.kaggle.com/terms"
-            },
-            "max_session_secs": 43200,
-            "idle_shutdown_secs": null,
-            "quota": [
-                {
-                    "what": "gpu-hours",
-                    "limit": "The quota resets weekly and is 30 hours or sometimes higher depending on demand and resources",
-                    "reset": "weekly",
-                    "source": "https://www.kaggle.com/docs/efficient-gpu-usage"
-                },
-                {
-                    "what": "tpu-hours",
-                    "limit": "up to 20 hours per week of TPUs and up to 9h at a time in a single session",
-                    "reset": "weekly",
-                    "source": "https://www.kaggle.com/docs/tpu"
-                },
-                {
-                    "what": "session-length",
-                    "limit": "12 h for CPU and GPU sessions, 9 h for TPU sessions",
-                    "reset": null,
-                    "source": "https://www.kaggle.com/docs/notebooks#technical-specifications"
-                }
-            ],
-            "use_scope": {
-                "text": "You will only use the Services for your own internal, personal, non-commercial use, and not on behalf of or for the benefit of any third party",
-                "source": "https://www.kaggle.com/terms"
-            },
-            "headline": "Batch only: a submitted kernel takes minutes per call and returns files, never a live response; a second account is a Terms \u00a73 ban, and Kaggle's own docs disagree on whether an idle session dies at 20 or 60 minutes.",
-            "sources": [
-                "https://www.kaggle.com/docs/api",
-                "https://github.com/Kaggle/kaggle-cli/blob/main/skills/references/auth.md",
-                "https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels.md",
-                "https://www.kaggle.com/docs/notebooks#technical-specifications",
-                "https://www.kaggle.com/docs/efficient-gpu-usage",
-                "https://www.kaggle.com/docs/tpu",
-                "https://www.kaggle.com/terms"
-            ],
-            "can_serve_requests": false,
-            "can_run_batch": true,
-            "refusals": {
-                "synchronous": [
-                    {
-                        "code": "lane_is_batch_only",
-                        "message": "Kaggle Notebooks runs submitted jobs and returns files; it has no endpoint a chat request can be answered from",
-                        "source": "https://www.kaggle.com/docs/api"
-                    }
-                ],
-                "batch": []
-            }
-        },
-        {
-            "kind": "saturn",
-            "id": "saturn",
-            "display": "Saturn Cloud",
-            "shape": "serving",
-            "inbound": "public-endpoint",
-            "submission": "rest-api",
-            "credentials": [
-                "api-token"
-            ],
-            "accounts": {
-                "verdict": "allowed"
-            },
-            "max_session_secs": null,
-            "idle_shutdown_secs": 3600,
-            "quota": [
-                {
-                    "what": "gpus-per-instance",
-                    "limit": "8 GPUs per instance \u2014 reached by g4dn.metal, p3.16xlarge, g5.48xlarge and Nebius 8xH100",
-                    "reset": null,
-                    "source": "https://saturncloud.io/plans/hosted/"
-                },
-                {
-                    "what": "auto-shutoff",
-                    "limit": "1 hour, 6 hours, 24 hours, 3 days, 7 days or Never; Jupyter servers default to 1 hour",
-                    "reset": null,
-                    "source": "https://api.saturncloud.io/reference/workspaces_create-1.md"
-                },
-                {
-                    "what": "plan-quota",
-                    "limit": "per-plan and machine-readable only: GET /api/limits reports hours_per_day, hours_per_month, hours_forever, instance_sizes, num_instances, auto_shutoff and storage_in_gb; the values are not published and were not read",
-                    "reset": null,
-                    "source": "https://api.saturncloud.io/reference/limits_list-1.md"
-                }
-            ],
-            "use_scope": null,
-            "headline": "An OpenAI-compatible Token Factory endpoint created and started entirely over the API, at the cost of one hand-minted token and with no verified free tier.",
-            "sources": [
-                "https://saturncloud.io/docs/inference/calling-endpoints/",
-                "https://saturncloud.io/docs/inference/",
-                "https://api.saturncloud.io/reference/inferenceendpoints_create.md",
-                "https://api.saturncloud.io/llms.txt",
-                "https://saturncloud.io/docs/user-guide/how-to/access/tokens/",
-                "https://saturncloud.io/docs/user-guide/how-to/access/autoshutoff/",
-                "https://api.saturncloud.io/reference/workspaces_create-1.md",
-                "https://saturncloud.io/docs/user-guide/how-to/resources/deployments/",
-                "https://saturncloud.io/docs/user-guide/how-to/access/ide_ssh/",
-                "https://saturncloud.io/plans/hosted/",
-                "https://saturncloud.io/plans/hosted-orgs/",
-                "https://api.saturncloud.io/reference/limits_list-1.md"
-            ],
-            "can_serve_requests": true,
-            "can_run_batch": true,
-            "refusals": {
-                "synchronous": [],
-                "batch": []
-            }
-        },
-        {
-            "kind": "molab",
-            "id": "molab",
-            "display": "molab",
-            "shape": "attended",
-            "inbound": "none",
-            "submission": "manual",
-            "credentials": [
-                "none"
-            ],
-            "accounts": {
-                "verdict": "allowed"
-            },
-            "max_session_secs": 43200,
-            "idle_shutdown_secs": 5400,
-            "quota": [],
-            "use_scope": {
-                "text": "connecting to remote proxies or otherwise exposing molab compute to outside traffic; reselling compute to third parties",
-                "source": "https://marimo.io/pages/molab/restrictions"
-            },
-            "headline": "A person must be at the keyboard to attach the GPU and run cells; the notebook is not a server, and tunnelling traffic through it is grounds for termination without notice.",
-            "sources": [
-                "https://docs.marimo.io/guides/molab/",
-                "https://marimo.io/pages/molab/restrictions",
-                "https://clerk.marimo.io/v1/environment",
-                "https://marimo.io/pages/legal/terms",
-                "https://marimo.io/blog/reintroducing-molab"
-            ],
-            "can_serve_requests": false,
-            "can_run_batch": false,
-            "refusals": {
-                "synchronous": [
-                    {
-                        "code": "lane_is_attended",
-                        "message": "molab needs a person to open the session, so it cannot answer a request that arrives while nobody is watching",
-                        "source": "https://docs.marimo.io/guides/molab/"
-                    }
-                ],
-                "batch": [
-                    {
-                        "code": "lane_is_attended",
-                        "message": "molab has no job API: work is started by hand and returns files, so it cannot be queued",
-                        "source": "https://docs.marimo.io/guides/molab/"
-                    }
-                ]
-            }
+          "what": "containers",
+          "limit": "100 containers on Starter, 5000 on Team",
+          "reset": null,
+          "source": "https://modal.com/pricing"
         }
-    ],
-    "note": "Policy facts read from each platform's own documents, not live quotas. A \"refusal\" is the platform's rule quoted back, not this router's preference."
+      ],
+      "use_scope": null,
+      "headline": "Serverless GPUs behind proxy tokens; a cold start per container and a 60 s idle shutdown by default.",
+      "sources": [
+        "https://modal.com/docs/guide/gpu.md",
+        "https://modal.com/pricing",
+        "https://modal.com/docs/guide/cold-start",
+        "https://modal.com/docs/guide/webhook-urls"
+      ],
+      "can_serve_requests": true,
+      "can_run_batch": true,
+      "refusals": {
+        "synchronous": [],
+        "batch": []
+      }
+    },
+    {
+      "kind": "kaggle",
+      "id": "kaggle",
+      "display": "Kaggle Notebooks",
+      "shape": "batch",
+      "inbound": "none",
+      "submission": "kernel-push",
+      "credentials": [
+        "api-token"
+      ],
+      "accounts": {
+        "verdict": "prohibited",
+        "clause": "You also may not have, control, or operate under more than one active Kaggle account or Kaggle User ID",
+        "source": "https://www.kaggle.com/terms"
+      },
+      "max_session_secs": 43200,
+      "idle_shutdown_secs": null,
+      "quota": [
+        {
+          "what": "gpu-hours",
+          "limit": "The quota resets weekly and is 30 hours or sometimes higher depending on demand and resources",
+          "reset": "weekly",
+          "source": "https://www.kaggle.com/docs/efficient-gpu-usage"
+        },
+        {
+          "what": "tpu-hours",
+          "limit": "up to 20 hours per week of TPUs and up to 9h at a time in a single session",
+          "reset": "weekly",
+          "source": "https://www.kaggle.com/docs/tpu"
+        },
+        {
+          "what": "session-length",
+          "limit": "12 h for CPU and GPU sessions, 9 h for TPU sessions",
+          "reset": null,
+          "source": "https://www.kaggle.com/docs/notebooks#technical-specifications"
+        }
+      ],
+      "use_scope": {
+        "text": "You will only use the Services for your own internal, personal, non-commercial use, and not on behalf of or for the benefit of any third party",
+        "source": "https://www.kaggle.com/terms"
+      },
+      "headline": "Batch only: a submitted kernel takes minutes per call and returns files, never a live response; a second account is a Terms \u00a73 ban, and Kaggle's own docs disagree on whether an idle session dies at 20 or 60 minutes.",
+      "sources": [
+        "https://www.kaggle.com/docs/api",
+        "https://github.com/Kaggle/kaggle-cli/blob/main/skills/references/auth.md",
+        "https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels.md",
+        "https://www.kaggle.com/docs/notebooks#technical-specifications",
+        "https://www.kaggle.com/docs/efficient-gpu-usage",
+        "https://www.kaggle.com/docs/tpu",
+        "https://www.kaggle.com/terms"
+      ],
+      "can_serve_requests": false,
+      "can_run_batch": true,
+      "refusals": {
+        "synchronous": [
+          {
+            "code": "lane_is_batch_only",
+            "message": "Kaggle Notebooks runs submitted jobs and returns files; it has no endpoint a chat request can be answered from",
+            "source": "https://www.kaggle.com/docs/api"
+          }
+        ],
+        "batch": []
+      }
+    }
+  ],
+  "note": "Policy facts read from each platform's own documents, not live quotas. A \"refusal\" is the platform's rule quoted back, not this router's preference."
 }

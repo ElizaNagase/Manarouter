@@ -254,3 +254,122 @@ Sources: https://modal.com/docs/guide/gpu.md (ids), https://modal.com/pricing
 | T4 | 0.000164 | 0.5904 |
 | CPU (per core) | 0.0000131 | 0.04716 |
 | Memory (per GiB) | 0.00000222 | 0.007992 |
+
+## Verified against Modal's own CLI output (2026-11-12)
+
+A second kind of evidence from the Q1–Q10 above: a live `modal` CLI session in the operator's own
+terminal rather than a documentation page. It records how Modal's real login and credential surface
+compares with what this tree implements. No credential material is reproduced here or anywhere else
+in this document — only the `ak-` / `as-` / `wk-` / `ws-` prefixes Modal uses to *name* each class.
+
+**What Modal's own tooling shows**
+
+- `modal token set --token-id ak-... --token-secret as-... --profile=<name>` creates or updates a
+  **named profile**, and the tool warns that the token secret is displayed only once.
+  `modal profile activate <name>` then selects that profile.
+- Environment/config shapes named by Modal: `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`,
+  `MODAL_PROFILE`, and a `.modal.toml` profile file. Q8 above already lists these from the docs; the
+  CLI session confirms they are the shapes `token set` / `profile activate` actually write and read.
+- For **webhook / proxy authentication** (Auto Endpoints and Modal Servers) Modal documents two
+  equivalent forms: the header pair `Modal-Key: wk-...` with `Modal-Secret: ws-...`, **or** a single
+  `Authorization: Bearer wk-....ws-...` for OpenAI-compatible clients and gateways, the two parts
+  joined by a single `.`. Q5 above records both; nothing there changed.
+- The `ak-...` / `as-...` pair is a **CLI login pair** and the `wk-...` / `ws-...` pair is a **proxy
+  token pair**. They are different credential classes for different jobs, not two encodings of one
+  credential.
+
+**The three shapes side by side**
+
+| Credential shape | What Modal does with it | What Manarouter stores / sends | What matches | What does not match |
+|---|---|---|---|---|
+| CLI login pair `ak-...` / `as-...` | `modal token set` writes it into a **named profile** (`--profile=<name>`), readable also as `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` / `MODAL_PROFILE` / `.modal.toml`; selected with `modal profile activate` | Nothing. No column, vault slot, environment shape or dialect accepts it, and the panel refuses it in the proxy-token fields (see the trap note below) | Only that both sides treat a credential as a two-part value | Everything else: no profile field, no config file, no env shape, no consumer of this class |
+| Proxy token pair `wk-...` + `ws-...`, sent as `Modal-Key` + `Modal-Secret` | One of the two accepted webhook/proxy forms | Stored as **one combined string** at `rental:<account id>`, split on the single `.` per request and sent as exactly these two headers | The pair, the header names, the split point, the `wk-`/`ws-` prefixes | Modal lets an operator name, keep and switch between pairs; we hold one pair per account and expose no rotation or replace surface of our own |
+| Single `Authorization: Bearer wk-....ws-...` | The other accepted form, for OpenAI-compatible clients and gateways | **Not offered.** No dialect spelling emits it; every writer emits the header pair instead | The combined `id.secret` string is byte-for-byte what Modal's bearer form carries, so the split produces the right two halves | We cannot send this form at all: a client or fronting gateway that wants one header has no configuration path |
+
+**How the pair is stored — already specified, not repeated**
+
+`docs/research/ARCHITECTURE-gpu-rentals.md` §4 (lines 218–236) already settles the storage shape and
+this section does not restate it: the platform credential lives at `rental:<account id>` as **one
+combined string** (`wk-<token id>.ws-<token secret>`, joined by a single `.`) rather than a JSON
+bundle; a Hugging Face token, when needed, goes to `rental:<account id>:hf`; the apply path refuses a
+missing dot, a second dot, an empty half or whitespace; and the entry is written exactly once at
+account creation because `Vault::put` is not reference-counted. What this section adds is the pairing
+of that decision with the shape Modal's own CLI actually handed the operator.
+
+**Verified in the tree while writing this section (2026-11-12)**
+
+- `crates/mr-core/src/dialect.rs:485-523` — `enum AuthKind`, with the `Modal` variant at :509-510
+  documented as "Modal-style authentication, using `Modal-Key` and `Modal-Secret` headers".
+- `crates/mr-core/src/catalog.rs:1352-1362` — `auth_cell` renders `AuthKind::Modal` as `` `modal` ``
+  (:1359). Note for anyone following an older pointer: there is **no**
+  `crates/manarouter-conductor/src/catalog.rs` — `auth_cell` lives in `mr-core`'s catalogue module,
+  at the lines given here.
+- `crates/mr-core/src/lane/modal.rs:41` — `credentials: &[Credential::ProxyTokenPair]`;
+  `crates/mr-core/src/lane/mod.rs:222-240` — `ProxyTokenPair` documented as "Two-part proxy token,
+  sent as platform-specific headers" (:228-229); `LaneKind::Modal` at `lane/mod.rs:69-70`.
+- `crates/mr-core/src/model.rs:275` — an account stores one `secret_ref`. There is no token-id,
+  token-secret or profile column anywhere in `Account`.
+- `crates/manarouter-conductor/src/gpu_api.rs:97-115` — `rental_credential_id` returns
+  `rental:<account id>` and documents the **combined** `wk-<token_id>.ws-<token_secret>` value;
+  `rental_hf_token_id` returns `rental:<account id>:hf`. The shape refusal is
+  `modal_credential_problem` (`:117-132`).
+- Split points: `crates/manarouter-relay/src/server.rs:4028-4042` (`apply_auth` splits with
+  `split_once('.')` and inserts `modal-key` / `modal-secret`); `crates/manarouter-conductor/src/api.rs:2461-2477`
+  (same split, and the `invalid_credential` message "Modal account secrets must be the Token
+  ID.Token Secret pair"); `crates/mr-cli/src/provider.rs:898-906` (`auth_headers`, same split).
+- `panel/gpu-setup-model.js:1722-1723` — two `kind: 'password'` fields, `tokenId` and `tokenSecret`;
+  validated separately at `:2017-2026`, rejecting `^ak-` in the id field (`:2019-2021`) and `^as-` in
+  the secret field (`:2024-2026`); the pair is combined into the one vault entry.
+- `panel/view-providers.js:281` — the "Modal vLLM" platform entry has `baseUrl: ''`: the operator
+  supplies the app URL. On the apply path `base_url` is required from the request body
+  (`gpu_api.rs:1822-1830`, "the endpoint URL Modal prints when the bundle is deployed ... it cannot
+  be guessed, because Modal assigns it per app"), and `gpu_api.rs:2061-2063` builds the provider from
+  that URL with `AuthKind::Modal`. The only hardcoded Modal constants are documentation links
+  (`crates/mr-core/src/lane/modal.rs:23-30`, `crates/mr-core/src/gpu/catalog.rs:47-51`). No inference
+  endpoint is hardcoded anywhere.
+
+**Gaps**
+
+1. **No named-profile concept.** `MODAL_PROFILE` and `.modal.toml` occur nowhere in the tree outside
+   this document (and Q8's description of them); a repository-wide search for the strings finds only
+   these notes. One account carries one credential, and there is no way to say "this account is
+   Modal's `staging` profile" — nor to keep a `default` and a named profile side by side, which is
+   exactly what `modal token set --profile=` exists for.
+2. **The `ak-...` / `as-...` login pair is not modelable as an account secret.** `Account` has one
+   `secret_ref` (`model.rs:275`) and no token-id / token-secret / profile fields, so the pair has
+   nowhere to live; and the only Modal reader in the tree expects the proxy pair, splitting on `.`
+   and failing with the Token ID.Token Secret message. Refusing that class is correct behaviour, but
+   it also means Manarouter cannot hold the credential that `modal deploy` itself needs.
+3. **The single-header form is absent.** Our relay always sends the two headers
+   (`server.rs:4028-4047`), and `AuthKind::Modal` (`dialect.rs:485-523`) names only the header pair.
+   The `Authorization: Bearer wk-....ws-...` form Modal documents for OpenAI-compatible clients and
+   gateways is therefore not an alternative dialect we can be configured into; a caller that wants
+   one header in front of us has to terminate that elsewhere.
+4. **OPEN, not guessed:** whether `mr account add --secret-stdin` can create a `modal-vllm`
+   (`AuthKind::Modal`) provider account at all, or whether such accounts arise only through
+   `POST /api/gpu/apply` (`gpu_api.rs:9` and `:173` register that route). Facts observed, no
+   conclusion drawn: `add_with` (`crates/mr-cli/src/account.rs:284-330`) resolves the provider id
+   first, reads the secret, writes it to a provider-derived vault id and performs **no**
+   auth-kind-specific shape check; `parse_auth` (`crates/mr-cli/src/provider.rs:177-224`) lists
+   `bearer`, `api-key`/`api-key-header`, `header`, `query`/`query-param` and `oauth` and no `modal`
+   spelling, but it tries the serde spelling first (`:180`), so the accepted set cannot be read off
+   the match arms alone. Left open deliberately; recorded here rather than under §Unverified so the
+   question stays with its evidence.
+
+**The `ak-`/`as-`-in-the-wrong-field trap is already guarded**
+
+The two prefixes are easy to confuse, and a login pair sent as `Modal-Key`/`Modal-Secret` would be
+the wrong credential class at the wrong door — presumably answered as an ordinary auth failure that
+says nothing about the cause (what Modal returns for that case is **UNVERIFIED**, not stated in the
+evidence). The panel's account
+step prevents that: it collects the two proxy-token halves as separate password fields
+(`gpu-setup-model.js:1722-1723`), validates each independently (`:2017-2026`), and rejects an `ak-`
+value in the id field and an `as-` value in the secret field with a message naming the class that
+belongs there. An operator pasting the wrong credential class gets an explicit refusal in the form,
+not a confusing upstream error later. The guard is **panel-side only**: `mr account add` stores
+whatever it is handed (`account.rs:284-330`), so a wrong-class paste on the CLI path is caught only
+when the first request fails.
+
+**Operator action.** The token pairs used during that verification session should be treated as
+exposed and rotated with Modal; no value is recorded in this document, in the repository or in any
+Manarouter configuration.

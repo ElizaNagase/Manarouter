@@ -208,8 +208,7 @@ Two scripts are worth knowing about:
   `/tmp/mr-test-relay-$PORT` (default `20905`) and runs a second relay there, so a change to the
   request path can be exercised without touching the instance your apps are using.
 - `scripts/gpu-lanes-e2e.py` is the acceptance sweep for the GPU lanes: it asks each lane for its
-  status, probes Saturn and Cerebrium where a probe route exists, and exits non-zero unless every
-  lane is ready. It starts nothing and spends nothing.
+  status and exits non-zero unless every lane is ready. It starts nothing and spends nothing.
 
 **Current implementation note:** `mr serve` runs both processes together with one Ctrl-C to stop
 them — it spawns the conductor and relay as child processes, so they keep the separate runtimes the
