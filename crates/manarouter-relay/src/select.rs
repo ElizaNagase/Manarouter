@@ -1268,7 +1268,12 @@ mod tests {
         let now = now_millis().max(0) as u64;
         let wait = 13 * 3_600_000u64 + 24 * 60_000;
         for failures in [0, 1, 2, 9] {
-            let until = cooldown_until(CooldownReason::QuotaExhausted, failures, Some(wait), &config);
+            let until = cooldown_until(
+                CooldownReason::QuotaExhausted,
+                failures,
+                Some(wait),
+                &config,
+            );
             assert!(
                 until <= now + wait + 50,
                 "the provider said {wait} ms; growth on a stated instant parks a healthy account"

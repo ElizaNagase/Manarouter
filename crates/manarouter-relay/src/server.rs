@@ -2385,42 +2385,90 @@ async fn attempt_step(
         None
     };
 
-    let request = UpstreamRequest {
-        method: method.clone(),
-        url,
-        headers: upstream_headers(
-            provider,
-            step,
-            credential.as_deref(),
-            headers,
-            &head,
-            force_stream,
-            dialect_content_type,
-            &oauth_headers,
-        ),
-        proxy: proxy_endpoint,
-        body: outgoing,
-        http2: provider.http2,
-        connect_timeout: Duration::from_millis(
-            provider
-                .cold_start_ttfb_timeout_ms
-                .map(|_| step.connect_timeout_ms.max(300_000))
-                .unwrap_or(step.connect_timeout_ms),
-        ),
-        ttfb_timeout: Duration::from_millis(
-            provider
-                .cold_start_ttfb_timeout_ms
-                .unwrap_or(step.ttfb_timeout_ms),
-        ),
-        total_timeout: (step.total_timeout_ms > 0).then(|| {
-            Duration::from_millis(
-                step.total_timeout_ms
-                    .max(provider.cold_start_ttfb_timeout_ms.unwrap_or(0)),
-            )
-        }),
+    let initial_body = outgoing.clone();
+    let mut current_body = outgoing;
+    let mut reconciled_once = false;
+
+    let response = loop {
+        let request = UpstreamRequest {
+            method: method.clone(),
+            url: url.clone(),
+            headers: upstream_headers(
+                provider,
+                step,
+                credential.as_deref(),
+                headers,
+                &head,
+                force_stream,
+                dialect_content_type,
+                &oauth_headers,
+            ),
+            proxy: proxy_endpoint.clone(),
+            body: current_body.clone(),
+            http2: provider.http2,
+            connect_timeout: Duration::from_millis(
+                provider
+                    .cold_start_ttfb_timeout_ms
+                    .map(|_| step.connect_timeout_ms.max(300_000))
+                    .unwrap_or(step.connect_timeout_ms),
+            ),
+            ttfb_timeout: Duration::from_millis(
+                provider
+                    .cold_start_ttfb_timeout_ms
+                    .unwrap_or(step.ttfb_timeout_ms),
+            ),
+            total_timeout: (step.total_timeout_ms > 0).then(|| {
+                Duration::from_millis(
+                    step.total_timeout_ms
+                        .max(provider.cold_start_ttfb_timeout_ms.unwrap_or(0)),
+                )
+            }),
+        };
+
+        match app.relay.upstream().send(request).await {
+            Ok(resp) if resp.status.is_success() => break Ok(resp),
+            Ok(resp)
+                if !reconciled_once
+                    && resp.status.is_client_error()
+                    && resp.status != StatusCode::UNAUTHORIZED
+                    && resp.status != StatusCode::FORBIDDEN
+                    && resp.status != StatusCode::TOO_MANY_REQUESTS =>
+            {
+                let first_frame = resp.body.first_frame_bytes();
+                let error_text = first_frame
+                    .map(|b| String::from_utf8_lossy(b))
+                    .unwrap_or_default();
+                let requested_effort = crate::reasoning::extract_requested_effort(&initial_body);
+
+                if let Some(action) =
+                    crate::reasoning::inspect_refusal(&error_text, requested_effort.as_deref())
+                {
+                    if let Some(new_body) =
+                        crate::reasoning::apply_reconcile_to_body(&initial_body, &action)
+                    {
+                        reconciled_once = true;
+                        let target_desc = match &action {
+                            crate::reasoning::ReconcileAction::Remap(target) => target.as_str(),
+                            crate::reasoning::ReconcileAction::DropField => "none (dropped)",
+                        };
+                        tracing::warn!(
+                            provider = %step.provider_id,
+                            model = model_name,
+                            original = requested_effort.as_deref().unwrap_or("unspecified"),
+                            reconciled = target_desc,
+                            "reconciling unsupported reasoning effort and retrying upstream attempt once"
+                        );
+                        current_body = Bytes::from(new_body);
+                        continue;
+                    }
+                }
+                break Ok(resp);
+            }
+            other => break other,
+        }
     };
 
-    match app.relay.upstream().send(request).await {
+    match response {
         Ok(response) if response.status.is_success() => {
             app.health.record_success(
                 provider.cooldown_scope,
@@ -3456,7 +3504,11 @@ fn stated_wait_ms(text: &str) -> Option<u64> {
     let lower = text.to_ascii_lowercase();
     ANCHORS
         .iter()
-        .find_map(|anchor| lower.find(anchor).and_then(|at| duration_after(&lower[at + anchor.len()..])))
+        .find_map(|anchor| {
+            lower
+                .find(anchor)
+                .and_then(|at| duration_after(&lower[at + anchor.len()..]))
+        })
         .or_else(|| reset_instant_ms(&lower, time::OffsetDateTime::now_utc()))
 }
 
@@ -3505,8 +3557,13 @@ fn reset_instant_ms(text: &str, now: time::OffsetDateTime) -> Option<u64> {
     }
 
     for (i, &(_, _, word)) in tokens.iter().enumerate() {
-        let Some(month) = month_of(word) else { continue };
-        let Some(day) = i.checked_sub(1).and_then(|d| tokens[d].2.parse::<u8>().ok()) else {
+        let Some(month) = month_of(word) else {
+            continue;
+        };
+        let Some(day) = i
+            .checked_sub(1)
+            .and_then(|d| tokens[d].2.parse::<u8>().ok())
+        else {
             continue;
         };
         let Some(year) = tokens.get(i + 1).and_then(|t| t.2.parse::<i32>().ok()) else {
@@ -3565,7 +3622,10 @@ fn clock_after(rest: &str) -> Option<(u8, u8)> {
             let hour_digits = bytes[i..].iter().take_while(|b| b.is_ascii_digit()).count();
             if hour_digits <= 2 && bytes.get(i + hour_digits) == Some(&b':') {
                 let minute_at = i + hour_digits + 1;
-                let minute_digits = bytes[minute_at..].iter().take_while(|b| b.is_ascii_digit()).count();
+                let minute_digits = bytes[minute_at..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_digit())
+                    .count();
                 if minute_digits == 2 {
                     let hour: u8 = rest[i..i + hour_digits].parse().ok()?;
                     let minute: u8 = rest[minute_at..minute_at + 2].parse().ok()?;
@@ -7108,7 +7168,10 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         let body = br#"{"success":false,"error":{"code":"BAD_REQUEST","status":400,"message":"You have insufficient credits. Please top up your account to continue."}}"#;
         let (reason, wait) = exhausted_by_body(body).expect("a spent balance");
         assert_eq!(reason, select::CooldownReason::QuotaExhausted);
-        assert_eq!(wait, None, "no reset was stated, so the default guess applies");
+        assert_eq!(
+            wait, None,
+            "no reset was stated, so the default guess applies"
+        );
     }
 
     #[test]
@@ -7126,13 +7189,24 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
 
     #[test]
     fn a_human_duration_is_read_in_the_forms_providers_write_it() {
-        assert_eq!(stated_wait_ms("resets in 13h 24m"), Some(13 * 3_600_000 + 24 * 60_000));
+        assert_eq!(
+            stated_wait_ms("resets in 13h 24m"),
+            Some(13 * 3_600_000 + 24 * 60_000)
+        );
         assert_eq!(stated_wait_ms("Resets every 24 hours"), Some(86_400_000));
         assert_eq!(stated_wait_ms("try again in 45 minutes"), Some(2_700_000));
         assert_eq!(stated_wait_ms("retry in 30s"), Some(30_000));
         assert_eq!(stated_wait_ms("available in 2 days"), Some(86_400_000));
-        assert_eq!(stated_wait_ms("resets in 0 seconds"), None, "a zero wait is no wait");
-        assert_eq!(stated_wait_ms("resets in 2 months"), None, "months are not minutes");
+        assert_eq!(
+            stated_wait_ms("resets in 0 seconds"),
+            None,
+            "a zero wait is no wait"
+        );
+        assert_eq!(
+            stated_wait_ms("resets in 2 months"),
+            None,
+            "months are not minutes"
+        );
         assert_eq!(stated_wait_ms("resets in 3 requests"), None);
         assert_eq!(stated_wait_ms("slow down"), None);
     }
@@ -7152,18 +7226,30 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
     fn a_weekly_reset_stated_as_a_date_is_read() {
         let now = time::macros::datetime!(2026-11-12 14:00:00 UTC);
         let message = "your next rolling 7-day period starts on 19 nov 2026 at 01:29 utc.";
-        assert_eq!(reset_instant_ms(message, now), Some(6 * 86_400_000 + 11 * 3_600_000 + 29 * 60_000));
+        assert_eq!(
+            reset_instant_ms(message, now),
+            Some(6 * 86_400_000 + 11 * 3_600_000 + 29 * 60_000)
+        );
     }
 
     #[test]
     fn a_date_that_promises_nothing_is_not_a_wait() {
         let now = time::macros::datetime!(2026-11-12 14:00:00 UTC);
         // No anchor, so this is a timestamp in a diagnostic, not a recovery instant.
-        assert_eq!(reset_instant_ms("request failed at 12 nov 2026 15:05 utc", now), None);
+        assert_eq!(
+            reset_instant_ms("request failed at 12 nov 2026 15:05 utc", now),
+            None
+        );
         // Already elapsed: the width of the reset is unknown, so leave it to the default guess.
-        assert_eq!(reset_instant_ms("resets on 12 nov 2026 at 13:00 utc", now), None);
+        assert_eq!(
+            reset_instant_ms("resets on 12 nov 2026 at 13:00 utc", now),
+            None
+        );
         // Further away than any real quota window: a typo, not a fact.
-        assert_eq!(reset_instant_ms("resets on 12 nov 2027 at 15:05 utc", now), None);
+        assert_eq!(
+            reset_instant_ms("resets on 12 nov 2027 at 15:05 utc", now),
+            None
+        );
         // A year is required; a missing one would turn a typo into a very long cooldown.
         assert_eq!(reset_instant_ms("resets on 12 nov at 15:05 utc", now), None);
     }
@@ -10893,5 +10979,313 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(!text.contains("sk-"), "{text}");
         assert!(!text.contains("http"), "{text}");
+    }
+
+    /// A mock upstream that records every request body it receives, and responds according to a closure.
+    async fn mock_upstream_custom<F>(handler: F) -> (String, Arc<std::sync::Mutex<Vec<String>>>)
+    where
+        F: Fn(usize, &str) -> (StatusCode, &'static str) + Send + Sync + 'static,
+    {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let handler = Arc::new(handler);
+
+        let app = Router::new().fallback(any(move |body: Bytes| {
+            let sink = Arc::clone(&sink);
+            let handler = Arc::clone(&handler);
+            async move {
+                let text = String::from_utf8_lossy(&body).into_owned();
+                let mut guard = sink.lock().unwrap();
+                let attempt = guard.len();
+                guard.push(text.clone());
+                drop(guard);
+
+                let (status, resp_body) = handler(attempt, &text);
+                (
+                    status,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    resp_body,
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    async fn reasoning_test_state<F>(
+        handler: F,
+    ) -> (
+        AppState,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tempfile::TempDir,
+    )
+    where
+        F: Fn(usize, &str) -> (StatusCode, &'static str) + Send + Sync + 'static,
+    {
+        let (url, seen) = mock_upstream_custom(handler).await;
+        let mut provider = keyless_provider();
+        provider.auth = AuthKind::Bearer;
+        provider.base_url = url;
+        let config = mr_core::config::Config {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let snapshot = mr_core::snapshot::RoutingSnapshot::compile(&config).unwrap();
+        let relay = Arc::new(RelayState::new(
+            &config,
+            snapshot,
+            crate::upstream::Upstream::from_latency(&config.latency).unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Arc::new(mr_core::secret::Vault::open(dir.path()).unwrap());
+        let store = Arc::new(mr_core::store::Store::open_in_memory().unwrap());
+        let state = AppState {
+            relay,
+            no_key_required: true,
+            health: Arc::new(crate::select::Health::new()),
+            vault,
+            oauth_refreshers: Arc::new(std::collections::HashMap::new()),
+            quota: Arc::new(crate::quota::QuotaManager::new(Arc::clone(&store))),
+            oauth_store: Arc::clone(&store),
+            quota_store: Arc::clone(&store),
+            sticky_success: Arc::new(crate::sticky::StickySuccess::default()),
+            activity: Arc::new(crate::activity::ActivityLog::new()),
+            kv_usage: Arc::new(crate::kv_budget::AdmissionPool::new()),
+            batch: crate::batch::BatchLane::inert(),
+        };
+        (state, seen, dir)
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_refusal_is_reconciled_to_nearest_and_retried_once() {
+        let (state, seen, _dir) = reasoning_test_state(|attempt, body| {
+            if attempt == 0 {
+                assert!(body.contains("\"reasoning_effort\":\"high\""));
+                (
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":{"message":"reasoning effort must be low, medium, xhigh","type":"invalid_request_error","code":"unsupported_reasoning_effort"}}"#,
+                )
+            } else {
+                assert!(body.contains("\"reasoning_effort\":\"xhigh\""));
+                (
+                    StatusCode::OK,
+                    r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"success"},"finish_reason":"stop"}]}"#,
+                )
+            }
+        })
+        .await;
+
+        let req_body = r#"{"model":"local/m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}"#;
+        let resp = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            HeaderMap::new(),
+            AxumBody::from(req_body.to_owned()),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sent = seen.lock().unwrap();
+        assert_eq!(
+            sent.len(),
+            2,
+            "exactly two upstream attempts: first rejected, second reconciled"
+        );
+        assert!(sent[0].contains("\"reasoning_effort\":\"high\""));
+        assert!(sent[1].contains("\"reasoning_effort\":\"xhigh\""));
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_accepted_value_issues_one_attempt_no_rewrite() {
+        let (state, seen, _dir) = reasoning_test_state(|_attempt, body| {
+            assert!(body.contains("\"reasoning_effort\":\"medium\""));
+            (
+                StatusCode::OK,
+                r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+            )
+        })
+        .await;
+
+        let req_body = r#"{"model":"local/m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"medium"}"#;
+        let resp = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            HeaderMap::new(),
+            AxumBody::from(req_body.to_owned()),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(seen.lock().unwrap().len(), 1, "exactly one attempt");
+    }
+
+    #[tokio::test]
+    async fn non_reconcilable_statuses_401_429_500_never_reconcile() {
+        for (status, body_text) in [
+            (
+                StatusCode::UNAUTHORIZED,
+                r#"{"error":{"message":"unauthorized: reasoning effort must be low"}}"#,
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"message":"rate limited: reasoning effort must be low"}}"#,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":{"message":"server error: reasoning effort must be low"}}"#,
+            ),
+        ] {
+            let (state, seen, _dir) =
+                reasoning_test_state(move |_attempt, _body| (status, body_text)).await;
+
+            let req_body = r#"{"model":"local/m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}"#;
+            let resp = dispatch(
+                state,
+                Dialect::OpenAi,
+                Method::POST,
+                Uri::from_static("/v1/chat/completions"),
+                HeaderMap::new(),
+                AxumBody::from(req_body.to_owned()),
+            )
+            .await;
+
+            assert_eq!(resp.status(), status);
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                1,
+                "never retried on status {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciled_request_refused_too_caps_at_two_attempts() {
+        let (state, seen, _dir) = reasoning_test_state(|attempt, _body| {
+            if attempt == 0 {
+                (
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":{"message":"reasoning effort must be low, medium, xhigh"}}"#,
+                )
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":{"message":"still bad request"}}"#,
+                )
+            }
+        })
+        .await;
+
+        let health = Arc::clone(&state.health);
+        let req_body = r#"{"model":"local/m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}"#;
+        let resp = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            HeaderMap::new(),
+            AxumBody::from(req_body.to_owned()),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(seen.lock().unwrap().len(), 2, "at most two attempts");
+        assert_eq!(
+            health.failures(
+                mr_core::model::CooldownScope::Account,
+                "local",
+                "local",
+                "m"
+            ),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_unsupported_without_list_drops_field_and_retries_once() {
+        let (state, seen, _dir) = reasoning_test_state(|attempt, body| {
+            if attempt == 0 {
+                assert!(body.contains("\"reasoning_effort\""));
+                (
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":{"message":"The reasoning_effort parameter is not supported by this model."}}"#,
+                )
+            } else {
+                assert!(!body.contains("\"reasoning_effort\""));
+                (
+                    StatusCode::OK,
+                    r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                )
+            }
+        })
+        .await;
+
+        let req_body = r#"{"model":"local/m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}"#;
+        let resp = dispatch(
+            state,
+            Dialect::OpenAi,
+            Method::POST,
+            Uri::from_static("/v1/chat/completions"),
+            HeaderMap::new(),
+            AxumBody::from(req_body.to_owned()),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sent = seen.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].contains("\"reasoning_effort\""));
+        assert!(!sent[1].contains("\"reasoning_effort\""));
+    }
+
+    #[test]
+    fn reasoning_ranking_table_and_tie_breaking_all_six_values() {
+        let candidates = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        // none (0) -> low (2) (closest)
+        assert_eq!(
+            crate::reasoning::find_closest_effort("none", &candidates),
+            Some("low".to_string())
+        );
+        // minimal (1) -> low (2) (closest)
+        assert_eq!(
+            crate::reasoning::find_closest_effort("minimal", &candidates),
+            Some("low".to_string())
+        );
+        // low (2) -> low (2) (exact)
+        assert_eq!(
+            crate::reasoning::find_closest_effort("low", &candidates),
+            Some("low".to_string())
+        );
+        // medium (3) -> medium (3) (exact)
+        assert_eq!(
+            crate::reasoning::find_closest_effort("medium", &candidates),
+            Some("medium".to_string())
+        );
+        // high (4) -> equidistant to medium(3, diff 1) and xhigh(5, diff 1) -> tie breaker picks HIGHER rank: xhigh
+        assert_eq!(
+            crate::reasoning::find_closest_effort("high", &candidates),
+            Some("xhigh".to_string())
+        );
+        // xhigh (5) -> xhigh (5) (exact)
+        assert_eq!(
+            crate::reasoning::find_closest_effort("xhigh", &candidates),
+            Some("xhigh".to_string())
+        );
+        // case insensitivity
+        assert_eq!(
+            crate::reasoning::find_closest_effort("HIGH", &candidates),
+            Some("xhigh".to_string())
+        );
+        assert_eq!(
+            crate::reasoning::find_closest_effort("Low", &candidates),
+            Some("low".to_string())
+        );
     }
 }

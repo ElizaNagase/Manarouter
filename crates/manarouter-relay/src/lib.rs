@@ -57,6 +57,7 @@ pub mod kv_budget;
 pub mod model_scan;
 pub mod proxy;
 pub mod quota;
+pub mod reasoning;
 pub mod recovery;
 pub mod select;
 pub mod server;
