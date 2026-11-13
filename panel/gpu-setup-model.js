@@ -81,14 +81,6 @@ export const MODAL_GPU_COUNT_LIMITS = Object.freeze({ A10: 4 });
 /** Cards per container when neither the catalog nor `MODAL_GPU_COUNT_LIMITS` says otherwise. */
 export const GPU_COUNT_LIMIT_DEFAULT = 8;
 
-/** Cerebrium compute type ids, matching `COMPUTE_TYPES` in the Rust bundle route. */
-export const CEREBRIUM_COMPUTE_IDS = Object.freeze([
-  'BLACKWELL_B200', 'HOPPER_H200', 'HOPPER_H100',
-  'BLACKWELL_RTX6000', 'AMPERE_A100_80GB', 'AMPERE_A100_40GB',
-  'ADA_L40', 'AMPERE_A10', 'ADA_L4', 'TURING_T4',
-  'INF2', 'TRN1', 'CPU',
-]);
-
 /**
  * Requantisation planning constants (§8, `requantize-recipes.md` §5).
  *
@@ -292,14 +284,6 @@ export function emptyDraft(platformId) {
     batchGpu: null,
     gpuMemoryUtilization: DEFAULT_GPU_MEMORY_UTILIZATION,
     baseUrl: '',
-    // Cerebrium-specific fields — UI defaults, not hardware measurements.
-    // `cerebriumApp` derives from the repo slug when the payload builder receives an empty value.
-    // `hostCpu` defaults to 8 cores and `hostMemoryGb` to 64 GiB.
-    cerebriumApp: '',
-    cerebriumProject: '',
-    cerebriumCompute: '',
-    hostCpu: 8,
-    hostMemoryGb: 64,
     sizing: null,
     probe: null,
   };
@@ -325,10 +309,6 @@ function normalizeDraft(draft) {
   if (merged.batchGpu === undefined) merged.batchGpu = null;
   if (merged.maxModelLen === undefined) merged.maxModelLen = null;
   if (merged.maxNumSeqs === undefined) merged.maxNumSeqs = null;
-  // Cerebrium fields — derive the app name from the repo slug when empty.
-  merged.cerebriumApp = text(merged.cerebriumApp) || slugify(merged.repo);
-  merged.cerebriumProject = text(merged.cerebriumProject);
-  merged.cerebriumCompute = text(merged.cerebriumCompute);
   return merged;
 }
 
@@ -1715,12 +1695,12 @@ export function stepList(draft, catalog = null) {
     {
       id: 'account',
       title: 'Account',
-      hint: 'A rental account exists before any model is chosen: it carries the workspace credentials every deployment bills against.',
+      hint: 'The workspace credentials every rental bills through. Continuing stores this account in the vault: it is not part of the draft, and the panel cannot delete an account later.',
       fields: [
         textField({ name: 'accountId', label: 'Account id', required: true, value: fieldValue(d, 'accountId'), placeholder: 'mana-modal', hint: 'Local identifier used by the deployment and the vault entry.' }),
         selectField({ name: 'plan', label: 'Plan', optionsSource: 'plans', required: true, value: planLabel, hint: 'Unknown is a real answer and is never rendered as free or as paid.' }),
-        textField({ name: 'tokenId', label: 'Modal proxy token id', kind: 'password', required: true, value: fieldValue(d, 'tokenId'), placeholder: 'wk-…', hint: 'Sent as the `Modal-Key` header by the relay. Stored in the vault; never rendered back.' }),
-        textField({ name: 'tokenSecret', label: 'Modal proxy token secret', kind: 'password', required: true, value: fieldValue(d, 'tokenSecret'), placeholder: 'ws-…', hint: 'Sent as the `Modal-Secret` header. The pair is stored as one vault entry so a half-configured account cannot exist.' }),
+        textField({ name: 'tokenId', label: 'Modal proxy token id', kind: 'password', required: true, value: fieldValue(d, 'tokenId'), placeholder: 'wk-…', hint: 'Half of the Modal proxy token pair: the `wk-…` id the relay sends as `Modal-Key`. Stored in the vault; never rendered back.' }),
+        textField({ name: 'tokenSecret', label: 'Modal proxy token secret', kind: 'password', required: true, value: fieldValue(d, 'tokenSecret'), placeholder: 'ws-…', hint: 'The other half: the `ws-…` secret sent as `Modal-Secret`. Both halves are stored as one vault entry, so an account cannot exist half-configured.' }),
         readout({
           name: 'planMarker', label: 'Plan marker', optionsSource: 'planMarker',
           hint: 'Shown only for a card the catalog marks `free_plan: "unavailable"`.',
@@ -1788,13 +1768,13 @@ export function stepList(draft, catalog = null) {
     {
       id: 'card',
       title: 'Card',
-      hint: 'Every catalog card is offered, with its own plan marker. Quantisation and KV dtype are filtered by what this card can execute.',
+      hint: 'The card this rental runs on. Its plan marker, its price and which quantisations are legal all come from it.',
       fields: [
-        selectField({ name: 'gpu', label: 'GPU', optionsSource: 'catalog.gpus', required: true, value: fieldValue(d, 'gpu'), hint: 'Canonical hyphenated id, e.g. `RTX-PRO-6000`. The catalog’s price and VRAM travel with it.' }),
+        selectField({ name: 'gpu', label: 'GPU', optionsSource: 'catalog.gpus', required: true, value: fieldValue(d, 'gpu'), hint: 'From the catalogue. The price, the VRAM ceiling and the legal quantisations on this step all follow from this choice.' }),
         numberField({ name: 'gpuCount', label: 'Cards', value: fieldValue(d, 'gpuCount'), min: 1, max: maxGpuCountFor(d.gpu, catalog), step: 1, required: true, hint: `Cards per container: up to ${GPU_COUNT_LIMIT_DEFAULT}, except A10 at ${MODAL_GPU_COUNT_LIMITS.A10}. More than one card needs tensor parallelism, and the KV pool is then assumed to be sharded evenly.` }),
         numberField({ name: 'gpuMemoryUtilization', label: 'GPU memory utilization', value: fieldValue(d, 'gpuMemoryUtilization'), min: 0.05, max: 1, step: 0.01, required: true, hint: 'vLLM’s own budget knob (default 0.92). It must cover weights, activations and CUDA graphs, not only the KV cache.' }),
         selectField({ name: 'weightQuant', label: 'Weight quantisation', optionsSource: 'quantOptions', enabled: hasRepo, required: hasRepo, value: fieldValue(d, 'weightQuant'), hint: hasRepo ? 'Only quants this repository ships, filtered by this card.' : 'Paste a model repo first: the quant list is resolved from the probe, not guessed.' }),
-        selectField({ name: 'kvCacheDtype', label: 'KV-cache dtype', optionsSource: 'kvDtypesForGpu', enabled: true, required: true, value: fieldValue(d, 'kvCacheDtype'), hint: 'A separate axis from weight quantisation, with separate legality.' }),
+        selectField({ name: 'kvCacheDtype', label: 'KV-cache dtype', optionsSource: 'kvDtypesForGpu', enabled: true, required: true, value: fieldValue(d, 'kvCacheDtype'), hint: 'Independent of the weight quantisation: each card has its own legal dtypes.' }),
         readout({
           name: 'gpuPrice', label: 'Price', optionsSource: 'catalog.gpus.price_usd_per_second',
           hint: 'Per second of container life. Modal bills per second, including the cold boot.',
@@ -2478,42 +2458,6 @@ export function applyPayload(draft, sizing) {
   if (wire) deployment.sizing = wire;
 
   return { action: 'create-deployment', account_id: d.accountId, deployment };
-}
-
-/**
- * The bundle-creation body for `POST /api/gpu/lanes/cerebrium/bundle`.
- *
- * Required strings are always included (even when empty); optional fields like
- * `max_model_len`, `max_num_seqs`, `kv_cache_dtype`, `weight_quant`, `cooldown_secs`,
- * `max_replicas` and `vllm_pin` are omitted when they are falsy or empty after trimming.
- *
- * @param {object} draft
- */
-export function cerebriumBundlePayload(draft) {
-  const d = normalizeDraft(draft);
-  const body = {
-    app: text(d.cerebriumApp) || slugify(d.repo),
-    project: text(d.cerebriumProject),
-    repo: text(d.repo),
-    revision: text(d.revision),
-    compute: text(d.cerebriumCompute),
-    gpu_count: Math.max(1, Math.trunc(toNumber(d.gpuCount) ?? 1)),
-    cpu: d.hostCpu ?? 8,
-    memory_gb: d.hostMemoryGb ?? 64,
-  };
-  // Optional fields — omit when empty or falsy.
-  const opt = (key, wire) => {
-    const val = d[key];
-    if (val != null && String(val).trim() !== '') body[wire] = String(val).trim();
-  };
-  opt('maxModelLen', 'max_model_len');
-  opt('maxNumSeqs', 'max_num_seqs');
-  opt('kvCacheDtype', 'kv_cache_dtype');
-  opt('weightQuant', 'weight_quant');
-  opt('shutdownCooldownSecs', 'cooldown_secs');
-  opt('maxReplicas', 'max_replicas');
-  opt('vllmPin', 'vllm_pin');
-  return body;
 }
 
 // ---------------------------------------------------------------------------

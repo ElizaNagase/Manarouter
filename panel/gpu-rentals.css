@@ -108,15 +108,6 @@
   border-bottom-color: color-mix(in srgb, var(--amber) 25%, transparent);
 }
 
-/* The attach form sits inside a lane card, between its status and its actions. It is structure, so
- * it is a grey rule and grey labels; the only pink on it is the Attach button, which is interaction. */
-.gpu-rentals .gpu-attach {
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--line);
-}
-.gpu-rentals .gpu-attach .field { margin-bottom: 8px; }
-
 /* ---------- plan limits ---------- */
 
 .gpu-rentals .gpu-plan-note { margin-bottom: 10px; }
@@ -346,9 +337,6 @@
 /* The plan probe's answer: a detail under the controls, not another box. */
 .gpu-rentals .gpu-plan-result { margin-top: 12px; }
 .gpu-rentals .gpu-plan-result-line { color: inherit; }
-
-/* The plan block is a detail of the card, not a second card: indent with a rule, not a border box. */
-.gpu-rentals .gpu-plan-block { margin-top: 10px; padding-left: 8px; border-left: 1px solid var(--line); }
 
 .gpu-rentals .gpu-plan-marker {
   display: flex;

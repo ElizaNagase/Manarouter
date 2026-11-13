@@ -426,6 +426,16 @@ function findButton(root, label) {
   return button;
 }
 
+// The account step is the flow's only write before the end, so its forward button names the write.
+// Every other step, and the review step, keep their own label.
+function advanceButton(root) {
+  const labels = ['Save account', 'Save rental', 'Continue'];
+  const button = descendants(root).find((el) => el.tagName === 'BUTTON'
+    && labels.includes(String(el.textContent ?? '').trim()));
+  assert.ok(button, 'expected a forward button on the step');
+  return button;
+}
+
 function fire(el, type) {
   assert.ok(el, 'cannot dispatch an event on a missing element');
   const listeners = el.listeners?.[type] ?? [];
@@ -514,49 +524,20 @@ const lanes = () => ({
   note: 'Policy facts read from each platform.'
 });
 
-// Every endpoint the inventory reads on mount, in the order it asks. The four lane status routes
-// are fetched together and independently: one lane being down must not hide the other three.
+// Every endpoint the inventory reads on mount, in the order it asks. Kaggle is the one lane left
+// after Molab, Saturn Cloud and Cerebrium were removed from the panel.
 const ENDPOINTS = [
   '/api/gpu/rentals',
   '/api/gpu/catalog',
   '/api/lanes',
   '/api/gpu/lanes/kaggle/status',
-  '/api/gpu/lanes/molab/status',
-  '/api/gpu/lanes/saturn/status',
-  '/api/gpu/lanes/cerebrium/status',
 ];
 
-// Lane statuses shaped like the conductor's answers: Kaggle reports readiness and per-account
-// health, Saturn reports a budget that is null until an operator records usage, Cerebrium reports a
-// registered app, and Molab reports a warm host.
+// The lane status shaped like the conductor's answer: readiness and per-account health.
 const laneStatuses = () => ({
   '/api/gpu/lanes/kaggle/status': {
     ready: true,
     accounts: [{ account: 'kaggle-work', host: 'kaggle.com', health: 'healthy', failure_count: 0, warnings: [] }],
-  },
-  '/api/gpu/lanes/molab/status': {
-    status: 'ok',
-    accounts: [{ account: 'molab-main', host: 'molab.google.com', warm: true, remaining: 3600, failure_count: 0 }],
-  },
-  '/api/gpu/lanes/saturn/status': {
-    status: 'ok',
-    plan: {
-      budget: { used_secs: null, remaining_secs: null, total_secs: 540000, measured: false, cap_exceeded: false },
-      warnings: [{ code: 'budget_unrecorded', message: 'usage is recorded by the operator' }],
-    },
-    accounts: [{ account: 'saturn-work', host: 'saturncloud.io', health: 'healthy', warm: false, failure_count: 0 }],
-  },
-  '/api/gpu/lanes/cerebrium/status': {
-    status: 'ok',
-    ready: true,
-    detail: null,
-    accounts: [{
-      account: 'cerebrium-main',
-      app_name: 'manarouter-a1b2',
-      project_id: 'proj-1',
-      health: 'healthy',
-      warm: false,
-    }],
   },
 });
 
@@ -602,27 +583,25 @@ test('inventory renders the account table with a fingerprint and never the secre
   assert.ok(!text.includes(TOKEN_FINGERPRINT), 'even the full fingerprint is middle-truncated');
 });
 
-test('a lane that names what is missing is quoted, and an empty lane says how to attach', async () => {
+test('a lane that names what is missing is quoted, and an empty lane says there is no attach route', async () => {
   const handlers = standardHandlers();
-  handlers['/api/gpu/lanes/cerebrium/status'] = {
+  handlers['/api/gpu/lanes/kaggle/status'] = {
     ready: false,
-    detail: 'No Cerebrium project is attached. Attach one with a service-account token.',
+    detail: 'No kaggle CLI credential is configured on this host.',
     accounts: [],
-    note: 'ready means an account is registered, not that a model is serving.',
+    notes: 'ready means the CLI answers, not that a kernel has run.',
   };
   const { mount } = await mountView({ handlers });
   const text = textOf(mount);
 
-  assert.match(text, /No Cerebrium project is attached/,
+  assert.match(text, /No kaggle CLI credential is configured/,
     'the lane\'s own instruction reaches the operator instead of a generic not-ready chip');
-  assert.match(text, /ready means an account is registered/,
+  assert.match(text, /ready means the CLI answers/,
     'the lane\'s note about what readiness does not prove is quoted');
-  assert.match(text, /POST \/api\/gpu\/lanes\/cerebrium\/attach \{account, project_id, app_name, token\}/,
-    'the empty card names the route and fields, since the panel has no attach form yet');
-  assert.match(text, /kept in the conductor's memory and in the encrypted vault/,
-    'the card states that an attached account survives a restart');
-  assert.match(text, /restored account is not probed until/,
-    'and that a restored account is not a measurement');
+  assert.match(text, /This lane runs through the kaggle CLI on the host and has no attach route/,
+    'the empty card says where the credential comes from, since there is no form to fill in');
+  assert.doesNotMatch(text, /saturn|molab|cerebrium/i,
+    'the three removed hosts appear nowhere on the inventory, not even quoted from /api/lanes');
 });
 
 test('inventory renders deployments with mode, batch card and the derived sizing', async () => {
@@ -806,9 +785,6 @@ test('an empty response renders neutral empty states and a next step', async () 
       '/api/gpu/catalog': { platforms: [] },
       '/api/lanes': { lanes: [] },
       '/api/gpu/lanes/kaggle/status': { ready: false, accounts: [] },
-      '/api/gpu/lanes/molab/status': { status: 'ok', accounts: [] },
-      '/api/gpu/lanes/saturn/status': { status: 'ok', accounts: [] },
-      '/api/gpu/lanes/cerebrium/status': { status: 'ok', ready: false, accounts: [] },
     },
   });
   const text = textOf(mount);
@@ -984,12 +960,66 @@ test('requirement 5 in the DOM: the quant selector is blank before a probe and p
   assert.match(requant, /does not run the quantiser for you/);
 });
 
+test('an unprobed repository can be probed from the card step, where its absence blocks a field', async (t) => {
+  if (!hasSetupModel) return t.skip('panel/gpu-setup-model.js is not present');
+  await resetSetup();
+  const model = await mountView({ param: 'new/model', handlers: standardHandlers() });
+  setInput(model.mount, 'repo', 'Qwen/Qwen3-32B');
+  fire(findButton(model.mount, 'Continue'), 'click');
+  await settle();
+
+  const card = await mountView({ param: 'new/card', handlers: standardHandlers() });
+  const quant = card.mount.querySelector('[data-field="weightQuant"]');
+  assert.equal(quant.disabled, true, 'the selector is still gated before the probe');
+  assert.match(textOf(card.mount), /It is one button, just below\./,
+    'the reason names where the button is instead of sending the operator back a step');
+  await withPost(PROBE, async (posts) => {
+    fire(findButton(card.mount, 'Probe repository'), 'click');
+    await settle(6);
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].path, '/api/gpu/probe');
+  });
+  assert.equal(descendants(card.mount)
+    .filter((el) => el.tagName === 'BUTTON' && /Probe/.test(String(el.textContent ?? ''))).length, 0,
+  'the probe panel leaves the step once it has nothing left to resolve');
+  // The probe alone does not legalise a quant: the card is the other half of the gate, so the next
+  // sentence names that instead of still asking for a probe.
+  assert.match(textOf(card.mount.querySelector('[data-field="weightQuant"]').closest('.gpu-field-off') ?? card.mount),
+    /Choose a card on this step first/);
+  const pre = card.mount.querySelector('[data-field="gpu"]');
+  pre.value = 'h100';
+  fire(pre, 'change');
+  await settle(4);
+  const gated = card.mount.querySelector('[data-field="weightQuant"]');
+  const gpuEl = card.mount.querySelector('[data-field="gpu"]');
+  assert.equal(gated.disabled, false, 'the probe and the card together unblock the selector in place');
+  assert.deepEqual(gated.children.map((option) => option.getAttribute('value')), ['fp8']);
+});
+
+test('the account step names the write it performs, because the review step comes after it', async (t) => {
+  if (!hasSetupModel) return t.skip('panel/gpu-setup-model.js is not present');
+  await resetSetup();
+  const { mount } = await mountView({ param: 'new/account', handlers: standardHandlers() });
+
+  assert.equal(advanceButton(mount).textContent.trim(), 'Save account',
+    'the button that writes a credential to the vault does not read as a plain Continue');
+  assert.match(textOf(mount), /Writes this account to the vault now/);
+  assert.match(textOf(mount), /The rental itself is saved at the end\./);
+
+  // A reused account writes nothing: its credential is already in the vault.
+  fire(findButton(mount, 'USE'), 'click');
+  await settle(4);
+  assert.equal(advanceButton(mount).textContent.trim(), 'Continue',
+    'reusing a stored account posts no request, so its button is a plain Continue');
+  assert.ok(!textOf(mount).includes('Writes this account to the vault now'));
+});
+
 test('validation pins every problem to its field and reports all of them at once', async (t) => {
   if (!hasSetupModel) return t.skip('panel/gpu-setup-model.js is not present');
   await resetSetup();
   const { mount } = await mountView({ param: 'new/account', handlers: standardHandlers() });
 
-  fire(findButton(mount, 'Continue'), 'click');
+  fire(advanceButton(mount), 'click');
   await settle();
 
   const account = mount.querySelector('[data-field="accountId"]');
@@ -1029,7 +1059,7 @@ test('the account step posts the vault entry before any model step, and clears n
   setInput(mount, 'tokenSecret', 'ws-super-secret-value');
 
   await withPost({ account: { id: 'mana-modal', secret_fingerprint: TOKEN_FINGERPRINT } }, async (posts) => {
-    fire(findButton(mount, 'Continue'), 'click');
+    fire(advanceButton(mount), 'click');
     await settle(6);
     assert.equal(posts.length, 1, 'one account request, before the flow reaches the model step');
     assert.equal(posts[0].path, '/api/gpu/apply');
@@ -1146,10 +1176,10 @@ test('the lane table quotes the platform that refuses, and invents nothing where
 });
 
 // ---------------------------------------------------------------------------
-// Lane status cards: one platform down must not hide the other three
+// The lane status card: a lane that is down must not blank the inventory
 // ---------------------------------------------------------------------------
 
-test('a lane whose status route fails is named, and the other lanes still render', async () => {
+test('a lane whose status route fails is named, and the inventory still renders', async () => {
   const { mount } = await mountView({
     handlers: { ...laneStatuses(), '/api/gpu/lanes/kaggle/status': new Error('connect refused') },
   });
@@ -1158,22 +1188,10 @@ test('a lane whose status route fails is named, and the other lanes still render
   assert.match(text, /GET \/api\/gpu\/lanes\/kaggle\/status failed/,
     'the failed route is named, with its own path');
   assert.match(text, /connect refused/, 'the reason is quoted, not swallowed');
-  assert.match(text, /molab-main/, 'the lane that answered is still on screen');
-  assert.match(text, /saturn-work/);
-  assert.match(text, /cerebrium-main/);
-  assert.match(text, /project: proj-1/,
-    'Cerebrium names the field project_id; the row still has to say which project it belongs to');
-  assert.match(text, /app: manarouter-a1b2/,
-    'Cerebrium names the field app_name; without it two apps in one project look identical');
-});
-
-test('a Saturn budget that was never recorded reads as unrecorded, not as full allowance', async () => {
-  const { mount } = await mountView({ handlers: standardHandlers() });
-  const text = textOf(mount);
-
-  // The fixture reports used_secs: null. Printing "0s used" would invent a measurement nobody took.
-  assert.match(text, /budget_unrecorded/, 'the warning travels with the lane');
-  assert.doesNotMatch(text, /Budget used\s*0s/, 'an unrecorded ledger is never shown as zero');
+  assert.match(text, /Rental accounts/, 'the page above the lane card is unaffected');
+  assert.match(text, /Your rentals/);
+  assert.match(text, /kaggle \(endpoint unavailable\)/,
+    'the card says which lane it is even when the lane could not answer');
 });
 
 test('the plan preview posts the schedule and shows each wave with the deployments it holds',
@@ -1206,143 +1224,3 @@ test('the plan preview posts the schedule and shows each wave with the deploymen
       assert.match(text, /does not start/i, 'the preview says it starts nothing');
     });
   });
-
-test('a lane account can be attached from its card, and a vault refusal is not swallowed', async () => {
-  const handlers = standardHandlers();
-  handlers['/api/gpu/lanes/molab/status'] = {
-    lane: 'molab',
-    warm_lanes: 0,
-    detail: '0 warm lanes, start one',
-    accounts: [],
-  };
-  const { mount, posts } = await mountView({
-    handlers,
-    onPost: () => ({
-      status: 'ok',
-      remembered: false,
-      remember_error: 'the vault is read-only',
-    }),
-  });
-  // mountView restores api.post once the first render is done; the click happens after that, so
-  // the stub has to outlive the render for this interaction test.
-  const originalPost = api.post;
-  api.post = async (path, body) => {
-    posts.push({ path, body });
-    return { status: 'ok', remembered: false, remember_error: 'the vault is read-only' };
-  };
-  try {
-
-  fire(findButton(mount, 'Attach account'), 'click');
-  const form = mount.querySelector('.gpu-attach');
-  assert.ok(form, 'the button opens the attach form on the card');
-  for (const [name, value] of [['account', 'molab-a'], ['url', 'https://molab.example/'], ['token', 's3cret']]) {
-    form.querySelector(`[data-lane-field="${name}"]`).value = value;
-  }
-  fire(findButton(form, 'Attach'), 'click');
-  await new Promise((resolve) => realSetTimeout(resolve, 10));
-
-  assert.deepEqual(posts, [{
-    path: '/api/gpu/lanes/molab/attach',
-    body: { account: 'molab-a', url: 'https://molab.example/', token: 's3cret' },
-  }], 'the form posts the route fields and nothing else');
-  assert.match(textOf(mount), /Attached for this process only — the vault did not keep it: the vault is read-only/,
-    'an attach the vault refused is reported, because it will not survive a restart');
-  assert.equal(form.querySelector('[data-lane-field="token"]').value, 's3cret',
-    'a failed attach keeps the token so the operator can retry without retyping it');
-  } finally {
-    api.post = originalPost;
-  }
-});
-
-test('a successful attach says the vault kept the credential, and the card repaint does not erase it', async () => {
-  const handlers = standardHandlers();
-  handlers['/api/gpu/lanes/molab/status'] = {
-    lane: 'molab',
-    warm_lanes: 0,
-    detail: '0 warm lanes, start one',
-    accounts: [],
-  };
-  const { mount, posts } = await mountView({ handlers });
-  // The attach repaints the card, and mountView has already restored the stubs, so both verbs have
-  // to outlive the render for this interaction test.
-  const originalPost = api.post;
-  const originalGet = api.get;
-  api.get = async (path) => handlers[path] ?? Promise.reject(new Error(`test did not expect GET ${path}`));
-  api.post = async (path, body) => {
-    posts.push({ path, body });
-    return { status: 'ok', remembered: true };
-  };
-  try {
-    fire(findButton(mount, 'Attach account'), 'click');
-    const form = mount.querySelector('.gpu-attach');
-    for (const [name, value] of [['account', 'molab-b'], ['url', 'https://molab.example/'], ['token', 's3cret']]) {
-      form.querySelector(`[data-lane-field="${name}"]`).value = value;
-    }
-    fire(findButton(form, 'Attach'), 'click');
-    await new Promise((resolve) => realSetTimeout(resolve, 10));
-
-    assert.deepEqual(posts, [{
-      path: '/api/gpu/lanes/molab/attach',
-      body: { account: 'molab-b', url: 'https://molab.example/', token: 's3cret' },
-    }]);
-    assert.match(textOf(mount), /Attached molab-b and kept it in the encrypted vault\./,
-      'the confirmation survives the repaint, because the form that held it does not');
-    assert.equal(mount.querySelector('.gpu-attach'), null,
-      'a successful attach closes the form and re-reads the card');
-  } finally {
-    api.post = originalPost;
-    api.get = originalGet;
-  }
-});
-
-test('a repaint while the attach form is open does not delete what is being typed', async () => {
-  const handlers = standardHandlers();
-  handlers['/api/gpu/lanes/molab/status'] = {
-    lane: 'molab',
-    warm_lanes: 0,
-    detail: '0 warm lanes, start one',
-    accounts: [],
-  };
-  const { mount } = await mountView({ handlers });
-  const originalGet = api.get;
-  api.get = async (path) => handlers[path] ?? Promise.reject(new Error(`test did not expect GET ${path}`));
-  try {
-    fire(findButton(mount, 'Attach account'), 'click');
-    const form = mount.querySelector('.gpu-attach');
-    const token = form.querySelector('[data-lane-field="token"]');
-    token.value = 'half-typed';
-    const card = form.closest('.gpu-section');
-    fire(findButton(card, 'Refresh'), 'click');
-    await new Promise((resolve) => realSetTimeout(resolve, 10));
-    assert.equal(mount.querySelector('.gpu-attach'), form, 'the form is still the same node');
-    assert.equal(token.value, 'half-typed', 'the token in progress survived the refresh');
-  } finally {
-    api.get = originalGet;
-  }
-});
-
-test('a lane account says warm or cold in words, and quotes what its last probe said', async () => {
-  const handlers = standardHandlers();
-  handlers['/api/gpu/lanes/saturn/status'] = {
-    lane: 'saturn',
-    healthy: 1,
-    total_accounts: 2,
-    accounts: [
-      { account: 'saturn-warm', host: '127.0.0.1:8000', warm: true, health: 'healthy', failure_count: 0 },
-      {
-        account: 'saturn-restored',
-        host: '127.0.0.1:8001',
-        warm: false,
-        health: 'registered',
-        last_probe_error: 'restored from the vault; not probed since this process started',
-      },
-    ],
-  };
-  const { mount } = await mountView({ handlers });
-  const text = textOf(mount);
-  assert.match(text, /saturn-warm\s+·\s+127\.0\.0\.1:8000\s+·\s+healthy\s+·\s+warm/);
-  assert.match(text, /saturn-restored\s+·\s+127\.0\.0\.1:8001\s+·\s+registered\s+·\s+cold/);
-  assert.match(text, /restored from the vault; not probed since this process started/,
-    'the sentence that says the account has not been dialled is shown, not just "registered"');
-  assert.ok(!text.includes('· false'), 'a boolean warm flag is not printed as the word "false"');
-});

@@ -320,14 +320,6 @@ test('emptyDraft fills every documented key and starts on Modal with no plan cla
     batchGpu: null,
     gpuMemoryUtilization: 0.92,
     baseUrl: '',
-    // Cerebrium-specific fields — UI defaults, not measurements.
-    // `cerebriumApp` derives from the repo slug when the payload builder receives an empty value.
-    // `hostCpu` defaults to 8 cores and `hostMemoryGb` to 64 GiB.
-    cerebriumApp: '',
-    cerebriumProject: '',
-    cerebriumCompute: '',
-    hostCpu: 8,
-    hostMemoryGb: 64,
     sizing: null,
     probe: null,
   });

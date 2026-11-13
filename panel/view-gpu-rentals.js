@@ -202,13 +202,20 @@ function provenanceCell(item) {
 // ---------------------------------------------------------------------------
 
 const DRAFT_CONTAINERS = Object.freeze([
-  'account', 'deployment', 'model', 'sizing', 'platform', 'card', 'rental', 'probe',
+  'account', 'deployment', 'model', 'platform', 'card', 'rental',
 ]);
+
+// `sizing` and `probe` reuse the draft's own names for computed values — sizing.gpu, probe.repo —
+// because both describe the draft rather than hold part of it. They are therefore readable when
+// looking a field up, and never writable: a card chosen in the form belongs on the draft, and a
+// write into sizing.gpu is thrown away by the next applySizing(), which is exactly how the card
+// selector came back blank after the operator picked a card.
+const DRAFT_DERIVED = Object.freeze(['sizing', 'probe']);
 
 function draftGet(draft, name) {
   if (!draft || typeof draft !== 'object') return undefined;
   if (draft[name] !== undefined && draft[name] !== null) return draft[name];
-  for (const c of DRAFT_CONTAINERS) {
+  for (const c of [...DRAFT_CONTAINERS, ...DRAFT_DERIVED]) {
     const box = objectOf(draft[c]);
     if (box && box[name] !== undefined && box[name] !== null) return box[name];
   }
@@ -435,9 +442,11 @@ function bundlePanel(bundle, platform, { emptyNote = null, honesty = true } = {}
 
 const USAGE_POLL_MS = 15000;
 
-/* The four GPU-rental lanes the conductor can report on. Order matters: it is the order the
-   status cards appear in, and the index the parallel fetch results are matched against. */
-const LANE_PLATFORMS = Object.freeze(['kaggle', 'molab', 'saturn', 'cerebrium']);
+/* The lane the panel still reports on. Molab, Saturn Cloud and Cerebrium were removed from this
+   screen together with their attach forms, budget and bundle: the catalogue rents on Modal, and
+   Kaggle is the one host left with a lane status route. Order matters — it is the index the
+   parallel fetch results are matched against. */
+const LANE_PLATFORMS = Object.freeze(['kaggle']);
 
 export async function render(mount, ctx, param = null) {
   navigateFromView = (hash) => ctx.navigate(hash);
@@ -522,14 +531,7 @@ async function renderInventory(mount, ctx) {
     selectedDeploymentId: null,
     updatedAt: null,
     quietFailed: false,
-    cerebriumBusy: false,
-    cerebriumResult: null,
-    cerebriumError: null,
     laneStatuses: null,
-    // One line per platform recording what the last attach answered. It lives on the view rather
-    // than in the form because a successful attach repaints the card, and a sentence that vanished
-    // with the form would leave the operator guessing whether the vault kept the credential.
-    laneNotices: {},
     planBusy: false,
     planResult: null,
   };
@@ -545,7 +547,6 @@ async function renderInventory(mount, ctx) {
   const lanesBox = h('div', { class: 'gpu-lanes' });
   const laneCardsBox = h('div', { class: 'gpu-lane-cards' });
   const planBox = h('div', { class: 'gpu-plan' });
-  const cerebriumBox = h('div', { class: 'gpu-cerebrium' });
 
   const toolbar = h('div', { class: 'toolbar' },
     countEl,
@@ -561,7 +562,7 @@ async function renderInventory(mount, ctx) {
     h('summary', {}, 'Platform details'),
     hint('Plan tiers, the generated deploy command, and what each host allows. Nothing here is '
       + 'needed to rent a GPU.'),
-    plansBox, bundleBox, lanesBox, laneCardsBox, planBox, cerebriumBox);
+    plansBox, bundleBox, lanesBox, laneCardsBox, planBox);
 
   mount.replaceChildren(toolbar, glanceBox, statusEl, deploymentsBox, accountsBox, catalogBox, advanced);
 
@@ -572,12 +573,7 @@ async function renderInventory(mount, ctx) {
       api.get('/api/gpu/rentals'),
       api.get('/api/gpu/catalog'),
       api.get('/api/lanes'),
-      Promise.allSettled([
-        api.get('/api/gpu/lanes/kaggle/status'),
-        api.get('/api/gpu/lanes/molab/status'),
-        api.get('/api/gpu/lanes/saturn/status'),
-        api.get('/api/gpu/lanes/cerebrium/status'),
-      ]),
+      Promise.allSettled(LANE_PLATFORMS.map((platform) => api.get(`/api/gpu/lanes/${platform}/status`))),
     ]);
     if (!view.alive) return;
     view.rentals = rentals.status === 'fulfilled' ? rentals.value : null;
@@ -653,7 +649,11 @@ async function renderInventory(mount, ctx) {
       card.append(failedEndpoint('GET /api/lanes', view.lanesError));
       return;
     }
-    const lanes = listOf(pick(view.lanes, 'lanes'));
+    // The route still answers for the removed hosts; this screen does not. A row for a platform
+    // the panel has no rental, status card or attach route for would only invite a question.
+    const documented = new Set(['modal', ...LANE_PLATFORMS]);
+    const lanes = listOf(pick(view.lanes, 'lanes'))
+      .filter((lane) => documented.has(asString(pick(lane, 'id')).toLowerCase()));
     if (!lanes.length) {
       card.append(emptyState('No lane catalogue to read.',
         'GET /api/lanes returned no rows, so nothing is claimed about what a host may be used for.'));
@@ -706,16 +706,13 @@ async function renderInventory(mount, ctx) {
         ? h('div', { class: 'gpu-lane-docs' }, ...[...hosts].map(([host, href]) => externalLink(href, host)))
         : h('span', { class: 'hint' }, '—');
 
-      const isCerebrium = asString(pick(lane, 'kind', 'id')).toLowerCase() === 'cerebrium';
       return h('tr', {},
         h('td', {}, h('strong', {}, dashes(pick(lane, 'display') || pick(lane, 'id')))),
         h('td', {}, chip(asString(pick(lane, 'shape')) || '—')),
         h('td', { class: 'mono' }, dashes(pick(lane, 'inbound'))),
         h('td', { class: 'mono' }, dashes(pick(lane, 'submission'))),
         h('td', {}, why),
-        h('td', {},
-          docs,
-          isCerebrium ? button('Get cerebrium.toml', () => getCerebriumBundle(lane), { className: 'btn btn-primary' }) : null));
+        h('td', {}, docs));
     });
     card.append(dataTable([
       { label: 'Platform' },
@@ -732,69 +729,21 @@ async function renderInventory(mount, ctx) {
       card.append(noteList('In one sentence', headlines.map(({ lane, text }) =>
         `${dashes(pick(lane, 'display') || pick(lane, 'id'))}: ${text}`)));
     }
-
-    // -- Cerebrium bundle ---------------------------------------------------------
-
-    let cerebriumLaneId = '';
-
-    async function getCerebriumBundle(lane) {
-      cerebriumLaneId = asString(pick(lane, 'id', 'display')).trim() || 'cerebrium';
-      const { app = '', repo = '', compute = '', cpu = '4', memory_gb = '16' } = await (ctx.prompt?.({
-        message: 'Missing draft fields — fill in app, repo, compute, cpu, memory_gb for the bundle:',
-        fields: [
-          { name: 'app', label: 'App name', value: draftGet(wizard?.draft, 'repo') || '' },
-          { name: 'repo', label: 'Repository (owner/name)', value: '' },
-          { name: 'compute', label: 'Compute class', value: '' },
-          { name: 'cpu', label: 'CPU cores', value: '4' },
-          { name: 'memory_gb', label: 'Memory (GB)', value: '16' },
-        ],
-      })) || {};
-      const body = { app, repo, compute, cpu: Number(cpu) || 4, memory_gb: Number(memory_gb) || 16 };
-      view.cerebriumBusy = true;
-      paintLanes();
-      try {
-        const result = await api.post('/api/gpu/lanes/cerebrium/bundle', body);
-        view.cerebriumBusy = false;
-        view.cerebriumResult = result;
-        if (ctx?.toast?.success) ctx.toast.success('cerebrium.toml generated.');
-      } catch (err) {
-        view.cerebriumBusy = false;
-        view.cerebriumError = err;
-        if (ctx?.toast?.error) ctx.toast.error('Failed to generate cerebrium.toml', err);
-      }
-      paintLanes();
-    }
-
-    if (view.cerebriumBusy) {
-      cerebriumBox.replaceChildren(h('p', { class: 'hint gpu-status', 'aria-live': 'polite' }, 'Generating cerebrium.toml…'));
-    } else if (view.cerebriumResult) {
-      const r = view.cerebriumResult;
-      const plat = currentPlatform();
-      const bundle = { filename: (r.filename || 'cerebrium.toml').trim(), text: (r.text || '').trim(), command: (r.command || '').trim(), warnings: listOf(r.warnings) };
-      cerebriumBox.replaceChildren(section(`cerebrium.toml — ${cerebriumLaneId}`, bundlePanel(bundle, plat)));
-    } else if (view.cerebriumError) {
-      cerebriumBox.replaceChildren(section(`cerebrium.toml — ${cerebriumLaneId}`, failedEndpoint('POST /api/gpu/lanes/cerebrium/bundle', view.cerebriumError)));
-    } else {
-      cerebriumBox.replaceChildren();
-    }
   }
 
   /**
    * Per-platform lane cards: "Lane endpoints" — one card per platform, showing readiness, accounts,
-   * warnings, and the Saturn plan block when present. Loaded in parallel with Promise.allSettled.
+   * warnings. Fetched independently of the inventory, so a lane that is down cannot blank the page.
    *
-   * The Rust status handlers each return a different shape:
-   *   kaggle    → { ready, accounts: [{ account, host, health, failure_count, warnings[] }] }
-   *   molab     → { status, accounts: [{ account, host, warm, remaining, failure_count, errors[] }] }
-   *   saturn    → { status, plan: { budget, warnings[] }, accounts: [{ account, host, health, warm, ... }] }
-   *   cerebrium → { status, ready, detail, accounts: [{ app, project, health, warm }] }
+   * The Kaggle status route answers:
+   *   { ready, accounts: [{ account, host, health, failure_count, warnings[] }] }
    */
   function readinessLabel(status) {
     // Derive a human-readable readiness from the status. Green is only when the status itself says
     // healthy or ready; otherwise we say the account count in words.
     if (status.ready === true) return { cls: 'chip-green', text: 'ready' };
     if (status.ready === false) return { cls: 'chip-neutral', text: 'not ready' };
-    // Derive from account count: Molab has no `ready` field.
+    // No `ready` field: say the account count in words rather than invent a verdict.
     const count = (status.accounts || []).length;
     if (count === 0) return { cls: 'chip-neutral', text: 'no accounts' };
     return { cls: 'chip-neutral', text: `${count} account${count === 1 ? '' : 's'}` };
@@ -803,29 +752,13 @@ async function renderInventory(mount, ctx) {
   function laneAccountRow(acc) {
     const label = asString(pick(acc, 'account', 'label')).trim() || '(unnamed)';
     const host = asString(pick(acc, 'host')).trim();
-    // Cerebrium's own view names these `project_id` and `app_name`; a row that showed neither
-    // would leave two accounts on the same project indistinguishable.
-    const project = asString(pick(acc, 'project', 'project_id')).trim();
-    const app = asString(pick(acc, 'app', 'app_name')).trim();
     const health = asString(pick(acc, 'health')).trim();
-    const warm = pick(acc, 'warm', 'is_warm');
-    const minutesLeft = asNumber(pick(acc, 'minutes_left'));
     const probeError = asString(pick(acc, 'last_probe_error')).trim();
     const failures = asNumber(pick(acc, 'failure_count', 'failures'));
 
     const parts = [h('span', { class: 'mono' }, label)];
     if (host) parts.push(h('span', { class: 'hint' }, ` · ${host}`));
-    if (project) parts.push(h('span', { class: 'hint' }, ` · project: ${project}`));
-    if (app) parts.push(h('span', { class: 'hint' }, ` · app: ${app}`));
     if (health) parts.push(h('span', { class: 'hint' }, ` · ${health}`));
-    // `warm` is a boolean on three lanes. Printing `String(false)` would put the word "false" on a
-    // card as if it were a status, so the boolean is said in words and any other value is quoted.
-    if (typeof warm === 'boolean') parts.push(h('span', { class: 'hint' }, warm ? ' · warm' : ' · cold'));
-    else {
-      const said = asString(warm).trim();
-      if (said) parts.push(h('span', { class: 'hint' }, ` · ${said}`));
-    }
-    if (minutesLeft !== null) parts.push(h('span', { class: 'hint' }, ` · ${minutesLeft} min left`));
     if (failures !== null && failures > 0) parts.push(h('span', { class: 'hint mono' }, `failures: ${failures}`));
     // The lane's own measurement of the last probe, including the sentence a restored account
     // carries before it has been dialled ("restored from the vault; not probed since …").
@@ -833,17 +766,17 @@ async function renderInventory(mount, ctx) {
     return h('li', {}, ...parts);
   }
 
+  /* The one lane card left. Molab, Saturn Cloud and Cerebrium had their own shapes here — a warm
+     host and minutes left, a budget that is null until an operator records usage, a project and an
+     app, and an attach form each. They are gone from the panel, so this renders the Kaggle shape and
+     nothing it cannot be asked for. */
   function paintLaneCards() {
-    // The live counters repaint this box on their own interval. An open attach form is operator
-    // input in progress — usually a token — so a repaint here would delete what is being typed.
-    // The data waits; closing the form repaints with whatever arrived meanwhile.
-    if (laneCardsBox.querySelector('.gpu-attach')) return;
     laneCardsBox.replaceChildren();
     if (!view.laneStatuses) return;
 
-    const card = section('Lane endpoints');
-    card.append(hint(
-      'One section per platform, fetched independently. A single failure leaves the others visible.'));
+    const card = section('Lane endpoint');
+    card.append(hint('The lane answers on its own route, so a failure here leaves the rentals above '
+      + 'untouched.'));
 
     const cards = [];
     for (let i = 0; i < LANE_PLATFORMS.length; i++) {
@@ -862,25 +795,18 @@ async function renderInventory(mount, ctx) {
 
       const status = objectOf(entry.data) ?? {};
       const accounts = listOf(pick(status, 'accounts')).map(objectOf).filter(Boolean);
-      // `detail` is the lane's own instruction for what is missing (molab: which server to attach;
-      // cerebrium: which of its two credentials the control plane needs). Kaggle answers in
-      // `notes` with the platform's own wording. This screen quotes the lane; it never writes a
-      // readiness sentence of its own.
+      // Kaggle answers in `notes` with the platform's own wording, and in `detail` with what is
+      // missing. This screen quotes the lane; it never writes a readiness sentence of its own.
       const detail = asString(pick(status, 'detail')).trim();
       const note = asString(pick(status, 'notes', 'note')).trim();
       const warnings = listOf(pick(status, 'warnings')).map(objectOf).filter(Boolean);
-      const plan = objectOf(pick(status, 'plan'));
       const ready = readinessLabel(status);
 
       const parts = [];
-      // Readiness chip
       parts.push(h('div', { class: 'gpu-lane-status' }, chip(ready.text, ready.cls)));
       if (detail) parts.push(h('p', { class: 'hint' }, detail));
       if (note) parts.push(h('p', { class: 'hint' }, note));
-      const notice = asString(view.laneNotices[platform]).trim();
-      if (notice) parts.push(h('p', { class: 'hint' }, notice));
 
-      // Warnings as plain list (advisory, not errors)
       if (warnings.length) {
         const warningLines = [];
         for (const w of warnings) {
@@ -892,193 +818,27 @@ async function renderInventory(mount, ctx) {
           ...warningLines.map((l) => h('li', {}, l))));
       }
 
-      // Plan block (Saturn emits a plan with budget + warnings)
-      if (plan) {
-        const planParts = [];
-        const budget = objectOf(pick(plan, 'budget'));
-        if (budget) {
-          const used = asNumber(pick(budget, 'used_seconds', 'used'));
-          const total = asNumber(pick(budget, 'total_seconds', 'total'));
-          const remaining = asNumber(pick(budget, 'remaining_seconds', 'remaining'));
-          const rows = [];
-          if (used !== null) rows.push(['Budget used', `${used}s`]);
-          if (total !== null) rows.push(['Budget total', `${total}s`]);
-          if (remaining !== null) rows.push(['Budget remaining', `${remaining}s`]);
-          if (rows.length) planParts.push(kv(rows));
-        }
-        const planWarnings = listOf(pick(plan, 'warnings')).map(objectOf).filter(Boolean);
-        if (planWarnings.length) {
-          for (const w of planWarnings) {
-            const code = asString(pick(w, 'code')).trim();
-            const msg = asString(pick(w, 'message', 'reason', 'text')).trim();
-            planParts.push(richHint(code ? `${code}: ${msg}` : msg, 'hint'));
-          }
-        }
-        const refusals = listOf(pick(plan, 'refusals')).map(objectOf).filter(Boolean);
-        if (refusals.length) {
-          for (const r of refusals) {
-            const msg = asString(pick(r, 'message', 'reason', 'text')).trim();
-            if (msg) planParts.push(h('p', { class: 'gpu-failed' }, msg));
-          }
-        }
-        if (planParts.length) {
-          parts.push(h('div', { class: 'gpu-plan-block' },
-            h('h4', {}, 'Plan'), ...planParts));
-        }
-      }
-
-      // Account rows
       if (accounts.length) {
-        parts.push(h('ul', { class: 'gpu-lane-accounts' },
-          ...accounts.map(laneAccountRow)));
+        parts.push(h('ul', { class: 'gpu-lane-accounts' }, ...accounts.map(laneAccountRow)));
       } else {
         parts.push(h('p', { class: 'hint' },
           'The conductor has no account attached for this platform.'));
-        // The lane is attached over its own route, not by creating a rental: a rental deploys a
-        // model, while a lane account is the credential and host that serve one. Say which fields
-        // the route takes, and point at the form when this platform has one.
-        const attach = {
-          kaggle: 'This lane runs through the kaggle CLI on the host and has no attach route; '
-            + 'install it and sign in before submitting a kernel.',
-          molab: 'POST /api/gpu/lanes/molab/attach {account, url, token} after the notebook '
-            + 'server is up — Attach account above posts the same body.',
-          saturn: 'POST /api/gpu/lanes/saturn/attach {account, host, token} — Attach account above '
-            + 'posts the same body.',
-          cerebrium: 'POST /api/gpu/lanes/cerebrium/attach {account, project_id, app_name, token}, '
-            + 'then deploy with a cerebrium.toml. Attach account above posts the attach half.',
-        }[platform];
-        if (attach) parts.push(h('p', { class: 'hint' }, attach));
         parts.push(h('p', { class: 'hint' },
-          'An attached account is kept in the conductor\'s memory and in the encrypted vault under '
-          + 'lane:<platform>:<account>, so a restart re-registers it. A restored account is not '
-          + 'probed until the lane asks the platform again; attaching the same label again rotates '
-          + 'the credential.'));
+          'This lane runs through the kaggle CLI on the host and has no attach route: install it '
+          + 'and sign in before submitting a kernel.'));
       }
 
       const actionsRow = h('div', { class: 'gpu-actions gpu-actions-tight' },
         ghostButton('Refresh', () => refreshSingleLane(platform),
           `Re-fetch ${platform} lane status only`));
-      const cardEl = h('section', { class: 'card gpu-section' },
+      cards.push(h('section', { class: 'card gpu-section' },
         h('h2', {}, platform),
         statusLine, ...parts,
-        actionsRow);
-
-      if (LANE_ATTACH_FIELDS[platform]) {
-        actionsRow.append(ghostButton('Attach account', () => {
-          const open = cardEl.querySelector('.gpu-attach');
-          if (open) {
-            open.remove();
-            paintLaneCards();
-            return;
-          }
-          const form = laneAttachForm(platform);
-          if (form) cardEl.append(form);
-        }, `POST /api/gpu/lanes/${platform}/attach`));
-      }
-
-      cards.push(cardEl);
+        actionsRow));
     }
     card.append(...cards);
     laneCardsBox.append(card);
   }
-
-
-/**
- * The fields each lane's attach route takes. Kaggle is absent on purpose: it has no attach route —
- * it runs through the `kaggle` CLI on the host — and a form here would invent one.
- */
-const LANE_ATTACH_FIELDS = Object.freeze({
-  molab: Object.freeze([
-    Object.freeze({ name: 'account', label: 'Account label', placeholder: 'molab-main' }),
-    Object.freeze({ name: 'url', label: 'Notebook URL', placeholder: 'https://…' }),
-    Object.freeze({ name: 'token', label: 'Token', secret: true }),
-  ]),
-  saturn: Object.freeze([
-    Object.freeze({ name: 'account', label: 'Account label', placeholder: 'saturn-main' }),
-    Object.freeze({ name: 'host', label: 'Workspace host', placeholder: 'workspace-abc.saturncloud.io' }),
-    Object.freeze({ name: 'token', label: 'Token', secret: true }),
-  ]),
-  cerebrium: Object.freeze([
-    Object.freeze({ name: 'account', label: 'Account label', placeholder: 'cerebrium-main' }),
-    Object.freeze({ name: 'project_id', label: 'Project id', placeholder: 'project-…' }),
-    Object.freeze({ name: 'app_name', label: 'App name', placeholder: 'app-…' }),
-    Object.freeze({ name: 'token', label: 'Service-account token', secret: true }),
-  ]),
-});
-
-/**
- * An inline form for POST /api/gpu/lanes/{platform}/attach.
- *
- * The token field is a password input, is never prefilled, and is cleared on success; the reply's
- * `remembered` flag is reported verbatim, because an attach that the vault refused still happened
- * and the operator has to know it will not survive a restart.
- */
-function laneAttachForm(platform) {
-  const fields = LANE_ATTACH_FIELDS[platform];
-  if (!fields) return null;
-
-  const inputs = new Map();
-  const rows = fields.map((f) => {
-    const id = `lane-attach-${platform}-${f.name}`;
-    const input = h('input', {
-      id,
-      class: `input${f.secret ? '' : ' mono'}`,
-      type: f.secret ? 'password' : 'text',
-      placeholder: f.placeholder ?? null,
-      autocomplete: 'off',
-      spellcheck: 'false',
-      autocapitalize: 'off',
-      'data-lane-field': f.name,
-      'aria-label': f.label,
-    });
-    inputs.set(f.name, input);
-    return h('div', { class: 'field' },
-      h('label', { for: id }, f.label), input);
-  });
-
-  const note = h('p', { class: 'hint' });
-  const submit = button('Attach', async () => {
-    const body = {};
-    for (const f of fields) body[f.name] = String(inputs.get(f.name).value ?? '').trim();
-    const missing = fields.filter((f) => !body[f.name]).map((f) => f.label.toLowerCase());
-    if (missing.length) {
-      note.textContent = `Fill in ${missing.join(', ')} before attaching.`;
-      return;
-    }
-    setDisabled(submit, true);
-    view.laneNotices[platform] = '';
-    note.textContent = 'Attaching…';
-    try {
-      const result = await api.post(`/api/gpu/lanes/${platform}/attach`, body);
-      const remembered = asBool(pick(result, 'remembered'));
-      if (remembered === false) {
-        // The attach happened; the vault write did not. Repainting the card now would throw this
-        // sentence away with the form, and a credential that will vanish at restart is exactly the
-        // thing the operator must not miss.
-        const why = asString(pick(result, 'remember_error')).trim();
-        note.textContent = `Attached for this process only — the vault did not keep it${why ? `: ${why}` : '.'}`;
-        return;
-      }
-      for (const input of inputs.values()) input.value = '';
-      view.laneNotices[platform] = `Attached ${body.account} and kept it in the encrypted vault.`;
-      wrapper.remove();
-      await refreshSingleLane(platform);
-    } catch (err) {
-      note.textContent = asString(pick(err, 'message')).trim() || 'The attach request failed.';
-    } finally {
-      setDisabled(submit, false);
-    }
-  });
-
-  const wrapper = h('div', { class: 'gpu-attach' },
-    h('h4', {}, 'Attach an account'),
-    ...rows,
-    h('div', { class: 'gpu-actions' },
-      submit,
-      ghostButton('Cancel', () => { wrapper.remove(); paintLaneCards(); })),
-    note);
-  return wrapper;
-}
 
   async function refreshSingleLane(platform) {
     try {
@@ -1928,19 +1688,24 @@ function refreshBundle(wizard) {
   }
 }
 
+/* Leaving discards the whole draft, including anything typed into the account fields -- the vault
+ * only receives an account when the flow is saved. The wording says that rather than implying the
+ * account step survives a departure. */
+const LEAVE_CONFIRM = Object.freeze({
+  title: 'Discard this setup?',
+  message: 'Leaving GPU rentals discards this draft. Nothing typed here is stored, and an account '
+    + 'is only written to the vault when the flow is saved; an account stored earlier stays.',
+  confirmLabel: 'Leave and discard',
+  cancelLabel: 'Keep editing',
+  danger: true,
+});
+
 function installSetupGuard(wizard, ctx) {
   if (!ctx || typeof ctx !== 'object') return;
   const guard = () => {
     if (wizard.suppressGuard || !wizard.dirty) return true;
     if (typeof ctx.confirm !== 'function') return false;
-    return ctx.confirm({
-      title: 'Discard this deployment setup?',
-      message: 'This draft has unsaved progress. Leaving GPU rentals discards the steps after the '
-        + 'account step. An account that was already stored stays in the vault; only this draft is lost.',
-      confirmLabel: 'Leave and discard',
-      cancelLabel: 'Stay on this page',
-      danger: true,
-    });
+    return ctx.confirm(LEAVE_CONFIRM);
   };
   wizard.guard = guard;
   ctx.leaveGuard = guard;
@@ -2159,6 +1924,19 @@ function paintSetup(wizard, mount, ctx, stepParam) {
   if (wizard.callProblems.length) body.append(renderCallProblems(wizard));
   if (wizard.applied) body.append(appliedBlock(wizard, ctx));
 
+  // The account step is the flow's one write before the end, and it has already happened by the
+  // time the review step exists. A button that says "Continue" while it stores a credential is a trap.
+  const storesAccount = current === 'account' && wizard.draft?.reuseAccount !== true && !wizard.accountResult;
+  const forwardLabel = wizard.busy ? 'Working…'
+    : current === 'review' ? 'Save rental'
+      : storesAccount ? 'Save account'
+        : 'Continue';
+  const actionNote = current === 'review' && !wizard.applied
+    ? 'Records the request in Manarouter; it does not start a container.'
+    : storesAccount
+      ? 'Writes this account to the vault now. The rental itself is saved at the end.'
+      : null;
+
   const actions = h('div', { class: 'gpu-step-actions' },
     currentIndex > 0 ? ghostButton('Back', () => goPrevious(wizard)) : null,
     h('button', {
@@ -2166,10 +1944,8 @@ function paintSetup(wizard, mount, ctx, stepParam) {
       type: 'button',
       disabled: wizard.busy || Boolean(wizard.applied),
       onclick: () => advance(wizard, ctx),
-    }, wizard.busy ? 'Working…' : current === 'review' ? 'Save rental' : 'Continue'),
-    current === 'review' && !wizard.applied
-      ? h('span', { class: 'hint' }, 'Records the request in Manarouter; it does not start a container.')
-      : null);
+    }, forwardLabel),
+    actionNote ? h('span', { class: 'hint' }, actionNote) : null);
 
   root.replaceChildren(head, rail, status, body, actions);
 }
@@ -2226,7 +2002,7 @@ function selectRow(wizard, desc) {
   const select = fieldData(h('select', { class: 'input' }), name);
   const values = choices.map((c) => asString(c.value));
   if (!values.includes(current)) {
-    select.append(h('option', { value: '' }, '— not set —'));
+    select.append(h('option', { value: '' }, 'Choose…'));
   }
   for (const choice of choices) {
     select.append(h('option', {
@@ -2441,7 +2217,8 @@ function quantState(wizard) {
       ready: false,
       choices: [],
       reason: 'The quant selector stays blank until the repository has been probed. The probe reports '
-        + 'which quants the repository actually ships; guessing one would make vLLM refuse the checkpoint.',
+        + 'which quants the repository actually ships; guessing one would make vLLM refuse the checkpoint. '
+        + 'It is one button, just below.',
     };
   }
   const gpuId = asString(draftGet(wizard.draft, 'gpu')).trim();
@@ -2500,6 +2277,12 @@ function commitField(wizard, name, value) {
   }
   if (name === 'gpu') {
     wizard.sizing = null;
+  }
+  if (name === 'accountId' || name === 'plan' || name === 'tokenId' || name === 'tokenSecret') {
+    // The stored result describes the account that was written. Editing an identity field makes it
+    // stale, and the next Continue posts again — so the button and the panel must agree with that.
+    wizard.accountSignature = null;
+    wizard.accountResult = null;
   }
   if (name === 'mode' && asString(value).trim() !== 'batch') {
     draftSet(wizard.draft, 'batchGpu', null);
@@ -2605,7 +2388,13 @@ function stepPanels(wizard, stepId) {
     ];
   }
   if (stepId === 'model') return [probePanel(wizard)];
-  if (stepId === 'card') return [cardPanel(wizard)];
+  if (stepId === 'card') {
+    // The quant selector cannot be filled until the repository has been probed, and the probe
+    // button is on the model step. Rather than send the operator backwards to find it, the card
+    // step carries it whenever the probe is the one thing standing between them and a quant.
+    const unprobed = Boolean(asString(draftGet(wizard.draft, 'repo')).trim()) && !objectOf(wizard.probe);
+    return unprobed ? [cardPanel(wizard), probePanel(wizard)] : [cardPanel(wizard)];
+  }
   if (stepId === 'sizing') return [sizingPanel(wizard, wizard.ctx)];
   if (stepId === 'review') return [reviewPanel(wizard)];
   return [];
@@ -3257,13 +3046,7 @@ async function leaveSetup(wizard, ctx) {
     ctxNavigate('#/gpu-rentals');
     return;
   }
-  const leave = await setupDestructiveConfirm(ctx, {
-    title: 'Leave without saving?',
-    message: 'This draft has unsaved progress. Leaving discards the steps after the account step; a stored account remains in the vault.',
-    confirmLabel: 'Leave and discard',
-    cancelLabel: 'Stay on this page',
-    danger: true,
-  });
+  const leave = await setupDestructiveConfirm(ctx, LEAVE_CONFIRM);
   if (!leave) return;
   retractSetupGuard(wizard, ctx);
   setupSession = null;
