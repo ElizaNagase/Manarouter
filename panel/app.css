@@ -1143,14 +1143,7 @@ input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
 .combo-row .combo-stat:focus-visible { outline: 2px solid var(--pink); outline-offset: 1px; }
 .combo-row-empty { color: var(--tx3); font-size: 12px; padding: 4px 0; }
 
-.empty-state {
-  border: 1px dashed var(--line2);
-  border-radius: var(--radius);
-  color: var(--tx2);
-  padding: 18px 14px;
-  text-align: center;
-}
-.empty-state p { margin: 4px 0 0; color: var(--tx3); font-size: 12px; }
+/* .empty-state lives in lab.css, which loads after this sheet. */
 
 /* ---------- combo steps ---------- */
 

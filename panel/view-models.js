@@ -714,20 +714,19 @@ export async function renderModels(mount, ctx) {
       return;
     }
 
-    headline.replaceChildren(
-      h('strong', { class: 'models-headline-number' }, fmt(total)),
-      ' models across ',
-      h('strong', { class: 'models-headline-number' }, fmt(providers.length)),
-      providers.length === 1 ? ' provider' : ' providers',
-    );
+    // The page title is the page title on every other view ("Providers", "Combos", "Keys"). A
+    // sentence with two numbers in it was the only h1 in the panel that changed size with the data.
+    headline.textContent = 'Models';
     // Stats, not prose: three facts the provider payload can actually answer, in one scan line.
     const coverageParts = [
+      txt(fmt(total), total === 1 ? ' model' : ' models', ' · ',
+        fmt(providers.length), providers.length === 1 ? ' provider' : ' providers'),
       txt('labels ', fmt(labelCount)),
       txt('context ', fmt(ctxCount)),
       priceCount ? txt('pricing ', fmt(priceCount)) : 'pricing not reported',
     ];
     if (hiddenCount) coverageParts.push(txt(fmt(hiddenCount), ' hidden'));
-    coverage.textContent = txt('Provider coverage · ', coverageParts.join(' · '));
+    coverage.textContent = coverageParts.join(' · ');
     coverage.title = 'Counts across all loaded models. Rows that report context or reasoning are listed first.';
     search.placeholder = txt('Search ', fmt(total), ' models by id or label…');
   }
@@ -904,8 +903,10 @@ export async function renderModels(mount, ctx) {
 
       const rowAddToCombo = buildAddToComboDropdown(p, m, { className: 'btn btn-sm' });
 
+      // One primary per page: Test all models. Per-row Test is a quiet control until it is the
+      // thing being used — twenty-three pink buttons down the table drowned the data they act on.
       const test = h('button', {
-        class: 'btn btn-primary btn-sm',
+        class: 'btn btn-sm model-test',
         type: 'button',
         'aria-label': txt('Test ', m.id, ' on provider ', p.id),
       }, 'Test');

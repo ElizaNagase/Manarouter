@@ -181,11 +181,20 @@ function provenanceCell(item) {
   const source = asString(pick(item, 'source')).trim();
   const checked = asString(pick(item, 'checked_at', 'checkedAt')).trim();
   const url = pick(item, 'source_url', 'sourceUrl');
-  const parts = [];
-  parts.push(source ? h('span', { class: 'mono' }, source) : h('span', { class: 'hint' }, 'source not reported'));
-  if (checked) parts.push(h('span', { class: 'hint', title: `checked ${checked}` }, ` · ${formatAge(checked)}`));
   const href = safeHref(url);
-  if (href) parts.push(h('span', { class: 'hint' }, ' · '), h('a', { href, target: '_blank', rel: 'noopener noreferrer' }, 'source'));
+  const parts = [];
+  // The source's own name is the link when there is one: "documented · 1d 17h ago · source" printed
+  // the same fact twice and made a five-word column out of two.
+  if (source && href) {
+    parts.push(h('a', { class: 'mono gpu-prov-src', href, target: '_blank', rel: 'noopener noreferrer' }, source));
+  } else if (source) {
+    parts.push(h('span', { class: 'mono' }, source));
+  } else if (href) {
+    parts.push(h('a', { class: 'gpu-prov-src', href, target: '_blank', rel: 'noopener noreferrer' }, 'source'));
+  } else {
+    parts.push(h('span', { class: 'hint' }, 'source not reported'));
+  }
+  if (checked) parts.push(h('span', { class: 'hint', title: `checked ${checked}` }, ` · ${formatAge(checked)}`));
   const notes = asString(pick(item, 'notes')).trim();
   if (notes) parts.push(h('span', { class: 'hint' }, ' · '), h('span', { class: 'hint', title: notes }, 'note'));
   return h('div', { class: 'gpu-prov' }, ...parts);
@@ -309,6 +318,11 @@ function section(title, ...children) {
   return h('section', { class: 'card gpu-section' }, h('h2', {}, title), ...children);
 }
 
+/** A card's title row: the section name and the one action that belongs to that section. */
+function cardHead(title, action = null) {
+  return h('div', { class: 'card-head' }, h('h2', {}, title), action);
+}
+
 function button(label, onClick, { className = 'btn', title = null } = {}) {
   return h('button', { class: className, type: 'button', title, onclick: onClick }, label);
 }
@@ -430,7 +444,11 @@ function bundlePanel(bundle, platform, { emptyNote = null, honesty = true } = {}
   // A command is a literal too: keep it in a <pre> so a copy from the screen does not inherit
   // wrapping or markup, exactly like the file above.
   parts.push(h('pre', { class: 'gpu-pre gpu-command', 'aria-label': 'deploy command' }, command));
-  for (const note of notes) parts.push(richHint(messageOf(note)));
+  // Seven consecutive two-line paragraphs read as one grey wall and none of them is optional. One
+  // titled list keeps every sentence, ranks it under the file and the command, and lets the eye skip
+  // the whole block once it has been read.
+  const noteBlock = noteList('Before you run it', notes);
+  if (noteBlock) parts.push(noteBlock);
   if (warnings.length) parts.push(noteList('Warnings that affect the deployment', warnings, 'gpu-notes gpu-caveat'));
   if (sdk) parts.push(hint(`SDK alternative, when you would rather not use the CLI: ${sdk}`));
   return h('div', { class: 'gpu-bundle' }, ...parts);
@@ -536,9 +554,11 @@ async function renderInventory(mount, ctx) {
     planResult: null,
   };
 
-  const countEl = h('span', { class: 'count' }, 'GPU rentals');
+  const countEl = h('span', { class: 'count gpu-count', 'aria-live': 'polite' }, 'GPU rentals');
   const statusEl = h('p', { class: 'hint gpu-status', role: 'status' }, 'Loading GPU rentals…');
-  const glanceBox = h('div', { class: 'stat-grid gpu-glance' });
+  // The ledger total and the card count used to be five .stat boxes above the tables; the page
+  // now opens the way the providers page does — one toolbar, then the list it counts.
+  const usageEl = h('span', { class: 'gpu-usage' });
   const plansBox = h('div', { class: 'gpu-plans' });
   const accountsBox = h('div', { class: 'gpu-accounts' });
   const deploymentsBox = h('div', { class: 'gpu-deployments' });
@@ -548,7 +568,10 @@ async function renderInventory(mount, ctx) {
   const laneCardsBox = h('div', { class: 'gpu-lane-cards' });
   const planBox = h('div', { class: 'gpu-plan' });
 
-  const toolbar = h('div', { class: 'toolbar' },
+  // Same shape as the providers page: what the list holds on the left, the verbs on the right, and
+  // one framed table underneath. The primary action lives here rather than on a section title,
+  // because "New rental" is the page's action, not the table's.
+  const toolbar = h('div', { class: 'toolbar gpu-toolbar' },
     countEl,
     h('span', { class: 'spacer' }),
     ghostButton('Refresh', () => refresh(false), 'Re-read /api/gpu/rentals and /api/gpu/catalog'),
@@ -564,11 +587,16 @@ async function renderInventory(mount, ctx) {
       + 'needed to rent a GPU.'),
     plansBox, bundleBox, lanesBox, laneCardsBox, planBox);
 
-  mount.replaceChildren(toolbar, glanceBox, statusEl, deploymentsBox, accountsBox, catalogBox, advanced);
+  mount.replaceChildren(toolbar, statusEl, deploymentsBox, accountsBox, catalogBox, advanced);
+
+  function setStatus(text) {
+    statusEl.textContent = text;
+    statusEl.hidden = !text;
+  }
 
   async function refresh(quiet) {
     if (!view.alive) return;
-    if (!quiet) statusEl.textContent = 'Reading GPU rentals…';
+    if (!quiet) setStatus('Reading GPU rentals…');
     const [rentals, catalog, lanes, laneStatuses] = await Promise.allSettled([
       api.get('/api/gpu/rentals'),
       api.get('/api/gpu/catalog'),
@@ -1062,18 +1090,16 @@ async function renderInventory(mount, ctx) {
     plansBox.append(...cards);
   }
 
-  // -- at a glance -------------------------------------------------------------
+  // -- the numbers -------------------------------------------------------------
 
-  // The conductor's ledger has one instance-wide aggregate and no per-account column. Rendering
-  // that total as if it belonged to the first account would be a division the data does not
-  // support, so it is shown once, at the top of the page, and the per-account cells stay honest em
-  // dashes. A future serializer that does add a per-account `usage` object is still read.
-  //
-  // These are the page's first answer — how many rentals there are, what they cost, what they run
-  // on — so they are numbers above the tables rather than a section inside one of them.
-  function paintGlance() {
-    glanceBox.replaceChildren();
-    if (view.rentalsError) return;
+  // The conductor's ledger has one instance-wide aggregate and no per-account column, so the total
+  // is stated once, beside the account table it belongs to, rather than split across the accounts.
+  function paintNumbers() {
+    if (view.rentalsError) {
+      countEl.textContent = '—';
+      usageEl.textContent = '';
+      return;
+    }
     const deployments = listOf(pick(view.rentals, 'deployments')).map(normaliseDeployment);
     const accounts = listOf(pick(view.rentals, 'accounts')).map(normaliseAccount);
     const usage = objectOf(pick(view.rentals, 'usage')) ?? {};
@@ -1081,39 +1107,31 @@ async function renderInventory(mount, ctx) {
     const requests = asNumber(pick(usage, 'gpu_requests', 'requests'));
     const seconds = asNumber(pick(usage, 'gpu_seconds'));
     const cost = asNumber(pick(usage, 'cost_usd', 'cost'));
-    const broken = deployments.filter((d) => d.problems.length + d.hardwareProblems.length > 0).length;
-    const enabled = deployments.filter((d) => d.enabled !== false).length;
     const gpus = platformList().flatMap((p) => listOf(pick(p, 'gpus')));
-    const prices = gpus.map((g) => asNumber(pick(g, 'price_usd_per_hour'))).filter((n) => n !== null);
-    const cheapest = prices.length ? Math.min(...prices) : null;
+    const count = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
-    const stat = (label, value, sub) => h('div', { class: 'stat' },
-      h('div', { class: 'k' }, label),
-      h('div', { class: 'v' }, value),
-      h('div', { class: 's' }, sub));
+    // The card count belongs to the catalogue, which prints it on its own head; repeating it here
+    // made the toolbar count a sentence nobody reads twice.
+    countEl.textContent = `${count(accounts.length, 'account', 'accounts')} · `
+      + `${count(deployments.length, 'rental', 'rentals')}`;
 
-    glanceBox.append(
-      stat('Rentals', String(deployments.length),
-        deployments.length
-          ? `${enabled} enabled${broken ? ` · ${broken} with problems` : ''}`
-          : 'none yet'),
-      stat('Instance usage', cost === null ? '—' : usd(cost),
-        usageError || 'one ledger total for every provider on this instance'),
-      stat('GPU time', seconds === null ? '—' : formatUptime(seconds),
-        requests === null ? 'requests not reported' : `${requests} request${requests === 1 ? '' : 's'}`),
-      stat('Accounts', String(accounts.length),
-        accounts.length
-          ? [...new Set(accounts.map((a) => a.platform).filter(Boolean))].join(', ') || '—'
-          : 'no platform credential yet'),
-      stat('Cards', String(gpus.length),
-        cheapest === null ? 'no price reported' : `from ${usd(cheapest)}/hour`));
+    const requestsPart = requests === null
+      ? null
+      : `across ${count(requests, 'request', 'requests')}`;
+    usageEl.textContent = `Instance usage ${cost === null ? '—' : usd(cost)}`
+      + (requestsPart ? ` ${requestsPart}` : '')
+      + ` · GPU time ${seconds === null ? '—' : formatUptime(seconds)}`;
+    usageEl.title = usageError || 'One ledger total for every provider on this instance.';
   }
 
   // -- rental accounts ---------------------------------------------------------
 
   function paintAccounts() {
     accountsBox.replaceChildren();
-    const card = section('Rental accounts');
+    const card = h('section', { class: 'card gpu-section' },
+      cardHead('Rental accounts', h('div', { class: 'gpu-head-extras' },
+        usageEl,
+        ghostButton('Add rental account', () => ctx.navigate('#/gpu-rentals/new/account')))));
     if (view.rentalsError) {
       card.append(failedEndpoint('GET /api/gpu/rentals', view.rentalsError));
       accountsBox.append(card);
@@ -1128,9 +1146,6 @@ async function renderInventory(mount, ctx) {
       card.append(emptyState('No rental accounts yet.',
         'A rental account is a platform credential (Modal: a token id and its secret). Add one here; '
         + 'every deployment on that platform can share it.'));
-      card.append(h('div', { class: 'gpu-actions' },
-        button('Add rental account', () => ctx.navigate('#/gpu-rentals/new/account'),
-          { className: 'btn' })));
       accountsBox.append(card);
       return;
     }
@@ -1192,8 +1207,8 @@ async function renderInventory(mount, ctx) {
       ] : []),
     ], rows));
     if (!perAccount) {
-      card.append(hint('Usage is one ledger total for the whole instance, so it is not divided '
-        + 'between accounts: the total is in the numbers at the top of this page.'));
+      card.append(hint('Usage is one ledger total for every provider on this instance, so it is not '
+        + 'divided between accounts: the reading beside the title above is the whole of it.'));
     }
     accountsBox.append(card);
   }
@@ -1210,7 +1225,7 @@ async function renderInventory(mount, ctx) {
 
   function paintDeployments() {
     deploymentsBox.replaceChildren();
-    const card = section('Your rentals');
+    const card = h('section', { class: 'card gpu-section' }, cardHead('Your rentals'));
     if (view.rentalsError) {
       card.append(failedEndpoint('GET /api/gpu/rentals', view.rentalsError));
       deploymentsBox.append(card);
@@ -1222,9 +1237,6 @@ async function renderInventory(mount, ctx) {
         'A rental is a GPU on a host, configured as a provider so the relay can route to it. Pick '
         + 'the platform, the account, the model and the card, and the panel writes the app file and '
         + 'the command that deploys it.'));
-      card.append(h('div', { class: 'gpu-actions' },
-        button('New rental', () => ctx.navigate('#/gpu-rentals/new/platform'),
-          { className: 'btn', title: 'The same flow as New rental in the toolbar' })));
       deploymentsBox.append(card);
       return;
     }
@@ -1386,7 +1398,9 @@ async function renderInventory(mount, ctx) {
 
   function paintCatalog() {
     catalogBox.replaceChildren();
-    const card = section('GPU catalogue');
+    const cardCount = h('span', { class: 'hint' });
+    const card = h('section', { class: 'card gpu-section' },
+      cardHead('GPU catalogue', cardCount));
     if (view.catalogError) {
       card.append(failedEndpoint('GET /api/gpu/catalog', view.catalogError));
       catalogBox.append(card);
@@ -1420,6 +1434,7 @@ async function renderInventory(mount, ctx) {
       + 'renting that card for nothing, with its source beside it.'));
 
     const gpus = listOf(pick(platform, 'gpus'));
+    cardCount.textContent = `${gpus.length} card${gpus.length === 1 ? '' : 's'}`;
     if (!gpus.length) {
       card.append(emptyState('No cards reported for this platform.',
         'The catalogue knows the platform but not its cards, so no price or VRAM is shown.'));
@@ -1456,22 +1471,17 @@ async function renderInventory(mount, ctx) {
   }
 
   function paint() {
-    const accounts = listOf(pick(view.rentals, 'accounts'));
-    const deployments = listOf(pick(view.rentals, 'deployments'));
-    countEl.textContent = view.rentalsError
-      ? '—'
-      : `${accounts.length} account${accounts.length === 1 ? '' : 's'} · `
-        + `${deployments.length} rental${deployments.length === 1 ? '' : 's'}`;
+    paintNumbers();
     if (view.rentalsError || view.catalogError) {
       const which = [view.rentalsError ? 'GET /api/gpu/rentals' : null,
         view.catalogError ? 'GET /api/gpu/catalog' : null].filter(Boolean).join(' and ');
-      statusEl.textContent = `${which} failed. What is shown below comes from whichever endpoint answered.`;
+      setStatus(`${which} failed. What is shown below comes from whichever endpoint answered.`);
     } else {
-      const stamp = view.updatedAt ? view.updatedAt.toLocaleTimeString() : '';
-      statusEl.textContent = `Updated ${stamp}. Live usage is re-read every ${USAGE_POLL_MS / 1000} `
-        + 'seconds while this tab is visible.';
+      // Nothing to report. A line saying "Updated 7:06:23 PM" was the first thing under the toolbar
+      // on every visit, reporting that the page had worked. The refresh button carries the same
+      // answer when it is asked for, so the line exists only when an endpoint failed.
+      setStatus('');
     }
-    paintGlance();
     paintPlans();
     // A failure inside the disclosure must not be hidden behind a closed summary.
     if (view.catalogError || view.lanesError) advanced.open = true;
@@ -1531,6 +1541,76 @@ const VIEW_OWNED_READOUTS = new Set([
 
 /** The live draft for this tab's setup flow. Deliberately not persisted: see the header. */
 let setupSession = null;
+
+function setupPlatform(catalog, id) {
+  const wanted = asString(id).trim();
+  if (!wanted) return null;
+  return listOf(pick(catalog, 'platforms')).map(objectOf).filter(Boolean)
+    .find((p) => sameText(pick(p, 'id'), wanted)) ?? null;
+}
+
+function setupGpu(catalog, platformId, gpuId) {
+  const platform = setupPlatform(catalog, platformId);
+  const wanted = asString(gpuId).trim();
+  if (!platform || !wanted) return null;
+  return listOf(pick(platform, 'gpus')).map(objectOf).filter(Boolean)
+    .find((g) => sameText(pick(g, 'id'), wanted)) ?? null;
+}
+
+function summaryRow(label, value, { title = null } = {}) {
+  const text = asString(value).trim();
+  return h('div', { class: 'gpu-sum-row' },
+    h('span', { class: 'gpu-sum-label' }, label),
+    h('span', { class: `gpu-sum-value${text ? '' : ' gpu-sum-empty'}`, title: title ?? (text || null) },
+      text || 'Not chosen'));
+}
+
+/**
+ * The running record of the rental being built, beside the step that is building it.
+ *
+ * A six-step flow that only ever shows one step leaves the operator holding the other five in their
+ * head — which platform, which card, whether the model was ever named. This is the same record the
+ * review step prints in full, at a glance, and it fills the empty right-hand side that the 980px
+ * column left on every step. It reads the draft, never writes it.
+ */
+function setupAside(wizard) {
+  const draft = objectOf(wizard.draft) ?? {};
+  const platformId = asString(pick(draft, 'platform')).trim();
+  const platform = setupPlatform(wizard.catalog, platformId);
+  const gpuId = asString(pick(draft, 'gpu')).trim();
+  const gpu = setupGpu(wizard.catalog, platformId, gpuId);
+  const accountId = asString(pick(draft, 'accountId', 'account_id')).trim();
+  const account = listOf(wizard.accounts).find((a) => sameText(a.id, accountId)) ?? null;
+  const repo = asString(pick(draft, 'repo')).trim();
+  const revision = asString(pick(draft, 'revision')).trim();
+  const count = Math.max(1, asNumber(pick(draft, 'gpuCount')) ?? 1);
+  const sizing = objectOf(wizard.sizing) ?? objectOf(pick(draft, 'sizing')) ?? {};
+  const tokens = asNumber(pick(sizing, 'max_model_len')) ?? asNumber(pick(draft, 'maxModelLen'));
+
+  const gpuLabel = gpu
+    ? asString(pick(gpu, 'label', 'name')) || gpuId
+    : gpuId || '';
+  const rows = [
+    summaryRow('Platform', platform ? (asString(pick(platform, 'label')) || platformId) : platformId),
+    summaryRow('Account', account ? account.label : accountId || ''),
+    summaryRow('Model', repo ? `${repo}${revision ? `@${revision}` : ''}` : ''),
+    summaryRow('Card', gpuLabel ? `${gpuLabel}${count > 1 ? ` × ${count}` : ''}` : ''),
+    summaryRow('Context', tokens ? `${tokens.toLocaleString("en-US")} tokens` : ''),
+  ];
+
+  const perSecond = gpu ? asNumber(pick(gpu, 'price_usd_per_second')) : null;
+  const price = perSecond === null ? null : perSecond * 3600;
+
+  return h('aside', { class: 'gpu-setup-aside' },
+    h('div', { class: 'card gpu-summary' },
+      h('div', { class: 'card-head' }, h('h2', {}, 'This rental')),
+      ...rows,
+      price === null ? null : h('div', { class: 'gpu-sum-row gpu-sum-total' },
+        h('span', { class: 'gpu-sum-label' }, 'Card price'),
+        h('span', { class: 'gpu-sum-value mono', title: secondsTitle(gpu) }, `${dollarsShort(price)}/hour`)),
+      h('p', { class: 'hint gpu-sum-note' },
+        'Billed by the platform to the account above. Nothing here starts a container.')));
+}
 
 function firstPlatformId(catalog) {
   const platforms = listOf(pick(catalog, 'platforms'));
@@ -1900,8 +1980,13 @@ function paintSetup(wizard, mount, ctx, stepParam) {
   }));
 
   const stepHint = asString(pick(step, 'hint')).trim();
-  const status = h('p', { class: 'hint gpu-status', role: 'status', 'aria-live': 'polite' },
-    wizard.busy ? 'Working…' : dirtyLine);
+  // "No unsaved changes in this step." was a sentence printed on every step that had none of them:
+  // it said nothing, in the most prominent place under the rail. The line now exists only when it
+  // has something to report.
+  const statusText = wizard.busy ? 'Working…' : wizard.dirty ? dirtyLine : '';
+  const status = statusText
+    ? h('p', { class: 'hint gpu-status', role: 'status', 'aria-live': 'polite' }, statusText)
+    : null;
   const body = h('div', { class: 'gpu-step-body' });
 
   for (const desc of listOf(pick(step, 'fields'))) {
@@ -1947,7 +2032,13 @@ function paintSetup(wizard, mount, ctx, stepParam) {
     }, forwardLabel),
     actionNote ? h('span', { class: 'hint' }, actionNote) : null);
 
-  root.replaceChildren(head, rail, status, body, actions);
+  // The step's verbs belong to the step's card, not to the page: below the card they floated at the
+  // page's left edge, reading as a second set of actions for the whole route.
+  body.append(actions);
+  if (status) body.prepend(status);
+  // Rail, step, and the record being built. Narrow viewports stack them in that order.
+  const grid = h('div', { class: 'gpu-setup-grid' }, rail, body, setupAside(wizard));
+  root.replaceChildren(head, grid);
 }
 
 // --- controls -------------------------------------------------------------------------------
@@ -2798,6 +2889,7 @@ function reviewPanel(wizard) {
   if (wizard.bundleError) parts.push(failedEndpoint('panel/gpu-setup-model.js deploymentBundle()', wizard.bundleError));
   if (wizard.applyError) parts.push(failedEndpoint('POST /api/gpu/apply (create-deployment)', wizard.applyError));
   const platform = selectedPlatform(wizard);
+  parts.push(h('h3', {}, 'The bundle'));
   if (wizard.bundle) {
     parts.push(bundlePanel(wizard.bundle, platform, { honesty: false }));
   } else {
@@ -2807,7 +2899,7 @@ function reviewPanel(wizard) {
   const payload = objectOf(callModel(wizard, 'applyPayload', null, wizard.draft, wizard.sizing));
   if (payload) {
     const dep = objectOf(pick(payload, 'deployment')) ?? {};
-    parts.push(h('h4', {}, 'The request Manarouter will record'));
+    parts.push(h('h3', {}, 'The request Manarouter will record'));
     parts.push(kv([
       ['Action', asString(pick(payload, 'action'))],
       ['Account', asString(pick(payload, 'account_id')) || '—'],

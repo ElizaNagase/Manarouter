@@ -351,6 +351,31 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--pink); width: 
   font-weight: 650;
 }
 
+/* A card's title row. The section's own action belongs on the section's line, not floating under
+ * its content where it reads as a second, equal verb for the whole page. */
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 12px;
+}
+.card-head > h2 {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--tx3);
+  margin: 0;
+  font-weight: 650;
+  text-transform: uppercase;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.card-head > .hint, .card-head > .count {
+  color: var(--tx3);
+  font-size: 11.5px;
+  margin: 0;
+}
+.card-head .btn, .card-head .btn-sm { flex: none; }
+
 .stat-grid { gap: 10px; margin-bottom: 16px; }
 .stat {
   border-radius: var(--radius);
@@ -384,27 +409,44 @@ table.tbl { border-collapse: separate; border-spacing: 0; width: 100%; }
   border-bottom: 1px solid var(--line);
   white-space: nowrap;
 }
+/* At 3.5% white a row rule is invisible on most displays, so a table reads as floating text and the
+ * eye has to travel back to the left edge to find the next row. 7% separates rows without drawing a
+ * grid. */
 .tbl tbody td {
   padding: 9px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.035);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
   vertical-align: middle;
 }
 .tbl tbody tr:last-child td { border-bottom: 0; }
-.tbl tbody tr:hover td { background: rgba(255, 255, 255, 0.024); }
+.tbl tbody tr:hover td { background: rgba(255, 255, 255, 0.035); }
+
+/* A table that sits inside a card is already framed by that card. Drawing .table-scroll's border
+ * around it as well put a box inside a box on the catalogue, quota and provider tables. */
+.card .table-scroll {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
 .tbl tbody tr.row-selected td { background: rgba(224, 112, 155, 0.09); }
 .tbl td.num, .tbl th.num { text-align: right; font-variant-numeric: tabular-nums; }
 
+/* An empty list is a statement, not a box. A dashed panel drawn inside a card repeats the card's
+ * own border, centres a sentence that is not a headline, and spends 48px of padding on three lines
+ * of text. The left rule is the panel's existing shape for "a note, not a control" (see
+ * .gpu-advanced), and it keeps the note on the same left edge as the section it belongs to. */
 .empty-state {
-  max-width: 520px;
-  margin: 10px auto;
-  padding: 24px 20px;
-  border: 1px dashed var(--line2);
-  border-radius: var(--radius-lg);
-  background: rgba(255, 255, 255, 0.012);
+  max-width: 84ch;
+  margin: 0;
+  padding: 2px 0 2px 12px;
+  border: 0;
+  border-left: 2px solid var(--line2);
+  border-radius: 0;
+  background: none;
   color: var(--tx2);
-  text-align: center;
+  text-align: left;
 }
-.empty-state p { margin: 4px 0 0; color: var(--tx3); font-size: 12.5px; }
+.empty-state > div { font-size: 13px; }
+.empty-state p { margin: 3px 0 0; color: var(--tx3); font-size: 12.5px; }
 
 .hint { color: var(--tx3); font-size: 11.5px; }
 
