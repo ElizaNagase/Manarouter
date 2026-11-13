@@ -48,13 +48,16 @@ OAuth entries add `oauth_platform`, `oauth_*_url`, `oauth_scopes`, `oauth_redire
 `oauth_pkce`, and for the Copilot family `copilot_*` fields. See
 [OAuth overview](../10-oauth-overview.md).
 
-### The nine dialects
+### The ten dialects
 
 `open-ai`, `anthropic`, `google`, `google-ai-studio`, `codex`, `copilot`, `antigravity`,
-`command-code-go`, `modal-vllm`. The two Gemini entries are different surfaces of the same body: `google` is the
+`command-code-go`, `modal-vllm`, `zcode`. The two Gemini entries are different surfaces of the same body: `google` is the
 Cloud Code envelope shape and `google-ai-studio` is the public `generativelanguage` API, whose
 thinking rules are its own — see
-[the dialects guide](../24-provider-dialects.md#google-ai-studio--the-same-body-on-the-public-api). Modal vLLM is a self-hosted OpenAI chat endpoint with separate proxy-token headers and capacity settings; see [Modal vLLM](modal-vllm.md) and the operator-facing [GPU rentals](../25-gpu-rentals.md) guide.
+[the dialects guide](../24-provider-dialects.md#google-ai-studio--the-same-body-on-the-public-api). Modal vLLM is a self-hosted OpenAI chat endpoint with separate proxy-token headers and capacity settings; see [Modal vLLM](modal-vllm.md) and the operator-facing [GPU rentals](../25-gpu-rentals.md) guide. Z Code is
+the ZCode desktop app's plan surface — Anthropic Messages behind the app's attribution headers, with
+its brokered login and with its signing layer deliberately not reproduced; see [Z Code](zcode.md) and
+[the dialects guide](../24-provider-dialects.md#zcode--anthropic-messages-behind-the-apps-plan-surface).
 
 A dialect must be one of those. There is no "custom" dialect, and that is deliberate: a provider whose
 requests cannot be described by one of these is a provider the router cannot route to, and pretending

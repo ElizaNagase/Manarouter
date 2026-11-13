@@ -7,7 +7,7 @@
 > capability list that disagrees fails the build. The prose under the tables is written by hand and
 > is not checked.
 
-206 provider templates ship. Each row names the `Dialect` the relay uses, the base URL it sends to,
+207 provider templates ship. Each row names the `Dialect` the relay uses, the base URL it sends to,
 and the `AuthKind` it authenticates with. Entries whose `note` field flags uncertainty are marked
 **UNCERTAIN** and explained below the tables.
 
@@ -17,7 +17,7 @@ implementation this project mirrors. An entry derived that way is marked **UNCER
 the provider publishes its own documentation, that is the authority. See
 [the reference notes](../omniroute-reference.md) and [the credits](../credits.md).
 
-The 206 includes providers that need no credential at all — the loopback locals — and providers
+The 207 includes providers that need no credential at all — the loopback locals — and providers
 Manarouter covers that the reference router did not. It is **not** the same figure as the 28
 credentialed providers carried over from OmniRoute, which [the migration
 document](../17-migrating-from-omniroute.md#why-the-provider-count-is-not-what-the-plan-said)
@@ -27,7 +27,7 @@ many of OmniRoute's credentialed providers could be carried across.
 
 ## Templated base URLs: `{account_id}` and `{account}`
 
-Two of the 206 entries cannot spell their base URL without knowing something about *one particular
+Two of the 207 entries cannot spell their base URL without knowing something about *one particular
 account*, so their `base_url` carries a placeholder:
 
 | id | base URL | name |
@@ -311,6 +311,7 @@ route override carries one.
 | `yi` ⚠ | Yi (01.AI) | `open-ai` | `https://api.lingyiwanwu.com/v1` | `bearer` | chat, models, tool-calling |
 | `yolo-auto` ⚠ | Yolo-Auto | `open-ai` | `https://yolo-auto.com/v1` | `bearer` | chat, models, tool-calling |
 | `zai` ⚠ | Z.AI | `anthropic` | `https://api.z.ai/api/anthropic/v1` | `api-key-header` (x-api-key) | messages, models, tool-calling |
+| `zcode` | Z Code (Z.ai plan) | `zcode` | `https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1` | `oauth` (zcode) | messages, tool-calling, reasoning |
 | `zenmux` ⚠ | ZenMux | `open-ai` | `https://zenmux.ai/api/v1` | `bearer` | chat, models, tool-calling |
 | `zerolimitai` ⚠ | ZeroLimitAI | `open-ai` | `https://www.zerolimitai.com/api/v1` | `bearer` | chat, models, tool-calling |
 | `zylo-api` ⚠ | Zylo API | `open-ai` | `https://api.zyloai.net/v1` | `bearer` | chat, models, tool-calling |

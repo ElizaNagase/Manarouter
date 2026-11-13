@@ -151,7 +151,7 @@ export function buildRedirectPaste(p, ctx, session) {
 // `open-ai`, `parse` wants `openai`. A value here that the backend rejects turns "Add provider"
 // into a save-time error, which is how the pre-rename `command-code` spelling was caught. The Rust
 // test `the_panel_offers_only_dialects_this_binary_deserialises` pins this list.
-const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go', 'modal-vllm'];
+const DIALECTS = ['open-ai', 'anthropic', 'google', 'google-ai-studio', 'codex', 'copilot', 'antigravity', 'command-code-go', 'modal-vllm', 'zcode'];
 const KEY_STRATEGIES = ['priority', 'round-robin', 'random', 'least-used'];
 // What a refusal parks: the credential (every model), that model on the credential, or that model
 // on every credential of the provider. Widening past `account` is only right when the upstream
@@ -277,6 +277,7 @@ const PROVIDER_PRESETS = {
     { name: 'Codex', dialect: 'codex', baseUrl: 'https://chatgpt.com/backend-api/codex', auth: 'oauth', hint: 'OpenAI Codex — OAuth sign-in from the panel.' },
     { name: 'Copilot', dialect: 'copilot', baseUrl: 'https://api.githubcopilot.com', auth: 'oauth', hint: 'GitHub Copilot — OAuth sign-in from the panel.' },
     { name: 'Antigravity', dialect: 'antigravity', baseUrl: 'https://cloudcode-pa.googleapis.com', auth: 'oauth', hint: 'Google Antigravity / Cloud Code — OAuth sign-in from the panel.' },
+    { name: 'Z Code', dialect: 'zcode', baseUrl: 'https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1', auth: 'oauth', hint: 'Z.ai coding plan — sign in with the ZCode desktop app’s own login flow; the link opens at zcode.z.ai and the panel waits for the browser.' },
     { name: 'Command Code', dialect: 'command-code-go', baseUrl: 'https://api.commandcode.ai', auth: 'bearer', hint: 'Command Code — bearer auth.' },
     { name: 'Modal vLLM', dialect: 'modal-vllm', baseUrl: '', auth: 'modal', hint: 'Enter your Modal app’s HTTPS public URL (for example https://your-app--serve.modal.run). Add the Modal Token ID.Token Secret as the account secret after saving; the panel sends it as Modal-Key and Modal-Secret headers.' },
     { name: 'OpenCode Zen', dialect: 'open-ai', baseUrl: 'https://opencode.ai/zen/v1', auth: 'bearer', hint: 'OpenCode Console, pay-as-you-go. Needs a funded key: the free models are refused outside the OpenCode client, so they cannot be routed from here.' },

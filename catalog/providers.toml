@@ -1851,6 +1851,24 @@ auth = { type = "api-key-header", header = "x-api-key" }
 capabilities = ["messages", "models", "tool-calling"]
 note = "UNCERTAIN: recorded from the reference router's registry, not confirmed against the vendor's own documentation; capabilities are declared conservatively because the reference does not record per-provider reasoning or vision support."
 [[providers]]
+id = "zcode"
+label = "Z Code (Z.ai plan)"
+dialect = "zcode"
+# The ZCode desktop app's own plan surface. The trailing `/v1` is the version the URL carries; the
+# dialect's own Messages path gives up its duplicate, so the joined URL is
+# https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages — the exact URL the app sends.
+base_url = "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1"
+auth = { type = "oauth", platform = "zcode" }
+oauth_platform = "zcode"
+capabilities = ["messages", "tool-calling", "reasoning"]
+key_strategy = "round-robin"
+note = "OAuth only, through the login the ZCode app itself starts: init a flow, send the human to zcode.z.ai, poll for the access token. The app signs its plan requests (X-Client-Ts/X-Client-Sig and a proof-of-work header) and that layer is NOT implemented here; the token is sent unsigned as x-api-key, which the account-key surfaces accept and which the app itself falls back to when signing fails. Requests carry the app's attribution headers (x-request-id, x-zcode-trace-id, x-zcode-session-type, x-session-id) and anthropic-version. UNCERTAIN: the plan endpoint may reject an unsigned zhipu-account token; a plan API key belongs in the `zai` provider, which points at https://api.z.ai/api/anthropic/v1 and takes x-api-key directly."
+docs_url = "https://zcode.z.ai/en"
+
+[providers.headers]
+anthropic-version = "2023-06-01"
+
+[[providers]]
 id = "zenmux"
 label = "ZenMux"
 dialect = "open-ai"
@@ -1880,7 +1898,7 @@ note = "UNCERTAIN: recorded from the reference router's registry, not confirmed 
 # ---------------------------------------------------------------------------------------------
 # kiro               — AWS CodeWhisperer event-stream protocol; no Dialect can express it.
 # fishaudio          — bespoke TTS surface; the research records no HTTP chat base.
-# auggie, zcode      — non-HTTP (CLI/stdio) transports.
+# auggie             — non-HTTP (CLI/stdio) transport.
 # cloudflare-playground — cf_agent RPC over WebSocket, no key.
 # codex-app-server, devin-cli-agentic — local app servers, not upstream providers.
 # aihorde, pollinations — excluded by the project's no-web-session decision.

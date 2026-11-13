@@ -75,6 +75,33 @@ pub enum Dialect {
     /// Modal-hosted vLLM endpoint: OpenAI-compatible, but with `Modal-Key` and `Modal-Secret`
     /// headers.
     ModalVllm = 8,
+    /// The ZCode desktop app's plan surface: Anthropic Messages, at
+    /// `zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`.
+    ///
+    /// The body and the path are Anthropic's, unchanged — the app builds them with the AI SDK's
+    /// Anthropic client, so `thinking`, cache markers, `tool_use` blocks and the SSE event names
+    /// are all the ones [`Dialect::Anthropic`] already speaks. What is *not* Anthropic's is
+    /// everything around the body:
+    ///
+    /// - The credential is a ZCode **business** token minted from a Z.ai or BigModel login, not an
+    ///   Anthropic key. It goes in `x-api-key`, exactly as the AI SDK puts it there.
+    /// - The request has to *look* like the app. `User-Agent: ZCode/<version>`, `X-ZCode-App-Version`,
+    ///   `X-Title`, `X-Platform`, `X-Os-Category`, `X-Client-Language`, `X-Client-Timezone` and
+    ///   `HTTP-Referer` are the installer-visible identity, and `X-Session-Id`,
+    ///   `x-zcode-query-source` and `x-zcode-session-type` are the per-request attribution the
+    ///   endpoint expects. They live in [`crate::dialect::zcode`]'s constants and are added by the
+    ///   relay, per the same split [`Dialect::CommandCodeGo`] documents.
+    /// - The app *also* signs its model requests (`X-Client-Sig`, `X-Client-Pow`, `X-App-Id`) when
+    ///   the provider is an API key or an individual/team coding plan. That layer is not
+    ///   implemented here; `docs/providers/zcode.md` records the gap and the handshake it would
+    ///   need. The account (start-plan/off-peak/highspeed) path the OAuth platform here targets is
+    ///   the one the app itself sends **unsigned**.
+    ///
+    /// Because the shape is Anthropic's, the translator forwards it byte-for-byte from an
+    /// Anthropic client rather than re-serialising, the way [`Dialect::Copilot`] is verbatim for an
+    /// OpenAI client. It is not in [`Dialect::is_passthrough_to`]: that predicate means "the same
+    /// dialect twice", and a request to this one still needs a different set of headers.
+    Zcode = 9,
 }
 
 impl Dialect {
@@ -97,6 +124,7 @@ impl Dialect {
             6 => Self::CommandCodeGo,
             7 => Self::GoogleAiStudio,
             8 => Self::ModalVllm,
+            9 => Self::Zcode,
             _ => return None,
         })
     }
@@ -121,6 +149,7 @@ impl Dialect {
             Self::CommandCodeGo => "command-code-go",
             Self::GoogleAiStudio => "google-ai-studio",
             Self::ModalVllm => "modal-vllm",
+            Self::Zcode => "zcode",
         }
     }
 
@@ -154,6 +183,7 @@ impl Dialect {
             "antigravity" | "agy" | "gemini-code-assist" | "cloudcode" => Self::Antigravity,
             "command-code-go" | "cmdgo" => Self::CommandCodeGo,
             "modal-vllm" | "modal" | "modalvllm" => Self::ModalVllm,
+            "zcode" | "z-code" | "zcode-plan" => Self::Zcode,
             _ => return None,
         })
     }
@@ -182,7 +212,7 @@ impl Dialect {
     }
 
     /// Every dialect, in snapshot order. Useful for exhaustive tests.
-    pub const ALL: [Dialect; 9] = [
+    pub const ALL: [Dialect; 10] = [
         Self::OpenAi,
         Self::Anthropic,
         Self::Google,
@@ -192,6 +222,7 @@ impl Dialect {
         Self::CommandCodeGo,
         Self::GoogleAiStudio,
         Self::ModalVllm,
+        Self::Zcode,
     ];
 
     /// The reasoning levels this dialect can put on the wire as *themselves*, ascending.
@@ -219,9 +250,11 @@ impl Dialect {
             }
             // The budget dialects and AI Studio take a level or budget into their own fields.
             // Every tier is expressible for the same reason — the upper tiers share a ceiling.
-            Self::Anthropic | Self::Google | Self::Antigravity | Self::GoogleAiStudio => {
-                &ReasoningLevel::ALL
-            }
+            Self::Anthropic
+            | Self::Google
+            | Self::Antigravity
+            | Self::GoogleAiStudio
+            | Self::Zcode => &ReasoningLevel::ALL,
         }
     }
 
@@ -1175,7 +1208,7 @@ mod tests {
         }
         // Unknown values must be rejected rather than silently mapping onto a dialect, because a
         // misread snapshot byte would otherwise route traffic to an unrelated provider.
-        assert_eq!(Dialect::from_u8(9), None);
+        assert_eq!(Dialect::from_u8(10), None);
         assert_eq!(Dialect::from_u8(255), None);
     }
 
@@ -1393,6 +1426,7 @@ mod tests {
             (Dialect::CommandCodeGo, "command-code-go"),
             (Dialect::GoogleAiStudio, "google-ai-studio"),
             (Dialect::ModalVllm, "modal-vllm"),
+            (Dialect::Zcode, "zcode"),
         ];
         assert_eq!(expected.len(), Dialect::ALL.len());
         for (dialect, id) in expected {

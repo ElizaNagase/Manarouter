@@ -36,6 +36,7 @@ pub mod google;
 pub mod openai;
 pub mod responses;
 pub mod sse;
+pub mod zcode;
 
 /// Per-process storage for the Gemini thought signatures a client cannot carry itself.
 mod thought;
@@ -199,6 +200,14 @@ pub fn translate_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<Option<T
         (Dialect::Anthropic, Dialect::ModalVllm) => {
             openai::from_anthropic_request(ctx, body).map(Some)
         }
+        // ZCode's plan surface *is* Anthropic Messages — the app builds it with the AI SDK's
+        // Anthropic client — so an Anthropic client's body is forwarded byte for byte, the way an
+        // OpenAI client's is for Copilot above. The differences are the path, the headers and the
+        // credential, and none of those live in a translated body. An OpenAI client still needs the
+        // body converted, and `anthropic::from_openai_request` is the converter that names the
+        // same `messages` path.
+        (Dialect::Anthropic, Dialect::Zcode) => Ok(None),
+        (Dialect::OpenAi, Dialect::Zcode) => anthropic::from_openai_request(ctx, body).map(Some),
 
         (Dialect::OpenAi, Dialect::Anthropic) => {
             anthropic::from_openai_request(ctx, body).map(Some)
@@ -256,6 +265,10 @@ pub fn translate_response_body(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<By
         (Dialect::Anthropic, Dialect::Copilot) => openai::to_anthropic_response(ctx, body),
         (Dialect::OpenAi, Dialect::ModalVllm) => Ok(Bytes::copy_from_slice(body)),
         (Dialect::Anthropic, Dialect::ModalVllm) => openai::to_anthropic_response(ctx, body),
+        // ZCode answers in Anthropic Messages JSON, so an Anthropic client's body is byte-identical
+        // and an OpenAI client's goes through the same converter `(OpenAi, Anthropic)` uses.
+        (Dialect::Anthropic, Dialect::Zcode) => Ok(Bytes::copy_from_slice(body)),
+        (Dialect::OpenAi, Dialect::Zcode) => anthropic::to_openai_response(ctx, body),
         // `google::to_pivot_response` unwraps the Cloud Code `{response: {...}, traceId}`
         // envelope when the upstream is Antigravity, so every Gemini pairing answers here.
         (Dialect::OpenAi, Dialect::Google)
@@ -302,6 +315,10 @@ pub fn translate_sse_data(ctx: &TranslateCtx<'_>, data: &str) -> Result<Vec<Stri
         (Dialect::Anthropic, Dialect::Copilot) => openai::sse_to_anthropic(ctx, data),
         (Dialect::OpenAi, Dialect::ModalVllm) => Ok(vec![data.to_owned()]),
         (Dialect::Anthropic, Dialect::ModalVllm) => openai::sse_to_anthropic(ctx, data),
+        // Anthropic SSE event names end to end: `message_start`, `content_block_delta`,
+        // `ping`/keep-alives. `(OpenAi, Zcode)` is the same conversion as `(OpenAi, Anthropic)`.
+        (Dialect::Anthropic, Dialect::Zcode) => Ok(vec![data.to_owned()]),
+        (Dialect::OpenAi, Dialect::Zcode) => anthropic::sse_to_openai(ctx, data),
         (Dialect::OpenAi, Dialect::CommandCodeGo)
         | (Dialect::Anthropic, Dialect::CommandCodeGo) => commandcode::sse_to_pivot(ctx, data),
         // Cloud Code's stream frames carry the same `{"response": ...}` wrapper, unwrapped per
@@ -622,5 +639,66 @@ mod tests {
             !end.contains("data: [DONE]"),
             "an Anthropic SDK rejects the OpenAI terminator"
         );
+    }
+
+    #[test]
+    fn zcode_passes_an_anthropic_body_through_and_converts_an_openai_one() {
+        // The plan surface is Anthropic Messages, so an Anthropic client's body is already the
+        // right shape; an OpenAI client's must be converted, and the converter also names the
+        // `messages` path the dialect's endpoint expects.
+        let anthropic_ctx = TranslateCtx::new(RouteKind::Messages, Dialect::Zcode, "glm-4.6");
+        let body = br#"{"model":"glm-4.6","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+        assert!(translate_request(&anthropic_ctx, body).unwrap().is_none());
+
+        let openai_ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Zcode, "glm-4.6");
+        let translated = translate_request(
+            &openai_ctx,
+            br#"{"model":"glm-4.6","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap()
+        .expect("an OpenAI body is not an Anthropic body");
+        assert_eq!(translated.path_override.as_deref(), Some("messages"));
+        let sent: serde_json::Value = serde_json::from_slice(&translated.body).unwrap();
+        assert!(sent.get("max_tokens").is_some(), "the Messages API requires it");
+
+        // The dialect is not a passthrough pair, even to Anthropic: `is_passthrough_to` means
+        // "identical dialect", and a header and credential change alongside the path.
+        assert!(!Dialect::Zcode.is_passthrough_to(Dialect::Anthropic));
+    }
+
+    #[test]
+    fn zcode_answers_a_client_with_its_own_dialect_and_reads_anthropic_events() {
+        // The upstream half is Anthropic-shaped for both client dialects, so only the client side
+        // of the pair decides whether the bytes change on the way back.
+        let anthropic_ctx = TranslateCtx::new(RouteKind::Messages, Dialect::Zcode, "glm-4.6");
+        let message = serde_json::json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "model": "glm-4.6",
+            "content": [{"type": "text", "text": "hey"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        });
+        let raw = serde_json::to_vec(&message).unwrap();
+        assert_eq!(
+            translate_response_body(&anthropic_ctx, &raw).unwrap().as_ref(),
+            raw.as_slice(),
+            "an Anthropic client gets the upstream document verbatim"
+        );
+
+        let openai_ctx = TranslateCtx::new(RouteKind::ChatCompletions, Dialect::Zcode, "glm-4.6");
+        let converted = translate_response_body(&openai_ctx, &raw).unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&converted).unwrap();
+        assert_eq!(out["choices"][0]["message"]["content"], "hey");
+
+        openai::reset_stream_state();
+        let frames = translate_sse_data(
+            &anthropic_ctx,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+        )
+        .expect("an Anthropic client's ZCode stream is Anthropic SSE");
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].contains("content_block_delta"));
     }
 }

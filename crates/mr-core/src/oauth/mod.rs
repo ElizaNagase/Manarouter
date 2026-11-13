@@ -8,6 +8,7 @@
 //! | `openai-codex`     | [`codex::Codex`]     | loopback authorization code + PKCE (S256) |
 //! | `github-copilot`   | [`copilot::Copilot`] | GitHub device code                |
 //! | `antigravity`      | [`antigravity::Antigravity`] | loopback authorization code (T2 experimental, T1 selectable) |
+//! | `zcode`            | [`zcode::Zcode`]     | brokered CLI login: created, then polled until the browser finishes |
 //! | `cline`            | not registered       | no verified interactive flow      |
 //! | OmniRoute additional providers | not ported | provider-specific review required |
 //!
@@ -46,6 +47,7 @@ pub mod migrate;
 pub mod reference;
 pub mod refresh;
 pub mod session;
+pub mod zcode;
 
 use std::fmt;
 use std::time::Duration;
@@ -620,13 +622,15 @@ pub trait OAuthPlatform: Send + Sync {
 use antigravity::Antigravity;
 use codex::Codex;
 use copilot::Copilot;
+use zcode::Zcode;
 
 static CODEX: Codex = Codex;
 static COPILOT: Copilot = Copilot;
 static ANTIGRAVITY: Antigravity = Antigravity::ide();
+static ZCODE: Zcode = Zcode;
 
 /// Registration order for implemented platforms, matching `catalog/providers.toml`.
-static PLATFORMS: [&'static dyn OAuthPlatform; 3] = [&CODEX, &COPILOT, &ANTIGRAVITY];
+static PLATFORMS: [&'static dyn OAuthPlatform; 4] = [&CODEX, &COPILOT, &ANTIGRAVITY, &ZCODE];
 
 /// Every registered platform. Required to resolve every `AuthKind::OAuth` catalogue id — see
 /// the tests at the bottom of this file, which check both directions.

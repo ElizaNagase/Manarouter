@@ -1979,6 +1979,11 @@ async fn attempt_step(
     // an estimate and marks it with a header, so a client can tell the difference between a number
     // the provider counted and a number the relay guessed.
     //
+    // ZCode is the dialect that makes this rule visible: its upstream *is* an Anthropic Messages
+    // endpoint, so a count could plausibly be proxied to `…/v1/messages/count_tokens` — but the app
+    // never counts that way, and a count sent down the generation path would be billed as a
+    // generation. It stays local.
+    //
     // The answer is produced before an account is chosen: there is no upstream to authenticate to,
     // no credential to read, and no request to bill. It is an ordinary local answer — the same
     // shape an upstream failure takes — so a step that fails further down still falls through to
@@ -3812,6 +3817,9 @@ fn dialect_version(dialect: Dialect) -> Option<&'static str> {
     match dialect {
         Dialect::OpenAi => Some("v1"),
         Dialect::Anthropic => Some("v1"),
+        // The plan base URL is `…/api/v1/zcode-plan/anthropic`, i.e. it already carries the `v1` of
+        // the API prefix but not the one the Messages endpoint needs, so the version is added.
+        Dialect::Zcode => Some("v1"),
         Dialect::Google => Some("v1beta"),
         Dialect::GoogleAiStudio => Some("v1beta"),
         Dialect::Antigravity => Some("v1internal"),
@@ -3957,6 +3965,14 @@ fn default_path(dialect: Dialect, route: RouteKind) -> &'static str {
             // so the translator names the path.
             _ => "/v1/messages",
         },
+        // ZCode is the same Anthropic Messages surface on a different origin. Its count-tokens
+        // path is named for completeness only: the route is answered locally for this dialect (the
+        // app never asks the endpoint to count, and a count sent to `/v1/messages` would be billed
+        // as a generation), so nothing reaches it in practice.
+        Dialect::Zcode => match route {
+            RouteKind::CountTokens => "/v1/messages/count_tokens",
+            _ => "/v1/messages",
+        },
         Dialect::Google => "/v1beta/models:generateContent",
         Dialect::GoogleAiStudio => "/v1beta/models:generateContent",
         Dialect::Antigravity => "/v1internal:generateContent",
@@ -3965,6 +3981,61 @@ fn default_path(dialect: Dialect, route: RouteKind) -> &'static str {
         Dialect::CommandCodeGo => "/alpha/generate",
         Dialect::ModalVllm => "/v1/chat/completions",
     }
+}
+
+/// The per-request headers ZCode's app attaches to a model request.
+///
+/// Four ids, and nothing else: `x-request-id` and `x-zcode-trace-id` are fresh for every attempt,
+/// `x-zcode-session-type` is `main` because a relay request is a turn somebody asked for, and
+/// `x-session-id` is the client's own conversation marker when it sent one — with the `sess_` and
+/// `subagent_agent_` prefixes the app strips before putting it on the wire.
+///
+/// `anthropic-version` is set only when the provider row did not already supply it: the AI SDK's
+/// Anthropic client always sends it, so a request without one is not a request the app could make,
+/// but an operator who pinned a different value keeps it.
+///
+/// A session id is minted when the client sent no marker. The app always has a conversation to name,
+/// and a request the endpoint cannot correlate is a request it can reject; the cost of the minted id
+/// is that two turns of one conversation do not share it, which is why the client's own marker is
+/// preferred whenever there is one.
+fn zcode_attribution_headers(headers: &mut HeaderMap, session_id: Option<&str>) {
+    use mr_dialects::zcode as zc;
+
+    headers
+        .entry(zc::ANTHROPIC_VERSION_HEADER)
+        .or_insert(HeaderValue::from_static(zc::ANTHROPIC_VERSION));
+
+    let fresh = uuid::Uuid::new_v4().to_string();
+    if let Ok(value) = HeaderValue::from_str(&fresh) {
+        headers.insert(zc::REQUEST_ID_HEADER, value.clone());
+        headers.insert(zc::TRACE_ID_HEADER, value);
+    }
+    headers.insert(
+        zc::SESSION_TYPE_HEADER,
+        HeaderValue::from_static(zc::SESSION_TYPE_MAIN),
+    );
+    let session = session_id.and_then(zcode_session_id).unwrap_or(&fresh);
+    if let Ok(value) = HeaderValue::from_str(session) {
+        headers.insert(zc::SESSION_ID_HEADER, value);
+    }
+}
+
+/// Normalise a client's conversation marker into the id ZCode's endpoint expects.
+///
+/// Returns `None` for a marker that cannot be an id on this wire: the app strips a `sess_` or
+/// `subagent_agent_` prefix, and its source-header sanitiser drops anything outside printable ASCII.
+/// Normalising here rather than forwarding verbatim keeps a marker that was meaningful to the client
+/// from reaching an endpoint that would reject it.
+fn zcode_session_id(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    let trimmed = trimmed
+        .strip_prefix("subagent_agent_")
+        .or_else(|| trimmed.strip_prefix("sess_"))
+        .unwrap_or(trimmed);
+    (!trimmed.is_empty()
+        && trimmed.len() <= 128
+        && trimmed.bytes().all(|b| (0x20..=0x7e).contains(&b)))
+    .then_some(trimmed)
 }
 
 /// Build the outgoing headers for one attempt.
@@ -4030,6 +4101,17 @@ fn upstream_headers(
             "x-cli-environment",
             HeaderValue::from_static(mr_dialects::commandcode::CLI_ENVIRONMENT),
         );
+    }
+
+    // ZCode's plan endpoint is Anthropic Messages behind the desktop app's own correlation
+    // headers. `apply_auth` has already put the credential in `x-api-key`; what is left is what the
+    // app's attribution layer attaches to every model request, and `x-session-id` is the one its
+    // signing layer refuses to sign without. The app's *identity* headers — `User-Agent`,
+    // `X-ZCode-App-Version`, `X-Title`, `X-Platform` and the `X-Client-*` family — are deliberately
+    // absent: they ride its configuration requests, not its model requests, and a header the app
+    // would never send is exactly what this dialect exists to avoid.
+    if step.dialect == Dialect::Zcode {
+        zcode_attribution_headers(&mut map, client_session_hint(client_headers));
     }
 
     // Cloud Code refuses clients below a rolling minimum build ("This version of Antigravity is
@@ -6839,6 +6921,170 @@ response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"out
             &[],
         );
         assert_eq!(out.get("user-agent").unwrap().to_str().unwrap(), RECORDED);
+    }
+
+    #[test]
+    fn zcode_inference_carries_the_apps_attribution_headers() {
+        // What the app attaches to a model request, and nothing else: the correlation ids, the
+        // session marker its signing layer keys on, the Anthropic version, and the credential.
+        let mut p = provider_plan();
+        p.headers
+            .insert("anthropic-version".to_owned(), "2023-06-01".to_owned());
+        let head = scan_request_head(br#"{"model":"glm-4.6"}"#);
+        let out = upstream_headers(
+            &p,
+            &step(Dialect::Zcode, "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1"),
+            None,
+            &HeaderMap::new(),
+            &head,
+            false,
+            None,
+            &[],
+        );
+
+        let request_id = out
+            .get("x-request-id")
+            .expect("a model request carries x-request-id")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(request_id.len() >= 32, "{request_id}");
+        // One id, two names: the app reuses the same value for the request and its trace.
+        assert_eq!(out.get("x-zcode-trace-id").unwrap(), request_id.as_str());
+        assert_eq!(out.get("x-zcode-session-type").unwrap(), "main");
+        // With no client marker the fresh id becomes the session so the header is always present.
+        assert_eq!(out.get("x-session-id").unwrap(), request_id.as_str());
+        assert_eq!(out.get("anthropic-version").unwrap(), "2023-06-01");
+    }
+
+    #[test]
+    fn zcode_invents_no_identity_header_the_app_does_not_send() {
+        // The recorded model request has no `User-Agent` override, no app version, no title and no
+        // `X-Client-*` family; those ride its configuration requests. Sending them would be a
+        // fingerprint of a request the app never makes.
+        let p = provider_plan();
+        let head = scan_request_head(br#"{"model":"glm-4.6"}"#);
+        let out = upstream_headers(
+            &p,
+            &step(Dialect::Zcode, "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1"),
+            None,
+            &HeaderMap::new(),
+            &head,
+            false,
+            None,
+            &[],
+        );
+        for name in [
+            "user-agent",
+            "x-zcode-app-version",
+            "x-title",
+            "x-platform",
+            "x-os-name",
+            "x-client-version",
+            "x-client-sig",
+            "x-client-ts",
+            "x-client-nonce",
+            "x-app-id",
+            "x-client-pow",
+        ] {
+            assert!(!out.contains_key(name), "{name} must not be invented");
+        }
+        // And the attribution block is this dialect's alone.
+        let out = upstream_headers(
+            &p,
+            &step(Dialect::Anthropic, "https://api.anthropic.com"),
+            None,
+            &HeaderMap::new(),
+            &head,
+            false,
+            None,
+            &[],
+        );
+        assert!(!out.contains_key("x-zcode-session-type"));
+        assert!(!out.contains_key("x-request-id"));
+    }
+
+    #[test]
+    fn zcode_takes_the_clients_session_marker_in_the_shape_its_endpoint_expects() {
+        let p = provider_plan();
+        let head = scan_request_head(br#"{"model":"glm-4.6"}"#);
+        let with_session = |raw: &str| {
+            let mut client = HeaderMap::new();
+            client.insert("session-id", raw.parse().unwrap());
+            upstream_headers(
+                &p,
+                &step(Dialect::Zcode, "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1"),
+                None,
+                &client,
+                &head,
+                false,
+                None,
+                &[],
+            )
+            .get("x-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned()
+        };
+
+        // The app strips its own prefixes before the id reaches the wire.
+        assert_eq!(with_session("sess_abc123"), "abc123");
+        assert_eq!(with_session("subagent_agent_xyz789"), "xyz789");
+        assert_eq!(with_session("  plain-id  "), "plain-id");
+        // A marker that cannot be an id falls back to the fresh one rather than being forwarded.
+        for unusable in ["", "   ", "sess_", "has space\tand tab"] {
+            let fallback = with_session(unusable);
+            assert!(fallback.len() >= 32, "{unusable:?} -> {fallback}");
+        }
+    }
+
+    #[test]
+    fn zcode_keeps_the_operators_anthropic_version() {
+        // `or_insert`, not `insert`: an operator who pins a different revision keeps it.
+        let mut p = provider_plan();
+        p.headers
+            .insert("anthropic-version".to_owned(), "2024-10-22".to_owned());
+        let head = scan_request_head(br#"{"model":"glm-4.6"}"#);
+        let out = upstream_headers(
+            &p,
+            &step(Dialect::Zcode, "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1"),
+            None,
+            &HeaderMap::new(),
+            &head,
+            false,
+            None,
+            &[],
+        );
+        assert_eq!(out.get("anthropic-version").unwrap(), "2024-10-22");
+    }
+
+    #[test]
+    fn zcode_builds_the_messages_url_the_app_sends() {
+        // The base URL stops at `anthropic`; the dialect supplies `v1/messages`, and the join must
+        // not double the version the base already ends short of.
+        let s = step(Dialect::Zcode, "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1");
+        let path = upstream_path(Dialect::Zcode, RouteKind::Messages, None, None);
+        assert_eq!(path, UpstreamPath::Dialect("/v1/messages"));
+        assert_eq!(
+            build_url(&s, path).as_deref(),
+            Some("https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages")
+        );
+    }
+
+    #[test]
+    fn the_zcode_default_path_is_the_messages_path_for_every_route() {
+        for route in [
+            RouteKind::Messages,
+            RouteKind::ChatCompletions,
+            RouteKind::CountTokens,
+        ] {
+            let expected = match route {
+                RouteKind::CountTokens => "/v1/messages/count_tokens",
+                _ => "/v1/messages",
+            };
+            assert_eq!(default_path(Dialect::Zcode, route), expected, "{route:?}");
+        }
     }
 
     #[test]
