@@ -641,8 +641,9 @@ mod tests {
     use axum::http::StatusCode as AxumStatusCode;
     use std::net::SocketAddr;
     use std::time::Duration;
-    // `TcpStream`'s write/flush come from the extension traits, not inherent methods.
-    use tokio::io::AsyncWriteExt;
+    // `TcpStream`'s read/write/flush/shutdown come from the extension traits, not inherent
+    // methods.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// An unreachable endpoint is named by its authority, never by its scheme.
     #[test]
@@ -660,53 +661,91 @@ mod tests {
         assert_eq!(endpoint_authority("http://"), "<host>");
     }
 
-    /// Run a TCP server that returns a valid `/v1/models` response.
-    async fn run_valid_server(addr: SocketAddr) -> std::io::Result<tokio::task::JoinHandle<()>> {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        let handle = tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n\
-                     {\"object\":\"list\",\"data\":[{\"id\":\"fake-model\",\"object\":\"model\"}]}",
-                    )
-                    .await;
-                let _ = stream.flush().await;
-            }
-        });
-        Ok(handle)
+    /// One HTTP/1.1 reply, with the length stated rather than left to EOF.
+    fn http_reply(status: &str, headers: &[&str], body: &str) -> Vec<u8> {
+        let mut reply = format!("HTTP/1.1 {status}\r\n");
+        for header in headers {
+            reply.push_str(header);
+            reply.push_str("\r\n");
+        }
+        reply.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ));
+        reply.into_bytes()
     }
 
-    /// Run a TCP server that returns a 302 redirect for `/v1/models`.
-    async fn run_redirect_server(addr: SocketAddr) -> std::io::Result<tokio::task::JoinHandle<()>> {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        let handle = tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let _ = stream
-                    .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://example.com/models\r\n\r\n")
-                    .await;
-                let _ = stream.flush().await;
-            }
-        });
-        Ok(handle)
+    /// Answer one connection with `reply`, then close it.
+    ///
+    /// The request is read before the reply is written, and the socket is shut down rather than
+    /// dropped. Both details matter: a socket dropped while the peer's request is still unread in
+    /// the receive queue makes the kernel send RST, and a reset discards whatever was queued to be
+    /// sent — including the reply — so the client sees a dead connection instead of a status.
+    /// macOS resets far more eagerly than Linux, which is what made these socket tests flaky on the
+    /// macOS runner, but the drain belongs here regardless.
+    async fn serve_once(listener: tokio::net::TcpListener, reply: Vec<u8>) {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.flush().await;
+            let _ = stream.shutdown().await;
+        }
     }
 
-    /// Run a TCP server that returns 500 repeatedly (for multiple probe cycles).
+    /// Bind an ephemeral port and answer its first connection with `reply`.
+    ///
+    /// The kernel picks the port, so a test can never collide with a hard-coded number another
+    /// test — or another `cargo test` binary running at the same time — already holds.
+    async fn run_once_server(
+        reply: Vec<u8>,
+    ) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        Ok((addr, tokio::spawn(serve_once(listener, reply))))
+    }
+
+    /// A `/v1/models` answer that lists one model.
+    async fn run_valid_server() -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        run_once_server(http_reply(
+            "200 OK",
+            &["Content-Type: application/json"],
+            "{\"object\":\"list\",\"data\":[{\"id\":\"fake-model\",\"object\":\"model\"}]}",
+        ))
+        .await
+    }
+
+    /// A 302 answer for `/v1/models`; the client is expected not to follow it.
+    async fn run_redirect_server() -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        run_once_server(http_reply(
+            "302 Found",
+            &["Location: http://example.com/models"],
+            "",
+        ))
+        .await
+    }
+
+    /// A server that answers every connection with 500, for repeated probe cycles.
     async fn run_persistent_error_server(
-        addr: SocketAddr,
-    ) -> std::io::Result<tokio::task::JoinHandle<()>> {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+    ) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let reply = http_reply(
+            "500 Internal Server Error",
+            &["Content-Type: application/json"],
+            "{\"error\":\"server error\"}",
+        );
         let handle = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
-                let _ = stream.write_all(
-                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n\
-                     {\"error\":\"server error\"}"
-                ).await;
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let _ = stream.write_all(&reply).await;
                 let _ = stream.flush().await;
+                let _ = stream.shutdown().await;
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         });
-        Ok(handle)
+        Ok((addr, handle))
     }
 
     /// A fresh, empty registry — every test gets its own so nothing leaks between them.
@@ -749,20 +788,15 @@ mod tests {
     /// Uses a real TCP listener (HTTP/1.1 200 with a valid models body).
     #[tokio::test]
     async fn test_attach_valid_server_registers() {
-        let port = 19201;
-        let addr = format!("127.0.0.1:{}", port);
-        let _server = run_valid_server(addr.parse().unwrap()).await.unwrap();
+        let (addr, _server) = run_valid_server().await.unwrap();
 
         let state = fresh_state();
-
-        // Give the server a moment to accept.
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let (status, body) = call_attach(
             state.clone(),
             "http://127.0.0.1",
             "test-acc",
-            &format!("http://{}", addr),
+            &format!("http://{addr}"),
             "test-token",
         )
         .await;
@@ -781,18 +815,14 @@ mod tests {
     /// The HTTP helper (`QuotaHttp`) does NOT follow redirects, so a 3xx is returned as-is.
     #[tokio::test]
     async fn test_attach_redirect_fails() {
-        let port = 19202;
-        let addr = format!("127.0.0.1:{}", port);
-        let _server = run_redirect_server(addr.parse().unwrap()).await.unwrap();
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (addr, _server) = run_redirect_server().await.unwrap();
 
         let state = fresh_state();
         let (status, body) = call_attach(
             state,
             "http://127.0.0.1",
             "test-acc",
-            &format!("http://{}", addr),
+            &format!("http://{addr}"),
             "test-token",
         )
         .await;
@@ -812,8 +842,8 @@ mod tests {
     /// Calls `probe_all` directly with a live error server.
     #[tokio::test]
     async fn test_three_failures_deregister() {
-        let port = 19203;
-        let addr = format!("127.0.0.1:{}", port);
+        // Start the error server first: the registration needs the port it chose.
+        let (addr, _server) = run_persistent_error_server().await.unwrap();
 
         // Insert a registration manually.
         let state = fresh_state();
@@ -823,7 +853,7 @@ mod tests {
                 "fail-acc".to_string(),
                 Registration {
                     account: "fail-acc".to_string(),
-                    url: format!("http://{}", addr),
+                    url: format!("http://{addr}"),
                     token: "fail-token".to_string(),
                     registered_at: Millis::now(),
                     last_probe: Some(Millis::now().to_rfc3339()),
@@ -833,12 +863,6 @@ mod tests {
                 },
             );
         }
-
-        // Start error server.
-        let _server = run_persistent_error_server(addr.parse().unwrap())
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Run 3 probe cycles (each probes once).
         for _ in 0..3 {

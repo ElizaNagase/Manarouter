@@ -875,7 +875,7 @@ mod tests {
     use axum::http::StatusCode as AxumStatusCode;
     use std::net::SocketAddr;
     use std::time::Duration;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
     // ---------------------------------------------------------------------------
@@ -911,56 +911,91 @@ mod tests {
         (AxumStatusCode::OK, json.0)
     }
 
-    /// Run a TCP server that returns a valid /v1/models response.
-    async fn run_valid_server(addr: SocketAddr) -> std::io::Result<tokio::task::JoinHandle<()>> {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        let handle = tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n\
-                         {\"object\":\"list\",\"data\":[{\"id\":\"fake-model\",\"object\":\"model\"}]}",
-                    )
-                    .await;
-                let _ = stream.flush().await;
-            }
-        });
-        Ok(handle)
+    /// One HTTP/1.1 reply, with the length stated rather than left to EOF.
+    fn http_reply(status: &str, headers: &[&str], body: &str) -> Vec<u8> {
+        let mut reply = format!("HTTP/1.1 {status}\r\n");
+        for header in headers {
+            reply.push_str(header);
+            reply.push_str("\r\n");
+        }
+        reply.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ));
+        reply.into_bytes()
     }
 
-    /// Run a TCP server that returns a 401 Unauthorized response.
-    async fn run_401_server(addr: SocketAddr) -> std::io::Result<tokio::task::JoinHandle<()>> {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        let handle = tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\n\r\nUnauthorized",
-                    )
-                    .await;
-                let _ = stream.flush().await;
-            }
-        });
-        Ok(handle)
+    /// Answer one connection with `reply`, then close it.
+    ///
+    /// The request is read before the reply is written, and the socket is shut down rather than
+    /// dropped. Both details matter: a socket dropped while the peer's request is still unread in
+    /// the receive queue makes the kernel send RST, and a reset discards whatever was queued to be
+    /// sent — including the reply — so the client sees a dead connection instead of a status.
+    /// macOS resets far more eagerly than Linux, which is what made these socket tests flaky on the
+    /// macOS runner, but the drain belongs here regardless.
+    async fn serve_once(listener: tokio::net::TcpListener, reply: Vec<u8>) {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.flush().await;
+            let _ = stream.shutdown().await;
+        }
     }
 
-    /// Run a TCP server that returns 500 repeatedly (for consecutive failure testing).
+    /// Bind an ephemeral port and answer its first connection with `reply`.
+    ///
+    /// The kernel picks the port, so a test can never collide with a hard-coded number another
+    /// test — or another `cargo test` binary running at the same time — already holds.
+    async fn run_once_server(
+        reply: Vec<u8>,
+    ) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        Ok((addr, tokio::spawn(serve_once(listener, reply))))
+    }
+
+    /// A `/v1/models` answer that lists one model.
+    async fn run_valid_server() -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        run_once_server(http_reply(
+            "200 OK",
+            &["Content-Type: application/json"],
+            "{\"object\":\"list\",\"data\":[{\"id\":\"fake-model\",\"object\":\"model\"}]}",
+        ))
+        .await
+    }
+
+    /// A 401 answer for `/v1/models`.
+    async fn run_401_server() -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        run_once_server(http_reply(
+            "401 Unauthorized",
+            &["Content-Type: text/plain"],
+            "Unauthorized",
+        ))
+        .await
+    }
+
+    /// A server that answers every connection with 500, for repeated probe cycles.
     async fn run_persistent_error_server(
-        addr: SocketAddr,
-    ) -> std::io::Result<tokio::task::JoinHandle<()>> {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+    ) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let reply = http_reply(
+            "500 Internal Server Error",
+            &["Content-Type: application/json"],
+            "{\"error\":\"server error\"}",
+        );
         let handle = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
-                let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n\
-                         {\"error\":\"server error\"}",
-                    )
-                    .await;
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let _ = stream.write_all(&reply).await;
                 let _ = stream.flush().await;
+                let _ = stream.shutdown().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         });
-        Ok(handle)
+        Ok((addr, handle))
     }
 
     // ---------------------------------------------------------------------------
@@ -970,15 +1005,12 @@ mod tests {
     /// Test 1: attach registers a valid account.
     #[tokio::test]
     async fn test_attach_registers_valid_account() {
-        let port = 19301;
-        let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-        let _server = run_valid_server(addr).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (addr, _server) = run_valid_server().await.unwrap();
 
         let state = fresh_state();
         let (status, body) = call_attach(
             state.clone(),
-            &format!("http://127.0.0.1:{port}"),
+            &format!("http://{addr}"),
             "test-token-123",
             "test-acc-1",
         )
@@ -992,7 +1024,7 @@ mod tests {
         let reg = saturn.registrations.get("test-acc-1");
         assert!(reg.is_some(), "account should be registered");
         let reg = reg.unwrap();
-        assert_eq!(reg.host, format!("http://127.0.0.1:{port}"));
+        assert_eq!(reg.host, format!("http://{addr}"));
         assert!(
             reg.is_warm(),
             "account should be warm after successful attach"
@@ -1030,16 +1062,13 @@ mod tests {
     /// Test 3: the token never appears in any response body.
     #[tokio::test]
     async fn test_token_never_in_response() {
-        let port = 19302;
-        let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-        let _server = run_valid_server(addr).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (addr, _server) = run_valid_server().await.unwrap();
 
         let state = fresh_state();
         let secret_token = "super-secret-token-that-should-not-appear";
         let _ = call_attach(
             state.clone(),
-            &format!("http://127.0.0.1:{port}"),
+            &format!("http://{addr}"),
             secret_token,
             "token-test",
         )
@@ -1048,7 +1077,7 @@ mod tests {
         // Check attach response — the secret token must not appear in the JSON body.
         let (_, attach_body) = call_attach(
             state.clone(),
-            &format!("http://127.0.0.1:{port}"),
+            &format!("http://{addr}"),
             secret_token,
             "token-test",
         )
@@ -1263,10 +1292,7 @@ mod tests {
     /// rather than `classify_probe` alone.
     #[tokio::test]
     async fn a_rejected_token_is_reported_and_never_echoed() {
-        let probe_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = probe_listener.local_addr().unwrap();
-        drop(probe_listener);
-        let _server = run_401_server(addr).await.unwrap();
+        let (addr, _server) = run_401_server().await.unwrap();
 
         let state = Arc::new(SaturnState::new());
         state
@@ -1300,10 +1326,7 @@ mod tests {
     /// Three consecutive failed probes deregister the account and answer `503 unavailable`.
     #[tokio::test]
     async fn three_consecutive_failures_deregister_the_account() {
-        let probe_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = probe_listener.local_addr().unwrap();
-        drop(probe_listener);
-        let _server = run_persistent_error_server(addr).await.unwrap();
+        let (addr, _server) = run_persistent_error_server().await.unwrap();
 
         let state = Arc::new(SaturnState::new());
         state
