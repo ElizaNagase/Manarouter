@@ -715,7 +715,7 @@ impl Exchange for DirectH2Exchange {
 
             let mut http_request = http::Request::builder()
                 .method(http::Method::POST)
-                .uri(request.path)
+                .uri(request_uri(&request.origin, request.path)?)
                 .version(http::Version::HTTP_2)
                 .body(())
                 .map_err(|error| Error::Transport(error.to_string()))?;
@@ -735,6 +735,28 @@ impl Exchange for DirectH2Exchange {
             })
         })
     }
+}
+
+/// The absolute URI an HTTP/2 request needs.
+///
+/// HTTP/2 sends no request line: the destination travels in the `:scheme`, `:authority` and `:path`
+/// pseudo-headers, which `h2` derives from the URI. A path-only URI therefore has no scheme or
+/// authority to derive them from, and `h2` refuses it with "request URI missing scheme and
+/// authority" *after* the connection is already open — a failure that reads like a provider fault
+/// and, worse, cools the account down for a request this router never managed to send. Every Cursor
+/// turn died there until the origin was joined to the path.
+fn request_uri(origin: &str, path: &str) -> Result<http::Uri, Error> {
+    let uri: http::Uri = format!("{}{}", origin.trim_end_matches('/'), path)
+        .parse()
+        .map_err(|error| {
+            Error::Config(format!("a Cursor request URI could not be built: {error}"))
+        })?;
+    if uri.scheme_str() != Some("https") || uri.authority().is_none() {
+        return Err(Error::Config(
+            "a Cursor request URI needs an https scheme and an authority".to_owned(),
+        ));
+    }
+    Ok(uri)
 }
 
 fn split_origin(origin: &str) -> Result<(String, u16), Error> {
@@ -1180,6 +1202,40 @@ mod tests {
             .headers
             .iter()
             .any(|(name, value)| name == "x-ghost-mode" && value == "false"));
+    }
+
+    #[test]
+    fn a_request_uri_carries_the_scheme_and_authority_http2_derives_its_pseudo_headers_from() {
+        // HTTP/2 has no request line: the destination is the `:scheme` and `:authority`
+        // pseudo-headers, which `h2` derives from the URI. A path-only URI has neither, and `h2`
+        // rejects it *after* dialling with "request URI missing scheme and authority" — which is
+        // how every live Cursor turn failed, and which then cooled the account down for a request
+        // this router had not managed to send. The scheme is not decoration here.
+        let uri = request_uri(cursor::FALLBACK_AGENT_ORIGIN, cursor::RUN_PATH).expect("a run URI");
+        assert_eq!(uri.scheme_str(), Some("https"));
+        assert_eq!(uri.authority().unwrap().as_str(), "agent.api5.cursor.sh");
+        assert_eq!(uri.path(), cursor::RUN_PATH);
+        assert!(uri.query().is_none());
+
+        let discovery = request_uri(cursor::DISCOVERY_ORIGIN, cursor::SERVER_CONFIG_PATH)
+            .expect("a discovery URI");
+        assert_eq!(discovery.scheme_str(), Some("https"));
+        assert_eq!(discovery.authority().unwrap().as_str(), "api2.cursor.sh");
+        assert_eq!(discovery.path(), cursor::SERVER_CONFIG_PATH);
+    }
+
+    #[test]
+    fn a_trailing_slash_on_the_origin_does_not_double_the_path() {
+        let uri = request_uri("https://agent.api5.cursor.sh/", cursor::RUN_PATH).unwrap();
+        assert_eq!(uri.path(), cursor::RUN_PATH);
+    }
+
+    #[test]
+    fn a_uri_that_cannot_be_absolute_is_refused_before_a_connection_is_opened() {
+        // Caught before dialling, so the refusal is ours to report rather than a provider fault.
+        assert!(request_uri("agent.api5.cursor.sh", cursor::RUN_PATH).is_err());
+        assert!(request_uri("http://agent.api5.cursor.sh", cursor::RUN_PATH).is_err());
+        assert!(request_uri("https://", cursor::RUN_PATH).is_err());
     }
 
     #[tokio::test]
