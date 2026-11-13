@@ -128,10 +128,19 @@ impl Harness {
             health: Arc::new(Health::new()),
             vault: Arc::new(vault),
             oauth_refreshers: Arc::new(HashMap::new()),
+            quota: Arc::new(manarouter_relay::quota::QuotaManager::new(Arc::clone(
+                &oauth_store,
+            ))),
             oauth_store: Arc::clone(&oauth_store),
-            quota: Arc::new(manarouter_relay::quota::QuotaManager::new(oauth_store)),
+            // The GPU-second ledger rides on the same in-memory store as the quota ledger, so the
+            // bench never touches (or creates) an operator's database file.
+            quota_store: Arc::clone(&oauth_store),
             activity: Arc::new(manarouter_relay::activity::ActivityLog::new()),
             sticky_success: Arc::new(StickySuccess::default()),
+            kv_usage: Arc::new(manarouter_relay::kv_budget::AdmissionPool::new()),
+            // A lane with no disk state and no workers. The bench measures the request path, and a
+            // lane that recovered an operator's real batches would be both slow and surprising.
+            batch: manarouter_relay::batch::BatchLane::inert(),
         };
 
         let router = router(state);
