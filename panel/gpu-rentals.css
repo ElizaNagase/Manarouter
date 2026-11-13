@@ -18,6 +18,38 @@
 
 .gpu-rentals .gpu-status { margin: 6px 0 10px; }
 
+/* Platform plumbing is reference material, so it is one disclosure at the foot of the page rather
+ * than six cards between the operator and their rentals. The disclosure itself is a rule, not a
+ * box: opening it must not put a bordered panel around a stack of bordered cards. */
+.gpu-rentals .gpu-advanced {
+  margin: 4px 0 0;
+  padding-top: 2px;
+  border-top: 1px solid var(--line);
+}
+.gpu-rentals .gpu-advanced > summary {
+  padding: 10px 0;
+  color: var(--tx2);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  cursor: pointer;
+  list-style: none;
+}
+.gpu-rentals .gpu-advanced > summary::-webkit-details-marker { display: none; }
+.gpu-rentals .gpu-advanced > summary::before {
+  content: "+";
+  display: inline-block;
+  width: 12px;
+  color: var(--tx3);
+}
+.gpu-rentals .gpu-advanced[open] > summary::before { content: "−"; }
+.gpu-rentals .gpu-advanced > summary:hover { color: var(--tx1); }
+.gpu-rentals .gpu-advanced > summary:focus-visible { outline: 1px solid var(--pink); outline-offset: 2px; }
+.gpu-rentals .gpu-advanced[open] > summary { padding-bottom: 4px; }
+.gpu-rentals .gpu-advanced > .hint { margin: 0 0 12px; }
+
 /* The card itself is lab.css's .card. The label keeps the .card > h2 metrics and the 12px that
  * separates it from content everywhere else in the panel; the intro line under it is separated from
  * the content below by its own bottom margin so the label and its hint read as one head. */
@@ -107,44 +139,17 @@
   font-size: 11.5px;
 }
 
-/* Instance usage is one ledger total, not an account column. It sits above the account table
- * because it answers "what has this instance spent", which is the question the table cannot. It is
- * separated from the card's prose by a rule rather than given a box of its own. */
-.gpu-rentals .gpu-usage {
-  margin: 12px 0;
-  padding-top: 10px;
-  border-top: 1px solid var(--line);
-}
-
-.gpu-rentals .gpu-usage-head { margin-bottom: 8px; }
-.gpu-rentals .gpu-usage-grid {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 28px;
-}
-
-.gpu-rentals .gpu-usage-cell {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-}
-
-.gpu-rentals .gpu-usage-label {
-  color: var(--tx3);
-  font-size: 10.5px;
-  font-weight: 650;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
-}
-
-.gpu-rentals .gpu-usage-cell > strong.num {
-  color: var(--tx1);
-  font-size: 13px;
+/* The answer strip. These are plain .stat boxes laid out by .stat-grid, the same boxes the overview
+ * puts at the top of its page, so the two routes read as the same panel. The value is the panel's
+ * .stat-value size; nothing else here is new. */
+.gpu-rentals .gpu-glance { margin: 2px 0 16px; }
+.gpu-rentals .gpu-glance .v {
+  font-size: 19px;
   font-weight: 620;
+  letter-spacing: -0.01em;
   font-variant-numeric: tabular-nums;
 }
-
-.gpu-rentals .gpu-usage-failed { margin: 12px 0; }
+.gpu-rentals .gpu-glance .s { margin-top: 1px; }
 
 /* ---------- catalogue ---------- */
 
@@ -357,9 +362,11 @@
 
 .gpu-rentals .gpu-setup { min-width: 0; max-width: 980px; }
 
-/* The wizard's own head: the route already printed its title above, so this one is a page-section
- * title (15.5px, the size the docs view gives a sub-page), not a second 21px page title. Its actions
- * sit to the right, as on every other head in the panel. */
+/* The setup flow owns its head. The shell's head would print "GPU rentals" and an inventory
+ * subtitle above a wizard that is not showing inventory, so it is hidden the way the models view
+ * hides it, and this head takes the page-title size. One head, one title. */
+#main:has(.gpu-setup-head) > .page-head { display: none; }
+
 .gpu-rentals .gpu-setup > .page-head {
   flex-direction: row;
   flex-wrap: wrap;
@@ -370,15 +377,15 @@
   padding-bottom: 12px;
 }
 
-.gpu-rentals .gpu-setup > .page-head h1 {
+.gpu-rentals .gpu-setup-head h1 {
   margin: 0;
-  font-size: 15.5px;
+  font-size: 21px;
   font-weight: 620;
-  letter-spacing: -0.01em;
-  line-height: 1.3;
+  letter-spacing: -0.015em;
+  line-height: 1.25;
 }
 
-.gpu-rentals .gpu-setup > .page-head > .gpu-actions { margin-top: 0; }
+.gpu-rentals .gpu-setup-head > .gpu-actions { margin-top: 0; }
 
 .gpu-rentals .gpu-steps {
   display: flex;

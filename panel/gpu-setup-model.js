@@ -1708,7 +1708,7 @@ export function stepList(draft, catalog = null) {
       title: 'Platform',
       hint: 'Which rental platform this deployment runs on. The catalog decides what the rest of the flow may offer.',
       fields: [
-        selectField({ name: 'platform', label: 'Platform', optionsSource: 'catalog.platforms', hint: 'Catalog platforms only: `GET /api/gpu/catalog`.', value: fieldValue(d, 'platform') }),
+        selectField({ name: 'platform', label: 'Platform', optionsSource: 'catalog.platforms', hint: 'Only the platforms the catalogue lists. Nothing beyond it is assumed.', value: fieldValue(d, 'platform') }),
         readout({ name: 'platformDeployment', label: 'How deployment works here', optionsSource: 'catalog.deployment', hint: 'Modal publishes no deployment REST API: the setup flow emits a bundle and a command, it does not deploy.' }),
       ],
     },

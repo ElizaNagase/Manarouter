@@ -381,7 +381,7 @@ function messageOf(item) {
   return '—';
 }
 
-function bundlePanel(bundle, platform, { emptyNote = null } = {}) {
+function bundlePanel(bundle, platform, { emptyNote = null, honesty = true } = {}) {
   const box = objectOf(bundle) ?? {};
   const filename = asString(pick(box, 'filename')).trim() || 'modal_app.py';
   const text = asString(pick(box, 'text', 'bundle_text')).trim();
@@ -393,7 +393,9 @@ function bundlePanel(bundle, platform, { emptyNote = null } = {}) {
   const notes = listOf(pick(box, 'notes'));
   const warnings = listOf(pick(box, 'warnings'));
 
-  const parts = [modalHonestyLine(platform), platformExplain(platform)];
+  // The explanation belongs to the bundle's first appearance. The review step already says it in
+  // the step hint, so it asks for the bundle without repeating itself.
+  const parts = honesty ? [modalHonestyLine(platform), platformExplain(platform)] : [];
   if (text) {
     parts.push(h('div', { class: 'gpu-bundle-head' },
       h('span', { class: 'mono' }, filename),
@@ -522,6 +524,7 @@ async function renderInventory(mount, ctx) {
 
   const countEl = h('span', { class: 'count' }, 'GPU rentals');
   const statusEl = h('p', { class: 'hint gpu-status', role: 'status' }, 'Loading GPU rentals…');
+  const glanceBox = h('div', { class: 'stat-grid gpu-glance' });
   const plansBox = h('div', { class: 'gpu-plans' });
   const accountsBox = h('div', { class: 'gpu-accounts' });
   const deploymentsBox = h('div', { class: 'gpu-deployments' });
@@ -536,10 +539,19 @@ async function renderInventory(mount, ctx) {
     countEl,
     h('span', { class: 'spacer' }),
     ghostButton('Refresh', () => refresh(false), 'Re-read /api/gpu/rentals and /api/gpu/catalog'),
-    button('New deployment', () => ctx.navigate('#/gpu-rentals/new/platform'),
-      { className: 'btn btn-primary', title: 'Start the platform, account, model, card, sizing, review flow' }));
+    button('New rental', () => ctx.navigate('#/gpu-rentals/new/platform'),
+      { className: 'btn btn-primary', title: 'Pick a platform, account, model and card; the flow writes the app file and deploy command' }));
 
-  mount.replaceChildren(toolbar, statusEl, plansBox, accountsBox, deploymentsBox, bundleBox, catalogBox, lanesBox, laneCardsBox, planBox, cerebriumBox);
+  // What is rented comes first, then what a rental can be attached to, then what is available.
+  // The platform plumbing — plan tiers, generated bundles, lane endpoints — is reference material,
+  // not the reason somebody opened this page, so it lives in one collapsed disclosure at the end.
+  const advanced = h('details', { class: 'gpu-advanced' },
+    h('summary', {}, 'Platform details'),
+    hint('Plan tiers, the generated deploy command, and what each host allows. Nothing here is '
+      + 'needed to rent a GPU.'),
+    plansBox, bundleBox, lanesBox, laneCardsBox, planBox, cerebriumBox);
+
+  mount.replaceChildren(toolbar, glanceBox, statusEl, deploymentsBox, accountsBox, catalogBox, advanced);
 
   async function refresh(quiet) {
     if (!view.alive) return;
@@ -636,8 +648,8 @@ async function renderInventory(mount, ctx) {
       return;
     }
     card.append(hint(
-      'What each GPU host may be used for. A refusal below is the platform\'s rule quoted back, '
-      + 'not this router\'s preference — and it is not a live quota, which only the platform counts.'));
+      'What each GPU host may be used for. A refusal is the platform\'s rule quoted back, not this '
+      + 'router\'s preference — and not a live quota, which only the platform counts.'));
     const rows = lanes.map((lane) => {
       const refusals = objectOf(pick(lane, 'refusals'));
       const reasons = [
@@ -1278,38 +1290,54 @@ function laneAttachForm(platform) {
     plansBox.append(...cards);
   }
 
-  // -- rental accounts ---------------------------------------------------------
+  // -- at a glance -------------------------------------------------------------
 
   // The conductor's ledger has one instance-wide aggregate and no per-account column. Rendering
   // that total as if it belonged to the first account would be a division the data does not
-  // support, so it is shown once, above the table, and the per-account cells stay honest em
+  // support, so it is shown once, at the top of the page, and the per-account cells stay honest em
   // dashes. A future serializer that does add a per-account `usage` object is still read.
-  function instanceUsagePanel(usage) {
-    if (!usage) return null;
-    const error = asString(pick(usage, 'error')).trim();
-    if (error) {
-      return h('div', { class: 'gpu-failed gpu-usage-failed' },
-        h('h3', {}, 'Instance usage unavailable'),
-        h('p', {}, error));
-    }
+  //
+  // These are the page's first answer — how many rentals there are, what they cost, what they run
+  // on — so they are numbers above the tables rather than a section inside one of them.
+  function paintGlance() {
+    glanceBox.replaceChildren();
+    if (view.rentalsError) return;
+    const deployments = listOf(pick(view.rentals, 'deployments')).map(normaliseDeployment);
+    const accounts = listOf(pick(view.rentals, 'accounts')).map(normaliseAccount);
+    const usage = objectOf(pick(view.rentals, 'usage')) ?? {};
+    const usageError = asString(pick(usage, 'error')).trim();
     const requests = asNumber(pick(usage, 'gpu_requests', 'requests'));
     const seconds = asNumber(pick(usage, 'gpu_seconds'));
     const cost = asNumber(pick(usage, 'cost_usd', 'cost'));
-    const cells = [
-      ['GPU requests', requests === null ? '—' : String(requests)],
-      ['GPU time', seconds === null ? '—' : formatUptime(seconds)],
-      ['Cost', cost === null ? '—' : usd(cost)],
-    ];
-    return h('div', { class: 'gpu-usage' },
-      h('div', { class: 'gpu-usage-head' },
-        h('strong', {}, 'Instance usage'),
-        h('span', { class: 'hint' }, ' · one ledger total for every provider on this instance')),
-      h('div', { class: 'gpu-usage-grid' }, ...cells.map(([label, value]) => (
-        h('div', { class: 'gpu-usage-cell' },
-          h('span', { class: 'gpu-usage-label' }, label),
-          h('strong', { class: 'num' }, value))
-      ))));
+    const broken = deployments.filter((d) => d.problems.length + d.hardwareProblems.length > 0).length;
+    const enabled = deployments.filter((d) => d.enabled !== false).length;
+    const gpus = platformList().flatMap((p) => listOf(pick(p, 'gpus')));
+    const prices = gpus.map((g) => asNumber(pick(g, 'price_usd_per_hour'))).filter((n) => n !== null);
+    const cheapest = prices.length ? Math.min(...prices) : null;
+
+    const stat = (label, value, sub) => h('div', { class: 'stat' },
+      h('div', { class: 'k' }, label),
+      h('div', { class: 'v' }, value),
+      h('div', { class: 's' }, sub));
+
+    glanceBox.append(
+      stat('Rentals', String(deployments.length),
+        deployments.length
+          ? `${enabled} enabled${broken ? ` · ${broken} with problems` : ''}`
+          : 'none yet'),
+      stat('Instance usage', cost === null ? '—' : usd(cost),
+        usageError || 'one ledger total for every provider on this instance'),
+      stat('GPU time', seconds === null ? '—' : formatUptime(seconds),
+        requests === null ? 'requests not reported' : `${requests} request${requests === 1 ? '' : 's'}`),
+      stat('Accounts', String(accounts.length),
+        accounts.length
+          ? [...new Set(accounts.map((a) => a.platform).filter(Boolean))].join(', ') || '—'
+          : 'no platform credential yet'),
+      stat('Cards', String(gpus.length),
+        cheapest === null ? 'no price reported' : `from ${usd(cheapest)}/hour`));
   }
+
+  // -- rental accounts ---------------------------------------------------------
 
   function paintAccounts() {
     accountsBox.replaceChildren();
@@ -1322,21 +1350,23 @@ function laneAttachForm(platform) {
     const accounts = listOf(pick(view.rentals, 'accounts')).map(normaliseAccount);
     card.append(hint(
       'One account is one platform credential, stored under one vault id, plus a HuggingFace token '
-      + 'when a gated repository needs it. The secret is never rendered: only a fingerprint, which '
-      + 'is what tells two keys apart without exposing either.'));
-    const usage = objectOf(pick(view.rentals, 'usage'));
-    const usagePanel = instanceUsagePanel(usage);
-    if (usagePanel) card.append(usagePanel);
+      + 'when a gated repository needs it. The secret is never rendered — only a fingerprint, which '
+      + 'is what tells two keys apart.'));
     if (!accounts.length) {
       card.append(emptyState('No rental accounts yet.',
         'A rental account is a platform credential (Modal: a token id and its secret). Add one here; '
         + 'every deployment on that platform can share it.'));
       card.append(h('div', { class: 'gpu-actions' },
         button('Add rental account', () => ctx.navigate('#/gpu-rentals/new/account'),
-          { className: 'btn btn-primary' })));
+          { className: 'btn' })));
       accountsBox.append(card);
       return;
     }
+    // The conductor reports usage as one instance-wide total with no per-account filter. Four
+    // columns of em dashes are noise, so they appear only when an account actually carries a
+    // number; otherwise one line says where the total lives.
+    const perAccount = accounts.some((a) => a.gpuRequests !== null || a.gpuSeconds !== null
+      || a.costUsd !== null);
     const rows = accounts.map((account) => {
       const plan = planLimitsFor(account.platform);
       const planLimit = plan.limits.find((l) => asString(pick(l, 'id')) === account.plan);
@@ -1346,7 +1376,7 @@ function laneAttachForm(platform) {
       const planNote = planLimit
         ? `${asNumber(pick(planLimit, 'gpu_concurrency')) ?? '—'} GPU concurrency · source: ${dashes(pick(planLimit, 'source'))}`
         : plan.limits.length
-          ? 'plan tier not recorded; see the plan limits above'
+          ? 'plan tier not recorded; see Platform details'
           : 'plan limits not reported for this platform';
       const credential = [];
       if (account.fingerprint) {
@@ -1359,18 +1389,23 @@ function laneAttachForm(platform) {
       } else {
         credential.push(h('span', { class: 'hint' }, 'no credential fingerprint reported'));
       }
-      return h('tr', {},
+      const cells = [
         h('td', {},
           h('div', {}, account.label),
           account.id && account.id !== account.label ? h('span', { class: 'hint mono' }, account.id) : null),
         h('td', {}, mono(account.platform)),
         h('td', {}, h('span', {}, dashes(account.plan)), h('span', { class: 'hint', title: planNote }, ` · ${planNote}`)),
         h('td', {}, ...credential),
-        h('td', { class: 'num' }, account.maxContainers === null ? '—' : String(account.maxContainers)),
-        h('td', { class: 'num' }, account.gpuRequests === null ? '—' : String(account.gpuRequests)),
-        h('td', { class: 'num' }, account.gpuSeconds === null ? '—' : formatUptime(account.gpuSeconds)),
-        h('td', { class: 'num' }, account.costUsd === null ? '—' : usd(account.costUsd)),
-      );
+        h('td', { class: 'num' },
+          account.maxContainers === null ? '—' : String(account.maxContainers)),
+      ];
+      if (perAccount) {
+        cells.push(
+          h('td', { class: 'num' }, account.gpuRequests === null ? '—' : String(account.gpuRequests)),
+          h('td', { class: 'num' }, account.gpuSeconds === null ? '—' : formatUptime(account.gpuSeconds)),
+          h('td', { class: 'num' }, account.costUsd === null ? '—' : usd(account.costUsd)));
+      }
+      return h('tr', {}, ...cells);
     });
     card.append(dataTable([
       { label: 'Account' },
@@ -1378,18 +1413,15 @@ function laneAttachForm(platform) {
       { label: 'Plan' },
       { label: 'Credential' },
       { label: 'Container ceiling', num: true },
-      { label: 'GPU requests', num: true },
-      { label: 'GPU time', num: true },
-      { label: 'Cost', num: true },
+      ...(perAccount ? [
+        { label: 'GPU requests', num: true },
+        { label: 'GPU time', num: true },
+        { label: 'Cost', num: true },
+      ] : []),
     ], rows));
-    card.append(hint('Live columns come from GET /api/gpu/rentals and are re-read every '
-      + `${USAGE_POLL_MS / 1000} seconds while this tab is visible. While the tab is hidden the panel `
-      + 'stops asking, rather than waking a socket nobody is looking at.'));
-    if (usage && !usage.error && accounts.some((a) => a.gpuRequests === null
-      || a.gpuSeconds === null || a.costUsd === null)) {
-      card.append(hint('The conductor reports usage as one instance-wide total, with no per-account '
-        + 'filter. The account rows therefore show — for those columns rather than dividing the '
-        + 'total between accounts.'));
+    if (!perAccount) {
+      card.append(hint('Usage is one ledger total for the whole instance, so it is not divided '
+        + 'between accounts: the total is in the numbers at the top of this page.'));
     }
     accountsBox.append(card);
   }
@@ -1406,7 +1438,7 @@ function laneAttachForm(platform) {
 
   function paintDeployments() {
     deploymentsBox.replaceChildren();
-    const card = section('Deployments');
+    const card = section('Your rentals');
     if (view.rentalsError) {
       card.append(failedEndpoint('GET /api/gpu/rentals', view.rentalsError));
       deploymentsBox.append(card);
@@ -1414,13 +1446,13 @@ function laneAttachForm(platform) {
     }
     const deployments = listOf(pick(view.rentals, 'deployments')).map(normaliseDeployment);
     if (!deployments.length) {
-      card.append(emptyState('No GPU deployments yet.',
-        'A deployment is a self-hosted provider backed by a rented GPU. Pick the platform, the '
-        + 'account, the model and the card, and the panel will generate the app file and the command '
-        + 'that deploys it.'));
+      card.append(emptyState('No GPU rentals yet.',
+        'A rental is a GPU on a host, configured as a provider so the relay can route to it. Pick '
+        + 'the platform, the account, the model and the card, and the panel writes the app file and '
+        + 'the command that deploys it.'));
       card.append(h('div', { class: 'gpu-actions' },
-        button('Start the setup flow', () => ctx.navigate('#/gpu-rentals/new/platform'),
-          { className: 'btn btn-primary' })));
+        button('New rental', () => ctx.navigate('#/gpu-rentals/new/platform'),
+          { className: 'btn', title: 'The same flow as New rental in the toolbar' })));
       deploymentsBox.append(card);
       return;
     }
@@ -1481,6 +1513,8 @@ function laneAttachForm(platform) {
 
       return row;
     });
+    card.append(hint('One row per rented GPU. Select a row to see the app file and the command that '
+      + 'deploys it.'));
     card.append(dataTable([
       { label: 'Provider' },
       { label: 'Account' },
@@ -1502,9 +1536,9 @@ function laneAttachForm(platform) {
         h('h3', {}, 'Deployment records that could not be read'),
         h('ul', {}, ...recordErrors.map((entry) => h('li', {}, entry)))));
     }
-    card.append(hint('Session counts and KV pool sizes are derived estimates, marked with ~. The '
-      + 'vLLM startup line ("GPU KV cache size: N tokens") is authoritative; these are the defaults '
-      + 'written into the provider and can be overridden. Select a row to see its bundle.'));
+    card.append(hint('Sessions and KV pool are estimates, marked with ~. The vLLM startup line '
+      + '("GPU KV cache size: N tokens") is authoritative; these are the defaults written into the '
+      + 'provider and can be overridden.'));
 
     // Plan-launch preview control (PREVIEW ONLY: does not start anything)
     const planControls = h('div', { class: 'gpu-plan-controls' });
@@ -1610,9 +1644,8 @@ function laneAttachForm(platform) {
       safeHref(pick(platform, 'docs_url'))
         ? h('span', { class: 'hint' }, ' · ', externalLink(pick(platform, 'docs_url'), 'pricing documentation'))
         : null));
-    card.append(hint('Prices are per card and unconditional; the free-plan column is what the '
-      + 'platform states about renting that card without paying, with its provenance beside it. '
-      + 'Weight quantisation and KV cache dtype legality are checked per card in the setup flow.'));
+    card.append(hint('Prices are per card. The free-plan column is what the platform states about '
+      + 'renting that card for nothing, with its source beside it.'));
 
     const gpus = listOf(pick(platform, 'gpus'));
     if (!gpus.length) {
@@ -1650,9 +1683,9 @@ function laneAttachForm(platform) {
     const accounts = listOf(pick(view.rentals, 'accounts'));
     const deployments = listOf(pick(view.rentals, 'deployments'));
     countEl.textContent = view.rentalsError
-      ? 'GPU rentals'
-      : `GPU rentals · ${accounts.length} account${accounts.length === 1 ? '' : 's'} · `
-        + `${deployments.length} deployment${deployments.length === 1 ? '' : 's'}`;
+      ? '—'
+      : `${accounts.length} account${accounts.length === 1 ? '' : 's'} · `
+        + `${deployments.length} rental${deployments.length === 1 ? '' : 's'}`;
     if (view.rentalsError || view.catalogError) {
       const which = [view.rentalsError ? 'GET /api/gpu/rentals' : null,
         view.catalogError ? 'GET /api/gpu/catalog' : null].filter(Boolean).join(' and ');
@@ -1662,7 +1695,10 @@ function laneAttachForm(platform) {
       statusEl.textContent = `Updated ${stamp}. Live usage is re-read every ${USAGE_POLL_MS / 1000} `
         + 'seconds while this tab is visible.';
     }
+    paintGlance();
     paintPlans();
+    // A failure inside the disclosure must not be hidden behind a closed summary.
+    if (view.catalogError || view.lanesError) advanced.open = true;
     paintAccounts();
     paintDeployments();
     paintBundle();
@@ -2050,15 +2086,18 @@ function paintSetup(wizard, mount, ctx, stepParam) {
   wizard.root = root;
   if (root.parentNode !== mount) mount.replaceChildren(root);
 
+  // The status line under the rail already says whether this step has unsaved edits, so the head
+  // says only where the flow is. Two copies of the same sentence were the page saying everything
+  // twice, which is what made it unreadable.
   const dirtyLine = wizard.dirty
     ? 'Draft in this tab; nothing is saved until you use Continue.'
     : 'No unsaved changes in this step.';
 
-  const head = h('div', { class: 'page-head' },
+  const head = h('div', { class: 'page-head gpu-setup-head' },
     h('div', {},
       h('h1', {}, 'New GPU rental'),
-      h('p', { class: 'hint' },
-        `Step ${currentIndex + 1} of ${steps.length}: ${asString(pick(step, 'title'))}. ${dirtyLine}`)),
+      h('p', { class: 'page-sub' },
+        `Step ${currentIndex + 1} of ${steps.length} — ${asString(pick(step, 'title'))}`)),
     h('div', { class: 'gpu-actions' },
       wizard.applied ? null : ghostButton('Discard setup', () => discardSetup(wizard, ctx)),
       ghostButton('Back to GPU rentals', () => leaveSetup(wizard, ctx))));
@@ -2111,7 +2150,7 @@ function paintSetup(wizard, mount, ctx, stepParam) {
       type: 'button',
       disabled: wizard.busy || Boolean(wizard.applied),
       onclick: () => advance(wizard, ctx),
-    }, wizard.busy ? 'Working…' : current === 'review' ? 'Record deployment' : 'Continue'),
+    }, wizard.busy ? 'Working…' : current === 'review' ? 'Save rental' : 'Continue'),
     current === 'review' && !wizard.applied
       ? h('span', { class: 'hint' }, 'Records the request in Manarouter; it does not start a container.')
       : null);
@@ -2568,7 +2607,10 @@ function platformPanel(wizard) {
     return h('div', { class: 'gpu-blank' }, hint('The catalog names no platform, so no deployment mechanism can be shown. Nothing was assumed.'));
   }
   const dep = objectOf(pick(platform, 'deployment'));
-  const parts = [h('h3', {}, `${asString(pick(platform, 'label', 'id'))} deployment`), modalHonestyLine(platform), platformExplain(platform)];
+  // One sentence states the rule; the catalogue's longer explanation says the same thing again in
+  // more detail, so it goes behind a summary instead of standing in front of the first choice the
+  // operator has to make.
+  const parts = [h('h3', {}, `${asString(pick(platform, 'label', 'id'))} deployment`), modalHonestyLine(platform)];
   if (dep) {
     const rows = [];
     const programmatic = pick(dep, 'programmatic');
@@ -2578,6 +2620,11 @@ function platformPanel(wizard) {
     if (rows.length) parts.push(kv(rows));
   } else {
     parts.push(hint('The catalog does not describe how deployments are created for this platform. The bundle on the review step is still what Manarouter can produce.'));
+  }
+  const explain = platformExplain(platform);
+  if (explain) {
+    parts.push(h('details', { class: 'gpu-advanced' },
+      h('summary', {}, 'Why the panel cannot run the deploy'), explain));
   }
   return h('div', { class: 'gpu-explain' }, ...parts);
 }
@@ -2711,7 +2758,7 @@ function probePanel(wizard) {
   }, busy ? 'Probing…' : probe ? 'Probe again' : 'Probe repository');
 
   const parts = [h('h3', {}, 'Repository probe'),
-    h('p', { class: 'hint' }, 'The probe reads the repository and its config. It is what tells this form which quants exist and what the KV pool can be; the view does not infer either from the model name.'),
+    h('p', { class: 'hint' }, 'The probe reads the repository and its config. It reports the quants that exist and how large the KV pool can be; neither is guessed from the model name.'),
     h('div', { class: 'gpu-actions' }, probeButton)];
 
   if (wizard.probeError) parts.push(failedEndpoint('POST /api/gpu/probe', wizard.probeError));
@@ -2947,7 +2994,7 @@ function reviewPanel(wizard) {
   if (wizard.applyError) parts.push(failedEndpoint('POST /api/gpu/apply (create-deployment)', wizard.applyError));
   const platform = selectedPlatform(wizard);
   if (wizard.bundle) {
-    parts.push(bundlePanel(wizard.bundle, platform));
+    parts.push(bundlePanel(wizard.bundle, platform, { honesty: false }));
   } else {
     parts.push(h('div', { class: 'gpu-blank' }, hint('The deployment bundle has not been generated yet. It is generated from the draft; nothing is posted by rendering it.')));
   }

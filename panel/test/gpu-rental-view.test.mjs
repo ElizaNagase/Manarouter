@@ -589,7 +589,7 @@ test('inventory renders the account table with a fingerprint and never the secre
   assert.match(text, /42/, 'live gpu_requests');
   assert.match(text, /1 h 2 m/, 'live gpu_seconds, formatted');
   assert.match(text, /\$12\.50/, 'live cost');
-  assert.match(text, /account rows therefore show — for those columns/,
+  assert.match(text, /it is not divided between accounts/,
     'the table says why it does not attribute the total to an account');
 
   assert.ok(!text.includes(TOKEN_SECRET), 'the credential value is never rendered');
@@ -629,7 +629,7 @@ test('inventory renders deployments with mode, batch card and the derived sizing
   const { mount } = await mountView({ handlers: standardHandlers() });
   const text = textOf(mount);
 
-  assert.match(text, /Deployments/);
+  assert.match(text, /Your rentals/);
   assert.match(text, /modal-vllm/);
   assert.match(text, /Qwen\/Qwen3-32B/);
   assert.match(text, /32\.8 k ctx/);
@@ -660,7 +660,7 @@ test('inventory renders deployments with mode, batch card and the derived sizing
   assert.ok(problems, 'deployment and hardware problems are counted, not dropped');
   assert.match(String(problems.getAttribute('title')), /max_model_len: does not fit the chosen card/);
   assert.match(String(problems.getAttribute('title')), /rtx-pro-6000: 96 GiB is below the KV pool floor/);
-  assert.match(text, /derived estimates, marked with ~/,
+  assert.match(text, /estimates, marked with ~/,
     'the table explains what the ~ means and which number is authoritative');
 
   // Only deployment rows say "enabled"; the lane cards use their own readiness wording, so this
@@ -796,7 +796,7 @@ test('every error.details entry reaches the screen', async () => {
     'the status line says which endpoint failed');
   const alerts = descendants(mount).filter((el) => el.getAttribute('role') === 'alert');
   assert.ok(alerts.length >= 1, 'the failure is announced, not only coloured');
-  assert.match(text, /Deployments/, 'the half that answered is still shown');
+  assert.match(text, /Your rentals/, 'the half that answered is still shown');
 });
 
 test('an empty response renders neutral empty states and a next step', async () => {
@@ -814,7 +814,7 @@ test('an empty response renders neutral empty states and a next step', async () 
   const text = textOf(mount);
 
   assert.match(text, /No rental accounts yet\./);
-  assert.match(text, /No GPU deployments yet\./);
+  assert.match(text, /No GPU rentals yet\./);
   assert.match(text, /No platform catalogue to read\./);
   assert.match(text, /No lane catalogue to read\./);
 
@@ -828,7 +828,7 @@ test('an empty response renders neutral empty states and a next step', async () 
   assert.ok(!descendants(mount).some((el) => el.getAttribute('role') === 'alert'),
     'nothing failed, so nothing is announced as a failure');
   const buttons = descendants(mount).map((el) => textOf(el).trim());
-  assert.ok(buttons.includes('New deployment'), 'the operator is told what to do next');
+  assert.ok(buttons.includes('New rental'), 'the operator is told what to do next');
   assert.ok(buttons.includes('Add rental account'));
 });
 
