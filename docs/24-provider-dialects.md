@@ -88,7 +88,7 @@ upstream response straight back.
 
 ---
 
-## The eight dialects at a glance
+## The ten dialects at a glance
 
 | Dialect | Upstream path | Body passthrough possible | Always answers as SSE | Upstream shape |
 |---|---|---|---|---|
@@ -100,6 +100,7 @@ upstream response straight back.
 | `copilot` | `/chat/completions` | yes, from an OpenAI client | no | OpenAI Chat Completions, behind a Copilot bearer |
 | `antigravity` | `v1internal:generateContent` | no | effectively yes | Gemini `generateContent` inside a Cloud Code envelope |
 | `command-code-go` | `alpha/generate` | no | yes | Command Code CLI envelope and private event stream |
+| `cursor` | `/agent.v1.AgentService/Run` | no | yes, only | Cursor's bidirectional Connect stream of protobuf frames |
 
 The path column is the path a request ends up at: the **dialect default** for the client's route,
 unless the provider's `route_overrides` names one or a translator supplies one. The two Gemini
@@ -608,6 +609,68 @@ from it (`lib.rs:212-215`, `commandcode.rs:59-85`), unlike the Google and Codex 
 Chat Completions `system` *message* and for `tool_calls` (`commandcode.rs:114-180`).
 
 **Read next.** [Command Code](providers/commandcode.md) for the envelope fields and the bridge.
+
+---
+
+## `cursor` — the Cursor agent stream
+
+**On the wire.** There is no REST endpoint. `POST /agent.v1.AgentService/Run` is a Connect-RPC
+*bidirectional* stream: the client sends one `AgentRunRequest` protobuf frame and then keeps the
+request side **open**, because the server asks questions mid-turn — what tools this client offers,
+what a blob it wrote in an earlier turn contained — and answers them on the same stream. A client
+that half-closes its body never receives an answer, which is why a pooled HTTP client cannot carry
+this dialect: `crates/manarouter-relay/src/cursor_transport.rs` opens a raw HTTP/2 connection and
+writes frames itself. Each frame is a 5-byte header (flags, `u32` big-endian length) followed by the
+payload; flag `0x01` marks a gzip payload and flag `0x02` an end-stream JSON trailer, and a frame
+larger than 16 MiB is refused before it is allocated
+(`crates/mr-dialects/src/cursor.rs`, `MAX_FRAME_BYTES`).
+
+**Host discovery.** The agent host is not a constant. `POST
+https://api2.cursor.sh/aiserver.v1.ServerConfigService/GetServerConfig` returns field 27 as
+`{1: agent_url, 2: agentn_url}`; the result is cached for an hour and only an `https` origin on
+`api5.cursor.sh` or its subdomains is ever dialled, because the relay is about to attach a bearer
+token to it. A corrupt response falls back to the host the reference client ships with rather than
+failing the turn. The provider's `base_url` is the discovery origin (`https://api2.cursor.sh`); an
+`api5` origin there is treated as an override of the agent host, which is what an operator names
+when discovery is wrong for their deployment.
+
+**Authentication.** `AuthKind::OAuth` with platform `cursor`; the token comes from the page login in
+[cursor](28-oauth-cursor.md). Any other auth kind is refused before a socket opens, because the
+agent endpoint reads `Authorization: Bearer` and nothing else.
+
+**Translation.** Cursor answers only as a frame stream, so the relay always renders SSE and folds it
+for a non-streaming client (`force_stream`). An OpenAI client's body is what `prepare_run` parses
+directly; an Anthropic client is reduced to the same OpenAI-shaped body first, so both client
+dialects reach the same encoder and the response arm picks the rendering. The conversation is a
+single text prompt: history is labelled `User:` / `Assistant:` / `Assistant called tool …` / `Tool
+result (…)` and joined by blank lines, and a one-message turn is sent verbatim. A system prompt is
+sent twice on purpose — as a `sha256` digest in `conversation_state`, which is the field Cursor
+honours, and prepended to the user text, because the server does not apply the digest.
+
+**What it will not do.** Client tools are refused rather than half-supported: answering a `tool_call`
+the server asks for is a protocol this transport does not implement, and the error names the field
+that would be needed. So are images and other non-text content. A provider with a proxy configured is
+refused with an actionable message instead of quietly going direct around an egress policy, since a
+proxied bidirectional stream is not implemented.
+
+**Reasoning.** The dialect offers `ReasoningLevel::None` only. An extended effort would have to live
+in `requested_model.parameters`, which this transport does not send, and advertising a level it
+cannot express would be a lie about what the model was asked to do
+(`dialect.rs`, `expressible_reasoning_levels`).
+
+**Conversation continuity, deliberately given up.** The id fingerprint includes the per-turn message
+id, so a retry — and every request without a client session id — opens a new Cursor conversation.
+The alternative, a session-free fingerprint, lets two unrelated callers who happen to open with the
+same words share one Cursor conversation and its memory. A prompt-cache miss is the cheaper of the
+two costs.
+
+**Status.** Every byte in the tests is canned: framing, request bytes, headers, discovery, and the
+state machine are pinned by exact-byte assertions, but no live credential has been used, so whether
+the server accepts these bytes, the acceptance of the pinned client version, and the post-`turn_ended`
+end conditions are unverified. See [the implementation status](23-implementation-status.md).
+
+**Read next.** [Cursor](28-oauth-cursor.md) for the login, and
+[providers/cursor.md](providers/cursor.md) for the operator steps.
 
 ---
 

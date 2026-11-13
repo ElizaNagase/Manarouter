@@ -134,7 +134,10 @@ dialect = "cursor"
 base_url = "https://api2.cursor.sh"
 auth = { type = "oauth", platform = "cursor" }
 oauth_platform = "cursor"
-capabilities = ["chat", "models", "tool-calling", "reasoning"]
+# Chat only, and deliberately: the agent stream carries no effort field, so no reasoning level
+# above `none` can be expressed, and a turn that asks this client to run a tool is refused by the
+# transport rather than half-answered. Claiming either would promise what the relay will not send.
+capabilities = ["chat"]
 key_strategy = "round-robin"
 note = "OAuth only, and not a redirect flow: the operator opens cursor.com/loginDeepControl with a PKCE challenge bound to a session id, finishes the sign-in there, and this router polls /auth/poll until the page reports it done. Chat is not REST — it is a bidirectional Connect stream of protobuf frames to agent{,.n}.api5.cursor.sh, whose host is discovered hourly from aiserver.v1.ServerConfigService/GetServerConfig. UNCERTAIN: the client version and the agent host discovery are reverse-engineered from a working CLI and may lag it; a 4xx on every request usually means the client version needs bumping. No vision capability is claimed because image parts travel through the blob store, which this build does not implement."
 docs_url = "https://cursor.com"

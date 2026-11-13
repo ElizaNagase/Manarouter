@@ -33,7 +33,7 @@ So the catalogue is curated data, reviewed like code.
 |---|---|
 | `id` | Stable identifier. Referenced by combos as `provider/model`. Renaming one breaks stored combos. |
 | `label` | Display name for the panel. Free to change. |
-| `dialect` | **One of the nine.** Determines request and response translation. |
+| `dialect` | **One of the ten.** Determines request and response translation. |
 | `base_url` | Where requests go: the prefix the route path is appended to. The version segment, if the provider has one, is part of it. |
 | `auth` | An `AuthKind`: `bearer`, `api-key-header`, `header`, `query-param`, `oauth`. The relay sends `bearer`, `api-key-header` and `header`; it never sends `query-param`, because a credential does not go in a URL. |
 | `capabilities` | Which behaviours are claimed. Drives what the router will even attempt. |
