@@ -8,6 +8,7 @@
 //! | `openai-codex`     | [`codex::Codex`]     | loopback authorization code + PKCE (S256) |
 //! | `github-copilot`   | [`copilot::Copilot`] | GitHub device code                |
 //! | `antigravity`      | [`antigravity::Antigravity`] | loopback authorization code (T2 experimental, T1 selectable) |
+//! | `cursor`           | [`cursor::Cursor`]   | browser-completion page + poll     |
 //! | `cline`            | not registered       | no verified interactive flow      |
 //! | OmniRoute additional providers | not ported | provider-specific review required |
 //!
@@ -41,6 +42,7 @@
 pub mod antigravity;
 pub mod codex;
 pub mod copilot;
+pub mod cursor;
 pub mod flow;
 pub mod migrate;
 pub mod reference;
@@ -445,6 +447,64 @@ impl DevicePoll {
     }
 }
 
+/// A login the human finishes on the provider's own page, with no redirect back to this router.
+///
+/// This is Cursor's shape and it is *not* the device flow: there is no code to retype and no
+/// `verification_uri_complete`. The provider mints a session id, the client publishes a PKCE
+/// challenge bound to it, and completion is detected by polling the provider until it reports the
+/// tokens. The two halves are named separately because only the id is public (it travels in the
+/// URL the human opens) while the ticket is the PKCE verifier and must stay server-side.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ScreenLogin {
+    /// The page the human opens. Public by definition: it is shown in the panel and opened in a
+    /// browser.
+    pub url: String,
+    /// The provider's session id, echoed back on every poll. Public — it is in [`Self::url`].
+    session: String,
+    /// The secret half of the PKCE pair. Never logged, never shown, never leaves this process
+    /// except to the provider's own poll endpoint.
+    ticket: String,
+}
+
+impl ScreenLogin {
+    /// Build a login from its public and secret halves.
+    ///
+    /// Callers are platform implementations that have just generated both; the constructor exists
+    /// so the secret cannot be reached through a public field by accident.
+    pub fn new(
+        url: impl Into<String>,
+        session: impl Into<String>,
+        ticket: impl Into<String>,
+    ) -> Self {
+        Self {
+            url: url.into(),
+            session: session.into(),
+            ticket: ticket.into(),
+        }
+    }
+
+    /// The provider's session id, for the poll request.
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+
+    /// The PKCE verifier, for the poll request.
+    pub fn ticket(&self) -> &str {
+        &self.ticket
+    }
+}
+
+/// The URL is public; the verifier is the one thing in this struct that must never be printed.
+impl fmt::Debug for ScreenLogin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScreenLogin")
+            .field("url", &self.url)
+            .field("session", &self.session)
+            .field("ticket", &format_args!("***({} chars)", self.ticket.len()))
+            .finish()
+    }
+}
+
 /// One OAuth-capable provider: how to log in, how to refresh, and how the credential becomes
 /// request headers.
 ///
@@ -485,7 +545,10 @@ pub trait OAuthPlatform: Send + Sync {
     /// the device code (Copilot) returns `false` for [`begins_with_loopback`](Self::begins_with_loopback)
     /// and `true` here.
     fn supports_device_flow(&self) -> bool {
-        !self.begins_with_loopback()
+        // `begins_with_screen_login` is excluded explicitly: the device flow and the
+        // provider-page flow are both "not loopback", so the deduction alone would advertise a
+        // code prompt for a platform whose login can only be finished on its own page.
+        !self.begins_with_loopback() && !self.begins_with_screen_login()
     }
 
     /// Where a browser-based login may send the user back. Device platforms return an inert
@@ -613,6 +676,39 @@ pub trait OAuthPlatform: Send + Sync {
             self.id()
         )))
     }
+
+    /// Whether login starts by sending the human to the provider's page with nothing to retype and
+    /// no listener here to receive a redirect: completion is detected by polling the provider.
+    ///
+    /// A separate flag from [`begins_with_loopback`](Self::begins_with_loopback) because the
+    /// direction of the flow is genuinely different: a loopback login *receives* a callback, this
+    /// one *asks* the provider whether the human is done. Cursor is the only such platform.
+    fn begins_with_screen_login(&self) -> bool {
+        false
+    }
+
+    /// Begin a screen login: generate the PKCE pair and the provider session id, and return the
+    /// URL to open plus the secret halves the poll will need.
+    async fn screen_login_start(&self) -> Result<ScreenLogin> {
+        Err(oauth_error(format!(
+            "{} does not use the browser-completion flow",
+            self.id()
+        )))
+    }
+
+    /// One poll of a screen login.
+    ///
+    /// The [`DevicePoll`] vocabulary is reused deliberately: pending, refused, expired and failed
+    /// are the same four facts here, and only *how the answer is discovered* differs. Implementations
+    /// must map a not-yet-finished provider reply to [`DevicePoll::Pending`] rather than an error,
+    /// or the panel would report a failure every time a human is still typing a password.
+    async fn screen_login_poll(&self, login: &ScreenLogin) -> Result<DevicePoll> {
+        let _ = login;
+        Err(oauth_error(format!(
+            "{} does not use the browser-completion flow",
+            self.id()
+        )))
+    }
 }
 
 // The registry. Each platform type carries its own `pub const ID` (see the trait docs); the
@@ -620,13 +716,15 @@ pub trait OAuthPlatform: Send + Sync {
 use antigravity::Antigravity;
 use codex::Codex;
 use copilot::Copilot;
+use cursor::Cursor;
 
 static CODEX: Codex = Codex;
 static COPILOT: Copilot = Copilot;
 static ANTIGRAVITY: Antigravity = Antigravity::ide();
+static CURSOR: Cursor = Cursor;
 
 /// Registration order for implemented platforms, matching `catalog/providers.toml`.
-static PLATFORMS: [&'static dyn OAuthPlatform; 3] = [&CODEX, &COPILOT, &ANTIGRAVITY];
+static PLATFORMS: [&'static dyn OAuthPlatform; 4] = [&CODEX, &COPILOT, &ANTIGRAVITY, &CURSOR];
 
 /// Every registered platform. Required to resolve every `AuthKind::OAuth` catalogue id — see
 /// the tests at the bottom of this file, which check both directions.

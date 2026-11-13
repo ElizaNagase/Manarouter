@@ -194,6 +194,32 @@ pub mod github {
     pub const COPILOT_TOKEN: &str = "https://api.github.com/copilot_internal/v2/token";
 }
 
+/// The Cursor endpoints used by the deep-control login and by Cursor inference.
+///
+/// Cursor has no registered OAuth client: the editor signs in through a "deep control" page that
+/// binds a PKCE challenge to a session id it generates, and the client polls an API host until the
+/// human finishes the browser step. Every constant below is taken from OmniRoute's
+/// `src/lib/oauth/constants/oauth.ts` (`CURSOR_CONFIG`), which records the editor's own values.
+pub mod cursor {
+    /// Where the human signs in. The query string carries `challenge`, `uuid`, `mode=login` and
+    /// `redirectTarget=cli`; the page completes the flow server-side and never redirects back to
+    /// this router, which is why the login polls instead of listening on a loopback port.
+    pub const LOGIN: &str = "https://cursor.com/loginDeepControl";
+    /// Where the login polls for its tokens: `?uuid=…&verifier=…`. `404` means the human has not
+    /// finished yet; a `200` carries `accessToken` and `refreshToken`.
+    pub const POLL: &str = "https://api2.cursor.sh/auth/poll";
+    /// The refresh endpoint. `POST` with `Authorization: Bearer <refreshToken>` and an empty JSON
+    /// object; it answers `{accessToken, refreshToken}`.
+    pub const REFRESH: &str = "https://api2.cursor.sh/auth/exchange_user_api_key";
+    /// The API host every Cursor inference and model-list call goes to.
+    pub const API: &str = "https://api2.cursor.sh";
+    /// The gRPC-web method Cursor chat goes through. Not a REST endpoint: the body is a protobuf
+    /// message and the reply is a gRPC-web frame sequence.
+    pub const CHAT_PATH: &str = "/aiserver.v1.ChatService/StreamUnifiedChatWithTools";
+    /// The model list method, also gRPC-web.
+    pub const MODELS_PATH: &str = "/aiserver.v1.AiService/AvailableModels";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

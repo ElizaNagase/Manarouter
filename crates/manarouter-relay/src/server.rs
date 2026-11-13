@@ -3819,6 +3819,9 @@ fn dialect_version(dialect: Dialect) -> Option<&'static str> {
         Dialect::Copilot => None,
         Dialect::CommandCodeGo => None,
         Dialect::ModalVllm => None,
+        // The Connect path's version is inside the service name (`agent.v1.AgentService`), so it is
+        // not a segment that could be swapped for a base URL's.
+        Dialect::Cursor => None,
     }
 }
 
@@ -3964,6 +3967,9 @@ fn default_path(dialect: Dialect, route: RouteKind) -> &'static str {
         Dialect::Copilot => "/chat/completions",
         Dialect::CommandCodeGo => "/alpha/generate",
         Dialect::ModalVllm => "/v1/chat/completions",
+        // A Connect method, not a REST path: the body is a protobuf frame stream and the exchange is
+        // driven by the dialect's own transport rather than the generic JSON forwarder.
+        Dialect::Cursor => "/agent.v1.AgentService/Run",
     }
 }
 

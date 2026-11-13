@@ -9,10 +9,33 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use super::flow::{Callback, Loopback};
-use super::{DeviceAuthorization, DevicePoll, OAuthPlatform, Pkce, TokenSet};
+use super::{DeviceAuthorization, DevicePoll, OAuthPlatform, Pkce, ScreenLogin, TokenSet};
 
 const SESSION_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_SESSIONS: usize = 64;
+/// How soon after the page opens the first completion poll runs.
+///
+/// A browser-completion login is short: the human is already signed in to the provider in that
+/// browser, so the common case is one click and the page reports done within a second or two.
+const SCREEN_POLL_START: Duration = Duration::from_secs(1);
+/// Growth factor between polls while the human is still on the provider's page.
+///
+/// The cadence the page itself advertises: poll once a second, stretch by 1.2 each time, so an
+/// abandoned tab costs a request every ten seconds instead of one every ten milliseconds.
+const SCREEN_POLL_GROWTH: f32 = 1.2;
+/// Ceiling for [`SCREEN_POLL_GROWTH`].
+const SCREEN_POLL_MAX: Duration = Duration::from_secs(10);
+
+/// Why a session id cannot be used from this request. See [`OAuthSessions::validate_binding`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingError {
+    /// No such session, or it is past its TTL. Polling again cannot revive it.
+    Gone,
+    /// A request for this session is already in flight; the next attempt will find it free.
+    Busy,
+    /// The session exists, but another provider or platform started it.
+    Mismatch,
+}
 
 #[derive(Clone)]
 pub struct OAuthSessions {
@@ -69,6 +92,15 @@ enum PendingKind {
         authorization: DeviceAuthorization,
         result: Option<TokenSet>,
     },
+    /// The human finishes on the provider's own page; this router only watches for it.
+    ///
+    /// `result` mirrors the device flow: once tokens exist they are kept, so a repeated poll answers
+    /// with the same pair instead of spending another exchange, and a failure to read the identity
+    /// afterwards does not throw the tokens away.
+    Screen {
+        login: ScreenLogin,
+        result: Option<TokenSet>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -103,7 +135,12 @@ impl OAuthSessions {
         provider_id: String,
     ) -> Result<(String, String), String> {
         if !platform.begins_with_loopback() {
-            return Err("platform requires device-code authorization".into());
+            return Err(if platform.begins_with_screen_login() {
+                "platform is finished on the provider's own page, not by redirecting back here"
+                    .to_string()
+            } else {
+                "platform requires device-code authorization".to_string()
+            });
         }
         self.ensure_capacity().await?;
         // A new attempt for this provider supersedes an older one: the operator clicking Connect
@@ -197,7 +234,12 @@ impl OAuthSessions {
         provider_id: String,
     ) -> Result<(String, DeviceAuthorization), String> {
         if !platform.supports_device_flow() {
-            return Err("platform requires browser redirect authorization".into());
+            return Err(if platform.begins_with_screen_login() {
+                "platform is finished on the provider's own page, so there is no code to enter"
+                    .to_string()
+            } else {
+                "platform requires browser redirect authorization".to_string()
+            });
         }
         self.ensure_capacity().await?;
         let authorization = platform.device_start().await.map_err(safe_error)?;
@@ -223,6 +265,43 @@ impl OAuthSessions {
         Ok((id, authorization))
     }
 
+    /// Begin a login the human finishes on the provider's own page.
+    ///
+    /// Returns the session id and the page to open. There is no listener and no paste fallback
+    /// because nothing comes back to this router: the only exits are a poll that reports the tokens
+    /// or the TTL. That is also why the supersession rule matters here — a second click on Connect
+    /// abandons the first page, and leaving both sessions alive would let a stale page complete a
+    /// login the operator has already replaced.
+    pub async fn start_screen(
+        &self,
+        platform: &'static dyn OAuthPlatform,
+        provider_id: String,
+    ) -> Result<(String, String), String> {
+        if !platform.begins_with_screen_login() {
+            return Err("platform is not finished in the browser".into());
+        }
+        self.ensure_capacity().await?;
+        self.discard_superseded(&provider_id, platform.id()).await;
+        let login = platform.screen_login_start().await.map_err(safe_error)?;
+        let url = login.url.clone();
+        let expires = tokio::time::Instant::now() + SESSION_TTL;
+        let id = self
+            .insert(Pending {
+                platform,
+                kind: PendingKind::Screen {
+                    login,
+                    result: None,
+                },
+                expires,
+                provider_id,
+                last_polled: None,
+                interval: SCREEN_POLL_START,
+                busy: false,
+            })
+            .await?;
+        Ok((id, url))
+    }
+
     async fn ensure_capacity(&self) -> Result<(), String> {
         let now = tokio::time::Instant::now();
         let live = {
@@ -244,6 +323,15 @@ impl OAuthSessions {
         Ok(())
     }
 
+    /// Flip the in-flight flag the way a running poll does, so a test can observe the `Busy`
+    /// binding without racing one.
+    #[cfg(test)]
+    async fn mark_busy(&self, id: &str) {
+        if let Some(pending) = self.sessions.lock().await.get_mut(id) {
+            pending.busy = true;
+        }
+    }
+
     async fn insert(&self, pending: Pending) -> Result<String, String> {
         let mut sessions = self.sessions.lock().await;
         sessions.retain(|_, p| p.expires > tokio::time::Instant::now());
@@ -255,24 +343,30 @@ impl OAuthSessions {
         Ok(id)
     }
 
+    /// Check that `id` is a live session this request is allowed to use.
+    ///
+    /// The three failures are not interchangeable to the caller: a session that is gone can never
+    /// come back, one that is busy will work on the next attempt, and a mismatched binding will
+    /// never work at all. `BindingError` keeps them apart so the HTTP layer can answer with a
+    /// status the panel acts on instead of one it retries.
     pub async fn validate_binding(
         &self,
         id: &str,
         provider_id: &str,
         platform_id: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), BindingError> {
         let sessions = self.sessions.lock().await;
-        let pending = sessions
-            .get(id)
-            .ok_or_else(|| "OAuth session not found or expired".to_string())?;
+        let Some(pending) = sessions.get(id) else {
+            return Err(BindingError::Gone);
+        };
         if pending.expires <= tokio::time::Instant::now() {
-            return Err("OAuth session expired".into());
+            return Err(BindingError::Gone);
         }
         if pending.busy {
-            return Err("OAuth session operation already in progress".into());
+            return Err(BindingError::Busy);
         }
         if pending.provider_id != provider_id || pending.platform.id() != platform_id {
-            return Err("OAuth session provider binding does not match".into());
+            return Err(BindingError::Mismatch);
         }
         Ok(())
     }
@@ -571,6 +665,105 @@ impl OAuthSessions {
         }
     }
 
+    /// Ask the provider whether the page has been finished, advancing the poll cadence.
+    ///
+    /// The cadence belongs to the session rather than to the platform: it describes how hard this
+    /// router may knock on somebody else's door while a human is looking at it, which is the same
+    /// question for every platform that uses this flow.
+    pub async fn poll_screen(&self, id: &str, provider_id: &str) -> Result<PollResult, String> {
+        // Taken out for the duration of the network wait, exactly as the device flow does: one
+        // session cannot be polled twice at once, and the map lock is not held across the call.
+        let mut pending = self.take(id, provider_id).await?;
+        if pending.busy {
+            self.reinsert(id.to_owned(), pending).await?;
+            return Err("OAuth session operation already in progress".into());
+        }
+        pending.busy = true;
+        let PendingKind::Screen { login, result } = &pending.kind else {
+            self.reinsert(id.to_owned(), pending).await?;
+            return Err("OAuth session is not a browser-completion login".into());
+        };
+        let login = login.clone();
+        if let Some(tokens) = result.as_ref() {
+            let tokens = tokens.clone();
+            let identity = match pending.platform.account_identity(&tokens).await {
+                Ok(identity) => identity,
+                Err(error) => {
+                    self.reinsert(id.to_owned(), pending).await?;
+                    return Err(safe_error(error));
+                }
+            };
+            self.reinsert(id.to_owned(), pending).await?;
+            return Ok(PollResult::Complete { tokens, identity });
+        }
+        let now = tokio::time::Instant::now();
+        if let Some(last) = pending.last_polled {
+            if now < last + pending.interval {
+                let wait = (last + pending.interval - now).as_secs().max(1);
+                self.reinsert(id.to_owned(), pending).await?;
+                return Ok(PollResult::Pending {
+                    retry_after_seconds: wait,
+                });
+            }
+        }
+        pending.last_polled = Some(now);
+        pending.interval = grow_screen_interval(pending.interval);
+        let outcome = match pending.platform.screen_login_poll(&login).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.reinsert(id.to_owned(), pending).await?;
+                return Err(safe_error(error));
+            }
+        };
+        match outcome {
+            DevicePoll::Pending => {
+                let retry_after_seconds = pending.interval.as_secs();
+                self.reinsert(id.to_owned(), pending).await?;
+                Ok(PollResult::Pending {
+                    retry_after_seconds,
+                })
+            }
+            DevicePoll::SlowDown => {
+                pending.interval =
+                    grow_screen_interval(pending.interval.saturating_add(Duration::from_secs(5)));
+                pending.last_polled = Some(tokio::time::Instant::now());
+                let interval_seconds = pending.interval.as_secs();
+                self.reinsert(id.to_owned(), pending).await?;
+                Ok(PollResult::SlowDown { interval_seconds })
+            }
+            DevicePoll::Success(tokens) => {
+                let identity = match pending.platform.account_identity(&tokens).await {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        if let PendingKind::Screen { result, .. } = &mut pending.kind {
+                            *result = Some(tokens);
+                        }
+                        self.reinsert(id.to_owned(), pending).await?;
+                        return Err(safe_error(error));
+                    }
+                };
+                if let PendingKind::Screen { result, .. } = &mut pending.kind {
+                    *result = Some(tokens.clone());
+                }
+                pending.busy = false;
+                self.reinsert(id.to_owned(), pending).await?;
+                Ok(PollResult::Complete { tokens, identity })
+            }
+            DevicePoll::ExpiredToken => Ok(PollResult::Failed {
+                message: "the login page expired; start again".into(),
+            }),
+            DevicePoll::AccessDenied => Ok(PollResult::Failed {
+                message: "authorization was denied".into(),
+            }),
+            DevicePoll::Failed { message } => {
+                self.reinsert(id.to_owned(), pending).await?;
+                Ok(PollResult::Failed {
+                    message: message.chars().take(240).collect(),
+                })
+            }
+        }
+    }
+
     pub async fn acknowledge(&self, id: &str, provider_id: &str) -> Result<(), String> {
         let mut sessions = self.sessions.lock().await;
         match sessions.get(id) {
@@ -617,6 +810,14 @@ impl Default for OAuthSessions {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Stretch the completion-poll cadence toward its ceiling.
+fn grow_screen_interval(interval: Duration) -> Duration {
+    interval
+        .mul_f32(SCREEN_POLL_GROWTH)
+        .min(SCREEN_POLL_MAX)
+        .max(SCREEN_POLL_START)
 }
 
 /// Bound what an upstream error can push into the log and the panel, keeping both of its ends.
@@ -1008,6 +1209,304 @@ mod tests {
                 panic!("the second attempt must not fail on the port the first one left bound: {e}")
             });
         assert_ne!(first, second);
+    }
+
+    /// A platform whose login finishes on its own page, with the poll outcomes scripted so a test
+    /// can name the exact sequence the provider would produce.
+    struct FakeScreen {
+        outcome: std::sync::Mutex<std::collections::VecDeque<DevicePoll>>,
+        polls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeScreen {
+        fn scripted(outcome: Vec<DevicePoll>) -> &'static Self {
+            Box::leak(Box::new(Self {
+                outcome: std::sync::Mutex::new(outcome.into()),
+                polls: std::sync::atomic::AtomicUsize::new(0),
+            }))
+        }
+
+        fn polls(&self) -> usize {
+            self.polls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl OAuthPlatform for FakeScreen {
+        fn id(&self) -> &'static str {
+            "fake-screen"
+        }
+        fn label(&self) -> &'static str {
+            "Fake screen"
+        }
+        fn description(&self) -> &'static str {
+            "Test double whose login finishes on its own page."
+        }
+        fn begins_with_loopback(&self) -> bool {
+            false
+        }
+        fn begins_with_screen_login(&self) -> bool {
+            true
+        }
+        fn redirect_ports(&self) -> RedirectPorts {
+            RedirectPorts {
+                host: "127.0.0.1",
+                primary: 0,
+                fallback: None,
+                path: "/cb",
+            }
+        }
+        fn requires_pkce(&self) -> bool {
+            true
+        }
+        fn validates_redirect_port(&self) -> bool {
+            false
+        }
+        fn authorization_url(
+            &self,
+            _state: &str,
+            _pkce: Option<&Pkce>,
+            _port: u16,
+        ) -> crate::oauth::Result<String> {
+            Err(crate::oauth::oauth_error("no redirect flow"))
+        }
+        async fn exchange_code(
+            &self,
+            _code: &str,
+            _pkce: Option<&Pkce>,
+            _port: u16,
+        ) -> crate::oauth::Result<TokenSet> {
+            Err(crate::oauth::oauth_error("no redirect flow"))
+        }
+        async fn refresh(&self, _refresh_token: &str) -> crate::oauth::Result<TokenSet> {
+            Ok(TokenSet::new("refreshed"))
+        }
+        async fn screen_login_start(&self) -> crate::oauth::Result<ScreenLogin> {
+            Ok(ScreenLogin::new(
+                "https://example.test/login?challenge=abc",
+                "session-1",
+                "ticket-1",
+            ))
+        }
+        async fn screen_login_poll(
+            &self,
+            _login: &ScreenLogin,
+        ) -> crate::oauth::Result<DevicePoll> {
+            self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self
+                .outcome
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(DevicePoll::Pending))
+        }
+        async fn account_identity(
+            &self,
+            _tokens: &TokenSet,
+        ) -> crate::oauth::Result<AccountIdentity> {
+            Ok(AccountIdentity {
+                id: "acct-screen".into(),
+                label: "Screen Account".into(),
+                email: None,
+                plan: None,
+            })
+        }
+        fn apply_credential(
+            &self,
+            _tokens: &TokenSet,
+        ) -> Vec<(http::HeaderName, http::HeaderValue)> {
+            Vec::new()
+        }
+        fn fingerprint_headers(&self) -> &'static [(&'static str, &'static str)] {
+            &[]
+        }
+        fn refresh_lead(&self) -> Duration {
+            Duration::from_secs(0)
+        }
+    }
+
+    /// The three failures need three different answers over HTTP: a dead session is final, a busy
+    /// one is worth retrying, and a mismatched binding will never work. Collapsing them into one
+    /// message is what makes a panel poll a dead id until its own deadline.
+    #[tokio::test]
+    async fn a_binding_failure_says_whether_to_retry() {
+        let sessions = OAuthSessions::new();
+        let platform = FakeScreen::scripted(vec![]);
+        let (id, _) = sessions
+            .start_screen(platform, "p1".into())
+            .await
+            .expect("the screen flow starts");
+
+        sessions
+            .validate_binding(&id, "p1", platform.id())
+            .await
+            .expect("the session validates against the provider that started it");
+        assert_eq!(
+            sessions
+                .validate_binding("no-such-session", "p1", platform.id())
+                .await,
+            Err(BindingError::Gone),
+            "a missing session is gone, not mismatched"
+        );
+        assert_eq!(
+            sessions.validate_binding(&id, "p2", platform.id()).await,
+            Err(BindingError::Mismatch),
+            "another provider's id is a mismatch"
+        );
+        assert_eq!(
+            sessions.validate_binding(&id, "p1", "some-other").await,
+            Err(BindingError::Mismatch),
+            "another platform's id is a mismatch"
+        );
+
+        sessions.mark_busy(&id).await;
+        assert_eq!(
+            sessions.validate_binding(&id, "p1", platform.id()).await,
+            Err(BindingError::Busy),
+            "a poll already in flight is busy, not gone"
+        );
+    }
+
+    /// The two flows a screen-login platform must refuse, and the refusal has to name the flow that
+    /// would actually work — an operator who clicked the wrong button needs to be told which one is
+    /// right, not that something is unsupported.
+    #[tokio::test]
+    async fn a_screen_login_opens_its_page_and_the_other_flows_refuse_it() {
+        let sessions = OAuthSessions::new();
+        let platform = FakeScreen::scripted(vec![]);
+        let (id, url) = sessions
+            .start_screen(platform, "p1".into())
+            .await
+            .expect("the screen flow starts");
+        assert!(!id.is_empty());
+        assert_eq!(url, "https://example.test/login?challenge=abc");
+
+        let browser = sessions.start_browser(platform, "p1".into()).await;
+        assert!(
+            browser
+                .as_ref()
+                .is_err_and(|error| error.contains("own page")),
+            "a browser start must name the page flow, got {browser:?}"
+        );
+        let device = sessions.start_device(platform, "p1".into()).await;
+        assert!(
+            device
+                .as_ref()
+                .is_err_and(|error| error.contains("own page")),
+            "a device start must name the page flow, got {device:?}"
+        );
+
+        // And the reverse: a platform without the flow cannot be started as one.
+        let wrong = sessions
+            .start_screen(FakeBrowser::leaked(), "p1".into())
+            .await;
+        assert!(
+            wrong.as_ref().is_err_and(|error| error.contains("browser")),
+            "a non-screen platform must be refused, got {wrong:?}"
+        );
+    }
+
+    /// The panel polls once, sees `complete`, and may poll again before it stops — the second answer
+    /// must be the same login rather than an error, so a replayed poll cannot log the operator out.
+    #[tokio::test]
+    async fn a_completed_screen_login_replays_its_tokens_without_asking_again() {
+        let sessions = OAuthSessions::new();
+        let platform = FakeScreen::scripted(vec![DevicePoll::Success(TokenSet::new("access-1"))]);
+        let (id, _) = sessions
+            .start_screen(platform, "p1".into())
+            .await
+            .expect("start");
+
+        let first = sessions.poll_screen(&id, "p1").await.expect("poll");
+        match first {
+            PollResult::Complete { tokens, identity } => {
+                assert_eq!(tokens.access_token, "access-1");
+                assert_eq!(identity.id, "acct-screen");
+            }
+            other => panic!("expected completion, got {other:?}"),
+        }
+        let second = sessions.poll_screen(&id, "p1").await.expect("replay");
+        assert!(
+            matches!(second, PollResult::Complete { .. }),
+            "a replayed poll must replay the completion, got {second:?}"
+        );
+        assert_eq!(platform.polls(), 1, "the provider must be asked once");
+    }
+
+    /// A page that is still open is not an error, and one poll per request is the most the provider
+    /// will accept: the second poll inside the interval is answered locally.
+    #[tokio::test]
+    async fn a_pending_screen_poll_waits_its_turn_instead_of_hammering_the_page() {
+        let sessions = OAuthSessions::new();
+        let platform = FakeScreen::scripted(vec![
+            DevicePoll::Pending,
+            DevicePoll::Success(TokenSet::new("access-2")),
+        ]);
+        let (id, _) = sessions
+            .start_screen(platform, "p1".into())
+            .await
+            .expect("start");
+
+        match sessions.poll_screen(&id, "p1").await.expect("first") {
+            PollResult::Pending {
+                retry_after_seconds,
+            } => assert_eq!(retry_after_seconds, SCREEN_POLL_START.as_secs()),
+            other => panic!("expected pending, got {other:?}"),
+        }
+        match sessions.poll_screen(&id, "p1").await.expect("second") {
+            PollResult::Pending {
+                retry_after_seconds,
+            } => assert!(
+                retry_after_seconds >= 1,
+                "a refused poll still says when to retry"
+            ),
+            other => panic!("expected pending, got {other:?}"),
+        }
+        assert_eq!(platform.polls(), 1, "the interval is enforced locally");
+    }
+
+    /// A failure the provider reports is a message, not the end of the session: the operator may
+    /// still finish the page, so the session stays until its TTL and the message is bounded.
+    #[tokio::test]
+    async fn a_failed_screen_poll_keeps_the_session_and_bounds_the_message() {
+        let sessions = OAuthSessions::new();
+        let long = "x".repeat(600);
+        let platform = FakeScreen::scripted(vec![DevicePoll::Failed { message: long }]);
+        let (id, _) = sessions
+            .start_screen(platform, "p1".into())
+            .await
+            .expect("start");
+
+        match sessions.poll_screen(&id, "p1").await.expect("first") {
+            PollResult::Failed { message } => assert_eq!(message.chars().count(), 240),
+            other => panic!("expected a bounded failure, got {other:?}"),
+        }
+        // Still there, and still rate-limited: the operator can finish the page and be let in.
+        assert!(matches!(
+            sessions.poll_screen(&id, "p1").await.expect("second"),
+            PollResult::Pending { .. }
+        ));
+    }
+
+    /// The cadence stretches and stops at its ceiling, and never falls below its floor — a poke at a
+    /// stalled page costs one request every ten seconds at worst.
+    #[test]
+    fn the_screen_poll_cadence_stretches_toward_its_ceiling() {
+        // A float multiply, so this is a window rather than an exact millisecond.
+        let stretched = grow_screen_interval(SCREEN_POLL_START);
+        assert!(
+            stretched >= Duration::from_millis(1_190) && stretched < Duration::from_millis(1_210),
+            "one second must stretch toward the ceiling, got {stretched:?}"
+        );
+        assert_eq!(
+            grow_screen_interval(Duration::from_secs(9)),
+            SCREEN_POLL_MAX
+        );
+        assert_eq!(grow_screen_interval(SCREEN_POLL_MAX), SCREEN_POLL_MAX);
+        assert_eq!(
+            grow_screen_interval(Duration::from_millis(1)),
+            SCREEN_POLL_START
+        );
     }
 
     #[tokio::test]

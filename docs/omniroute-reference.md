@@ -25,6 +25,12 @@ This is a provider-flow inventory, not a promise that every OmniRoute integratio
 - OpenAI Codex — loopback authorization code with PKCE by default, plus an OpenAI device-code fallback.
 - GitHub Copilot — device authorization.
 - Google Antigravity — loopback OAuth and Cloud Code account onboarding; experimental T2 client metadata remains unverified and paid-tier onboarding requires a project.
+- Cursor — browser-completion login (no redirect, no code: the provider's own page finishes the
+  sign-in and the router polls for the result) with PKCE binding the poll to the page that was
+  opened, and token refresh through the same endpoint the CLI uses. The login and refresh are
+  reverse-engineered from the CLI's traffic and covered by tests against a scripted transport; they
+  have not yet been exercised against a live Cursor account. Cursor is a gRPC/Connect dialected
+  provider, so its chat traffic needs the frame transport rather than the JSON forwarder.
 
 Cline appears as a catalog migration target but does not have an implemented adapter. The Anthropic catalog provider is API-key authentication; OmniRoute's Claude/Claude Code OAuth is a different account entitlement and provider protocol, so this work must not silently convert that template to OAuth. xAI's listed API-key provider similarly does not imply the distinct Grok CLI/xAI OAuth offerings.
 

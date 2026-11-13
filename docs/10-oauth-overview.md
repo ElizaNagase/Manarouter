@@ -52,7 +52,7 @@ legible rather than to make it for them.
 
 ---
 
-## 2. The two flow shapes, and which platform uses which
+## 2. The three flow shapes, and which platform uses which
 
 | Platform | Flow | Redirect | Why this flow |
 |---|---|---|---|
@@ -60,6 +60,7 @@ legible rather than to make it for them.
 | Antigravity (T2) | authorization code + PKCE `S256` | loopback `localhost:51121` | an IDE with a browser on the same machine |
 | gemini-cli (T1) | authorization code, no PKCE on the loopback path | loopback `127.0.0.1:{ephemeral}/oauth2callback` | Google's installed-app client; the client secret substitutes for PKCE |
 | Copilot | **device flow** | none | the client has no browser and cannot receive a loopback callback |
+| Cursor | **page login** (browser-completion) | none | the provider owns the sign-in page, and its own CLI learns of completion by polling |
 
 ### Authorization code with PKCE on a loopback redirect
 
@@ -123,6 +124,29 @@ no redirect port and no PKCE — the device code itself is the secret, and it is
 One consequence: the Copilot device flow has no client secret either. The device flow is defined for
 public clients, so the only thing identifying the client is the `client_id`.
 
+### The page login, where the provider owns the browser step
+
+Cursor has neither a loopback redirect nor a device code. Its sign-in page lives at
+`https://cursor.com/loginDeepControl`, and the CLI that already shipped for it does not receive a
+callback at all: it sends the operator to that page with a PKCE challenge and a UUID, then polls
+`GET https://api2.cursor.sh/auth/poll?uuid=…&verifier=…` until the page reports the login is done,
+at which point the poll answers with the token pair (see `docs/28-oauth-cursor.md`).
+
+The difference from the other two matters when deciding what a platform can do, because a third
+boolean is needed:
+
+* there is nothing to type, so it is **not** the device flow — `supports_device_flow()` must be
+  `false`, or the panel offers a code prompt that no page will ever accept;
+* there is nothing listening on this machine, so it is **not** the loopback flow —
+  `begins_with_loopback()` must be `false`, or the panel waits for a redirect that cannot arrive;
+* the completion signal is a page the *provider* controls, and the only way to observe it is to keep
+  polling, so the flow needs a session that survives being polled for minutes.
+
+`begins_with_screen_login()` is that third answer, and the panel reads it from `GET /api/oauth`
+(`"flows": ["screen"]`) to render the right button. The poll cadence starts at one second, grows by a
+fifth each attempt and stops growing at ten seconds — an abandoned tab costs a poll every ten
+seconds rather than one every second, and the session itself expires well before the page does.
+
 ---
 
 ## 3. What a platform must provide: the `OAuthPlatform` trait
@@ -143,7 +167,9 @@ Every item below is something a platform knows and the shared machinery does not
 |---|---|
 | `id()`, `label()`, `description()` | the stable platform id, matching `oauth_platform` in `catalog/providers.toml` and the `platform` field of `AuthKind::OAuth` in `crates/mr-core/src/dialect.rs`, plus the panel's label and one-line description |
 | `begins_with_loopback() -> bool` | the **default** flow: `true` for a loopback redirect, `false` for device code |
-| `supports_device_flow() -> bool` | whether the platform can *also* be logged in with a device code; defaults to `!begins_with_loopback()`, and Codex overrides it to `true` |
+| `supports_device_flow() -> bool` | whether the platform can *also* be logged in with a device code; defaults to `!begins_with_loopback() && !begins_with_screen_login()` — both of those are non-loopback flows that a device prompt cannot serve — and Codex overrides it to `true` |
+| `begins_with_screen_login() -> bool` | whether the login finishes on a provider page the router only observes; defaults to `false` |
+| `screen_login_start() -> Result<ScreenLogin>` / `screen_login_poll(&ScreenLogin) -> Result<DevicePoll>` | the page-login pair: open the page, then ask once whether that page has reported completion. The default implementations refuse with a message naming the flow the platform does use |
 | `redirect_ports() -> RedirectPorts` | host, primary/fallback port and path — the string must match what the provider registered |
 | `requires_pkce() -> bool` / `validates_redirect_port() -> bool` | whether the flow binds a PKCE `S256` challenge, and whether the bound port must be one of the registered ports |
 | `authorization_url(state, pkce, port) -> Result<String>` | builds the authorize URL, including PKCE, `state` and platform-specific extra parameters |
@@ -232,6 +258,7 @@ A refresh window is how far *before* expiry the credential is refreshed.
 | Codex | 5 minutes (`Codex::refresh_lead`, 300 s) | primary (`openai/codex`) |
 | Copilot | `refresh_in` from the mint response, ~1500 s; the language server sets `expires_at = now + refresh_in + 60` and VS Code refreshes at `expires_at - 300` | primary/T2 |
 | Antigravity | 60 seconds | T2 — the reverse-engineered IDE client refreshes within 60 s of expiry |
+| Cursor | 5 minutes (`Cursor::refresh_lead`, 300 s) | the observed token lifetime is an hour and the CLI refreshes minutes early; the window leaves room for one retry cycle |
 | Claude Code | **4 hours** | **UNCERTAIN** — not in the research dossier; see below |
 
 > **UNCERTAIN.** The 4-hour Claude Code figure is stated in this project's brief but does not appear

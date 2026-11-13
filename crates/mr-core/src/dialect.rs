@@ -75,6 +75,23 @@ pub enum Dialect {
     /// Modal-hosted vLLM endpoint: OpenAI-compatible, but with `Modal-Key` and `Modal-Secret`
     /// headers.
     ModalVllm = 8,
+    /// Cursor's `agent.v1.AgentService` — a bidirectional Connect-RPC stream of protobuf frames,
+    /// not an HTTP request/response pair.
+    ///
+    /// It has its own value rather than sharing [`Dialect::OpenAi`] because nothing about the wire
+    /// is shared: the body is a length-prefixed protobuf frame written without `END_STREAM`, the
+    /// answer is a stream of protobuf frames that must be answered in turn (request-context, blob
+    /// store, interaction queries), and the host is discovered at runtime rather than configured.
+    /// Treating it as OpenAI-compatible would send a JSON body to a service that only decodes
+    /// protobuf.
+    ///
+    /// **Chat transport only.** The OAuth login that mints the token this dialect sends is a
+    /// separate concern owned by `mr-core::oauth`; a provider using this dialect still needs a
+    /// credential stored the ordinary way.
+    ///
+    /// The exact bytes are implemented in `mr-dialects::cursor` (frames and protobuf) and
+    /// `manarouter-relay::cursor_transport` (the HTTP/2 exchange).
+    Cursor = 9,
 }
 
 impl Dialect {
@@ -97,6 +114,7 @@ impl Dialect {
             6 => Self::CommandCodeGo,
             7 => Self::GoogleAiStudio,
             8 => Self::ModalVllm,
+            9 => Self::Cursor,
             _ => return None,
         })
     }
@@ -121,6 +139,7 @@ impl Dialect {
             Self::CommandCodeGo => "command-code-go",
             Self::GoogleAiStudio => "google-ai-studio",
             Self::ModalVllm => "modal-vllm",
+            Self::Cursor => "cursor",
         }
     }
 
@@ -154,6 +173,9 @@ impl Dialect {
             "antigravity" | "agy" | "gemini-code-assist" | "cloudcode" => Self::Antigravity,
             "command-code-go" | "cmdgo" => Self::CommandCodeGo,
             "modal-vllm" | "modal" | "modalvllm" => Self::ModalVllm,
+            // `cursor-agent` is the installed CLI's own name, so it is the spelling an operator
+            // copying from `cursor-agent --version` is most likely to write.
+            "cursor" | "cursor-agent" | "cursoragent" => Self::Cursor,
             _ => return None,
         })
     }
@@ -174,15 +196,17 @@ impl Dialect {
     /// Whether this dialect always answers with `text/event-stream` even when the client asked
     /// for a single JSON document.
     ///
-    /// Codex and Antigravity do, so the relay must synthesize a non-streaming response for a
-    /// non-streaming client rather than forwarding the SSE body.
+    /// Codex, Antigravity and Cursor do, so the relay must synthesize a non-streaming response for
+    /// a non-streaming client rather than forwarding the SSE body. Cursor is the extreme case: the
+    /// upstream exchange is a bidirectional frame stream with no request/response mode at all, so
+    /// the relay's own OpenAI-SSE rendering is always the source of the client's bytes.
     #[inline]
     pub const fn force_stream(self) -> bool {
-        matches!(self, Self::Codex | Self::Antigravity)
+        matches!(self, Self::Codex | Self::Antigravity | Self::Cursor)
     }
 
     /// Every dialect, in snapshot order. Useful for exhaustive tests.
-    pub const ALL: [Dialect; 9] = [
+    pub const ALL: [Dialect; 10] = [
         Self::OpenAi,
         Self::Anthropic,
         Self::Google,
@@ -192,6 +216,7 @@ impl Dialect {
         Self::CommandCodeGo,
         Self::GoogleAiStudio,
         Self::ModalVllm,
+        Self::Cursor,
     ];
 
     /// The reasoning levels this dialect can put on the wire as *themselves*, ascending.
@@ -222,6 +247,13 @@ impl Dialect {
             Self::Anthropic | Self::Google | Self::Antigravity | Self::GoogleAiStudio => {
                 &ReasoningLevel::ALL
             }
+            // The agent wire format has no reasoning-effort field and no thinking budget: the model
+            // is chosen by id and the server decides how much to think. Offering `none` alone is
+            // the honest answer — every other tier would be a promise this dialect cannot keep, and
+            // the compiler would happily advertise it. A model routed here keeps its default
+            // behaviour; a request for a named tier is rerouted by the ordinary `-<level>` rule
+            // rather than silently sent as something else.
+            Self::Cursor => &NO_REASONING_LEVELS,
         }
     }
 
@@ -251,6 +283,13 @@ impl Dialect {
 /// [`Dialect::expressible_reasoning_levels`] can return a stable slice from a `const fn`; the
 /// order matches [`ReasoningLevel::ALL`] up to `xhigh`, which is what lets the compiler fold the
 /// list into an ascending bitmask without sorting it.
+/// The only level a dialect with no level field can put on the wire.
+///
+/// [`ReasoningLevel::None`] is present because it means "send no fragment at all", which is exactly
+/// what such a dialect does — and because the compiler requires every dialect's list to contain it
+/// so that an unaugmented request is always expressible.
+const NO_REASONING_LEVELS: [ReasoningLevel; 1] = [ReasoningLevel::None];
+
 const NAMED_EFFORT_LEVELS: [ReasoningLevel; 6] = [
     ReasoningLevel::None,
     ReasoningLevel::Minimal,
@@ -1175,7 +1214,7 @@ mod tests {
         }
         // Unknown values must be rejected rather than silently mapping onto a dialect, because a
         // misread snapshot byte would otherwise route traffic to an unrelated provider.
-        assert_eq!(Dialect::from_u8(9), None);
+        assert_eq!(Dialect::from_u8(10), None);
         assert_eq!(Dialect::from_u8(255), None);
     }
 
@@ -1382,6 +1421,28 @@ mod tests {
     }
 
     #[test]
+    fn cursor_parses_its_cli_spelling_and_offers_only_the_absent_level() {
+        assert_eq!(Dialect::parse("cursor"), Some(Dialect::Cursor));
+        assert_eq!(Dialect::parse("Cursor-Agent"), Some(Dialect::Cursor));
+        assert_eq!(Dialect::parse("cursor-cli"), None);
+        // The agent wire format has no effort field. Advertising another tier would make the
+        // panel and `/v1/models` promise a level the upstream never receives.
+        assert_eq!(
+            Dialect::Cursor.expressible_reasoning_levels(),
+            [ReasoningLevel::None]
+        );
+        for level in ReasoningLevel::ALL {
+            assert_eq!(
+                Dialect::Cursor.supports_reasoning_level(level),
+                level == ReasoningLevel::None,
+                "{level:?}"
+            );
+        }
+        assert!(Dialect::Cursor.force_stream());
+        assert!(!Dialect::Cursor.always_reasons());
+    }
+
+    #[test]
     fn every_dialect_has_its_own_stable_identifier() {
         let expected = [
             (Dialect::OpenAi, "openai"),
@@ -1393,6 +1454,7 @@ mod tests {
             (Dialect::CommandCodeGo, "command-code-go"),
             (Dialect::GoogleAiStudio, "google-ai-studio"),
             (Dialect::ModalVllm, "modal-vllm"),
+            (Dialect::Cursor, "cursor"),
         ];
         assert_eq!(expected.len(), Dialect::ALL.len());
         for (dialect, id) in expected {

@@ -238,7 +238,7 @@ For humans:
 | [The hedged race](docs/07-hedged-race.md) | The eligibility gate, in detail |
 | [Quota tracking](docs/08-quota-tracking.md) | Signals, windows, cooldowns |
 | [Reset-aware priority](docs/09-reset-aware-priority.md) | Demote, never remove |
-| [OAuth](docs/10-oauth-overview.md) · [Codex](docs/11-oauth-codex.md) · [Antigravity](docs/12-oauth-antigravity.md) · [Copilot](docs/13-oauth-copilot.md) · [Adding a platform](docs/14-oauth-adding-a-platform.md) · [OmniRoute reference notes and client-key rotation](docs/omniroute-reference.md) | Logins and key management |
+| [OAuth](docs/10-oauth-overview.md) · [Codex](docs/11-oauth-codex.md) · [Antigravity](docs/12-oauth-antigravity.md) · [Copilot](docs/13-oauth-copilot.md) · [Cursor](docs/28-oauth-cursor.md) · [Adding a platform](docs/14-oauth-adding-a-platform.md) · [OmniRoute reference notes and client-key rotation](docs/omniroute-reference.md) | Logins and key management |
 | [Web panel](docs/15-web-panel.md) | Views, API and design |
 | [Latency engineering](docs/16-latency-engineering.md) | Every decision, and the rejected ones |
 | [Migrating from OmniRoute](docs/17-migrating-from-omniroute.md) | Providers, combos, credentials |
