@@ -819,7 +819,7 @@ async function renderInventory(mount, ctx) {
 
     const card = section('Lane endpoints');
     card.append(hint(
-      'One card per platform, fetched independently. A single failure leaves the others visible.'));
+      'One section per platform, fetched independently. A single failure leaves the others visible.'));
 
     const cards = [];
     for (let i = 0; i < LANE_PLATFORMS.length; i++) {

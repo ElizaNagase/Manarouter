@@ -1,20 +1,29 @@
 /* gpu-rentals.css — layout for the GPU rentals view only.
  *
- * Everything here is prefixed `gpu-` and scoped to the `#/gpu-rentals` route, so no rule can reach
- * another view. Colours, radii, fonts and the greys all come from the custom properties in
- * app.css: this file adds arrangement, never a new palette, and it redefines nothing.
+ * Every selector is scoped to `#/gpu-rentals`, so nothing here can reach another view. Colours,
+ * radii, fonts and the greys all come from the custom properties in app.css/lab.css: this file adds
+ * arrangement, never a new palette. The type scale is the panel's scale, on purpose — a card label is
+ * the same 11px/650 uppercase as every other card, a sub-label is the same 10.5px/650 micro label as
+ * a table head, body text is 13px, a hint is 11.5px, and a table keeps its 9px 12px cell padding.
  *
- * The colour discipline is the panel's: greys carry structure, --pink marks interaction and the
- * selected/current item, and green/amber/red stay strictly semantic. The one amber panel below
- * (requantisation) is amber because it is a real cost and a real warning, not for decoration.
+ * The colour discipline is the panel's too: greys carry structure, --pink marks interaction and the
+ * selected/current item, and green/amber/red stay strictly semantic. The amber panels below
+ * (requantisation, refusals, warnings) are amber because they are a real cost or a real caveat, not
+ * for decoration; red is used only for something broken.
+ *
+ * Nested structure is a rule, not a second box: a card never contains another bordered card.
  */
 
 /* ---------- route shell ---------- */
 
 .gpu-rentals .gpu-status { margin: 6px 0 10px; }
 
+/* The card itself is lab.css's .card. The label keeps the .card > h2 metrics and the 12px that
+ * separates it from content everywhere else in the panel; the intro line under it is separated from
+ * the content below by its own bottom margin so the label and its hint read as one head. */
 .gpu-rentals .gpu-section { margin-bottom: 14px; }
-.gpu-rentals .gpu-section > h2 { margin-bottom: 6px; }
+.gpu-rentals .gpu-section > .hint { margin: 0 0 10px; }
+.gpu-rentals .gpu-section > .hint:last-child { margin-bottom: 0; }
 
 .gpu-rentals .gpu-actions {
   display: flex;
@@ -26,24 +35,65 @@
 /* A second action row directly under the first needs less air than a fresh block. */
 .gpu-rentals .gpu-actions-tight { margin-top: 8px; }
 
+/* Headings inside a body. A view that stacks titled blocks cannot rely on the browser's default
+ * heading sizes — those are the one thing on this page that was still 26px/15px beside a panel that
+ * uses 21px titles and 11px labels. h3 is the panel's ruled block title (.drawer section > h3, the
+ * same 11px uppercase label with a hairline under it); h4 is one rank quieter and drops the rule. */
+.gpu-rentals h3 {
+  margin: 0 0 10px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--line);
+  color: var(--tx3);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.gpu-rentals h4 {
+  margin: 14px 0 6px;
+  color: var(--tx2);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.gpu-rentals h3:first-child, .gpu-rentals h4:first-child { margin-top: 0; }
+
+/* A heading inside a notes list is a caption, not a block title: no rule, and less air. */
+.gpu-rentals .gpu-notes > h3 {
+  margin: 0 0 6px;
+  padding-bottom: 0;
+  border-bottom: 0;
+  font-size: 10.5px;
+  letter-spacing: 0.07em;
+}
+
+/* The amber panel's own heading belongs to it, as .banner strong does. */
+.gpu-rentals .gpu-requant h3 {
+  color: var(--amber);
+  border-bottom-color: color-mix(in srgb, var(--amber) 25%, transparent);
+}
+
 /* The attach form sits inside a lane card, between its status and its actions. It is structure, so
  * it is a grey rule and grey labels; the only pink on it is the Attach button, which is interaction. */
 .gpu-rentals .gpu-attach {
-  margin-top: 10px;
-  padding-top: 10px;
+  margin-top: 12px;
+  padding-top: 12px;
   border-top: 1px solid var(--line);
 }
-.gpu-rentals .gpu-attach > h4 { margin: 0 0 8px; font-size: 13px; color: var(--tx2); }
 .gpu-rentals .gpu-attach .field { margin-bottom: 8px; }
 
 /* ---------- plan limits ---------- */
 
-.gpu-rentals .gpu-plan-note { margin-bottom: 8px; }
+.gpu-rentals .gpu-plan-note { margin-bottom: 10px; }
 
+/* One sentence under the plan table: prose, one size down from body. */
 .gpu-rentals .gpu-ceiling {
-  margin: 6px 0 0;
-  font-size: 13px;
+  margin: 8px 0 0;
   color: var(--tx2);
+  font-size: 12.5px;
 }
 
 /* Provenance — source, when it was checked, a link. Quiet on purpose: it supports the number
@@ -53,24 +103,24 @@
   flex-wrap: wrap;
   align-items: baseline;
   gap: 0 4px;
-  font-size: 11px;
+  color: var(--tx3);
+  font-size: 11.5px;
 }
 
 /* Instance usage is one ledger total, not an account column. It sits above the account table
- * because it answers "what has this instance spent", which is the question the table cannot. */
+ * because it answers "what has this instance spent", which is the question the table cannot. It is
+ * separated from the card's prose by a rule rather than given a box of its own. */
 .gpu-rentals .gpu-usage {
-  margin: 10px 0;
-  padding: 8px 10px;
-  background: var(--bg1);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
+  margin: 12px 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
 }
 
-.gpu-rentals .gpu-usage-head { margin-bottom: 6px; }
+.gpu-rentals .gpu-usage-head { margin-bottom: 8px; }
 .gpu-rentals .gpu-usage-grid {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px 24px;
+  gap: 6px 28px;
 }
 
 .gpu-rentals .gpu-usage-cell {
@@ -79,8 +129,22 @@
   gap: 6px;
 }
 
-.gpu-rentals .gpu-usage-label { color: var(--tx3); font-size: 11px; }
-.gpu-rentals .gpu-usage-failed { margin: 10px 0; }
+.gpu-rentals .gpu-usage-label {
+  color: var(--tx3);
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.gpu-rentals .gpu-usage-cell > strong.num {
+  color: var(--tx1);
+  font-size: 13px;
+  font-weight: 620;
+  font-variant-numeric: tabular-nums;
+}
+
+.gpu-rentals .gpu-usage-failed { margin: 12px 0; }
 
 /* ---------- catalogue ---------- */
 
@@ -89,15 +153,15 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  margin-bottom: 6px;
+  margin-bottom: 10px;
 }
 
 .gpu-rentals .gpu-inline-label {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
   color: var(--tx2);
+  font-size: 12px;
 }
 
 .gpu-rentals .gpu-inline-label > .input { width: auto; min-width: 180px; }
@@ -116,19 +180,20 @@
   font-size: 12.5px;
 }
 
-.gpu-rentals .gpu-explain { margin-bottom: 8px; }
+.gpu-rentals .gpu-explain { margin-bottom: 10px; }
 
 .gpu-rentals .gpu-bundle-head {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  margin: 10px 0 4px;
+  margin: 10px 0 6px;
 }
 
+/* A code block is the panel's mono size (.mono, code = 12px), never a fraction smaller. */
 .gpu-rentals .gpu-pre {
   margin: 0;
-  padding: 8px 10px;
+  padding: 10px 12px;
   max-height: 340px;
   overflow: auto;
   background: var(--bg0);
@@ -136,21 +201,190 @@
   border-radius: var(--radius);
   color: var(--tx1);
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 12px;
   line-height: 1.5;
   white-space: pre;
   tab-size: 2;
 }
 
+/* Long commands scroll instead of wrapping. */
+.gpu-rentals .gpu-bundle .gpu-pre { overflow-x: auto; }
+
 .gpu-rentals .gpu-applied { margin-top: 10px; }
 
+/* ---------- notes and caveats ---------- */
+
+/* `noteList` renders a titled block (h3 + ul) while other call sites render the ul alone, so the
+ * indent and the heading are scoped to the shape actually present. */
+.gpu-rentals .gpu-notes { margin: 8px 0 0; padding-left: 18px; color: var(--tx3); font-size: 12px; }
+.gpu-rentals .gpu-notes > li { margin-bottom: 3px; }
+.gpu-rentals .gpu-notes:has(> h3) { padding-left: 0; }
+.gpu-rentals .gpu-notes > ul { margin: 0; padding-left: 18px; }
+.gpu-rentals .gpu-notes > ul > li { margin-bottom: 3px; }
+
+/* A caveat is the panel's amber aside: a rule on the left, secondary text, no alarm colour. */
+.gpu-rentals .gpu-caveat {
+  margin: 8px 0 0;
+  padding-left: 8px;
+  border-left: 2px solid var(--amber);
+  color: var(--tx2);
+  font-size: 12px;
+}
+
+/* Warnings are advisory, never failures: amber rule, secondary text, no alarm colour. */
+.gpu-rentals .gpu-warnings { margin: 6px 0 0; padding: 0; list-style: none; font-size: 12px; }
+.gpu-rentals .gpu-warnings li {
+  margin: 0 0 4px;
+  padding-left: 8px;
+  border-left: 2px solid var(--amber);
+  color: var(--tx2);
+}
+
+/* Something is broken: red, and the rule says where it starts. */
+.gpu-rentals .gpu-failed {
+  margin-top: 12px;
+  padding-left: 8px;
+  border-left: 2px solid var(--red);
+  color: var(--red);
+  font-size: 12.5px;
+}
+.gpu-rentals .gpu-failed h3 {
+  color: var(--red);
+  border-bottom-color: color-mix(in srgb, var(--red) 25%, transparent);
+}
+
+.gpu-rentals .gpu-validation { margin: 0 0 12px; }
+.gpu-rentals .gpu-validation .form-errors { margin-bottom: 8px; }
+
+/* An empty block is a blank, not an error: grey, and separated from whatever precedes it. */
+.gpu-rentals .gpu-blank { margin-top: 10px; padding: 8px 0; color: var(--tx3); }
+.gpu-rentals .gpu-blank > .hint, .gpu-rentals .gpu-blank > p { margin: 0; }
+
+/* A selector that is intentionally blank reads as neutral grey, not as a fault: requirement 5 is a
+ * deliberate constraint, so it must not be painted like an error. */
+.gpu-rentals .gpu-field-off > label { color: var(--tx3); }
+
+/* ---------- platform lanes ---------- */
+
+.gpu-rentals .gpu-lanes { margin-top: 10px; }
+
+/* The lanes table is a table like every other: 13px cells, 9px 12px padding. Only the alignment
+ * changes, because a cell may hold a short label and a tall clause at once. */
+.gpu-rentals .tbl-lanes th,
+.gpu-rentals .tbl-lanes td { vertical-align: top; }
+.gpu-rentals .tbl-lanes td { line-height: 1.45; }
+
+.gpu-rentals .gpu-lane-why { display: flex; flex-direction: column; gap: 3px; }
+
+/* Traffic type (requests / batch): muted, mono, small — a label, not data. */
+.gpu-rentals .gpu-lane-traffic {
+  color: var(--tx3);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* A refusal is the platform's own rule quoted back — a caveat, not a fault, so amber not red. */
+.gpu-rentals .gpu-lane-refusal {
+  margin: 0;
+  padding-left: 8px;
+  border-left: 2px solid var(--amber);
+  color: var(--tx1);
+  font-size: 12px;
+}
+
+.gpu-rentals .gpu-lane-refusal .gpu-lane-clause { font-style: italic; color: var(--tx3); }
+
+.gpu-rentals .gpu-lane-clause { font-style: italic; color: var(--tx2); }
+
+.gpu-rentals .gpu-lane-ok { color: var(--tx3); font-size: 12px; }
+
+.gpu-rentals .gpu-lane-docs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 11.5px;
+  color: var(--tx3);
+}
+.gpu-rentals .gpu-lane-docs a:hover { text-decoration: underline; }
+
+.gpu-rentals .gpu-lane-accounts { margin: 6px 0 0; padding-left: 16px; color: var(--tx2); font-size: 12px; }
+.gpu-rentals .gpu-lane-accounts li { margin-bottom: 2px; }
+.gpu-rentals .gpu-lane-accounts .mono { color: var(--tx1); }
+
+/* ---------- per-lane status cards ---------- */
+
+.gpu-rentals .gpu-lane-cards { margin-top: 10px; }
+
+/* One card per platform inside the endpoint card: a hairline between them and no box of their own,
+ * so the page keeps one column of text instead of nested cards. */
+.gpu-rentals .gpu-lane-cards > .gpu-section > .gpu-section {
+  border: 0;
+  border-top: 1px solid var(--line);
+  background: transparent;
+  margin: 0;
+  padding: 12px 0 14px;
+}
+.gpu-rentals .gpu-lane-cards > .gpu-section > .gpu-section:first-of-type { border-top: 0; padding-top: 0; }
+.gpu-rentals .gpu-lane-cards > .gpu-section > .gpu-section:last-of-type { padding-bottom: 2px; }
+
+.gpu-rentals .gpu-lane-status { margin-bottom: 6px; }
+
+/* ---------- the plan probe ---------- */
+
+.gpu-rentals .gpu-plan { margin-top: 10px; }
+
+.gpu-rentals .gpu-plan-controls { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+.gpu-rentals .gpu-plan-controls select { min-width: 140px; }
+
+/* The plan probe's answer: a detail under the controls, not another box. */
+.gpu-rentals .gpu-plan-result { margin-top: 12px; }
+.gpu-rentals .gpu-plan-result-line { color: inherit; }
+
+/* The plan block is a detail of the card, not a second card: indent with a rule, not a border box. */
+.gpu-rentals .gpu-plan-block { margin-top: 10px; padding-left: 8px; border-left: 1px solid var(--line); }
+
+.gpu-rentals .gpu-plan-marker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 4px;
+  margin: 8px 0 0;
+}
+
 /* ---------- setup: the step rail ---------- */
+
+.gpu-rentals .gpu-setup { min-width: 0; max-width: 980px; }
+
+/* The wizard's own head: the route already printed its title above, so this one is a page-section
+ * title (15.5px, the size the docs view gives a sub-page), not a second 21px page title. Its actions
+ * sit to the right, as on every other head in the panel. */
+.gpu-rentals .gpu-setup > .page-head {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px 16px;
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+}
+
+.gpu-rentals .gpu-setup > .page-head h1 {
+  margin: 0;
+  font-size: 15.5px;
+  font-weight: 620;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+}
+
+.gpu-rentals .gpu-setup > .page-head > .gpu-actions { margin-top: 0; }
 
 .gpu-rentals .gpu-steps {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
-  margin: 0 0 10px;
+  margin: 0 0 12px;
   padding: 0;
   list-style: none;
 }
@@ -162,8 +396,8 @@
   border-radius: var(--radius);
   color: var(--tx3);
   cursor: pointer;
-  font: 12px var(--sans);
-  padding: 3px 9px;
+  font: 11.5px var(--sans);
+  padding: 4px 10px;
   text-align: left;
 }
 
@@ -189,7 +423,15 @@
 
 .gpu-rentals .gpu-step-link.gpu-step-current .gpu-step-count { color: var(--tx2); }
 
-.gpu-rentals .gpu-step-body { min-width: 0; }
+/* The step's content is a card, like the content of every other view: one box per step, and the
+ * titled blocks inside it are separated by rules rather than by more boxes. */
+.gpu-rentals .gpu-step-body {
+  min-width: 0;
+  padding: 14px 16px;
+  background: var(--bg1);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
 
 .gpu-rentals .gpu-step-actions {
   display: flex;
@@ -199,8 +441,6 @@
 }
 
 /* ---------- setup: fields ---------- */
-
-.gpu-rentals .gpu-setup { min-width: 0; max-width: 980px; }
 
 .gpu-rentals .gpu-step-hint { margin: 0 0 12px; }
 
@@ -217,61 +457,11 @@
 
 .gpu-rentals .gpu-readout > .gpu-inline-label { color: var(--tx2); }
 
-.gpu-rentals .gpu-unit { margin-left: 2px; font-size: 11px; }
+.gpu-rentals .gpu-unit { margin-left: 2px; font-size: 11.5px; }
 
-.gpu-rentals .gpu-notes { margin: 6px 0 0; padding-left: 18px; color: var(--tx3); font-size: 12px; }
-.gpu-rentals .gpu-notes > li { margin-bottom: 3px; }
-/* `noteList` renders a titled block (h3 + ul) while other call sites render the ul alone, so the
- * indent and the heading are scoped to the shape actually present. */
-.gpu-rentals .gpu-notes:has(> h3) { padding-left: 0; }
-.gpu-rentals .gpu-notes > h3 {
-  margin: 0 0 3px;
-  font-family: var(--mono);
-  font-size: 10.5px;
-  font-weight: 700;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  color: var(--tx3);
-}
-.gpu-rentals .gpu-notes > ul { margin: 0; padding-left: 16px; }
-
-.gpu-rentals .gpu-blank {
-  margin-top: 10px;
-  padding: 8px 0;
-  color: var(--tx3);
-}
-
-.gpu-rentals .gpu-blank > .hint, .gpu-rentals .gpu-blank > p { margin: 0; }
-
-.gpu-rentals .gpu-failed {
-  margin-top: 12px;
-  padding-left: 8px;
-  border-left: 2px solid var(--red);
-}
-
-.gpu-rentals .gpu-failed h3 { margin: 0 0 4px; }
-
-.gpu-rentals .gpu-validation { margin: 0 0 12px; }
-.gpu-rentals .gpu-validation .form-errors { margin-bottom: 8px; }
-
-/* A selector that is intentionally blank reads as neutral grey, not as a fault: requirement 5 is a
- * deliberate constraint, so it must not be painted like an error. */
-.gpu-rentals .gpu-field-off > label { color: var(--tx3); }
-
-.gpu-rentals .gpu-blank-quant {
-  margin: 8px 0 0;
-  padding: 8px 10px;
-  border: 1px dashed var(--line2);
-  border-radius: var(--radius);
-  color: var(--tx3);
-  font-size: 12px;
-}
-
-/* ---------- setup: the probe and the sizing panel ---------- */
+/* ---------- setup: the sizing panel ---------- */
 
 .gpu-rentals .gpu-plans, .gpu-rentals .gpu-existing { margin-top: 14px; }
-
-.gpu-rentals .gpu-plans > h3, .gpu-rentals .gpu-existing > h3 { margin: 0 0 6px; }
 
 .gpu-rentals .gpu-probe { margin-top: 12px; }
 
@@ -281,33 +471,7 @@
   border-top: 1px solid var(--line);
 }
 
-.gpu-rentals .gpu-plan-marker {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 0 4px;
-  margin: 8px 0 0;
-}
-
 .gpu-rentals .gpu-sizing { margin-top: 14px; }
-
-.gpu-rentals .gpu-authority {
-  margin-top: 8px;
-  color: var(--tx2);
-}
-
-.gpu-rentals .gpu-caveat {
-  margin: 6px 0 0;
-  padding-left: 8px;
-  border-left: 2px solid var(--amber);
-  color: var(--tx2);
-  font-size: 12px;
-}
-
-.gpu-rentals .gpu-assumptions { margin-top: 10px; }
-.gpu-rentals .gpu-assumptions h3 { margin: 0 0 4px; }
-.gpu-rentals .gpu-assumptions ul { margin: 0; padding-left: 18px; }
-.gpu-rentals .gpu-assumptions li { color: var(--tx3); font-size: 12px; margin-bottom: 2px; }
 
 /* ---------- setup: quantisation that is not available ---------- */
 
@@ -324,22 +488,18 @@
 /* Amber, not red: a missing quantisation is a tradeoff with a path through it (the recipe below),
  * not a failure. Red is reserved for something broken or refused. */
 .gpu-rentals .gpu-requant {
-  margin-top: 8px;
-  padding: 10px;
+  margin-top: 10px;
+  padding: 12px;
   border: 1px solid color-mix(in srgb, var(--amber) 35%, transparent);
   border-radius: var(--radius);
   background: var(--amber-dim);
 }
 
-.gpu-rentals .gpu-requant h3 { margin: 0 0 6px; }
-
 .gpu-rentals .gpu-requant-path {
-  margin-top: 8px;
-  padding-top: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
   border-top: 1px solid color-mix(in srgb, var(--amber) 25%, transparent);
 }
-
-.gpu-rentals .gpu-requant-path > h4 { margin: 0 0 4px; }
 
 .gpu-rentals .gpu-requant-steps { margin: 8px 0 0; padding-left: 18px; }
 .gpu-rentals .gpu-requant-steps li { margin-bottom: 4px; }
@@ -355,115 +515,3 @@
 .gpu-rentals .gpu-review { margin-top: 12px; }
 
 .gpu-rentals .gpu-missing-setup { max-width: 780px; }
-
-/* ---------- platform lanes ---------- */
-
-.gpu-rentals .gpu-lanes { margin-top: 10px; }
-
-.gpu-rentals .gpu-lane-why { display: flex; flex-direction: column; gap: 3px; }
-
-/* Traffic type (requests / batch): muted, mono, small — a label, not data. */
-.gpu-rentals .gpu-lane-traffic {
-  color: var(--tx3);
-  font: 11px var(--mono);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-/* A refusal is the platform's own rule quoted back — a caveat, not a fault, so amber not red. */
-.gpu-rentals .gpu-lane-refusal {
-  margin: 0;
-  padding-left: 8px;
-  border-left: 2px solid var(--amber);
-  color: var(--tx1);
-  font-size: 12px;
-}
-
-.gpu-rentals .gpu-lane-refusal .gpu-lane-clause {
-  font-style: italic;
-  color: var(--tx3);
-}
-
-.gpu-rentals .gpu-lane-ok { color: var(--tx3); font-size: 12px; }
-
-.gpu-rentals .gpu-lane-docs { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; }
-
-/* ---------- lanes table ---------- */
-
-.gpu-rentals .gpu-lanes { margin-top: 8px; }
-
-.gpu-rentals .tbl-lanes { font-size: 12px; }
-
-/* Refusal: amber left border, matching .gpu-caveat precedent */
-.gpu-rentals .gpu-lane-refusal {
-  margin: 0 0 4px; padding-left: 8px; border-left: 2px solid var(--amber);
-  color: var(--tx2); font-size: 12px;
-}
-
-.gpu-rentals .gpu-lane-traffic {
-  font-family: var(--mono); color: var(--tx3); font-weight: 500; font-size: 11px;
-}
-
-.gpu-rentals .gpu-lane-clause { font-style: italic; color: var(--tx2); }
-
-.gpu-rentals .gpu-lane-ok { color: var(--tx3); font-size: 12px; }
-
-.gpu-rentals .gpu-lane-why { display: flex; flex-direction: column; gap: 2px; }
-
-.gpu-rentals .gpu-lane-docs { display: flex; flex-wrap: wrap; gap: 4px 8px; font-size: 11px; color: var(--tx3); }
-
-/* ---------- polish (added) ---------- */
-
-/* Multi-line refusal cells: align top so short labels don't fight tall text. */
-.gpu-rentals .tbl-lanes th,
-.gpu-rentals .tbl-lanes td { vertical-align: top; }
-
-/* Documentation links: make hover state visible. */
-.gpu-rentals .gpu-lane-docs a:hover { text-decoration: underline; }
-
-/* Bundle code blocks: scroll horizontally instead of wrapping long commands. */
-.gpu-rentals .gpu-bundle .gpu-pre { overflow-x: auto; }
-
-/* ---------- per-lane status cards and launch-plan preview ---------- */
-
-.gpu-rentals .gpu-lane-cards { margin-top: 10px; }
-
-/* One card per platform inside the endpoint card: a hairline between them and no box of their own,
- * so the page keeps one column of text instead of nested cards. */
-.gpu-rentals .gpu-lane-cards > .gpu-section > .gpu-section {
-  border: 0;
-  border-top: 1px solid var(--line);
-  background: transparent;
-  margin: 0;
-  padding: 12px 0 14px;
-}
-.gpu-rentals .gpu-lane-cards > .gpu-section > .gpu-section:first-of-type { border-top: 0; padding-top: 0; }
-.gpu-rentals .gpu-lane-cards > .gpu-section > .gpu-section:last-of-type { padding-bottom: 2px; }
-
-.gpu-rentals .gpu-lane-status { margin-bottom: 4px; }
-
-/* Warnings are advisory, never failures: amber rule, secondary text, no alarm colour. */
-.gpu-rentals .gpu-warnings { margin: 4px 0 6px; padding: 0; list-style: none; font-size: 12px; }
-.gpu-rentals .gpu-warnings li {
-  margin: 0 0 3px; padding-left: 8px; border-left: 2px solid var(--amber); color: var(--tx2);
-}
-
-.gpu-rentals .gpu-lane-accounts { margin: 6px 0 0; padding-left: 16px; font-size: 12px; color: var(--tx2); }
-.gpu-rentals .gpu-lane-accounts li { margin-bottom: 2px; }
-.gpu-rentals .gpu-lane-accounts .mono { font-family: var(--mono); color: var(--tx1); }
-
-.gpu-rentals .gpu-plan { margin-top: 10px; }
-
-.gpu-rentals .gpu-plan-controls { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
-.gpu-rentals .gpu-plan-controls select { min-width: 140px; }
-
-/* The plan probe's answer: a detail under the controls, not another box. */
-.gpu-rentals .gpu-plan-result { margin-top: 12px; }
-.gpu-rentals .gpu-plan-result-line { color: inherit; }
-
-/* The plan block is a detail of the card, not a second card: indent with a rule, not a border box. */
-.gpu-rentals .gpu-plan-block { margin-top: 8px; padding-left: 8px; border-left: 1px solid var(--line); }
-.gpu-rentals .gpu-plan-block > h4 {
-  margin: 0 0 4px; font-size: 11px; color: var(--tx3);
-  text-transform: uppercase; letter-spacing: .04em;
-}
