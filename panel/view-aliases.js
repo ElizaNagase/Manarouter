@@ -21,21 +21,26 @@ export async function renderAliases(mount, ctx) {
   const fromIn = h('input', { class: 'input mono', type: 'text', required: true, 'data-field': 'from', placeholder: 'alias name' });
   const toIn = h('input', { class: 'input mono', type: 'text', required: true, 'data-field': 'to', placeholder: 'target model or combo' });
   const addBtn = h('button', { class: 'btn btn-primary', type: 'submit' }, 'Add alias');
-  const addForm = h('form', { class: 'card', novalidate: true },
+  const addForm = h('form', { class: 'card aliases-form', novalidate: true },
     h('h2', {}, 'Add alias'),
-    h('p', { class: 'hint' }, 'A request for “from” is rewritten and served by “to”. Aliases live in the same namespace as models and combos.'),
-    h('div', { class: 'grid-fields' },
+    h('p', { class: 'hint aliases-lede' }, 'A request for “from” is rewritten and served by “to”. Aliases live in the same namespace as models and combos.'),
+    h('div', { class: 'alias-compose' },
       field('From', fromIn),
-      field('To', toIn)),
-    h('div', { class: 'form-actions' }, addBtn));
+      h('span', { class: 'alias-arrow', 'aria-hidden': 'true' }, '→'),
+      field('To', toIn),
+      h('div', { class: 'form-actions' }, addBtn)));
 
   // The count belongs to the list, not to the page chrome: it sits with the table it counts, after
   // the add form, so it never floats above unrelated controls.
   mount.replaceChildren(
-    addForm,
-    generatedToggle.row,
-    h('div', { class: 'toolbar' }, h('span', { class: 'spacer' }), count),
-    tableWrap,
+    h('div', { class: 'aliases-view' },
+      addForm,
+      h('div', { class: 'aliases-head' },
+        h('h2', { class: 'aliases-head-title' }, 'Model aliases'),
+        count,
+        h('span', { class: 'spacer' }),
+        generatedToggle.row),
+      tableWrap),
   );
 
   addForm.addEventListener('submit', async (e) => {

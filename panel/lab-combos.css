@@ -253,8 +253,6 @@ body.combo-dragging * {
 }
 
 .combo-tile .pin-btn {
-  width: 23px;
-  height: 23px;
   margin-top: -1px;
   opacity: 0.38;
 }

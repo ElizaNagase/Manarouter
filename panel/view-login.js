@@ -5,13 +5,18 @@ import { api } from './api.js';
 import { h, field, errorBlock, clearFieldErrors } from './dom.js';
 
 export function renderLogin(root, { onSuccess }) {
-  const form = h('form', { class: 'card', style: 'max-width:360px;margin:18vh auto 0;', novalidate: true });
+  const form = h('form', { class: 'card login-card', novalidate: true });
   const pwd = h('input', { class: 'input', type: 'password', autocomplete: 'current-password', required: true, 'aria-label': 'Panel password' });
-  const submit = h('button', { class: 'btn btn-primary', type: 'submit' }, 'Sign in');
+  const submit = h('button', { class: 'btn btn-primary login-submit', type: 'submit' }, 'Sign in');
 
   form.append(
-    h('h2', { style: 'margin:0 0 2px;font-size:16px;' }, 'Manarouter'),
-    h('p', { class: 'hint', style: 'margin:0 0 12px;' }, 'This control plane is password-protected.'),
+    h('div', { class: 'login-brand' },
+      h('img', { class: 'login-mark', src: './logo.svg', alt: '', width: '26', height: '26' }),
+      h('div', {},
+        h('div', { class: 'login-brand-name' }, 'Manarouter'),
+        h('div', { class: 'login-brand-sub' }, 'Control plane'))),
+    h('h1', { class: 'login-title' }, 'Sign in'),
+    h('p', { class: 'login-lede' }, 'This control plane is password-protected.'),
     field('Password', pwd),
     submit,
   );
@@ -29,7 +34,7 @@ export function renderLogin(root, { onSuccess }) {
       onSuccess();
     } catch (err) {
       const box = errorBlock(err);
-      box.style.marginTop = '10px';
+      box.classList.add('login-error');
       form.insertBefore(box, submit);
       submit.disabled = false;
       submit.textContent = 'Sign in';

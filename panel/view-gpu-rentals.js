@@ -931,7 +931,7 @@ async function renderInventory(mount, ctx) {
           + 'the credential.'));
       }
 
-      const actionsRow = h('div', { class: 'gpu-actions', style: 'margin-top:8px' },
+      const actionsRow = h('div', { class: 'gpu-actions gpu-actions-tight' },
         ghostButton('Refresh', () => refreshSingleLane(platform),
           `Re-fetch ${platform} lane status only`));
       const cardEl = h('section', { class: 'card gpu-section' },
@@ -1121,7 +1121,7 @@ function laneAttachForm(platform) {
     const existingResult = planBox.querySelector('.gpu-plan-result');
     if (existingResult) existingResult.remove();
 
-    const box = h('div', { class: 'gpu-plan-result', style: 'margin-top:12px' });
+    const box = h('div', { class: 'gpu-plan-result' });
 
     // Error case
     if (view.planResult.error) {
@@ -1172,7 +1172,7 @@ function laneAttachForm(platform) {
       for (const p of problems) {
         const field = asString(pick(p, 'field')).trim();
         const message = asString(pick(p, 'message', 'reason', 'text')).trim();
-        box.append(h('p', { class: 'hint', style: 'color:inherit' }, field ? `${field}: ${message}` : message));
+        box.append(h('p', { class: 'hint gpu-plan-result-line' }, field ? `${field}: ${message}` : message));
       }
     }
 
@@ -1507,7 +1507,7 @@ function laneAttachForm(platform) {
       + 'written into the provider and can be overridden. Select a row to see its bundle.'));
 
     // Plan-launch preview control (PREVIEW ONLY: does not start anything)
-    const planControls = h('div', { class: 'gpu-plan-controls', style: 'margin-top:12px' });
+    const planControls = h('div', { class: 'gpu-plan-controls' });
     const planSchedule = h('select', {
       class: 'input',
       'aria-label': 'Launch schedule mode',

@@ -174,16 +174,9 @@
 .models-col-actions { width: 280px; }
 
 .models-table thead th {
-  padding-top: 8px;
-  padding-bottom: 8px;
+  padding-top: 9px;
+  padding-bottom: 9px;
 }
-/* Column coverage lives in each header's title. A second line under Ctx/Reasoning read as part of the
- * column name and made an already dense header look crowded. */
-.models-table tbody td {
-  padding-top: 7px;
-  padding-bottom: 7px;
-}
-
 .models-row { cursor: pointer; }
 .models-row:focus { outline: none; }
 .models-row:focus-visible {
@@ -589,7 +582,7 @@
 }
 
 .models-combo-caret {
-  font-size: 9px;
+  font-size: 9.5px;
   line-height: 1;
   color: var(--tx2);
   transition: transform 80ms var(--ease);

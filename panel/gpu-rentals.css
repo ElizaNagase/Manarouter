@@ -23,6 +23,8 @@
   gap: 8px;
   margin-top: 10px;
 }
+/* A second action row directly under the first needs less air than a fresh block. */
+.gpu-rentals .gpu-actions-tight { margin-top: 8px; }
 
 /* The attach form sits inside a lane card, between its status and its actions. It is structure, so
  * it is a grey rule and grey labels; the only pink on it is the Attach button, which is interaction. */
@@ -219,6 +221,19 @@
 
 .gpu-rentals .gpu-notes { margin: 6px 0 0; padding-left: 18px; color: var(--tx3); font-size: 12px; }
 .gpu-rentals .gpu-notes > li { margin-bottom: 3px; }
+/* `noteList` renders a titled block (h3 + ul) while other call sites render the ul alone, so the
+ * indent and the heading are scoped to the shape actually present. */
+.gpu-rentals .gpu-notes:has(> h3) { padding-left: 0; }
+.gpu-rentals .gpu-notes > h3 {
+  margin: 0 0 3px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--tx3);
+}
+.gpu-rentals .gpu-notes > ul { margin: 0; padding-left: 16px; }
 
 .gpu-rentals .gpu-blank {
   margin-top: 10px;
@@ -413,9 +428,17 @@
 
 .gpu-rentals .gpu-lane-cards { margin-top: 10px; }
 
-/* One card per platform: a hairline between them, no box, so the page keeps one column of text. */
-.gpu-rentals .gpu-lane-cards .gpu-section { border-top: 1px solid var(--line); padding-top: 10px; }
-.gpu-rentals .gpu-lane-cards .gpu-section:first-of-type { border-top: 0; padding-top: 0; }
+/* One card per platform inside the endpoint card: a hairline between them and no box of their own,
+ * so the page keeps one column of text instead of nested cards. */
+.gpu-rentals .gpu-lane-cards > .gpu-section > .gpu-section {
+  border: 0;
+  border-top: 1px solid var(--line);
+  background: transparent;
+  margin: 0;
+  padding: 12px 0 14px;
+}
+.gpu-rentals .gpu-lane-cards > .gpu-section > .gpu-section:first-of-type { border-top: 0; padding-top: 0; }
+.gpu-rentals .gpu-lane-cards > .gpu-section > .gpu-section:last-of-type { padding-bottom: 2px; }
 
 .gpu-rentals .gpu-lane-status { margin-bottom: 4px; }
 
@@ -431,8 +454,12 @@
 
 .gpu-rentals .gpu-plan { margin-top: 10px; }
 
-.gpu-rentals .gpu-plan-controls { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.gpu-rentals .gpu-plan-controls { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
 .gpu-rentals .gpu-plan-controls select { min-width: 140px; }
+
+/* The plan probe's answer: a detail under the controls, not another box. */
+.gpu-rentals .gpu-plan-result { margin-top: 12px; }
+.gpu-rentals .gpu-plan-result-line { color: inherit; }
 
 /* The plan block is a detail of the card, not a second card: indent with a rule, not a border box. */
 .gpu-rentals .gpu-plan-block { margin-top: 8px; padding-left: 8px; border-left: 1px solid var(--line); }

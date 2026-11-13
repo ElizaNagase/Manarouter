@@ -1,0 +1,148 @@
+/* lab-keys.css — client-key index refinements.
+ *
+ * A key row carries eight facts, and the old markup printed the rolling caps as three full
+ * sentences ("5h: 1,200,000 tokens / 400 requests"), which made the widest column the least
+ * scannable one. Here the caps become a two-column micro-table — window on the left, numbers on
+ * the right — and the three row actions stop competing with the data they act on.
+ */
+
+.keys-view { min-width: 0; }
+
+/* ---------- head ---------- */
+
+.keys-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0 0 12px;
+  padding-bottom: 9px;
+  border-bottom: 1px solid var(--line);
+}
+
+.keys-head-title {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--tx1);
+}
+
+/* ---------- table ---------- */
+
+.keys-view .tbl tbody td { padding: 9px 12px; }
+
+.keys-label {
+  color: var(--tx1);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.keys-prefix {
+  font-size: 11.5px;
+  color: var(--tx3);
+  white-space: nowrap;
+}
+
+.keys-allow {
+  font-size: 11px;
+  color: var(--tx2);
+  max-width: 18ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.keys-req { font-size: 12px; color: var(--tx1); }
+
+/* ---------- rolling caps ---------- */
+
+.keys-caps {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.keys-caps-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  line-height: 1.5;
+}
+
+.keys-caps-w {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--tx3);
+  min-width: 22px;
+}
+
+.keys-caps-v {
+  font-size: 11.5px;
+  color: var(--tx2);
+  white-space: nowrap;
+}
+
+.keys-caps-n {
+  font-variant-numeric: tabular-nums;
+  color: var(--tx1);
+  font-weight: 600;
+}
+
+.keys-caps-v.is-none,
+.keys-caps-none {
+  color: var(--tx3);
+  font-size: 11.5px;
+}
+
+/* ---------- actions ---------- */
+
+.keys-view .keys-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+  padding-right: 8px;
+}
+
+.keys-view .keys-actions .btn {
+  height: 24px;
+  padding: 0 7px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--tx3);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.keys-view .keys-actions .btn:hover {
+  background: var(--bg3);
+  border-color: var(--line2);
+  color: var(--tx1);
+}
+
+.keys-view .keys-actions .btn-quiet-danger:hover {
+  color: #f08b8b;
+  border-color: rgba(239, 106, 106, 0.45);
+  background: var(--red-dim);
+}
+
+/* The row itself is the target; the actions come up when it is hovered or focused. */
+.keys-view .tbl tbody tr .keys-actions .btn { opacity: 0.55; }
+.keys-view .tbl tbody tr:hover .keys-actions .btn,
+.keys-view .tbl tbody tr:focus-within .keys-actions .btn { opacity: 1; }
+
+.keys-lede {
+  max-width: 86ch;
+  margin: 0 0 10px;
+  line-height: 1.55;
+}
+
+@media (max-width: 900px) {
+  .keys-view .keys-actions .btn { opacity: 1; }
+}

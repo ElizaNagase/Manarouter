@@ -116,9 +116,8 @@
 }
 .providers-view .provider-refresh svg.i { width: 13px; height: 13px; }
 .providers-view .provider-add {
-  height: 30px;
+  height: 28px;
   padding: 0 12px;
-  font-size: 12.5px;
 }
 .providers-view .provider-add svg.i { width: 13px; height: 13px; }
 
@@ -145,12 +144,11 @@
 .providers-view .provider-table .actions-col { width: 176px; }
 
 .providers-view .provider-table thead th {
-  padding: 8px 12px;
+  padding: 9px 12px;
   border-bottom: 1px solid var(--line);
   background: var(--bg0);
   color: var(--tx3);
-  font-size: 9.5px;
-  letter-spacing: 0.09em;
+  letter-spacing: 0.07em;
 }
 .providers-view .provider-table thead th.pin-col { padding-left: 10px; }
 .providers-view .provider-table thead th.provider-accounts-col,
@@ -163,7 +161,7 @@
 .providers-view .provider-table tbody td.actions { padding-right: 18px; }
 
 .providers-view .provider-table tbody td {
-  padding: 10px 12px;
+  padding: 9px 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.045);
   background: transparent;
   transition: background 120ms var(--ease);

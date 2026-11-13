@@ -71,7 +71,7 @@ export async function renderSettings(mount, ctx) {
         : describePortChange(ports);
       preview.replaceChildren();
       if (changes.length) {
-        preview.append(h('ul', { class: 'hint', style: 'padding-left:18px;' },
+        preview.append(h('ul', { class: 'hint settings-list' },
           ...changes.map((c) => h('li', {}, c))));
       } else if (ports.restart_pending) {
         preview.append(h('p', { class: 'hint' }, 'No unsaved edits; a previously saved change is still waiting for the restart.'));
@@ -109,7 +109,7 @@ export async function renderSettings(mount, ctx) {
 
     portsCard.replaceChildren(
       h('h2', {}, 'Listen ports'),
-      h('p', { class: 'hint', style: 'margin-bottom:10px;' },
+      h('p', { class: 'hint settings-lede' },
         'Changing a port does not move the listener immediately — edits apply on the next restart.'),
       h('div', { class: 'grid-2' },
         h('fieldset', { class: 'plain' },
@@ -142,7 +142,7 @@ export async function renderSettings(mount, ctx) {
     const save = h('button', { class: 'btn btn-primary', type: 'submit' }, passwordSet ? 'Change password' : 'Set password');
 
     const form = h('form', { novalidate: true },
-      h('p', { class: 'hint', style: 'margin-bottom:10px;' },
+      h('p', { class: 'hint settings-lede' },
         passwordSet
           ? 'The password is stored as an Argon2id hash; the panel never sees the plaintext again.'
           : 'No password is set. The control plane is reachable without one from allowed hosts — setting one is recommended.'),
@@ -223,7 +223,7 @@ export async function renderSettings(mount, ctx) {
       help: 'Use shorter idle connection lifetime and a smaller per-host connection pool to retain fewer sockets.',
     });
     const profile = profileToggle.input;
-    const advanced = h('details', { style: 'margin:12px 0;padding:10px;border:1px solid var(--line);border-radius:8px;' });
+    const advanced = h('details', { class: 'settings-advanced' });
     const idleSecs = h('input', { class: 'input mono', type: 'number', min: '0', max: '86400', step: '1', value: String(effective.pool_idle_secs), 'aria-label': 'Idle connection lifetime in seconds' });
     const maxIdle = h('input', { class: 'input mono', type: 'number', min: '1', step: '1', value: String(effective.pool_max_idle_per_host), 'aria-label': 'Maximum idle connections per host' });
     const status = h('div');
@@ -287,7 +287,7 @@ export async function renderSettings(mount, ctx) {
       profileToggle.row,
       advanced,
       restart,
-      h('div', { style: 'display:flex;gap:8px;margin-top:12px;' }, save),
+      h('div', { class: 'settings-actions' }, save),
       status,
     );
   }
@@ -389,7 +389,7 @@ export async function renderSettings(mount, ctx) {
           proxies.splice(index, 1);
           drawProxies();
         });
-        const row = h('div', { class: 'card', style: 'margin:10px 0;padding:12px;' },
+        const row = h('div', { class: 'card settings-proxy' },
           h('div', { class: 'grid-2' },
             field('Proxy ID', id, { hint: 'Stable id used by provider/account proxy references.' }),
             field('Proxy URL', url, { hint: 'Use http://, https://, socks4:// or socks5://. Authentication secrets are managed separately; do not include passwords in the URL.' })),
@@ -578,9 +578,9 @@ export async function renderSettings(mount, ctx) {
         remove.addEventListener('click', () => { syncPaths(); paths.splice(index, 1); drawPaths(); });
 
         inputs.push(input);
-        list.append(h('div', { style: 'margin:8px 0;' },
-          h('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;' },
-            h('span', { class: 'hint mono', style: 'min-width:20px;text-align:right;' }, String(index + 1)),
+        list.append(h('div', { class: 'settings-path' },
+          h('div', { class: 'settings-path-row' },
+            h('span', { class: 'hint mono settings-path-n' }, String(index + 1)),
             input, up, down, remove),
           problem));
       });
@@ -646,10 +646,10 @@ export async function renderSettings(mount, ctx) {
 
     quotaProbeCard.replaceChildren(
       h('h2', {}, 'Quota probing'),
-      h('p', { class: 'hint', style: 'margin-bottom:10px;' },
+      h('p', { class: 'hint settings-lede' },
         'Some providers report no allowance through an endpoint this router knows. For those, the router walks the candidate paths below against the account\'s own base URL, in order, and reads the first candidate that answers. Every request is made as that account, so it can count against the account\'s rate limit; a refresh from the Quota view is what runs the walk, and the page then names the candidate that answered. A single account can override this list in the configuration file, under its own quotaProbe key.'),
       walk.row,
-      h('p', { class: 'hint', style: 'margin-top:12px;' }, 'Candidates, in the order they are tried:'),
+      h('p', { class: 'hint settings-subhead' }, 'Candidates, in the order they are tried:'),
       list,
       h('p', { class: 'hint' }, inherited
         ? 'This deployment names no candidate list, so the router is walking the built-in candidates shown here. Saving writes this list into the configuration file explicitly.'
@@ -715,9 +715,8 @@ export async function renderSettings(mount, ctx) {
 
   async function renderRaw() {
     const ta = h('textarea', {
-      class: 'input', rows: '18', spellcheck: 'false',
+      class: 'input settings-raw', rows: '18', spellcheck: 'false',
       'aria-label': 'Raw configuration file contents',
-      style: 'font-family:var(--mono);',
     });
     const result = h('div');
     const loadBtn = h('button', { class: 'btn', type: 'button' }, 'Reload');
@@ -784,7 +783,7 @@ export async function renderSettings(mount, ctx) {
 
     rawCard.replaceChildren(
       h('h2', {}, 'Raw configuration'),
-      h('p', { class: 'hint', style: 'margin-bottom:10px;' },
+      h('p', { class: 'hint settings-lede' },
         'The whole config file, exactly as on disk (secrets omitted by the API). Structured views elsewhere in the panel edit the same file.'),
       ta,
       h('div', { class: 'dialog-actions' }, loadBtn, validateBtn, saveBtn),

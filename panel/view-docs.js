@@ -16,9 +16,10 @@ import { renderMarkdown } from './markdown.js';
 export async function renderDocs(mount, ctx, selected) {
   const listEl = h('ul', { class: 'docs-nav' });
   const content = h('div', { class: 'card' });
-  mount.replaceChildren(h('div', { class: 'docs-layout' },
-    h('div', { class: 'card' }, h('h2', {}, 'Documents'), listEl),
-    content));
+  mount.replaceChildren(h('div', { class: 'docs-view' },
+    h('div', { class: 'docs-layout' },
+      h('div', { class: 'card docs-index' }, h('h2', {}, 'Documents'), listEl),
+      content)));
 
   let docs = [];
   let loadSeq = 0; // last-request-wins: a slow older response must not overwrite a newer one
@@ -51,7 +52,7 @@ export async function renderDocs(mount, ctx, selected) {
   function renderList() {
     listEl.replaceChildren();
     for (const d of docs) {
-      const btn = h('button', { type: 'button' },
+      const btn = h('button', { class: 'docs-nav-item', type: 'button' },
         h('div', { class: 'dtitle' }, d.title ?? docName(d)),
         d.purpose ? h('div', { class: 'dpurpose' }, d.purpose) : null);
       btn.addEventListener('click', () => {
@@ -78,13 +79,9 @@ export async function renderDocs(mount, ctx, selected) {
     }
     if (seq !== loadSeq) return;
 
-    // Body of rendered markdown. The inline style stands in for a stylesheet rule this file does
-    // not own: the existing .doc-text class is pre-wrap monospace (right for a verbatim view)
-    // and would fight rendered HTML, so the scroll/typography rules are stated inline instead.
-    const body = h('div', {
-      class: 'md-body',
-      style: 'max-height:calc(100vh - 230px);overflow-y:auto;font-size:13px;line-height:1.6;overflow-wrap:anywhere;',
-    });
+    // Body of rendered markdown. The scroll and type scale live in lab-docs.css; this file only
+    // decides what goes in the pane.
+    const body = h('div', { class: 'md-body' });
     body.innerHTML = renderMarkdown(text); // safe — see the SECURITY NOTE at the top of this file
 
     // Most documents open with their own H1, which repeats the title already stated by the card
@@ -97,12 +94,10 @@ export async function renderDocs(mount, ctx, selected) {
     const downloadBtn = h('button', { class: 'btn btn-ghost btn-sm', type: 'button' }, 'Download');
     downloadBtn.addEventListener('click', () => downloadRaw(text, name));
 
-    // Header row: the existing .toolbar + .spacer classes push the button to the top-right of
-    // the card. The h2 is no longer a direct .card child, so its small-label styling is inline.
+    // Header row: the document title, then the download action pushed to the far right by .spacer.
     content.replaceChildren(
-      h('div', { class: 'toolbar' },
-        h('h2', { style: 'margin:0;font-size:13px;font-weight:600;text-transform:none;letter-spacing:0;' },
-          docTitle),
+      h('div', { class: 'docs-pane-head' },
+        h('h2', { class: 'docs-doc-title' }, docTitle),
         h('span', { class: 'spacer' }),
         downloadBtn),
       body,

@@ -17,9 +17,14 @@ export async function renderKeys(mount, ctx) {
   const newBtn = h('button', { class: 'btn btn-primary', type: 'button' }, 'New key');
 
   mount.replaceChildren(
-    h('div', { class: 'toolbar' }, newBtn, h('span', { class: 'spacer' }), count),
-    formSlot,
-    tableWrap,
+    h('div', { class: 'keys-view' },
+      h('div', { class: 'keys-head' },
+        h('h2', { class: 'keys-head-title' }, 'Client keys'),
+        count,
+        h('span', { class: 'spacer' }),
+        newBtn),
+      formSlot,
+      tableWrap),
   );
 
   newBtn.addEventListener('click', () => { editingId = 'new'; renderForm(null); });
@@ -61,20 +66,20 @@ export async function renderKeys(mount, ctx) {
       // value. A bare em dash read as "unknown" and repeated down the table as visual noise.
       const allowCell = (list) => {
         const summary = allowSummary(list);
-        return summary ? h('td', { class: 'mono' }, summary) : h('td', { class: 'cell-dim' }, 'all');
+        return summary ? h('td', { class: 'mono keys-allow' }, summary) : h('td', { class: 'cell-dim' }, 'all');
       };
       tbody.append(h('tr', {},
-        h('td', {}, k.label ?? ''),
-        h('td', { class: 'mono' }, k.prefix ?? '(prefix unavailable)'),
+        h('td', { class: 'keys-label' }, k.label ?? ''),
+        h('td', { class: 'mono keys-prefix' }, k.prefix ?? '(prefix unavailable)'),
         h('td', {}, k.enabled === false ? chip('disabled', 'chip-neutral') : chip('enabled', 'chip-green')),
         allowCell(k.allow_models),
         allowCell(k.allow_routes),
-        h('td', { class: 'num' }, k.limit_requests ? formatCompact(k.limit_requests) : '∞'),
-        h('td', {}, rollingCaps(k.limits)),
-        h('td', { class: 'actions' }, editBtn, rotateBtn, delBtn)));
+        h('td', { class: 'num keys-req' }, k.limit_requests ? formatCompact(k.limit_requests) : '∞'),
+        h('td', { class: 'keys-caps-cell' }, rollingCaps(k.limits)),
+        h('td', { class: 'actions keys-actions' }, editBtn, rotateBtn, delBtn)));
     }
     tableWrap.replaceChildren(
-      h('p', { class: 'hint' },
+      h('p', { class: 'hint keys-lede' },
         'Edit a key to change its rolling caps. This API does not carry per-key usage, so it is not shown as zero — the Quota page lists the recorded request usage. Enforcement is not confirmed.'),
       h('table', { class: 'tbl' },
         h('thead', {}, h('tr', {},
@@ -102,11 +107,14 @@ export async function renderKeys(mount, ctx) {
       ['30d', limits?.monthly_30d],
     ];
     const configured = windows.some(([, cap]) => cap && (Number(cap.tokens) > 0 || Number(cap.requests) > 0));
-    if (!configured) return 'No rolling caps (uncapped)';
-    return h('div', {}, ...windows.map(([name, cap]) => {
-      if (!cap) return h('div', {}, `${name}: uncapped`);
-      return h('div', {}, `${name}: ${capValue(cap.tokens)} tokens / ${capValue(cap.requests)} requests`);
-    }));
+    if (!configured) return h('span', { class: 'keys-caps-none' }, 'uncapped');
+    return h('div', { class: 'keys-caps' }, ...windows.map(([name, cap]) => h('div', { class: 'keys-caps-row' },
+      h('span', { class: 'keys-caps-w' }, name),
+      cap
+        ? h('span', { class: 'keys-caps-v' },
+          h('span', { class: 'keys-caps-n' }, capValue(cap.tokens)), ' tok · ',
+          h('span', { class: 'keys-caps-n' }, capValue(cap.requests)), ' req')
+        : h('span', { class: 'keys-caps-v is-none' }, 'uncapped'))));
   }
 
   function capValue(value) {

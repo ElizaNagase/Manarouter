@@ -2272,8 +2272,17 @@ export async function renderProviders(mount, ctx) {
     });
     if (!ok) return;
     try {
-      await api.del(`/api/providers/${encodeURIComponent(p.id)}/accounts/${encodeURIComponent(a.id)}`);
+      const result = await api.del(`/api/providers/${encodeURIComponent(p.id)}/accounts/${encodeURIComponent(a.id)}`);
+      // Removing the last account of a provider is a *successful* delete whose resulting
+      // configuration the conductor can only accept with an advisory: that provider can never
+      // serve again. The save path reports success plus a top-level `warnings` array, so say the
+      // delete happened — and then surface every advisory instead of letting the success message
+      // bury it. `result` is undefined when the response carried no JSON body at all.
       ctx.toast.success('Account deleted.');
+      const warnings = Array.isArray(result?.warnings) ? result.warnings : [];
+      for (const warning of warnings) {
+        if (typeof warning === 'string' && warning.trim()) ctx.toast.warning(warning);
+      }
       await reload(true);
     } catch (err) {
       ctx.toast.error('Delete failed', err);

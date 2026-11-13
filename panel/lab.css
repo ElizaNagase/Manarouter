@@ -259,6 +259,12 @@ body {
 .btn-ghost:hover { background: rgba(255, 255, 255, 0.05); border-color: transparent; color: var(--tx1); }
 .btn-sm { height: 24px; padding: 0 8px; border-radius: var(--radius-sm); font-size: 11.5px; }
 
+/* Row-level icon buttons (pin, copy) are one square target everywhere, so a table row and a combo
+ * tile keep the same rhythm. The "?" help dot is deliberately smaller: it is an affordance on a
+ * label, not an action on a row. */
+.pin-btn, .icon-btn { width: 21px; height: 21px; padding: 0; }
+.pin-btn { font-size: 13px; }
+
 button.chip {
   border-radius: var(--radius);
   border: 1px solid var(--line2);
@@ -314,6 +320,16 @@ button.chip.chip-active { background: var(--pink-dim); border-color: var(--pink-
 .input::placeholder { color: var(--tx3); font-weight: 400; }
 .input.mono, textarea.input { font-size: 12px; }
 select.input { padding-right: 26px; }
+
+/* A textarea holds a body of text, not a single value: it keeps the field skin but takes its height
+ * from `rows` instead of the fixed 28px that suits one-line inputs. */
+textarea.input {
+  height: auto;
+  min-height: 64px;
+  padding: 6px 8px;
+  line-height: 1.55;
+  resize: vertical;
+}
 
 input[type="checkbox"], input[type="radio"] { accent-color: var(--pink); width: 14px; height: 14px; }
 
