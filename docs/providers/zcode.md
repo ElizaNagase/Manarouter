@@ -74,9 +74,11 @@ There is no redirect URI to register and no user code to type. The app's desktop
 1. Manarouter generates a client id (32 random bytes, hex) and posts `{"provider":"zai"}` to
    `https://zcode.z.ai/api/v1/oauth/cli/init` with that id as a bearer token. The reply carries a
    `flow_id`, an `authorize_url` and a poll interval.
-2. The panel shows that `authorize_url`, extended with the desktop login redirect the app uses
-   (`/app/oauth/login?redirect=zcode://oauth/callback&app_version=…`). You sign in at zcode.z.ai in
-   a browser.
+2. The panel shows that `authorize_url` exactly as the reply carried it. You sign in at zcode.z.ai in
+   a browser, and the flow's own `redirect_uri` — the CLI callback the poll listens on — brings you
+   back. Nothing is appended to it: a second `redirect_uri` would be read *first* by the server, the
+   CLI callback would never be reached, and the poll would wait out the flow's five minutes around a
+   sign-in that had already succeeded.
 3. Manarouter polls `https://zcode.z.ai/api/v1/oauth/cli/poll/<flow_id>` with the *same* client id
    until the browser side finishes. A ready reply carries the account token.
 4. The token is exchanged once at `https://api.z.ai/api/auth/z/login` for the business access token

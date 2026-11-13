@@ -6,9 +6,9 @@
 //! browser completes a normal web sign-in at `zcode.z.ai`, and the CLI learns the outcome by
 //! polling `/api/v1/oauth/cli/poll/<flow_id>`. It is the device-code *shape* — create, poll,
 //! receive — without RFC 8628's `user_code`, which is why
-//! [`DeviceAuthorization::user_code`](super::DeviceAuthorization::user_code) is empty here and
-//! [`verification_uri_complete`](super::DeviceAuthorization::verification_uri_complete) carries
-//! the whole thing: the human opens a URL, they never type a code.
+//! [`DeviceAuthorization::user_code`](super::DeviceAuthorization::user_code) is empty here: the
+//! human opens a URL, they never type a code. The URL is the flow's `authorize_url` **verbatim** —
+//! it already carries the CLI callback the poll depends on, so nothing is appended to it.
 //!
 //! ## The client id is generated, not registered
 //!
@@ -75,24 +75,12 @@ const INIT_PATH: &str = "/api/v1/oauth/cli/init";
 /// Polls a flow by id. `GET`, same client bearer.
 const POLL_PATH: &str = "/api/v1/oauth/cli/poll";
 
-/// Where the human actually signs in — the app's own desktop login page, which knows how to hand
-/// the result back to the CLI flow. The `redirect_uri` appended to `authorize_url` points here.
-const DESKTOP_LOGIN_PATH: &str = "/app/oauth/login";
-
-/// The `zai` runtime's callback. Only this value is ever passed as `redirect_uri`.
-const CALLBACK: &str = "zcode://oauth/callback";
-
 /// Trades the ZCode JWT for an access token (`{"token": <jwt>}` → `data.access_token`).
 const BUSINESS_LOGIN: &str = "https://api.z.ai/api/auth/z/login";
 
 /// Which provider row of the app's runtime table this flow logs in. `bigmodel` is the other one;
 /// this module implements `zai` (the international account), which is what `zcode.z.ai` serves.
 const PROVIDER: &str = "zai";
-
-/// The app version appended to the desktop login URL, so the page renders for this client.
-/// Kept in step with `mr_dialects::zcode::APP_VERSION`; that crate depends on this one, so the
-/// constant cannot be shared in the other direction.
-const APP_VERSION: &str = "3.18.2";
 
 /// Flow lifetime when `init` omits `expires_at`. Five minutes is the app's own window.
 const DEFAULT_FLOW_SECS: u64 = 300;
@@ -394,38 +382,14 @@ fn parse_init(status: u16, body: &str, client: &str) -> Result<DeviceAuthorizati
         // on purpose rather than filled with something that looks typeable.
         user_code: String::new(),
         verification_uri: authorize_url.clone(),
-        verification_uri_complete: Some(with_redirect(&authorize_url)),
+        // Nothing is appended: `authorize_url` already carries the CLI callback that the poll
+        // depends on. Adding the desktop login as a second `redirect_uri` produced a URL with the
+        // parameter twice — the server reads the first, the app's page is never reached, and the
+        // flow would be abandoned while the panel waited.
+        verification_uri_complete: None,
         expires_in: Duration::from_secs(flow_secs.min(DEFAULT_FLOW_SECS)),
         interval: Duration::from_secs(interval_secs),
     })
-}
-
-/// Append the desktop login as `redirect_uri`. The app appends this itself before opening the
-/// browser; `state` is already part of `authorize_url` and must stay untouched.
-fn with_redirect(authorize_url: &str) -> String {
-    let separator = if authorize_url.contains('?') { '&' } else { '?' };
-    let redirect = format!(
-        "{ORIGIN}{DESKTOP_LOGIN_PATH}?redirect={CALLBACK}&app_version={APP_VERSION}"
-    );
-    format!(
-        "{authorize_url}{separator}redirect_uri={}",
-        percent_encode(&redirect)
-    )
-}
-
-/// Percent-encode everything outside the unreserved set, so the nested URL survives being a
-/// query value (`:` and `/` must not be read as structure).
-fn percent_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 /// Classify one poll reply.
@@ -668,10 +632,9 @@ mod tests {
             authorization.verification_uri,
             "https://chat.z.ai/api/oauth/authorize?state=xyz"
         );
-        let complete = authorization.verification_uri_complete.unwrap();
-        assert!(complete.starts_with("https://chat.z.ai/api/oauth/authorize?state=xyz&redirect_uri="));
-        // The callback is nested, so its own delimiters must be encoded.
-        assert!(complete.contains("%3A%2F%2Foauth%2Fcallback"));
+        // The flow's own URL is the whole instruction: it already names the CLI callback the poll
+        // listens on, and a second `redirect_uri` would have been read *first* by the server.
+        assert!(authorization.verification_uri_complete.is_none());
         assert_eq!(authorization.interval, Duration::from_secs(3));
         assert!(authorization.expires_in <= Duration::from_secs(DEFAULT_FLOW_SECS));
     }

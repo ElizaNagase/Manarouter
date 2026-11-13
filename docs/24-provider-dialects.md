@@ -310,7 +310,8 @@ requests, not its inference.
   row](providers/catalog.md) rather than here. See [Z Code](providers/zcode.md).
 - **The login is brokered, not redirected.** There is no redirect URI to register: Manarouter creates
   a flow at `zcode.z.ai/api/v1/oauth/cli/init` with a client id it generates, sends the human to the
-  desktop login URL the reply carries, and polls until the browser finishes. The token is then traded
+  `authorize_url` the reply carries (unmodified — the flow's own callback is what the poll listens
+  on), and polls until the browser finishes. The token is then traded
   once at `api.z.ai/api/auth/z/login` for the business access token the inference surface accepts.
 - `count_tokens` is answered locally. The plan surface is the same Messages endpoint, but the app
   never calls the counting route and the relay does not invent an upstream call for it.
