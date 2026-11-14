@@ -659,9 +659,18 @@ agent endpoint reads `Authorization: Bearer` and nothing else.
 
 **Model names.** `auto` is the wire name `default`; every other id passes through unchanged. Cursor
 publishes no model list, so the operator's list is the honest one and its names come from Cursor's
-own UI. An id the backend does not know is a `404 not_found`, which is the request's mistake and
-neither parks the credential nor fails over — a `502` there would park every model on the account for
-a typo.
+own UI: the desktop picker's titles, lowercased and hyphenated. The scheme is
+`<base>[-<effort>][-fast]` with effort in `{low, medium, high}`, the dots kept for the Grok and GPT
+families (`grok-4.7-high-fast`, `gpt-5.6-sol-medium`) and spelled as dashes for the Claude ones
+(`claude-opus-5-5-high`, `claude-fable-5-2-high`). Effort is therefore part of the id, not a request
+field — which is also why the dialect advertises no `reasoning` level it cannot express. An id the
+backend does not know is a `404 not_found`, which is the request's mistake and neither parks the
+credential nor fails over — a `502` there would park every model on the account for a typo. Two other
+answers are worth reading apart from it: `429 resource_exhausted` **with** a `switchModel` button
+means the name is real and the plan excludes it (the model alone is parked), and `400
+invalid_argument` means the name was retired with a migration sentence naming its replacement
+(`gemini-3-pro` → "Gemini 3 Pro is no longer available. Use Gemini 3.1 Pro instead."; `composer-2` →
+"We're upgrading you to Composer 2.5"). Only a `200` proves the id is included on the account.
 
 **Translation.** Cursor answers only as a frame stream, so the relay always renders SSE and folds it
 for a non-streaming client (`force_stream`). An OpenAI client's body is what `prepare_run` parses
@@ -692,10 +701,12 @@ that would be needed. So are images and other non-text content. A provider with 
 refused with an actionable message instead of quietly going direct around an egress policy, since a
 proxied bidirectional stream is not implemented.
 
-**Reasoning.** The dialect offers `ReasoningLevel::None` only. An extended effort would have to live
-in `requested_model.parameters`, which this transport does not send, and advertising a level it
-cannot express would be a lie about what the model was asked to do
-(`dialect.rs`, `expressible_reasoning_levels`).
+**Reasoning.** The dialect offers `ReasoningLevel::None` only, and that is not a limitation to work
+around: effort is selected by the model id. `grok-4.7-medium` answers, `grok-4.7-low` and
+`grok-4.7-high` are real names the plan may refuse, and no bracket or parameter form exists
+(`grok-4.7[high]`, `-thinking`, `-max`, `-extended` are all `404`). Advertising a level would be a
+lie about what the model was asked to do (`dialect.rs`, `expressible_reasoning_levels`); the honest
+knob is the id the operator added.
 
 **Conversation continuity, deliberately given up.** The id fingerprint includes the per-turn message
 id, so a retry — and every request without a client session id — opens a new Cursor conversation.

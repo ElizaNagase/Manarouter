@@ -47,6 +47,20 @@ JSON file), using the id Cursor's own client sends. `auto` is the one name the r
 does not know comes back as a `404` naming it — the request is at fault, so no credential is parked
 for it.
 
+**The id is the whole name.** Cursor does not take an effort field, so the effort lives in the id:
+`<base>[-<effort>][-fast]`, with `low`, `medium`, `high` as the efforts and `-fast` only on some
+families. The desktop app's model picker is the source of truth — it is what Cursor itself offers —
+and its titles map to ids by lowercasing and hyphenating them. Two families keep their dots
+(`grok-4.7-high-fast`, `gpt-5.6-sol-medium`); the Claude ids spell the version with dashes
+(`claude-opus-5-5-high`, `claude-sonnet-5-5-medium`, `claude-fable-5-2-high`). The verified set at
+the time of writing is `auto`, `composer-2.5`, `composer-2.5-fast`,
+`grok-4.7-{low,medium,high}`, `grok-4.7-high-fast`, `grok-4.6-{low,medium,high}`,
+`gemini-4-carbon-{low,medium,high}`, `gemini-4-hydrogen-{low,medium,high}`,
+`gpt-5.6-sol-{medium,high}`, `claude-opus-5-5-{medium,high}`, `claude-sonnet-5-5-{medium,high}` and
+`claude-fable-5-2-{medium,high}`. A `-low` variant of those three Claude families and of
+`gpt-5.6-sol` does not exist, and effort suffixes beyond the ones listed (`-thinking`, `-max`,
+`-minimal`, `-extended`) are `404` too, so an id is proved by a request rather than by pattern.
+
 **Plans.** Whether a model exists for you is the service's answer, not the router's. On Cursor's
 Free plan, for example, `auto` answers while a premium id is refused with "Free includes Grok 4.7,
 Grok 4.6, and Auto with fixed settings". The router passes that sentence through and parks **that
@@ -74,9 +88,13 @@ curl http://127.0.0.1:20900/v1/chat/completions \
 
 ## Limits worth knowing
 
-- **Reasoning effort is not selectable.** The frame has no effort field, so the dialect offers only
-  `none` and the service decides how much to think. Asking for a level is refused when the route is
-  built, not silently ignored.
+- **Reasoning effort is a different model id, not a setting.** The frame has no effort field, so the
+  dialect's own `reasoning` parameter stays `none`; the effort you get is the one baked into the id
+  you asked for (`grok-4.7-medium` versus `grok-4.7-high`). Setting a reasoning level on the route
+  cannot change it.
+- **Images never reach Cursor.** A turn that carries an image part is rerouted by the relay's
+  `routing.defaults.image` step before this dialect is reached; the answer, and the `model` it
+  reports, then belong to that other route.
 - **Every retry is a new conversation.** The router fingerprints a conversation per turn rather than
   per session, so a retry does not continue the previous exchange — and two callers who happen to
   open with the same words do not share one Cursor conversation and its memory.
