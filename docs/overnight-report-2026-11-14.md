@@ -1,7 +1,7 @@
 # Overnight report — 14 November 2026
 
 Written at 03:00 local (02:00 UTC). Everything below is either verified against the running instance
-or marked as unverified. Twenty-eight commits are on `main` locally and **not pushed** (see
+or marked as unverified. Twenty-nine commits are on `main` locally and **not pushed** (see
 "Blocked").
 
 ## What is running, right now
@@ -91,7 +91,7 @@ and that is stated where the figures live.
 ## Blocked, and needing you
 
 1. **Rotate the Modal CLI credential.** It was exposed in a log earlier. I did not repeat it anywhere.
-2. **Push.** Twenty-eight commits sit on local `main`. GitHub refuses writes from this session's
+2. **Push.** Twenty-nine commits sit on local `main`. GitHub refuses writes from this session's
    identity (`403 … denied to ElizaNagase`), so PR 15 is merged *locally* only (`0e36fa2`) and
    nothing upstream has moved.
 3. **One interpretation to confirm.** "Add a custom language for OpenRouter routing" was implemented
@@ -109,4 +109,4 @@ allow-list into the response side; and the `Intent`-side of the Anthropic tools 
 
 `cargo fmt --all --check` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean,
 `cargo test --workspace` 1 891 passed / 0 failed, `node --test panel/test/*.test.mjs` 347 passed /
-0 failed. Working tree clean; `main` at `a00920f`.
+0 failed. Working tree clean; `main` at the report commit.
