@@ -466,6 +466,7 @@ trigger.
     { "path": "docs/providers/catalog.md", "purpose": "Generated: every provider, its dialect, auth and base URL", "read_when": "looking up a provider" },
     { "path": "docs/providers/anthropic-compatible.md", "purpose": "Providers that serve the Anthropic Messages API natively", "read_when": "routing to an Anthropic-shaped upstream" },
     { "path": "docs/providers/openai-compatible.md", "purpose": "Providers that serve the OpenAI chat surface, and the base-URL convention", "read_when": "routing to an OpenAI-shaped upstream" },
+    { "path": "docs/providers/openrouter.md", "purpose": "OpenRouter routing fields (models, provider, plugins, fallbacks, variant suffixes) and how each one survives the trip through this gateway", "read_when": "working on OpenRouter, or on routing fields a client sends in the request body" },
     { "path": "docs/providers/zcode.md", "purpose": "The ZCode desktop app's plan surface: its OAuth login, the attribution headers, and the signing layer that is not implemented", "read_when": "working on Z Code / Z.ai plan routing" },
     { "path": "docs/providers/commandcode.md", "purpose": "The Command Code CLI envelope, its event stream and its fingerprint headers", "read_when": "working on Command Code" },
     { "path": "docs/providers/cursor.md", "purpose": "The Cursor provider: page login, models named by hand, and what the router refuses", "read_when": "configuring Cursor or explaining its limits" },

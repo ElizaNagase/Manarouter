@@ -90,6 +90,52 @@ pub fn to_pivot_request(ctx: &TranslateCtx<'_>, body: &[u8]) -> Result<PivotRequ
     }
 }
 
+/// Carry a router's routing language across the translation into Chat Completions.
+///
+/// None of these fields means anything in Anthropic Messages. A caller that sends them is talking
+/// to a router — OpenRouter is the one that documents them — rather than to a single model, and
+/// dropping them would silently remove the only control it has over which upstream serves the
+/// request. They are not interpreted here: whatever the router understands is its business, and
+/// what this function must not do is decide that an unknown field is not worth forwarding.
+///
+/// * `provider` (provider selection: `order`, `only`, `ignore`, `sort`, `max_price`, …) and
+///   `plugins` (the auto router's allow and exclude lists, context compression) pass through
+///   verbatim; Chat Completions has no field of either name to collide with.
+/// * `models` is the Chat Completions fallback array, so a caller that wrote it already wrote the
+///   right thing and it is copied as-is.
+/// * `fallbacks` is the Anthropic-shaped spelling of the same idea: a list of entries whose only
+///   field is `model`. Chat Completions has no such field, and forwarding it would be an
+///   unrecognised argument, so it becomes `models`, led by the model this request resolved to —
+///   the primary the caller asked for. A caller that sent both is left with the `models` it wrote,
+///   because the upstream rejects the pair and inventing an order for them would be guessing.
+fn carry_routing(obj: &Map<String, Value>, primary: &str, out: &mut Map<String, Value>) {
+    for key in ["provider", "plugins"] {
+        if let Some(v) = obj.get(key) {
+            out.insert(key.into(), v.clone());
+        }
+    }
+    if let Some(models) = obj.get("models") {
+        out.insert("models".into(), models.clone());
+        return;
+    }
+    let Some(fallbacks) = obj.get("fallbacks").and_then(Value::as_array) else {
+        return;
+    };
+    let mut models = Vec::with_capacity(fallbacks.len() + 1);
+    models.push(Value::String(primary.to_owned()));
+    models.extend(fallbacks.iter().filter_map(|entry| {
+        // The documented entry is `{"model": "..."}`. A bare string is not what the router's own
+        // clients send, but reading one costs nothing and forwarding it costs an extra model.
+        entry
+            .as_str()
+            .or_else(|| entry.get("model").and_then(Value::as_str))
+            .map(|model| Value::String(model.to_owned()))
+    }));
+    if models.len() > 1 {
+        out.insert("models".into(), Value::Array(models));
+    }
+}
+
 /// Translate an Anthropic Messages request object into a Chat Completions request.
 ///
 /// Handles the four things that actually differ: the system prompt is a top-level field rather than
@@ -114,6 +160,7 @@ pub fn anthropic_request_into_pivot(
     if let Some(stops) = obj.get("stop_sequences") {
         out.insert("stop".into(), stops.clone());
     }
+    carry_routing(obj, ctx.upstream_model, &mut out);
 
     let mut messages: Vec<Value> = Vec::new();
 
@@ -1186,6 +1233,67 @@ mod tests {
             client_dialect: mr_core::Dialect::Anthropic,
             ..TranslateCtx::new(route, mr_core::Dialect::OpenAi, "m")
         }
+    }
+
+    #[test]
+    fn open_router_fallbacks_become_the_chat_completions_fallback_array() {
+        // An Anthropic-shaped client asks for `fallbacks`, which is the router's own spelling on
+        // that surface. Chat Completions has no such field, so it is the fallback array that has
+        // to reach the upstream, led by the model the request resolved to.
+        let body = serde_json::to_vec(&json!({
+            "model": "m", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+            "fallbacks": [{"model": "anthropic/claude-a"}, {"model": "openai/gpt-b"}]
+        }))
+        .unwrap();
+        let p = to_pivot_request(&mut_ctx(RouteKind::Messages), &body).unwrap();
+        assert_eq!(
+            p.value["models"],
+            json!(["m", "anthropic/claude-a", "openai/gpt-b"])
+        );
+        assert_eq!(p.value.get("fallbacks"), None);
+    }
+
+    #[test]
+    fn open_router_provider_and_plugin_preferences_survive_the_translation() {
+        let body = serde_json::to_vec(&json!({
+            "model": "m", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+            "provider": {"order": ["a", "b"], "allow_fallbacks": false, "max_price": {"prompt": 1}},
+            "plugins": [{"id": "auto-router", "allowed_models": ["anthropic/*"]}]
+        }))
+        .unwrap();
+        let p = to_pivot_request(&mut_ctx(RouteKind::Messages), &body).unwrap();
+        assert_eq!(p.value["provider"]["order"], json!(["a", "b"]));
+        assert_eq!(p.value["provider"]["allow_fallbacks"], false);
+        assert_eq!(p.value["provider"]["max_price"]["prompt"], 1);
+        assert_eq!(p.value["plugins"][0]["allowed_models"][0], "anthropic/*");
+        // And a request that says nothing about routing gains no routing fields of its own.
+        let plain = serde_json::to_vec(&json!({
+            "model": "m", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let p = to_pivot_request(&mut_ctx(RouteKind::Messages), &plain).unwrap();
+        for key in ["models", "fallbacks", "provider", "plugins"] {
+            assert_eq!(p.value.get(key), None, "{key} must not be invented");
+        }
+    }
+
+    #[test]
+    fn a_caller_that_wrote_the_fallback_array_keeps_it_as_written() {
+        // The upstream refuses `models` and `fallbacks` together, so a caller that sent both gets
+        // back what it asked for and the refusal, rather than an order this translation guessed.
+        let body = serde_json::to_vec(&json!({
+            "model": "m", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+            "models": ["x/one"],
+            "fallbacks": [{"model": "y/two"}]
+        }))
+        .unwrap();
+        let p = to_pivot_request(&mut_ctx(RouteKind::Messages), &body).unwrap();
+        assert_eq!(p.value["models"], json!(["x/one"]));
+        assert_eq!(p.value.get("fallbacks"), None);
     }
 
     #[test]

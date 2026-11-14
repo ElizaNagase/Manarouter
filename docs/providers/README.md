@@ -33,7 +33,7 @@ So the catalogue is curated data, reviewed like code.
 |---|---|
 | `id` | Stable identifier. Referenced by combos as `provider/model`. Renaming one breaks stored combos. |
 | `label` | Display name for the panel. Free to change. |
-| `dialect` | **One of the ten.** Determines request and response translation. |
+| `dialect` | **One of the eleven.** Determines request and response translation. |
 | `base_url` | Where requests go: the prefix the route path is appended to. The version segment, if the provider has one, is part of it. |
 | `auth` | An `AuthKind`: `bearer`, `api-key-header`, `header`, `query-param`, `oauth`. The relay sends `bearer`, `api-key-header` and `header`; it never sends `query-param`, because a credential does not go in a URL. |
 | `capabilities` | Which behaviours are claimed. Drives what the router will even attempt. |
@@ -58,6 +58,11 @@ thinking rules are its own — see
 the ZCode desktop app's plan surface — Anthropic Messages behind the app's attribution headers, with
 its brokered login and with its signing layer deliberately not reproduced; see [Z Code](zcode.md) and
 [the dialects guide](../24-provider-dialects.md#zcode--anthropic-messages-behind-the-apps-plan-surface).
+
+OpenRouter is not a dialect, because it speaks `open-ai`; what it has of its own is a *routing*
+language in the request body (`models`, `provider`, `plugins`). The gateway carries those fields
+across the Anthropic-surface translation rather than treating them as unknown ones — see
+[OpenRouter](openrouter.md).
 
 A dialect must be one of those. There is no "custom" dialect, and that is deliberate: a provider whose
 requests cannot be described by one of these is a provider the router cannot route to, and pretending
