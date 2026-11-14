@@ -290,8 +290,18 @@ item is dispatched, and a batch that stops that way ends `cancelled` with
 `stopped_reason: "max_cost_usd_exceeded"` rather than a status OpenAI's vocabulary does not have
 ([25-gpu-rentals.md](25-gpu-rentals.md) §10).
 
-Still not verified: no batch has been submitted to a real GPU and observed to complete, so every
-figure in the lane is a computation over a recorded measurement rather than a fresh observation.
+The lane has now been driven end to end against a live provider, though not against a rented GPU. A
+one-item file was uploaded as `multipart/form-data`, submitted with `endpoint:
+/v1/chat/completions`, polled from `validating` through `in_progress` to `completed`, and the result
+read back from `GET /v1/files/{output}/content`: a real `200` body from a Free-plan Cursor account,
+25.75 recorded GPU-seconds later, with `request_counts` `{total: 1, completed: 1, failed: 0}`. It also
+exercised the unpriced path, which is the one a lane with no `price_per_second` takes: `cost_usd`,
+`boot_share_pct` and both per-million figures came back `null`, `boot_cost_usd` came back `0.0`
+because zero cold starts is a fee of exactly zero at any rate, `cold_start_verdict` was `unknown`, and
+`provider`/`model`/`card` were `null` because that route never resolved to one priced endpoint. What
+remains unobserved is the same thing it was before: nothing in the lane has ever been run against a
+rented Modal card, so every *cost* figure in it is still a computation over a recorded measurement
+rather than a fresh observation.
 
 **One lane is implemented (issue #11, Kaggle), and it has not been driven against the real
 platform from this host.** The catalogue answers two different questions

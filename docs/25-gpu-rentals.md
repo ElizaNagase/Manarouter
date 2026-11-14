@@ -415,6 +415,12 @@ The filename is metadata. It is recorded next to the file id and is never used t
 name containing `../` cannot reach outside the state directory. `purpose` must be `batch`; the refusal
 names the purpose it got, because `fine-tune` is the mistake people make.
 
+Both shapes were exercised against the running relay with the same input file, and the result of the
+form upload was read back from `/v1/files/{id}/content` byte for byte, which is the only way to know
+that the lane stored the JSONL rather than the envelope around it. That check is worth repeating after
+any change to the route: the first version of it stored the raw multipart body, and every other part
+of the lane — the line parser, the counts, the cap — was happy with a file that was not a batch.
+
 ## See also
 
 - [research/ARCHITECTURE-gpu-rentals.md](research/ARCHITECTURE-gpu-rentals.md) — the frozen interface:

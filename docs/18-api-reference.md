@@ -458,7 +458,8 @@ provider counted; `serving_usd_per_million_output_tokens` is the same with the b
 is the figure a card-to-card comparison needs. Every cost field is `null` rather than estimated when the
 provider declares no `price_per_second`, and `card` is non-null only when the declared price matches a
 measured profile within two cents. `provider` and `model` name the settled items' endpoint, or `null`
-when they disagreed.
+when they disagreed or when the route never resolved to one endpoint (a combo, an unknown model, or a
+provider the planner does not price).
 
 **A ceiling.** `max_cost_usd` is an optional extension: dollars, strictly positive, at most 1000. It is
 checked against money already settled **before each item is dispatched**, so it stops the queue rather
