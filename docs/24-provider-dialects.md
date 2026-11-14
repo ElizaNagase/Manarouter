@@ -1,6 +1,6 @@
 # 24 — Provider dialects
 
-A **dialect** is the shape of HTTP API an upstream speaks. This document says what each of the ten
+A **dialect** is the shape of HTTP API an upstream speaks. This document says what each of the eleven
 is on the wire, which client routes can reach it, what the relay rewrites on the way in and on the
 way back, and where the edges are. It is one level above the per-provider guides in
 [providers/](providers/README.md): those describe a *vendor*, this describes a *protocol*.
@@ -14,7 +14,7 @@ grouped by dialect because translation is only required when the client's dialec
 upstream's, and two providers that share a dialect share every code path
 (`crates/mr-core/src/dialect.rs:10-13`).
 
-The set is closed and small — ten members (`dialect.rs:17-45`, and `Dialect::ALL` at
+The set is closed and small — eleven members (`dialect.rs:17-45`, and `Dialect::ALL` at
 `dialect.rs:137-145`):
 
 | `Dialect` | Canonical id (`Dialect::as_str`, `dialect.rs:94-104`) | Serde id (what a `config.json` or `catalog/providers.toml` entry carries) | Templates in `catalog/providers.toml` |
@@ -101,6 +101,7 @@ upstream response straight back.
 | `copilot` | `/chat/completions` | yes, from an OpenAI client | no | OpenAI Chat Completions, behind a Copilot bearer |
 | `antigravity` | `v1internal:generateContent` | no | effectively yes | Gemini `generateContent` inside a Cloud Code envelope |
 | `command-code-go` | `alpha/generate` | no | yes | Command Code CLI envelope and private event stream |
+| `modal-vllm` | `/v1/chat/completions` | yes, from an OpenAI client | no | OpenAI Chat Completions on a Modal-hosted vLLM, behind Modal proxy headers |
 | `cursor` | `/agent.v1.AgentService/Run` | no | yes, only | Cursor's bidirectional Connect stream of protobuf frames |
 | `zcode` | `/v1/messages` | yes, from an Anthropic client | no | Anthropic Messages on the ZCode app's plan surface, behind its attribution headers |
 

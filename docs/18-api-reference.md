@@ -25,6 +25,12 @@ Both ports are configurable and both changes apply on **next restart**
 | `POST` | `/v1/audio/speech` | OpenAI, returns audio |
 | `POST` | `/v1/images/generations` | OpenAI Images |
 | `GET` | `/v1/models` | OpenAI Models, served from the compiled snapshot |
+| `POST` `GET` | `/v1/files` | OpenAI Files (upload, list) — the batch lane's input files |
+| `GET` `DELETE` | `/v1/files/{id}` | OpenAI Files (retrieve, delete) |
+| `GET` | `/v1/files/{id}/content` | The stored bytes |
+| `POST` `GET` | `/v1/batches` | OpenAI Batches (submit, list) |
+| `GET` | `/v1/batches/{id}` | OpenAI Batches (retrieve, with `usage`) |
+| `POST` | `/v1/batches/{id}/cancel` | OpenAI Batches (cancel) |
 | `POST` | `/v1/messages` | **Anthropic** Messages |
 | `POST` | `/v1/messages/count_tokens` | **Anthropic** token counting — counted upstream for an Anthropic provider, estimated locally (and marked with `x-manarouter-count-tokens-estimate: true`) for any other |
 | `GET` | `/healthz` | Liveness. **Never routed upstream.** |
@@ -396,6 +402,85 @@ model's answer, so there is nothing to un-send and nothing to announce.
 - **Content blocks** (`tool_use`, `tool_result`, `image`) are translated rather than passed through
   when the target is an OpenAI-shaped provider, and passed through verbatim when it is not.
 - **The error envelope differs.** See below.
+
+### The batch lane
+
+The routes above answer one request with one answer. `/v1/files` and `/v1/batches` are the second
+lane: submit a file of prompts, get an id back, poll it, read the results in order. The OpenAI shapes
+are used so that a client already written for OpenAI's batch API works unchanged; the lane behind them
+is a durable queue with per-item isolation, retry of transient failures only, and resume from disk
+after a restart. The full design is in [25-gpu-rentals.md](25-gpu-rentals.md) §2, §10 and §11; this
+section is the wire contract.
+
+**Upload.** `POST /v1/files` accepts `multipart/form-data` (`purpose=batch`, `file=@input.jsonl`) and,
+for a shell client that would rather not build an envelope, a raw body with `?filename=…&purpose=batch`
+in the query string. `purpose` must be `batch`; anything else is refused with the purpose it got, since
+`fine-tune` is the mistake people make. The filename is metadata and never becomes a path. The stored
+bytes are returned by `GET /v1/files/{id}/content`, which is how an operator checks what the lane
+actually received.
+
+**Submit.** `POST /v1/batches` takes `input_file_id`, `endpoint` (`/v1/chat/completions` is
+the only one this lane runs; any other is refused with `unsupported_endpoint`), `completion_window` (`24h` is the only accepted value, and it is
+not enforced — see below), optional `metadata`, and the optional `max_cost_usd` extension. It validates the file, reads
+every line as an independent request body, writes the job, and returns with status `validating`. Each
+input line is the usual OpenAI shape:
+
+```json
+{"custom_id": "item-1", "method": "POST", "url": "/v1/chat/completions",
+ "body": {"model": "modal-vllm/qwen", "messages": [{"role": "user", "content": "…"}]}}
+```
+
+`custom_id` is optional and, when present, comes back on the matching result line. Results are written
+in **input order**, not completion order, because a batch's consumer joins on position.
+
+**Status.** The set is OpenAI's: `validating`, `in_progress`, `finalizing`, `completed`, `failed`,
+`cancelled`, `expired`, `cancelling`. `request_counts` carries `total`, `completed` and `failed`. A batch
+whose items all failed still finishes `completed` — the batch did its job, and the failures are in the
+error file, which is what the error file is for. `expires_at` is reported as `created_at + 24h` and
+nothing enforces it: an item waits for admission at most `ADMISSION_WAIT` and every attempt has its own
+upstream timeout, so a batch always ends, but a stalled batch does not become `expired`. The status
+exists because the API shape needs it, not because a timer writes it.
+
+**Results and errors.** Two files, both readable through `/v1/files/{id}/content`: `output_file_id`
+holds one JSONL line per successful item, `error_file_id` one per failed item with the provider's code
+and message (never a credential, never the request body). An item that never ran appears in neither —
+see the cap below.
+
+**The cost report.** The batch object carries a `usage` block, an extension to OpenAI's schema that a
+client which ignores unknown fields is unaffected by. It is a computation over the GPU-second ledger,
+never over token counts: `gpu_seconds` (wall clock inside item attempts, cold-start and admission waits
+included), `cold_starts`, and then the money — `cost_usd` (`gpu_seconds × price_per_second`),
+`boot_cost_usd` (`cold_starts × boot_seconds × price`, kept separate because the boot fee is the price
+of the card being cold and is not proportional to anything the batch did), `boot_share_pct`, and
+`cold_start_verdict` (`boot_dominates` above half the bill, `work_dominates` below, `unknown` when there
+is no price to divide). `usd_per_million_output_tokens` is the whole bill over the output tokens the
+provider counted; `serving_usd_per_million_output_tokens` is the same with the boot fee removed, which
+is the figure a card-to-card comparison needs. Every cost field is `null` rather than estimated when the
+provider declares no `price_per_second`, and `card` is non-null only when the declared price matches a
+measured profile within two cents. `provider` and `model` name the settled items' endpoint, or `null`
+when they disagreed.
+
+**A ceiling.** `max_cost_usd` is an optional extension: dollars, strictly positive, at most 1000. It is
+checked against money already settled **before each item is dispatched**, so it stops the queue rather
+than killing a request — an in-flight item is never interrupted, because that would waste the GPU
+seconds already billed for it and produce neither a result nor an error. Items that never ran are
+retired with no result file, exactly as a cancellation retires them: not failures, since nothing about
+them failed. The batch ends `cancelled` (OpenAI has no "stopped early" status and inventing one would
+break clients that switch on the documented set) with `budget_exceeded: true` and `stopped_reason:
+"max_cost_usd_exceeded"` — or `"cancelled"` when an operator cancelled it — so the reason is never
+inferred from the status. `max_cost_usd` is echoed even when it is `null`, so a client polling a batch
+it did not submit can see that nothing was capped. An endpoint with no declared price adds `0.0` to the
+ledger, which makes a capped batch able to overspend by the unpriced share but never to under-report.
+
+**Cancellation.** `POST /v1/batches/{id}/cancel` moves a batch to `cancelling` and then `cancelled`:
+items not yet dispatched are retired, items in flight finish. It is the same machinery the cap uses,
+which is why the two share a terminal status.
+
+**What the lane deliberately does not do.** It does not re-apply per-client-key quota to individual
+items. A batch is authorized once, as a whole, when it is submitted, so an operator who meters client
+keys should treat one batch as one metered submission rather than N metered calls. It does not price
+tokens (see the cost report above), and it does not deploy anything: a rented GPU is woken and torn
+down by the operator, per [25-gpu-rentals.md](25-gpu-rentals.md) §1.
 
 ### Error envelopes
 

@@ -62,6 +62,7 @@ measured baseline of an existing Javascript router on the development machine �
 | Add a provider | `docs/providers/README.md`, `catalog/providers.toml`, `crates/mr-core/src/model.rs` |
 | Add a dialect or translator | `crates/mr-dialects/src/lib.rs`, `docs/24-provider-dialects.md`, `docs/18-api-reference.md` |
 | Connect Cursor, or answer "can we route to Cursor?" | `docs/providers/cursor.md` — Cursor is a client of the relay, not a provider; the protocol record is `docs/research/cursor-cli-inference.md` |
+| Work on the batch lane (`/v1/files`, `/v1/batches`) | `crates/manarouter-relay/src/batch.rs` (the whole lane, in one module), `docs/18-api-reference.md` §"The batch lane" for the wire contract, `docs/25-gpu-rentals.md` §2, §10 and §11 for why it is shaped that way |
 | Change combo behaviour | `docs/06-combos.md`, `docs/07-hedged-race.md`, `crates/mr-core/src/model.rs` |
 | Work on the hedged race | `docs/07-hedged-race.md` — read all of it; the semantics are counterintuitive |
 | Change account/key selection | `docs/05-key-selection.md`, `crates/mr-core/src/dialect.rs` (`KeyStrategy`) |
@@ -453,7 +454,7 @@ trigger.
     { "path": "docs/15-web-panel.md", "purpose": "The panel: views, API, port editor, design language", "read_when": "touching the UI" },
     { "path": "docs/16-latency-engineering.md", "purpose": "Every latency decision, the rejected ones, and the per-step budget", "read_when": "changing the hot path" },
     { "path": "docs/17-migrating-from-omniroute.md", "purpose": "Importing providers, combos and credentials safely", "read_when": "migrating or touching the importer" },
-    { "path": "docs/18-api-reference.md", "purpose": "Every route on both surfaces, with request and response shapes, model addressing with reasoning levels, and the /v1/models listing", "read_when": "adding or calling an endpoint" },
+    { "path": "docs/18-api-reference.md", "purpose": "Every route on both surfaces, with request and response shapes, model addressing with reasoning levels, the /v1/models listing, and the batch lane's files/batches contract", "read_when": "adding or calling an endpoint" },
     { "path": "docs/19-latency-benchmarks.md", "purpose": "Measured numbers, mock and real, kept strictly separate", "read_when": "making a performance claim" },
     { "path": "docs/20-troubleshooting.md", "purpose": "Symptom, cause, fix", "read_when": "something is broken" },
     { "path": "docs/21-security.md", "purpose": "Threat model, the vault, cookie prohibition, ToS posture", "read_when": "before writing credential code" },
