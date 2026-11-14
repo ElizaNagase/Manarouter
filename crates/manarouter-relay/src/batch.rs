@@ -114,7 +114,20 @@
 //!
 //! A fixed pool of [`DEFAULT_WORKERS`] tasks, not one thread per item: a batch of 10,000 items must
 //! not create 10,000 concurrent upstream calls, and the whole point of the KV budget is that the item
-//! count says nothing about how much can run at once. No lock is held across an `await` (the job map
+//! count says nothing about how much can run at once. The pool size can be lowered (or raised, to 64)
+//! with [`WORKERS_ENV`], which is the only priority knob this lane has.
+//!
+//! # Why there is no priority class
+//!
+//! A batch and an interactive request share one endpoint, so the question "does interactive traffic
+//! win" is real. This lane answers it by *waiting*, not by pre-empting: an item holds nothing between
+//! attempts (the KV lease is released before the retry sleep, and the sleep is not a reservation), and
+//! the operator can shrink the worker pool so a batch never occupies the whole card. What it will not
+//! do is cancel an in-flight upstream call to make room, because no route in this relay cancels its
+//! own upstream call and a cancelled generation is billed the same as a finished one — the token
+//! would be spent and wasted. So the choice is between "a batch delays an interactive request by one
+//! item" and "an interactive request costs the operator a killed generation", and the module picks
+//! the first. No lock is held across an `await` (the job map
 //! and each job's metadata are `std::sync::Mutex`, taken, mutated and dropped within a synchronous
 //! block), no batch I/O runs on the accept loop (file work goes through `spawn_blocking`), and no
 //! credential, `Authorization` header or request body is ever logged.
@@ -175,6 +188,59 @@ const MAX_ATTEMPTS: u32 = 3;
 /// worker is a task that can hold an upstream call open, so the useful size is "enough to keep the
 /// endpoint busy", which four does for a single rented card.
 pub const DEFAULT_WORKERS: usize = 4;
+
+/// Environment variable that overrides [`DEFAULT_WORKERS`].
+///
+/// The useful operator question this answers is not "how many items can the lane hold" — the queue
+/// holds as many as the disk does — but "how much of one card may a batch take". A batch shares the
+/// endpoint with interactive requests and this lane has no priority class (see the module notes), so
+/// the honest knob is how many items it may have in flight at once: setting this to `1` means a batch
+/// occupies one slot and an interactive request always finds room, and setting it high means the
+/// batch is allowed to be what keeps the card warm.
+pub const WORKERS_ENV: &str = "MANAROUTER_BATCH_WORKERS";
+
+/// Worker count from the environment, clamped to a range that cannot be a mistake.
+///
+/// Zero workers would be a lane that accepts batches and never runs them, and a thousand would be a
+/// thousand concurrent upstream calls, which is the failure the fixed pool exists to prevent. A value
+/// that is not a number is ignored with a warning rather than silently replaced, so an operator who
+/// mistyped can see that their setting had no effect.
+pub fn workers_from_env() -> usize {
+    match std::env::var(WORKERS_ENV) {
+        Ok(raw) => parse_workers(&raw),
+        Err(_) => DEFAULT_WORKERS,
+    }
+}
+
+/// The parsing half of [`workers_from_env`], so the clamping can be tested without touching the
+/// process environment (which every test in this binary shares).
+fn parse_workers(raw: &str) -> usize {
+    match raw.trim().parse::<usize>() {
+        Ok(0) => {
+            tracing::warn!(
+                value = %raw,
+                "the batch worker count cannot be zero; keeping the default"
+            );
+            DEFAULT_WORKERS
+        }
+        Ok(workers) if workers > 64 => {
+            tracing::warn!(
+                value = %raw,
+                "the batch worker count is above 64, which is more concurrent upstream calls than a batch should make; clamping"
+            );
+            64
+        }
+        Ok(workers) => workers,
+        Err(_) => {
+            tracing::warn!(
+                variable = WORKERS_ENV,
+                value = %raw,
+                "the batch worker count is not a number; keeping the default"
+            );
+            DEFAULT_WORKERS
+        }
+    }
+}
 
 /// How long one item may wait for KV-token admission before it is written off as failed.
 ///
@@ -4157,6 +4223,19 @@ mod tests {
         // A cap of zero is refused rather than obeyed: it would stop before the first item while
         // looking like a request that runs a batch.
         assert!(parse_max_cost_usd(Some(&json!(0))).is_err());
+    }
+
+    #[test]
+    fn the_worker_count_can_be_set_but_not_to_zero_or_a_thousand() {
+        // The default is what an operator who configures nothing gets.
+        assert_eq!(parse_workers(""), DEFAULT_WORKERS);
+        assert_eq!(parse_workers("nonsense"), DEFAULT_WORKERS);
+        assert_eq!(parse_workers("3"), 3);
+        assert_eq!(parse_workers("  3  "), 3);
+        // The two values that would be a mistake rather than a preference.
+        assert_eq!(parse_workers("0"), DEFAULT_WORKERS);
+        assert_eq!(parse_workers("1000"), 64);
+        assert_eq!(parse_workers("64"), 64);
     }
 
     #[test]

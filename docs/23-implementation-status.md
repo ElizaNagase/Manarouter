@@ -288,7 +288,10 @@ have for any card; inventing one is the guess the module refuses to make. What t
 stop: a submission may carry `max_cost_usd`, checked against dollars already settled before each
 item is dispatched, and a batch that stops that way ends `cancelled` with
 `stopped_reason: "max_cost_usd_exceeded"` rather than a status OpenAI's vocabulary does not have
-([25-gpu-rentals.md](25-gpu-rentals.md) §10).
+([25-gpu-rentals.md](25-gpu-rentals.md) §10). It also does not pre-empt: an item in flight is never cancelled to make room for an interactive
+request, because the GPU seconds are spent either way. The priority knob is the pool of workers —
+`MANAROUTER_BATCH_WORKERS`, default 4 and clamped to 1–64 — which an operator lowers to keep a batch
+off a card that interactive traffic needs ([25-gpu-rentals.md](25-gpu-rentals.md) §12).
 
 The lane has now been driven end to end against a live provider, though not against a rented GPU. A
 one-item file was uploaded as `multipart/form-data`, submitted with `endpoint:

@@ -62,7 +62,7 @@ measured baseline of an existing Javascript router on the development machine �
 | Add a provider | `docs/providers/README.md`, `catalog/providers.toml`, `crates/mr-core/src/model.rs` |
 | Add a dialect or translator | `crates/mr-dialects/src/lib.rs`, `docs/24-provider-dialects.md`, `docs/18-api-reference.md` |
 | Connect Cursor, or answer "can we route to Cursor?" | `docs/providers/cursor.md` — Cursor is a client of the relay, not a provider; the protocol record is `docs/research/cursor-cli-inference.md` |
-| Work on the batch lane (`/v1/files`, `/v1/batches`) | `crates/manarouter-relay/src/batch.rs` (the whole lane, in one module), `docs/18-api-reference.md` §"The batch lane" for the wire contract, `docs/25-gpu-rentals.md` §2, §10 and §11 for why it is shaped that way |
+| Work on the batch lane (`/v1/files`, `/v1/batches`) | `crates/manarouter-relay/src/batch.rs` (the whole lane, in one module), `docs/18-api-reference.md` §"The batch lane" for the wire contract, `docs/25-gpu-rentals.md` §2, §10, §11 and §12 for why it is shaped that way |
 | Change combo behaviour | `docs/06-combos.md`, `docs/07-hedged-race.md`, `crates/mr-core/src/model.rs` |
 | Work on the hedged race | `docs/07-hedged-race.md` — read all of it; the semantics are counterintuitive |
 | Change account/key selection | `docs/05-key-selection.md`, `crates/mr-core/src/dialect.rs` (`KeyStrategy`) |

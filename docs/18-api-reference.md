@@ -409,7 +409,7 @@ The routes above answer one request with one answer. `/v1/files` and `/v1/batche
 lane: submit a file of prompts, get an id back, poll it, read the results in order. The OpenAI shapes
 are used so that a client already written for OpenAI's batch API works unchanged; the lane behind them
 is a durable queue with per-item isolation, retry of transient failures only, and resume from disk
-after a restart. The full design is in [25-gpu-rentals.md](25-gpu-rentals.md) §2, §10 and §11; this
+after a restart. The full design is in [25-gpu-rentals.md](25-gpu-rentals.md) §2, §10, §11 and §12; this
 section is the wire contract.
 
 **Upload.** `POST /v1/files` accepts `multipart/form-data` (`purpose=batch`, `file=@input.jsonl`) and,
@@ -476,6 +476,13 @@ ledger, which makes a capped batch able to overspend by the unpriced share but n
 **Cancellation.** `POST /v1/batches/{id}/cancel` moves a batch to `cancelling` and then `cancelled`:
 items not yet dispatched are retired, items in flight finish. It is the same machinery the cap uses,
 which is why the two share a terminal status.
+
+**Priority.** A batch and an interactive request share the endpoint, and the lane has no priority
+class: an interactive request can be delayed by an item already in flight, but never by one that is
+waiting — an item holds no KV reservation between attempts. The knob is `MANAROUTER_BATCH_WORKERS`
+(default 4, clamped to 1–64): set it to `1` and a batch occupies one slot so interactive traffic
+always finds room. It is not a pre-emption mechanism, because cancelling an in-flight generation is
+billed the same as finishing it — the relay does not do that to save a queue position.
 
 **What the lane deliberately does not do.** It does not re-apply per-client-key quota to individual
 items. A batch is authorized once, as a whole, when it is submitted, so an operator who meters client

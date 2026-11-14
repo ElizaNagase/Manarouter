@@ -247,7 +247,7 @@ pub fn build_state(
     // whatever was recovered. Until this point the queue is populated and nothing consumes it, which
     // is exactly the state a recovered-but-not-yet-started batch should be in.
     batch_executor.install(state.clone());
-    state.batch.start_workers(crate::batch::DEFAULT_WORKERS);
+    state.batch.start_workers(crate::batch::workers_from_env());
 
     // Adopt routing changes written by the control plane, without a restart.
     //

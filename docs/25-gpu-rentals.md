@@ -421,6 +421,24 @@ that the lane stored the JSONL rather than the envelope around it. That check is
 any change to the route: the first version of it stored the raw multipart body, and every other part
 of the lane — the line parser, the counts, the cap — was happy with a file that was not a batch.
 
+## 12. Sharing one card with interactive traffic
+
+The batch lane and the request path dispatch through the same executor and the same KV budget, so a
+batch is not a separate card — it is a second consumer of the one the operator rented. Two facts make
+that safe to run overnight:
+
+* An item holds nothing while it waits. Its KV reservation is released before the retry sleep, so a
+  batch cannot starve a request by queueing, only by running.
+* The pool of workers is the knob. `MANAROUTER_BATCH_WORKERS` (default 4, clamped to 1–64) sets how
+  many items a batch may have in flight at once; `1` gives a batch one slot and leaves the rest of
+  the endpoint to interactive calls.
+
+There is deliberately no priority class and no pre-emption. Cancelling a generation to make room for
+another request does not refund the GPU seconds — the card was occupied either way — so the choice is
+between a batch delaying an interactive request by one item and an interactive request costing the
+operator a killed generation. The lane picks the first, and an operator who wants interactive traffic
+always to win lowers the worker count rather than trusting a scheduler this build does not have.
+
 ## See also
 
 - [research/ARCHITECTURE-gpu-rentals.md](research/ARCHITECTURE-gpu-rentals.md) — the frozen interface:
