@@ -614,29 +614,54 @@ Chat Completions `system` *message* and for `tool_calls` (`commandcode.rs:114-18
 
 ## `cursor` — the Cursor agent stream
 
-**On the wire.** There is no REST endpoint. `POST /agent.v1.AgentService/Run` is a Connect-RPC
-*bidirectional* stream: the client sends one `AgentRunRequest` protobuf frame and then keeps the
-request side **open**, because the server asks questions mid-turn — what tools this client offers,
-what a blob it wrote in an earlier turn contained — and answers them on the same stream. A client
-that half-closes its body never receives an answer, which is why a pooled HTTP client cannot carry
-this dialect: `crates/manarouter-relay/src/cursor_transport.rs` opens a raw HTTP/2 connection and
-writes frames itself. Each frame is a 5-byte header (flags, `u32` big-endian length) followed by the
+**On the wire, there are two endpoints.** `POST /agent.v1.AgentService/RunSSE` opens a Connect-RPC
+stream, but it carries exactly one client message: a `BidiRequestId`. The turn is not on it. Every
+client message after that — the run request itself, and each answer to a server question — is a
+separate unary `POST /aiserver.v1.BidiService/BidiAppend`, whose body names that same stream id in a
+nested `BidiRequestId`. A Cursor turn is therefore one long-lived read interleaved with a sequence
+of short writes, not a single duplex body, which is why a pooled HTTP client cannot carry this
+dialect: `crates/manarouter-relay/src/cursor_transport.rs` opens a raw HTTP/2 connection and writes
+the frames itself. Each frame is a 5-byte header (flags, `u32` big-endian length) followed by the
 payload; flag `0x01` marks a gzip payload and flag `0x02` an end-stream JSON trailer, and a frame
-larger than 16 MiB is refused before it is allocated
-(`crates/mr-dialects/src/cursor.rs`, `MAX_FRAME_BYTES`).
+larger than 16 MiB is refused before it is allocated (`crates/mr-dialects/src/cursor.rs`,
+`MAX_FRAME_BYTES`). An append is acknowledged with a 4-byte frame (`tag = 10`), and that ack proves
+nothing: the answer arrives on the run stream or not at all.
 
-**Host discovery.** The agent host is not a constant. `POST
-https://api2.cursor.sh/aiserver.v1.ServerConfigService/GetServerConfig` returns field 27 as
-`{1: agent_url, 2: agentn_url}`; the result is cached for an hour and only an `https` origin on
-`api5.cursor.sh` or its subdomains is ever dialled, because the relay is about to attach a bearer
-token to it. A corrupt response falls back to the host the reference client ships with rather than
-failing the turn. The provider's `base_url` is the discovery origin (`https://api2.cursor.sh`); an
-`api5` origin there is treated as an override of the agent host, which is what an operator names
-when discovery is wrong for their deployment.
+**Append encoding.** `BidiAppendRequest` is `{1: data, 2: BidiRequestId, 3: append_seqno, 4:
+data_binary}`, with the sequence number counting from 0 in step with the appends. `data` carries the
+payload as lowercase hex and `data_binary` the same bytes unwrapped; both are sent because which one
+the server prefers is not observable from a success. A server question the client never answers is
+indistinguishable from a slow model, which is why the transport keeps reading rather than timing out
+on the first quiet second.
+
+**The run request.** `AgentRunRequest` is one frame: `1` an **empty** `ConversationState`, `2` the
+action, `3` model details, `4` an empty `McpTools` (a client that sends no tool list is read as one
+that does not implement tools), `5` the conversation id, `9` the requested model, `12` a varint
+`false`, and `16` a conversation-group id equal to the conversation id. The action is three levels
+deep — `ConversationAction{1}` → `UserMessageAction{1}` → `UserMessage{1: text, 2: message id, 3:
+empty selected_context, 4: mode 1}` — and flattening any one of them parses and is then refused as
+`Action is required`. `conversation_state` must be empty on a fresh turn: its
+`root_prompt_messages_json` holds 32-byte SHA-256 *blob ids* that the server hydrates over the KV
+channel mid-turn, not prompt text, and an id it cannot resolve fails the whole turn with that same
+unhelpful message.
+
+**Host discovery: deliberately not used.** One origin — the provider's configured `base_url`
+(`https://api2.cursor.sh`) — serves both RPCs. The reference client asks
+`ServerConfigService/GetServerConfig` for an `api5` agent host and can change hosts mid-turn; this
+transport does neither, because the backend answers both endpoints and a discovered host would only
+be a second place to send a bearer token. The configured url is reduced to its origin and checked
+against `cursor.sh` / `cursor.com`; anything else falls back to the shipped backend rather than
+failing the turn, so a typo cannot redirect a credential.
 
 **Authentication.** `AuthKind::OAuth` with platform `cursor`; the token comes from the page login in
 [cursor](28-oauth-cursor.md). Any other auth kind is refused before a socket opens, because the
 agent endpoint reads `Authorization: Bearer` and nothing else.
+
+**Model names.** `auto` is the wire name `default`; every other id passes through unchanged. Cursor
+publishes no model list, so the operator's list is the honest one and its names come from Cursor's
+own UI. An id the backend does not know is a `404 not_found`, which is the request's mistake and
+neither parks the credential nor fails over — a `502` there would park every model on the account for
+a typo.
 
 **Translation.** Cursor answers only as a frame stream, so the relay always renders SSE and folds it
 for a non-streaming client (`force_stream`). An OpenAI client's body is what `prepare_run` parses
@@ -644,8 +669,22 @@ directly; an Anthropic client is reduced to the same OpenAI-shaped body first, s
 dialects reach the same encoder and the response arm picks the rendering. The conversation is a
 single text prompt: history is labelled `User:` / `Assistant:` / `Assistant called tool …` / `Tool
 result (…)` and joined by blank lines, and a one-message turn is sent verbatim. A system prompt is
-sent twice on purpose — as a `sha256` digest in `conversation_state`, which is the field Cursor
-honours, and prepended to the user text, because the server does not apply the digest.
+prepended to that text; it is not sent as a separate blob, because the blob path is not implemented
+and the server does not accept prompt text in the state field.
+
+**A plan refusal parks one model, not the account.** The refusal arrives as an end-stream JSON
+trailer whose top-level `message` is the placeholder `"Error"` — the sentence a person needs is
+`details[].debug.details.detail` ("Free includes Grok 4.7, Grok 4.6, and Auto with fixed settings").
+The dialect reads it, and classifies `resource_exhausted` **with** a `switchModel` button as the plan
+lacking *this model* rather than the account being spent; without the button it stays a rate limit
+and parks the account. The transport turns such a refusal into a `429` with `type:
+model_unavailable` before any bytes reach the client, which is what lets `server.rs` park the model
+alone and fail over to another step. `cooldown_scope` is a ceiling for failures of unknown cause, so
+a plan refusal is written at the narrower model key even when the provider's scope is `account`; the
+readers consult the account, model, and provider shapes alike, or that narrow entry would be written
+and then ignored. With nothing else to fail over to, the relay still tries the soonest-recovering
+step once rather than pretending the provider is down, so a single-account deployment reports the
+plan's own sentence.
 
 **What it will not do.** Client tools are refused rather than half-supported: answering a `tool_call`
 the server asks for is a protocol this transport does not implement, and the error names the field
@@ -662,12 +701,13 @@ cannot express would be a lie about what the model was asked to do
 id, so a retry — and every request without a client session id — opens a new Cursor conversation.
 The alternative, a session-free fingerprint, lets two unrelated callers who happen to open with the
 same words share one Cursor conversation and its memory. A prompt-cache miss is the cheaper of the
-two costs.
+two costs, and a caller that wants continuity supplies `session_id`.
 
-**Status.** Every byte in the tests is canned: framing, request bytes, headers, discovery, and the
-state machine are pinned by exact-byte assertions, but no live credential has been used, so whether
-the server accepts these bytes, the acceptance of the pinned client version, and the post-`turn_ended`
-end conditions are unverified. See [the implementation status](23-implementation-status.md).
+**Status.** Verified live on 14 November 2026 against an account on Cursor's **Free** plan:
+`cursor/auto` streams a real answer, and `cursor/grok-4.7` is refused with the plan's own sentence,
+parked per model, and failover-eligible. Still unverified: a real system prompt through the KV blob
+channel, tools, images, and continuity across turns. Framing, request bytes, headers, and the state
+machine are pinned by exact-byte assertions in the dialect's tests.
 
 **Read next.** [Cursor](28-oauth-cursor.md) for the login, and
 [providers/cursor.md](providers/cursor.md) for the operator steps.

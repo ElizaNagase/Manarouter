@@ -23,7 +23,7 @@ the account's own entitlements deciding which models exist and how much thinking
 mr provider add cursor --from-catalog cursor
 ```
 
-The template sets the dialect (`cursor`), the discovery origin (`https://api2.cursor.sh`), the auth
+The template sets the dialect (`cursor`), the backend origin (`https://api2.cursor.sh`), the auth
 kind (`oauth`, platform `cursor`), and the `chat` capability. Or use **Providers → Cursor** in the
 panel, which opens the same template.
 
@@ -42,8 +42,16 @@ ten-minute life.
 
 Nothing is synced, because Cursor publishes no model catalogue over this surface. Add the ids you
 intend to call as provider models (panel: **Providers → Cursor → Models**, or `mr models` against a
-JSON file), using the id Cursor's own client sends. A request for an id the service does not serve
-for your account comes back as an upstream error naming the model, not as a router fault.
+JSON file), using the id Cursor's own client sends. `auto` is the one name the router translates: it is sent as
+`default`, which is what Cursor calls automatic model selection. A request for an id the service
+does not know comes back as a `404` naming it — the request is at fault, so no credential is parked
+for it.
+
+**Plans.** Whether a model exists for you is the service's answer, not the router's. On Cursor's
+Free plan, for example, `auto` answers while a premium id is refused with "Free includes Grok 4.7,
+Grok 4.6, and Auto with fixed settings". The router passes that sentence through and parks **that
+model only** for a while, so the models your plan does include keep working and another provider can
+serve the turn.
 
 Then call it like any other provider:
 
@@ -72,9 +80,11 @@ curl http://127.0.0.1:20900/v1/chat/completions \
 - **Every retry is a new conversation.** The router fingerprints a conversation per turn rather than
   per session, so a retry does not continue the previous exchange — and two callers who happen to
   open with the same words do not share one Cursor conversation and its memory.
-- **The transport is reverse-engineered.** The endpoint, the discovery field numbers and the pinned
-  client version come from the CLI's traffic. If Cursor changes them, requests fail; see
-  [the implementation status](../23-implementation-status.md).
+- **The transport is reverse-engineered.** The endpoints, the frame and message shapes, and the
+  pinned client version come from the CLI's own traffic. It has been exercised live against a Free
+  plan account (a real streamed answer), but a system prompt delivered as a server-side blob, tools,
+  images, and continuity across turns are still unproven. If Cursor changes any of it, requests fail;
+  see [the implementation status](../23-implementation-status.md).
 
 ## Read next
 
