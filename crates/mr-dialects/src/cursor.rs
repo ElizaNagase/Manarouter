@@ -72,14 +72,28 @@ pub const KV_GRACE_MS: u64 = 2_000;
 /// The HTTP/2 request path of the agent stream.
 pub const RUN_PATH: &str = "/agent.v1.AgentService/Run";
 
-/// The unary endpoint that reports which host serves agent turns.
-pub const SERVER_CONFIG_PATH: &str = "/aiserver.v1.ServerConfigService/GetServerConfig";
-
-/// The host that serves [`SERVER_CONFIG_PATH`].
+/// The server-streaming path the reference client uses for a turn.
 ///
-/// It is *not* an agent host: the agent origin arrives in the response and is allow-listed by
-/// [`validate_origin`]. Dialling this host for a turn would be rejected.
-pub const DISCOVERY_ORIGIN: &str = "https://api2.cursor.sh";
+/// Not a preference: the bidi [`RUN_PATH`] accepts the connection and its head is answered with
+/// `200`, but the server never grants flow-control capacity for a request body on that stream, so a
+/// client that writes its turn there waits forever while the turn never starts. The CLI maps `run`
+/// onto this path and delivers the turn out of band through [`BIDI_APPEND_PATH`].
+pub const RUN_SSE_PATH: &str = "/agent.v1.AgentService/RunSSE";
+
+/// The unary endpoint that carries every client message for an open turn.
+///
+/// The request body is a `BidiAppendRequest` naming the id the run was opened with; the run stream
+/// itself is read-only. See [`bidi_append_request`].
+pub const BIDI_APPEND_PATH: &str = "/aiserver.v1.BidiService/BidiAppend";
+
+/// The backend a turn is opened on.
+///
+/// One origin serves both halves of a turn — the `RunSSE` stream and every `BidiAppend` — so a turn
+/// never hops hosts mid-conversation. The reference client also has an agent-host discovery step;
+/// this transport does not, because the backend answers both RPCs directly and a discovered host
+/// would only add a second place to send a bearer token. [`backend_origin`] turns the provider's
+/// configured url into this origin.
+pub const BACKEND_ORIGIN: &str = "https://api2.cursor.sh";
 
 /// The Connect protocol version the endpoint expects.
 pub const CONNECT_PROTOCOL_VERSION: &str = "1";
@@ -93,14 +107,6 @@ pub const PINNED_CLIENT_VERSION: &str = "cli-2026.07.08-0c04a8a";
 
 /// The environment variable that overrides [`PINNED_CLIENT_VERSION`].
 pub const CLIENT_VERSION_ENV: &str = "CURSOR_AGENT_CLI_VERSION";
-
-/// Origin used when the server-config call cannot be made or names no host.
-///
-/// The `agent.` host is the ghost-mode (privacy) one; see [`AgentUrls::select`].
-pub const FALLBACK_AGENT_ORIGIN: &str = "https://agent.api5.cursor.sh";
-
-/// Origin for a non-ghost turn when discovery is unavailable.
-pub const FALLBACK_AGENTN_ORIGIN: &str = "https://agentn.api5.cursor.sh";
 
 const FLAG_GZIP: u8 = 0x01;
 const FLAG_END_STREAM: u8 = 0x02;
@@ -195,6 +201,68 @@ pub fn encode_gzip_frame(payload: &[u8]) -> Result<Vec<u8>, CursorError> {
     out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
     out.extend_from_slice(&compressed);
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Turn delivery: the bidi request id and the append that carries the turn
+// ---------------------------------------------------------------------------------------------
+
+/// `BidiRequestId { request_id: 1 }`, the message a `RunSSE` request opens with.
+///
+/// The generation is a server-streaming call: its request side takes one small message and is then
+/// closed. Everything the client has to say afterwards goes through [`bidi_append_request`], which
+/// is what this id is for.
+pub fn bidi_request_id(request_id: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + request_id.len());
+    pb::put_str(&mut out, 1, request_id);
+    out
+}
+
+/// The framed body of the `RunSSE` request.
+///
+/// The stream's content type is `application/connect+proto`, so its body is a sequence of Connect
+/// envelopes: the message alone is unfinished framing and the server answers "incomplete envelope".
+/// Nothing follows the one envelope — the client half is closed, and every later message is an
+/// append instead.
+pub fn bidi_request_body(request_id: &str) -> Vec<u8> {
+    encode_frame(&bidi_request_id(request_id))
+}
+
+/// Lowercase hex, the encoding an append's `data` field uses.
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(2 * bytes.len());
+    for byte in bytes {
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+/// `BidiAppendRequest { data: 1, request_id: 2, append_seqno: 3 }`.
+///
+/// Field 2 is a *message* — the same `BidiRequestId` [`bidi_request_id`] builds — and not the bare
+/// uuid string. A bare string looks like a protobuf message to the server, which then parses the
+/// uuid as fields and fails on whichever ASCII character carries wire type 4 ("parse binary: cant
+/// skip wire type 4"). The nesting is load-bearing.
+///
+/// `append_seqno` is the CLI's counter starting at zero.
+///
+/// The payload goes in field 1 as hex, not in field 4 (`data_binary`) as bytes. The reference client
+/// picks between the two with a `binaryEncoding` flag that only the HTTP/2 path sets: on the
+/// HTTP/1.1 fallback the append transport is built without any options, so `binaryEncoding` is
+/// false and every append is hex. A `data_binary`-only request is answered with "Malformed bidi
+/// request payload" — the server looks at `data` and finds nothing to decode.
+///
+/// The payload itself is the bare client message, never a Connect envelope: the append is unary and
+/// the envelope belongs to the stream it stands in for.
+pub fn bidi_append_request(request_id: &str, append_seqno: u32, data: &[u8]) -> Vec<u8> {
+    let id = bidi_request_id(request_id);
+    let mut out = Vec::with_capacity(16 + id.len() + 2 * data.len());
+    pb::put_str(&mut out, 1, &hex(data));
+    pb::put_bytes(&mut out, 2, &id);
+    pb::put_uint(&mut out, 3, u64::from(append_seqno));
+    out
 }
 
 /// A streaming frame decoder.
@@ -508,8 +576,18 @@ pub struct PreparedRun {
     pub message_id: String,
     /// The flattened prompt actually sent.
     pub text: String,
-    /// The framed `AgentRunRequest` (header included).
+    /// The framed client message (Connect header included).
+    ///
+    /// The shape the request stream of a bidi call would have carried. Kept because it documents the
+    /// turn exactly, not because anything is sent in it.
     pub frame: Vec<u8>,
+    /// The `AgentClientMessage` holding the run request, unframed.
+    ///
+    /// What an append carries: the reference client appends `message.toBinary()`, so the payload is
+    /// the message and never an envelope — the Connect framing belongs to the stream that the append
+    /// stands in for. The oneof wrapper *is* part of the message: the server reads appended payloads
+    /// as `AgentClientMessage`, and a bare `AgentRunRequest` is refused as a malformed payload.
+    pub payload: Vec<u8>,
 }
 
 /// The OpenAI request as Cursor's `UserMessage` sees it.
@@ -541,18 +619,17 @@ pub fn prepare_run(
 
     let model = wire_model(ctx.upstream_model);
     let conversation_id = wire_conversation_id(ctx.session_id, &conversation, message_id);
-    let frame = encode_frame(&run_request(
-        &model,
-        &conversation,
-        &conversation_id,
-        message_id,
-    ));
+    let payload = client_message(
+        1,
+        &run_request(&model, &conversation, &conversation_id, message_id),
+    );
     Ok(PreparedRun {
         model,
         conversation_id,
         message_id: message_id.to_owned(),
         text: conversation.text,
-        frame,
+        frame: encode_frame(&payload),
+        payload,
     })
 }
 
@@ -685,9 +762,9 @@ fn flatten(value: &Value) -> Result<Conversation, FlattenError> {
     } else {
         Some(system.join("\n\n"))
     };
-    // The system prompt travels twice: as the digest in `conversation_state` (so the server can
-    // recognise a prompt it has cached) and prepended to the user text. The digest alone is not
-    // enough — Cursor is observed not to apply it — and the text is what actually reaches the model.
+    // The system prompt is prepended to the user text: the frame has no system role and the
+    // conversation state is sent empty (see `run_request`), so this is the only way it reaches the
+    // model.
     let text = match &system {
         Some(system) => format!("{system}\n\n{text}"),
         None => text,
@@ -817,33 +894,36 @@ fn run_request(
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(512);
 
-    // 1: conversation_state — the digest of the JSON prompt blob, and no turns.
+    // 1: conversation_state — present and empty.
     //
-    // The field is a sha256 *digest*, not the JSON. The server uses it to recognise a system prompt
-    // it has already cached for this conversation; sending the blob itself would be a different
-    // value and the cache would never hit.
-    if let Some(system) = &conversation.system {
-        let blob = serde_json::json!({
-            "role": "system",
-            "content": system,
-        });
-        let bytes = serde_json::to_vec(&blob).unwrap_or_default();
-        let digest = Sha256::digest(&bytes);
-        let mut state = Vec::new();
-        pb::put_bytes(&mut state, 1, &digest);
-        pb::put_bytes(&mut out, 1, &state);
-    }
+    // A first turn has no checkpoint to resume, and the field is not free-form: its
+    // `root_prompt_messages_json` holds *blob ids* that the server hydrates over the KV channel
+    // during the turn, not prompt text. An id it cannot resolve fails the whole turn, and the
+    // server reports that failure as `Action is required` — a message that names neither the state
+    // nor the blob, which is why this cost a day to find. An empty state is what the reference
+    // client sends for a fresh conversation, and it is the only shape observed to stream.
+    //
+    // The system prompt therefore travels in the user text (see `flatten`), not here.
+    pb::put_bytes(&mut out, 1, &[]);
 
     // 2: action -> user_message_action -> user_message
+    //
+    // Three levels, and the middle one is not optional: `ConversationAction` wraps a
+    // `UserMessageAction`, which wraps the `UserMessage`. Flattening the message up one level
+    // produces a payload the server accepts as a *parse* and then rejects as `Action is required`.
     let mut user_message = Vec::new();
     pb::put_str(&mut user_message, 1, &conversation.text);
     pb::put_str(&mut user_message, 2, message_id);
-    // 3: selected_context — an empty *message*, present but zero-length. Required.
+    // 3: selected_context — an empty *message*, present but zero-length. The reference client sends
+    // it on every turn; the server does not require it, but a turn without it is not the shape the
+    // CLI is known to work in.
     pb::put_bytes(&mut user_message, 3, &[]);
     // 4: mode = 1 (the CLI's "agent" mode).
     pb::put_uint(&mut user_message, 4, 1);
+    let mut user_message_action = Vec::new();
+    pb::put_bytes(&mut user_message_action, 1, &user_message);
     let mut action = Vec::new();
-    pb::put_bytes(&mut action, 1, &user_message);
+    pb::put_bytes(&mut action, 1, &user_message_action);
     pb::put_bytes(&mut out, 2, &action);
 
     // 3: model_details
@@ -875,93 +955,51 @@ fn run_request(
     out
 }
 
-// ---------------------------------------------------------------------------------------------
-// Host discovery
-// ---------------------------------------------------------------------------------------------
-
-/// The two agent origins the server-config endpoint reports.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AgentUrls {
-    /// The `agent.` origin, used when ghost mode is on.
-    pub agent: String,
-    /// The `agentn.` origin, used when ghost mode is off.
-    pub agentn: String,
-}
-
-impl AgentUrls {
-    /// Pick the origin for a turn, and whether it came from the server's configuration.
-    ///
-    /// Ghost mode defaults to **on**, which is the privacy-preserving choice: a turn that does not
-    /// explicitly ask for training-visible data should not get it.
-    ///
-    /// A configured url that fails [`validate_origin`] falls back to the known constant rather than
-    /// failing the turn. The allow-list still does its job — the bad url is never dialled — and a
-    /// corrupt or hostile discovery response degrades to the host the reference client ships with
-    /// instead of turning every request into an outage. The `bool` is what lets the caller log the
-    /// fallback.
-    pub fn select(&self, ghost_mode: bool) -> (String, bool) {
-        let (chosen, fallback) = if ghost_mode {
-            (&self.agent, FALLBACK_AGENT_ORIGIN)
-        } else {
-            (&self.agentn, FALLBACK_AGENTN_ORIGIN)
-        };
-        if let Ok(origin) = validate_origin(chosen) {
-            return (origin, true);
-        }
-        (fallback.to_owned(), false)
-    }
-}
-
-/// Read `AgentUrlConfig` out of a `GetServerConfig` response.
+/// The origin a turn is opened on when the bidi stream is unavailable.
 ///
-/// Field 27 of `ServerConfig` is `AgentUrlConfig{1: agent_url, 2: agentn_url}`. A response without
-/// it is not an error: the caller falls back, and the fallback is a constant that is known to work.
-pub fn parse_agent_url_config(payload: &[u8]) -> Option<AgentUrls> {
-    let config = pb::message(payload, 27).ok().flatten()?;
-    let agent = pb::message(config, 1)
-        .ok()
-        .flatten()
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .unwrap_or_default()
-        .to_owned();
-    let agentn = pb::message(config, 2)
-        .ok()
-        .flatten()
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .unwrap_or_default()
-        .to_owned();
-    Some(AgentUrls { agent, agentn })
+/// The reference client normally opens `Run` as a bidirectional stream and writes the turn onto it.
+/// When the server disables that — or the local configuration forces it — the client switches to
+/// `RunSSE` and delivers the turn through `BidiAppend` instead, and in that mode it points the agent
+/// client at its *backend* url rather than at a discovered agent host. Both halves of the turn then
+/// share one server, which matters because the append names a stream that server is holding.
+///
+/// This is the mode [`crate::cursor::RUN_SSE_PATH`] and [`crate::cursor::BIDI_APPEND_PATH`] exist
+/// for, so this is the origin a turn uses.
+///
+/// `hint` is the provider's configured base url. It is operator configuration rather than a value
+/// out of a response, but it is about to carry a bearer token, so it is still checked: a typo must
+/// not send the credential to whatever host it happens to name. Anything that is not a Cursor host
+/// falls back to [`BACKEND_ORIGIN`] instead of failing the turn.
+pub fn backend_origin(hint: Option<&str>) -> String {
+    hint.and_then(|url| cursor_host_origin(url).ok())
+        .unwrap_or_else(|| BACKEND_ORIGIN.to_owned())
 }
 
-/// Validate a discovered agent url and return its origin.
-///
-/// The allow-list is the security boundary, not a formality: the url arrives in a response body and
-/// the relay is about to attach a bearer token to it. `api5.cursor.sh` and its subdomains are the
-/// only hosts the real service uses; anything else — including a lookalike such as
-/// `api5.cursor.sh.evil.example` — is refused. Userinfo is refused because `https://user@host/`
-/// would send the *url's* userinfo, and a query or fragment has no meaning on an origin.
-pub fn validate_origin(url: &str) -> Result<String, &'static str> {
+/// Reduce a configured base url to an origin, if it points at Cursor.
+fn cursor_host_origin(url: &str) -> Result<String, &'static str> {
     let rest = url
         .strip_prefix("https://")
-        .ok_or("an agent url must use https")?;
+        .ok_or("a base url must use https")?;
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     if authority.is_empty() {
-        return Err("the agent url has no host");
+        return Err("the base url has no host");
     }
     if authority.contains('@') {
-        return Err("an agent url must not carry userinfo");
+        return Err("a base url must not carry userinfo");
     }
     let lower = authority.to_ascii_lowercase();
     let host = match lower.rsplit_once(':') {
         Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
         _ => lower.as_str(),
     };
-    let allowed = host == "api5.cursor.sh" || host.ends_with(".api5.cursor.sh");
+    let allowed = host == "cursor.sh"
+        || host.ends_with(".cursor.sh")
+        || host == "cursor.com"
+        || host.ends_with(".cursor.com");
     if !allowed {
-        return Err("an agent url must point at api5.cursor.sh");
+        return Err("a base url must point at a Cursor host");
     }
-    // Rebuilt from the lowercased authority so a mixed-case host does not defeat the SNI.
     Ok(format!("https://{lower}"))
 }
 
@@ -1107,6 +1145,10 @@ pub fn request_headers(
             "x-ghost-mode".to_owned(),
             if ghost_mode { "true" } else { "false" }.to_owned(),
         ),
+        // Set by the reference client on every request of a bidi-disabled session, which is the
+        // shape this transport implements. The h2 session does not carry it, so it is a marker of
+        // *how* the turn is delivered rather than of who is calling.
+        ("x-cursor-streaming".to_owned(), "true".to_owned()),
         ("x-request-id".to_owned(), identity.request_id.clone()),
         (
             "x-original-request-id".to_owned(),
@@ -1120,21 +1162,29 @@ pub fn request_headers(
     ])
 }
 
-/// The header list for the unary `GetServerConfig` call.
+/// The header list for a unary `BidiAppend`.
 ///
-/// Deliberately shorter than [`request_headers`]: the call is unary protobuf, not a Connect stream,
-/// so it carries no `connect-protocol-version`, no `x-ghost-mode` and no trace context. Sending the
-/// stream headers here would make the request look like something it is not.
-pub fn discovery_headers(authorization: &str) -> Result<Vec<(String, String)>, CursorError> {
-    if authorization.is_empty() || authorization.contains(['\r', '\n']) {
-        return Err(CursorError::Header("authorization"));
+/// The append endpoint is the agent service itself, so the client fingerprint and the credential
+/// travel with it; only the content type changes. `application/connect+proto` describes a Connect
+/// *stream*, and an append body is one bare protobuf message, so a request that claimed streaming
+/// would be framed wrongly at both ends.
+///
+/// UNCERTAIN: the append call was reconstructed from the installed CLI bundle, which shows the
+/// message and the endpoint but not the full header set. Every header here is one the CLI already
+/// sends somewhere on the same connection; none of them is invented.
+pub fn append_headers(
+    authorization: &str,
+    ghost_mode: bool,
+    client_version: &str,
+    identity: &RequestIdentity,
+) -> Result<Vec<(String, String)>, CursorError> {
+    let mut headers = request_headers(authorization, ghost_mode, client_version, identity)?;
+    for (name, value) in &mut headers {
+        if name == "content-type" {
+            *value = "application/proto".to_owned();
+        }
     }
-    Ok(vec![
-        ("authorization".to_owned(), authorization.to_owned()),
-        ("content-type".to_owned(), "application/proto".to_owned()),
-        ("accept".to_owned(), "application/proto".to_owned()),
-        ("user-agent".to_owned(), CONNECT_USER_AGENT.to_owned()),
-    ])
+    Ok(headers)
 }
 
 /// Token counts from `turn_ended`.
@@ -1168,7 +1218,10 @@ pub enum EndReason {
 /// What one decoded frame produced.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Effects {
-    /// Fully framed client messages to write back on the same HTTP/2 stream.
+    /// Bare client messages to deliver back to the server, one append each.
+    ///
+    /// Not framed: an append is a unary call carrying one protobuf message, so a Connect envelope
+    /// here would be read as part of the message.
     pub outbound: Vec<Vec<u8>>,
     /// OpenAI SSE bytes to hand to the client.
     pub sse: Vec<u8>,
@@ -1494,9 +1547,7 @@ impl StreamState {
                 pb::put_uint(&mut exec, 1, id);
                 pb::put_str(&mut exec, 15, &exec_id);
                 pb::put_bytes(&mut exec, 10, &result);
-                effects
-                    .outbound
-                    .push(encode_frame(&client_message(2, &exec)));
+                effects.outbound.push(client_message(2, &exec));
             }
         }
 
@@ -1507,9 +1558,7 @@ impl StreamState {
                 pb::put_uint(&mut exec, 1, id);
                 pb::put_str(&mut exec, 15, &exec_id);
                 pb::put_bytes(&mut exec, 36, &[]);
-                effects
-                    .outbound
-                    .push(encode_frame(&client_message(2, &exec)));
+                effects.outbound.push(client_message(2, &exec));
             }
         }
         Ok(())
@@ -1546,7 +1595,7 @@ impl StreamState {
                 // Echoed verbatim: it is an opaque routing token the server expects back.
                 pb::put_bytes(&mut kv, 4, metadata);
             }
-            effects.outbound.push(encode_frame(&client_message(3, &kv)));
+            effects.outbound.push(client_message(3, &kv));
         }
 
         if let Some(set) = set {
@@ -1560,7 +1609,7 @@ impl StreamState {
             if let Some(metadata) = metadata {
                 pb::put_bytes(&mut kv, 4, metadata);
             }
-            effects.outbound.push(encode_frame(&client_message(3, &kv)));
+            effects.outbound.push(client_message(3, &kv));
 
             // The ack of a blob write is the last thing some composer models ever send. Only those
             // models, only after text, and only when no tool activity has happened: for other models
@@ -1621,9 +1670,7 @@ impl StreamState {
         let mut response = Vec::new();
         pb::put_uint(&mut response, 1, query_id);
         pb::put_bytes(&mut response, answer_field, &[]);
-        effects
-            .outbound
-            .push(encode_frame(&client_message(6, &response)));
+        effects.outbound.push(client_message(6, &response));
         Ok(())
     }
 
@@ -1773,6 +1820,125 @@ fn json_error_message(value: &Value) -> Option<String> {
         return Some(text.to_owned());
     }
     Some(value.to_string())
+}
+
+/// A refusal the server sent in-band, classified.
+///
+/// "In-band" is the point: the turn was already accepted at the HTTP level — a `200` and an open
+/// stream — so this object is the only thing that says the turn will not happen. It is classified
+/// rather than left as prose because the relay acts on it, and *whether to fail over* and *which
+/// state to park* must not be decided by matching words in a sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// The server's code, e.g. `resource_exhausted`.
+    pub code: String,
+    /// The server's own sentence, already flattened for a human.
+    pub message: String,
+    /// Whether the server told the client to switch model.
+    ///
+    /// Cursor reports a model the account's plan does not include under `resource_exhausted` — the
+    /// same code a rate limit uses — and separates the two only by offering a model switch in the
+    /// error's buttons. That structure is the signal: a rate limit carries no such button. Matching
+    /// the sentence instead would be wrong twice over, because the wording is nobody's contract and
+    /// the sentence for a genuine rate limit can name a model too.
+    pub model_unavailable: bool,
+}
+
+impl Refusal {
+    /// The HTTP status this refusal becomes when it stands in for the turn.
+    ///
+    /// A refusal of the *request* stays a `400`: another account would refuse it identically, so the
+    /// relay must neither cool anything down nor fail over. A refusal about the account becomes the
+    /// status that makes the relay treat it as one — `429` rather than `402`, because the account is
+    /// not out of money, it is out of this model.
+    pub fn status(&self) -> u16 {
+        match self.code.as_str() {
+            "invalid_argument" | "failed_precondition" => 400,
+            // A model id the upstream's catalogue does not contain is the request's mistake, not the
+            // credential's. `404` keeps it in the branch that neither parks the account nor fails
+            // over, which is what a typo deserves; a `502` would park every model on the account.
+            "not_found" => 404,
+            "unauthenticated" => 401,
+            "permission_denied" => 403,
+            "resource_exhausted" => 429,
+            "unavailable" => 503,
+            _ => 502,
+        }
+    }
+}
+
+/// Classify a frame that is a JSON refusal, if it is one.
+///
+/// Both shapes the server uses are accepted: an ordinary frame carrying `{"error": …}` and the
+/// end-of-stream trailer carrying the same object. A frame that is not JSON, or JSON without an
+/// `error` member, is not a refusal and returns `None` — the caller keeps its existing behaviour
+/// rather than inventing a cause.
+pub fn refusal(frame: &Frame) -> Option<Refusal> {
+    if frame.payload.first() != Some(&b'{') {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&frame.payload).ok()?;
+    let error = value.get("error")?;
+    let message = refusal_message(&value)?;
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let model_unavailable = error
+        .get("details")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|detail| detail.get("debug"))
+        .filter_map(|debug| debug.get("details"))
+        .filter_map(|details| details.get("buttons"))
+        .filter_map(Value::as_array)
+        .flatten()
+        .any(|button| button.get("switchModel").is_some());
+    Some(Refusal {
+        code,
+        message,
+        model_unavailable,
+    })
+}
+
+/// The server's own sentence for a refusal.
+///
+/// The top-level `message` of these errors is the placeholder `"Error"`. What the reference client
+/// actually shows lives one level down, under each detail's debug structure: `detail` is the sentence
+/// (what happened, and what to do about it) and `title` is its short form. Reading only the top-level
+/// member would hand the operator a `429` whose body says `Error`, which is no more actionable than
+/// the status code alone — so the placeholder is skipped rather than preferred.
+fn refusal_message(value: &Value) -> Option<String> {
+    /// Wordings that carry no information; the caller has more to say than these do.
+    const PLACEHOLDERS: [&str; 2] = ["error", "unknown error"];
+    let top = json_error_message(value).filter(|message| {
+        let trimmed = message.trim();
+        !trimmed.is_empty()
+            && !PLACEHOLDERS
+                .iter()
+                .any(|placeholder| trimmed.eq_ignore_ascii_case(placeholder))
+    });
+    if top.is_some() {
+        return top;
+    }
+    let details = value.get("error")?.get("details")?.as_array()?;
+    for debug in details
+        .iter()
+        .filter_map(|detail| detail.get("debug"))
+        .filter_map(|debug| debug.get("details"))
+    {
+        for key in ["detail", "title"] {
+            if let Some(text) = debug.get(key).and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    return Some(text.to_owned());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Whether a model id belongs to the Composer family, the one that may end a turn with a blob write.
@@ -1935,10 +2101,6 @@ mod tests {
             client_streaming: true,
             session_id: session,
         }
-    }
-
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     fn varint_field(payload: &[u8], field: u32) -> Option<u64> {
@@ -2111,12 +2273,14 @@ mod tests {
         assert_eq!(
             hex(&payload),
             concat!(
-                "120d",       // 2: action, 13 bytes
-                "0a0b",       //   1: user_message_action, 11 bytes
-                "0a026869",   //     1: text "hi"
-                "120169",     //     2: message_id "i"
-                "1a00",       //     3: selected_context, present and empty
-                "2001",       //     4: mode = 1
+                "0a00",       // 1: conversation_state, present and empty
+                "120f",       // 2: action, 15 bytes
+                "0a0d",       //   1: user_message_action, 13 bytes
+                "0a0b",       //     1: user_message, 11 bytes
+                "0a026869",   //       1: text "hi"
+                "120169",     //       2: message_id "i"
+                "1a00",       //       3: selected_context, present and empty
+                "2001",       //       4: mode = 1
                 "1a09",       // 3: model_details, 9 bytes
                 "0a016d",     //   1: model_id "m"
                 "1a016d",     //   3: display_model_id "m"
@@ -2131,18 +2295,22 @@ mod tests {
     }
 
     #[test]
-    fn the_system_prompt_is_sent_as_a_sha256_digest_of_its_json_blob() {
+    fn the_conversation_state_is_present_and_empty() {
+        // A state that names a blob the server cannot hydrate fails the turn with a message about
+        // the *action*, so the empty state is load-bearing and worth pinning.
         let conversation = Conversation {
             system: Some("be brief".to_owned()),
-            text: "hi".to_owned(),
+            text: "be brief\n\nhi".to_owned(),
         };
         let payload = run_request("m", &conversation, "c", "i");
         let state = pb::message(&payload, 1).unwrap().unwrap();
-        let digest = pb::message(state, 1).unwrap().unwrap();
-        let expected = Sha256::digest(br#"{"role":"system","content":"be brief"}"#);
-        assert_eq!(digest, expected.as_slice());
-        // Turns are not sent: there is no conversation history in this frame.
-        assert!(pb::message(state, 8).unwrap().is_none());
+        assert!(state.is_empty(), "no checkpoint, no blob ids, no turns");
+        // The system prompt is not lost: it is the head of the user text.
+        let action = pb::message(&payload, 2).unwrap().unwrap();
+        let user_message_action = pb::message(action, 1).unwrap().unwrap();
+        let user_message = pb::message(user_message_action, 1).unwrap().unwrap();
+        let text = pb::message(user_message, 1).unwrap().unwrap();
+        assert_eq!(text, b"be brief\n\nhi");
     }
 
     #[test]
@@ -2153,7 +2321,16 @@ mod tests {
             run.model, "default",
             "`auto` is spelled `default` on the wire"
         );
-        let payload = &run.frame[5..];
+        // The frame is the Connect envelope; inside it is the `AgentClientMessage` an append also
+        // carries, and inside that is the run request itself.
+        let client_message = &run.frame[5..];
+        assert_eq!(
+            run.payload, client_message,
+            "the append carries the frame body"
+        );
+        let payload = pb::message(client_message, 1)
+            .unwrap()
+            .expect("1: run_request");
         assert_eq!(pb::message(payload, 4), Ok(Some(&[][..])), "mcp_tools");
         assert_eq!(
             varint_field(payload, 12),
@@ -2224,10 +2401,10 @@ mod tests {
     }
 
     #[test]
-    fn the_system_prompt_reaches_the_model_in_the_user_text_as_well_as_the_digest() {
-        // `conversation_state` carries a digest the server is observed not to apply, so the prompt
-        // itself has to travel in the one text field the frame has. Losing it here would silently
-        // drop every system prompt without any error.
+    fn the_system_prompt_reaches_the_model_in_the_user_text() {
+        // The prompt travels in the one text field the frame has, because the state field is a
+        // checkpoint and this transport never sends one. Losing it here would silently drop every
+        // system prompt without any error.
         let body = br#"{"messages":[{"role":"system","content":"be terse"},{"role":"user","content":"hi"}]}"#;
         let run = prepare_run(&ctx("auto", None), body, "message-system").unwrap();
         assert_eq!(run.text, "be terse\n\nhi");
@@ -2311,79 +2488,35 @@ mod tests {
         );
     }
 
-    // -- host discovery -----------------------------------------------------------------------
-
     #[test]
-    fn host_validation_admits_only_the_agent_allow_list() {
+    fn a_bidi_disabled_turn_goes_to_the_configured_cursor_backend() {
+        // The provider's own base url, reduced to an origin: this is the common case, and the path
+        // the configured url may carry has no meaning on an origin.
         assert_eq!(
-            validate_origin("https://agent.api5.cursor.sh").unwrap(),
-            "https://agent.api5.cursor.sh"
+            backend_origin(Some("https://api2.cursor.sh")),
+            "https://api2.cursor.sh"
         );
         assert_eq!(
-            validate_origin("https://AGENT.api5.cursor.sh").unwrap(),
-            "https://agent.api5.cursor.sh"
-        );
-        assert_eq!(
-            validate_origin("https://api5.cursor.sh").unwrap(),
+            backend_origin(Some("https://API5.cursor.sh/v1/chat")),
             "https://api5.cursor.sh"
         );
         assert_eq!(
-            validate_origin("https://agent.api5.cursor.sh:443/ignored/path?x=1").unwrap(),
-            "https://agent.api5.cursor.sh:443"
+            backend_origin(Some("https://api2.cursor.sh:8443")),
+            "https://api2.cursor.sh:8443"
         );
+        // Nothing configured, or something that is not Cursor at all: the shipped backend, not a
+        // failed turn. The credential is not sent to the host the typo named.
+        assert_eq!(backend_origin(None), BACKEND_ORIGIN);
         for refused in [
-            "http://agent.api5.cursor.sh",
-            "https://agent.api5.cursor.sh.evil.example",
+            "http://api2.cursor.sh",
+            "https://api2.cursor.sh.evil.example",
             "https://evil.example",
-            "https://user:pw@agent.api5.cursor.sh",
+            "https://user:pw@api2.cursor.sh",
             "https://",
-            "agent.api5.cursor.sh",
+            "api2.cursor.sh",
         ] {
-            assert!(validate_origin(refused).is_err(), "accepted {refused}");
+            assert_eq!(backend_origin(Some(refused)), BACKEND_ORIGIN, "{refused}");
         }
-    }
-
-    #[test]
-    fn host_selection_prefers_ghost_mode_and_falls_back_when_discovery_is_empty_or_bad() {
-        let urls = AgentUrls {
-            agent: "https://agent.api5.cursor.sh".to_owned(),
-            agentn: "https://agentn.api5.cursor.sh".to_owned(),
-        };
-        assert_eq!(
-            urls.select(true),
-            ("https://agent.api5.cursor.sh".to_owned(), true)
-        );
-        assert_eq!(
-            urls.select(false),
-            ("https://agentn.api5.cursor.sh".to_owned(), true)
-        );
-
-        let empty = AgentUrls::default();
-        assert_eq!(empty.select(true).0, FALLBACK_AGENT_ORIGIN);
-        assert_eq!(empty.select(false).0, FALLBACK_AGENTN_ORIGIN);
-        assert!(!empty.select(true).1);
-
-        let hostile = AgentUrls {
-            agent: "https://attacker.example".to_owned(),
-            agentn: String::new(),
-        };
-        assert_eq!(hostile.select(true).0, FALLBACK_AGENT_ORIGIN);
-        assert!(!hostile.select(true).1);
-    }
-
-    #[test]
-    fn the_server_config_field_27_yields_both_origins() {
-        let mut config = Vec::new();
-        pb::put_str(&mut config, 1, "https://agent.api5.cursor.sh");
-        pb::put_str(&mut config, 2, "https://agentn.api5.cursor.sh");
-        let mut response = Vec::new();
-        pb::put_bytes(&mut response, 27, &config);
-        let urls = parse_agent_url_config(&response).unwrap();
-        assert_eq!(urls.agent, "https://agent.api5.cursor.sh");
-        assert_eq!(urls.agentn, "https://agentn.api5.cursor.sh");
-
-        // No field 27 is not an error: the caller falls back.
-        assert!(parse_agent_url_config(&[]).is_none());
     }
 
     // -- headers ------------------------------------------------------------------------------
@@ -2414,6 +2547,7 @@ mod tests {
                 ("x-cursor-client-type", "cli"),
                 ("x-cursor-client-version", PINNED_CLIENT_VERSION),
                 ("x-ghost-mode", "true"),
+                ("x-cursor-streaming", "true"),
                 ("x-request-id", "0f8fad5b-d9cb-469f-a165-70867728950e"),
                 (
                     "x-original-request-id",
@@ -2480,35 +2614,6 @@ mod tests {
         assert!(headers
             .iter()
             .any(|(name, value)| name == "x-cursor-client-version" && value == good));
-    }
-
-    #[test]
-    fn the_discovery_call_carries_unary_proto_headers_and_nothing_else() {
-        let headers = discovery_headers("Bearer session-token").expect("headers");
-        let pairs: Vec<(&str, &str)> = headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
-            .collect();
-        assert_eq!(
-            pairs,
-            vec![
-                ("authorization", "Bearer session-token"),
-                ("content-type", "application/proto"),
-                ("accept", "application/proto"),
-                ("user-agent", CONNECT_USER_AGENT),
-            ]
-        );
-        // A unary protobuf call is not a Connect stream: sending the stream headers would describe
-        // the request as something `GetServerConfig` is not.
-        for (name, _) in &pairs {
-            assert_ne!(*name, "connect-protocol-version");
-            assert_ne!(*name, "x-ghost-mode");
-            assert_ne!(*name, "traceparent");
-        }
-        // A missing credential, and one that could inject a second header, are both refused rather
-        // than sent.
-        assert!(discovery_headers("").is_err());
-        assert!(discovery_headers("Bearer ok\r\nx-evil: 1").is_err());
     }
 
     #[test]
@@ -2640,6 +2745,88 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_is_classified_by_its_code_and_its_switch_model_button() {
+        // The shape Cursor used for a model the account's plan does not include, cut down to the
+        // parts that matter: the code, the placeholder top-level message, the sentence the client
+        // actually shows under the debug detail, and the button that offers a different model.
+        let payload = br#"{"error":{"code":"resource_exhausted","message":"Error",
+            "details":[{"debug":{"details":{"title":"Model unavailable on Free",
+            "detail":"Free includes Grok 4.7, Grok 4.6, and Auto with fixed settings.",
+            "buttons":[{"switchModel":{"suggestedModel":"default"}}]}}}]}}"#;
+        let classified = refusal(&Frame {
+            payload: payload.to_vec(),
+            trailer: false,
+        })
+        .expect("a refusal");
+        assert_eq!(classified.code, "resource_exhausted");
+        assert_eq!(classified.status(), 429);
+        assert!(classified.model_unavailable);
+        assert_eq!(
+            classified.message, "Free includes Grok 4.7, Grok 4.6, and Auto with fixed settings.",
+            "the placeholder must not be preferred over the sentence the server wrote"
+        );
+
+        // A title alone is still more than `Error`, so a payload whose detail is missing falls back
+        // to it rather than to the placeholder.
+        let titled = br#"{"error":{"code":"resource_exhausted","message":"Error",
+            "details":[{"debug":{"details":{"title":"Model unavailable on Free",
+            "buttons":[{"switchModel":{"suggestedModel":"default"}}]}}}]}}"#;
+        let classified = refusal(&Frame {
+            payload: titled.to_vec(),
+            trailer: false,
+        })
+        .expect("a refusal");
+        assert_eq!(classified.message, "Model unavailable on Free");
+        assert!(classified.model_unavailable);
+
+        // The same code without the button is a rate limit, not a plan limit: it must not park one
+        // model, and it must not claim the operator's plan is the cause.
+        let plain = br#"{"error":{"code":"resource_exhausted","message":"slow down"}}"#;
+        let classified = refusal(&Frame {
+            payload: plain.to_vec(),
+            trailer: false,
+        })
+        .expect("a refusal");
+        assert!(!classified.model_unavailable);
+        assert_eq!(classified.status(), 429);
+
+        // A request the server could not read is the *request's* fault. Another account would refuse
+        // it identically, so it must not become something the relay retries or cools down for.
+        let malformed = br#"{"error":{"code":"invalid_argument","message":"Action is required"}}"#;
+        let classified = refusal(&Frame {
+            payload: malformed.to_vec(),
+            trailer: false,
+        })
+        .expect("a refusal");
+        assert_eq!(classified.status(), 400);
+
+        // An unknown model id is a mistake in the request, so it must not become a `502` that parks
+        // the credential: the provider would be blamed for a name it never offered.
+        let unknown =
+            br#"{"error":{"code":"not_found","message":"Model name is not valid: \"grok-4.6\""}}"#;
+        let classified = refusal(&Frame {
+            payload: unknown.to_vec(),
+            trailer: false,
+        })
+        .expect("a refusal");
+        assert_eq!(classified.status(), 404);
+        assert!(!classified.model_unavailable);
+        assert!(classified.message.contains("not valid"));
+
+        // JSON that carries no error, and a frame that is not JSON at all, are not refusals.
+        assert!(refusal(&Frame {
+            payload: b"{}".to_vec(),
+            trailer: false,
+        })
+        .is_none());
+        assert!(refusal(&Frame {
+            payload: vec![0x0a, 0x00],
+            trailer: false,
+        })
+        .is_none());
+    }
+
+    #[test]
     fn a_request_context_request_is_answered_with_an_empty_tool_list_once() {
         let mut args = Vec::new();
         pb::put_bytes(&mut args, 1, &[]);
@@ -2652,7 +2839,7 @@ mod tests {
         let mut state = state();
         let effects = state.on_frame(&frame, 10).unwrap();
         assert_eq!(effects.outbound.len(), 1);
-        let message = &effects.outbound[0][5..];
+        let message = effects.outbound[0].as_slice();
         let exec = pb::message(message, 2).unwrap().unwrap();
         assert_eq!(varint_field(exec, 1), Some(7));
         assert_eq!(pb::message(exec, 15).unwrap().unwrap(), b"e1");
@@ -2689,7 +2876,7 @@ mod tests {
 
         let mut state = state();
         let effects = state.on_frame(&server_message(4, &kv), 10).unwrap();
-        let message = &effects.outbound[0][5..];
+        let message = effects.outbound[0].as_slice();
         let kv = pb::message(message, 3).unwrap().unwrap();
         assert_eq!(varint_field(kv, 1), Some(3));
         let result = pb::message(kv, 2).unwrap().unwrap();
@@ -2708,7 +2895,7 @@ mod tests {
 
         let mut state = state();
         let effects = state.on_frame(&server_message(4, &kv), 10).unwrap();
-        let message = &effects.outbound[0][5..];
+        let message = effects.outbound[0].as_slice();
         let reply = pb::message(message, 3).unwrap().unwrap();
         assert_eq!(varint_field(reply, 1), Some(4));
         assert_eq!(pb::message(reply, 3).unwrap().unwrap(), b"");
@@ -2719,7 +2906,7 @@ mod tests {
         pb::put_uint(&mut kv, 1, 5);
         pb::put_bytes(&mut kv, 2, &get);
         let effects = state.on_frame(&server_message(4, &kv), 11).unwrap();
-        let message = &effects.outbound[0][5..];
+        let message = effects.outbound[0].as_slice();
         let kv = pb::message(message, 3).unwrap().unwrap();
         let result = pb::message(kv, 2).unwrap().unwrap();
         assert_eq!(pb::message(result, 1).unwrap().unwrap(), b"state-bytes");
@@ -2763,7 +2950,7 @@ mod tests {
         let mut state = state();
         let effects = state.on_frame(&frame, 10).unwrap();
         assert_eq!(effects.outbound.len(), 1);
-        let message = &effects.outbound[0][5..];
+        let message = effects.outbound[0].as_slice();
         let reply = pb::message(message, 6).unwrap().unwrap();
         assert_eq!(varint_field(reply, 1), Some(42));
         // The reply carries the query's own variant field (2, here: a web-search approval). It
@@ -2857,5 +3044,67 @@ mod tests {
             )
             .unwrap();
         assert!(to_anthropic_response(&ctx, &error.sse).is_err());
+    }
+
+    #[test]
+    fn a_bidi_request_id_is_one_length_delimited_string_field_in_a_connect_envelope() {
+        // BidiRequestId: field 1, wire type 2, one byte of length, the id.
+        let encoded = bidi_request_id("abc");
+        assert_eq!(encoded, vec![0x0a, 0x03, b'a', b'b', b'c']);
+        // The ids this router mints are UUIDs, so the length is always one byte.
+        assert_eq!(bidi_request_id(&"0".repeat(36))[1], 36);
+        // On the stream it travels in an envelope, flags 0 and a big-endian length.
+        assert_eq!(
+            bidi_request_body("abc"),
+            vec![0x00, 0x00, 0x00, 0x00, 0x05, 0x0a, 0x03, b'a', b'b', b'c']
+        );
+    }
+
+    #[test]
+    fn a_bidi_append_carries_the_hex_payload_the_id_and_the_seqno() {
+        // The three fields the CLI's HTTP/1.1 path writes, in field order: data (1, hex), id (2, a
+        // BidiRequestId message), seqno (3). The payload must not be framed: a length prefix here
+        // would be encoded as hex and read back as protobuf, and the turn would be rejected or,
+        // worse, silently misparsed.
+        let encoded = bidi_append_request("ab", 0, &[0x08, 0x01]);
+        assert_eq!(
+            encoded,
+            vec![
+                0x0a, 0x04, b'0', b'8', b'0', b'1', // 1: data, the payload as lowercase hex
+                0x12, 0x04, // 2: request_id, a BidiRequestId message of 4 bytes
+                0x0a, 0x02, b'a', b'b', //   1: its request_id string
+                0x18, 0x00, // 3: append_seqno = 0
+            ]
+        );
+        // No `data_binary`: a binaryEncoding client would use it, this one does not, and the server
+        // reads whichever the reference client actually sends.
+        assert!(!encoded.contains(&0x22));
+        // A seqno above 127 needs two varint bytes, which is where a fixed-width encoder would lie.
+        let later = bidi_append_request("a", 300, &[]);
+        assert_eq!(
+            later,
+            vec![0x0a, 0x00, 0x12, 0x03, 0x0a, 0x01, b'a', 0x18, 0xac, 0x02]
+        );
+    }
+
+    #[test]
+    fn the_append_headers_describe_a_unary_call_but_keep_the_fingerprint() {
+        let identity = RequestIdentity {
+            request_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            traceparent: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_owned(),
+        };
+        let headers = append_headers("Bearer x", true, PINNED_CLIENT_VERSION, &identity).unwrap();
+        let find = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(find("content-type"), Some("application/proto"));
+        assert_eq!(find("authorization"), Some("Bearer x"));
+        assert_eq!(find("x-cursor-client-type"), Some("cli"));
+        assert_eq!(find("x-ghost-mode"), Some("true"));
+        assert_eq!(find("x-request-id"), Some(&identity.request_id[..]));
+        assert_eq!(find("connect-accept-encoding"), Some("gzip"));
     }
 }
