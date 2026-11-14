@@ -96,6 +96,16 @@ and that is stated where the figures live.
   (the kernel is push-and-run), the `kaggle` CLI is not installed on this host, and Kaggle's terms
   forbid more than one active account, so pooled rotation is out of scope rather than unimplemented.
 
+## Where the work actually went
+
+Direct pushes to `RobertoTornel/Manarouter` are refused for the only authenticated account
+(`403 Permission ... denied to ElizaNagase`), so the branch was pushed to the writable fork
+`ElizaNagase/Manarouter` as a fast-forward from `c3bbf88` to the tip and opened there as PR #16,
+which carries PR #15's merge (`0e36fa2`) plus everything after it. PR #15 is still `OPEN` and
+`MERGEABLE` upstream; merging #16 lands its content in `main` without a separate merge on #15,
+because #15's head `4f6eeda` is already an ancestor of the tip. A second identity with write
+access would let the same push go straight upstream.
+
 ## Blocked, and needing you
 
 1. **Rotate the Modal CLI credential.** It was exposed in a log earlier. I did not repeat it anywhere.
