@@ -994,7 +994,10 @@ impl Provider {
         let mut out = Vec::new();
         let wants = |c: Capability| self.capabilities.contains(&c);
         match self.dialect {
-            Dialect::Anthropic => {
+            // ZCode's plan surface is the same Messages endpoint and nothing else, so the same
+            // complaints apply. Its count-tokens route is answered locally rather than proxied, so
+            // `messages` covers a client that counts through it.
+            Dialect::Anthropic | Dialect::Zcode => {
                 if wants(Capability::Embeddings) {
                     out.push(
                         "the Anthropic Messages dialect has no embeddings endpoint".to_string(),

@@ -2085,7 +2085,9 @@ fn dialect_reasoning_fragment(
         Dialect::Codex => {
             serde_json::json!({ "reasoning": { "effort": effort, "summary": "auto" } })
         }
-        Dialect::Anthropic => serde_json::json!({
+        // ZCode is the same body shape as Anthropic — the app builds it with the AI SDK's
+        // Anthropic client — so it takes the same `thinking` fragment, budget and all.
+        Dialect::Anthropic | Dialect::Zcode => serde_json::json!({
             "thinking": { "type": "enabled", "budget_tokens": thinking_budget(level) }
         }),
         // The AI Studio surface takes a level **or** a budget and refuses a body carrying both —

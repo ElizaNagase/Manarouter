@@ -9,6 +9,7 @@
 //! | `github-copilot`   | [`copilot::Copilot`] | GitHub device code                |
 //! | `antigravity`      | [`antigravity::Antigravity`] | loopback authorization code (T2 experimental, T1 selectable) |
 //! | `cursor`           | [`cursor::Cursor`]   | browser-completion page + poll     |
+//! | `zcode`            | [`zcode::Zcode`]     | brokered CLI login: created, then polled until the browser finishes |
 //! | `cline`            | not registered       | no verified interactive flow      |
 //! | OmniRoute additional providers | not ported | provider-specific review required |
 //!
@@ -48,6 +49,7 @@ pub mod migrate;
 pub mod reference;
 pub mod refresh;
 pub mod session;
+pub mod zcode;
 
 use std::fmt;
 use std::time::Duration;
@@ -717,14 +719,17 @@ use antigravity::Antigravity;
 use codex::Codex;
 use copilot::Copilot;
 use cursor::Cursor;
+use zcode::Zcode;
 
 static CODEX: Codex = Codex;
 static COPILOT: Copilot = Copilot;
 static ANTIGRAVITY: Antigravity = Antigravity::ide();
 static CURSOR: Cursor = Cursor;
+static ZCODE: Zcode = Zcode;
 
 /// Registration order for implemented platforms, matching `catalog/providers.toml`.
-static PLATFORMS: [&'static dyn OAuthPlatform; 4] = [&CODEX, &COPILOT, &ANTIGRAVITY, &CURSOR];
+static PLATFORMS: [&'static dyn OAuthPlatform; 5] =
+    [&CODEX, &COPILOT, &ANTIGRAVITY, &CURSOR, &ZCODE];
 
 /// Every registered platform. Required to resolve every `AuthKind::OAuth` catalogue id — see
 /// the tests at the bottom of this file, which check both directions.

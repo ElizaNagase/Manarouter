@@ -1,6 +1,6 @@
 # 24 — Provider dialects
 
-A **dialect** is the shape of HTTP API an upstream speaks. This document says what each of the nine
+A **dialect** is the shape of HTTP API an upstream speaks. This document says what each of the ten
 is on the wire, which client routes can reach it, what the relay rewrites on the way in and on the
 way back, and where the edges are. It is one level above the per-provider guides in
 [providers/](providers/README.md): those describe a *vendor*, this describes a *protocol*.
@@ -29,6 +29,7 @@ The set is closed and small — ten members (`dialect.rs:17-45`, and `Dialect::A
 | `CommandCodeGo` | `command-code-go` | `command-code-go` | 1 |
 | `ModalVllm` | `modal-vllm` | `modal-vllm` | 0 |
 | `Cursor` | `cursor` | `cursor` | 1 |
+| `Zcode` | `zcode` | `zcode` | 1 |
 
 Two spellings exist for a reason, and they differ for one member. `as_str` is the permissive,
 human-facing id; `serde`'s `kebab-case` rename is the strict wire form, and the two differ exactly
@@ -101,6 +102,7 @@ upstream response straight back.
 | `antigravity` | `v1internal:generateContent` | no | effectively yes | Gemini `generateContent` inside a Cloud Code envelope |
 | `command-code-go` | `alpha/generate` | no | yes | Command Code CLI envelope and private event stream |
 | `cursor` | `/agent.v1.AgentService/Run` | no | yes, only | Cursor's bidirectional Connect stream of protobuf frames |
+| `zcode` | `/v1/messages` | yes, from an Anthropic client | no | Anthropic Messages on the ZCode app's plan surface, behind its attribution headers |
 
 The path column is the path a request ends up at: the **dialect default** for the client's route,
 unless the provider's `route_overrides` names one or a translator supplies one. The two Gemini
@@ -208,7 +210,7 @@ match (`crates/mr-dialects/src/google.rs:67-93`).
 
 **On the wire.** OpenAI's public API surface: `/v1/chat/completions`, `/v1/responses`,
 `/v1/embeddings`, `/v1/audio/*`, `/v1/images/generations`, `/v1/models` (`dialect.rs:18-22`). This is
-the baseline — by far the largest group of providers speak it, and 195 of the 206 shipped templates
+the baseline — by far the largest group of providers speak it, and 195 of the 207 shipped templates
 use it.
 
 **Who can reach it.** Every client route. The OpenAI dialect is the client dialect of every route
@@ -278,6 +280,47 @@ provider's base URL is expected to already end in `/v1`" (`anthropic.rs:43-50`).
 
 **Read next.** [Anthropic-compatible providers](providers/anthropic-compatible.md) for the native
 `/v1/messages` argument and the block-versus-message difference.
+
+---
+
+## `zcode` — Anthropic Messages behind the app's plan surface
+
+**On the wire.** `POST https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`: the ZCode desktop
+app's own plan endpoint, serving **Anthropic Messages**. The body is a Messages object, unchanged —
+the app builds it with the AI SDK's Anthropic client (`crates/mr-dialects/src/zcode.rs`). The
+credential is `x-api-key`, and `anthropic-version` is required.
+
+**Who can reach it.** Both client dialects. An Anthropic client's body is already the right shape, so
+it is forwarded byte for byte; an OpenAI client goes through `anthropic::from_openai_request`, which
+is the same converter the `anthropic` dialect uses. The pair is **not** listed in
+`Dialect::is_passthrough_to`, which keeps meaning "identical dialect" — the path, the attribution
+headers and the credential all differ, they just do not live in the body.
+
+**What the relay does.** Selects the dialect's `v1/messages` path, lets `mr-dialects::zcode` name it,
+and adds the header block the app attaches to every model request: `x-request-id`, `x-zcode-trace-id`
+(one fresh id, both names), `x-zcode-session-type: main`, and `x-session-id` — the client's own
+conversation marker with its `sess_` / `subagent_agent_` prefixes stripped, or the fresh id when the
+client has none. The app's *identity* headers (`User-Agent`, `X-ZCode-App-Version`, `X-Title`,
+`X-Platform`, `X-Client-*`) are deliberately absent: on the recorded wire they ride its configuration
+requests, not its inference.
+
+**Quirks.**
+
+- **Signing is not implemented, and that is a deliberate gap.** The app signs these requests
+  (`X-Client-Ts` / `X-Client-Sig` / `X-Client-Pow` and friends). This dialect sends the *unsigned*
+  request instead — the same one the app falls back to when its signer is skipped, the origin does
+  not match, or an attempt was refused. The consequence is honest and documented: a plan
+  `zhipu-account` token may be refused unsigned, and a plan API key belongs in the [`zai`
+  row](providers/catalog.md) rather than here. See [Z Code](providers/zcode.md).
+- **The login is brokered, not redirected.** There is no redirect URI to register: Manarouter creates
+  a flow at `zcode.z.ai/api/v1/oauth/cli/init` with a client id it generates, sends the human to the
+  `authorize_url` the reply carries (unmodified — the flow's own callback is what the poll listens
+  on), and polls until the browser finishes. The token is then traded
+  once at `api.z.ai/api/auth/z/login` for the business access token the inference surface accepts.
+- `count_tokens` is answered locally. The plan surface is the same Messages endpoint, but the app
+  never calls the counting route and the relay does not invent an upstream call for it.
+- Reasoning is the Anthropic `thinking` block: a reasoning level becomes
+  `{"thinking":{"type":"enabled","budget_tokens":…}}`, exactly as for `anthropic`.
 
 ---
 
@@ -722,6 +765,34 @@ machine are pinned by exact-byte assertions in the dialect's tests.
 
 **Read next.** [Cursor](28-oauth-cursor.md) for the login, and
 [providers/cursor.md](providers/cursor.md) for the operator steps.
+## Not a dialect — Cursor
+
+One platform is deliberately absent from the table above, and it is worth writing down why rather
+than rediscovering it: **Cursor**.
+
+Cursor publishes no inference API — only agent-management endpoints and its CLI's own agent
+protocol. That CLI talks to `agent.v1.AgentService` over the Connect protocol, and one turn is not a
+completion:
+
+- the request is an `AgentRunRequest` carrying a *conversation state* and an *action*, not a
+  `messages[]` array;
+- the prompt is assembled server-side from `ConversationStateStructure.root_prompt_messages_json`, a
+  repeated `bytes` field whose writer is not in the shipped client, so a router cannot produce it
+  from a chat history;
+- the traffic is a bidi channel: `RunSSE` streams `AgentServerMessage` frames while client messages
+  arrive on a separate `aiserver.v1.BidiService/BidiAppend` call with their own sequence numbers;
+- the auth is a two-layer API key → JWT exchange (`/auth/exchange_user_api_key`), the same shape as
+  Copilot's minted bearer.
+
+None of that is a dialect. A dialect maps one stateless request onto another stateless request;
+Cursor is an agent loop whose memory lives on the far side. The direction that does work is Cursor
+pointed at Manarouter's OpenAI surface through its own bring-your-own-key setting, which is a client
+configuration rather than a provider entry — and that is why there is no `cursor` row in the
+catalogue.
+
+**Read next.** [Cursor](providers/cursor.md) for the working direction, and
+[the CLI protocol record](research/cursor-cli-inference.md) for the recovered wire format, with every
+claim tagged read, observed, inferred or unknown.
 
 ---
 
