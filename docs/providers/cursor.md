@@ -98,6 +98,13 @@ curl http://127.0.0.1:20900/v1/chat/completions \
 - **Every retry is a new conversation.** The router fingerprints a conversation per turn rather than
   per session, so a retry does not continue the previous exchange — and two callers who happen to
   open with the same words do not share one Cursor conversation and its memory.
+- **A Free plan refuses most model ids, and the refusal is not a bug.** The plan includes `auto`,
+  `grok-4.7`, and `grok-4.6` with fixed settings; anything else answers with "Model unavailable on
+  Free" as a `429` naming the model, which the router treats as *this model is not on the plan* and
+  fails over. A `502` with "the server refused the turn without saying why" means Cursor refused
+  without naming a cause — the router cannot tell a plan limit from a transient fault there, so it
+  does not park anything.
+
 - **The transport is reverse-engineered.** The endpoints, the frame and message shapes, and the
   pinned client version come from the CLI's own traffic. It has been exercised live against a Free
   plan account (a real streamed answer), but a system prompt delivered as a server-side blob, tools,

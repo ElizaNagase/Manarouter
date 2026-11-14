@@ -739,6 +739,25 @@ and then ignored. With nothing else to fail over to, the relay still tries the s
 step once rather than pretending the provider is down, so a single-account deployment reports the
 plan's own sentence.
 
+**A refusal the server does not explain is still a refusal.** The gate above only helps if the
+dialect can name a refusal, and one shape has no sentence in it at all: `{"error":{"message":"Error",
+"type":"invalid_request_error"}}` — the placeholder, a type, and no code. That frame used to be
+treated as an ordinary in-band error, which meant the response head went out as `200` and a
+non-streaming caller received an error object under a success status; the account that had just
+refused kept the traffic. The dialect now writes the message itself when the server wrote none, and
+an unknown code keeps `Refusal::status`'s `502`. `UNCERTAIN:` the observation that produced this is a
+single live response from `cursor/gemini-4-hydrogen-high`; six later attempts against the same model
+were refused in-band with the Free-plan sentence instead.
+
+**A refusal later than the hold is reported in-band.** The transport holds the head for
+`FIRST_ANSWER_GRACE` (five seconds) so a refusal can still replace the response. A refusal that
+arrives after that window reaches a streaming caller as an ordinary SSE error chunk ending with
+`finish_reason: "error"`, and the non-streaming caller as `200` with an error body — the head is
+spent, and inventing a status after it would be a lie about what the client already received. This is
+the one case where the relay cannot fail over on a refusal; it is recorded here rather than fixed by
+lengthening the hold, because a longer hold would delay the first byte of every slow reasoning turn to
+buy correctness for a rare case.
+
 **What it will not do.** Client tools are refused rather than half-supported: answering a `tool_call`
 the server asks for is a protocol this transport does not implement, and the error names the field
 that would be needed. So are images and other non-text content. A provider with a proxy configured is
