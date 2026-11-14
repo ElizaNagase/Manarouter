@@ -344,6 +344,77 @@ own type.
 
 ---
 
+## 10. A ceiling on what a batch may spend
+
+Every dollar figure the batch lane reports is a report. A report does not stop anything, so a submission may
+also carry a ceiling:
+
+```json
+{"input_file_id": "file-…", "endpoint": "/v1/chat/completions",
+ "completion_window": "24h", "max_cost_usd": 2.50}
+```
+
+`max_cost_usd` is optional; absent or `null` means no ceiling, which is what every batch submitted
+before this field existed still means. When it is present it must be a finite number of dollars
+greater than zero and at most 1000. Zero is refused rather than obeyed: it would stop before the first
+item while looking like a request that runs a batch. Anything that is not a number — a string, a
+boolean, an array — is refused with the usual `invalid_request_error` shape instead of being coerced.
+
+**The check is against money already spent, never against a forecast.** Before each item is
+dispatched the lane reads the ledger it has been keeping (`gpu_seconds × price_per_second`, plus the
+boot fee for a cold start) and dispatches nothing further once that total has reached the cap. The
+consequence the operator should expect is that the cap is a *stopping* rule, not a hard bound: an item
+that is already in flight is never interrupted, because killing a request mid-answer wastes the GPU
+seconds it has already been billed for and yields neither a result nor an error.
+
+Two honest limits follow, and both are reported rather than papered over:
+
+- **An endpoint with no configured `price_per_second` contributes nothing to the ledger.** A capped
+  batch can therefore overspend by the unpriced share of its work, but it can never under-report what
+  it spent. If the operator wants the ceiling to bind exactly, they must declare the price.
+- **Items that never ran are retired, not failed.** They appear in no result file and in no error
+  file, exactly as a cancellation retires them: nothing about them failed, the ceiling arrived first.
+  `request_counts` therefore sums to fewer than `total`, which is the visible sign that a batch was
+  cut off.
+
+The terminal status is `cancelled`, because the OpenAI batch vocabulary has no "stopped early" status
+and inventing one would break clients that switch on the documented set. The reason is never left to
+inference: the batch object carries `budget_exceeded` (a boolean) and `stopped_reason`
+(`"max_cost_usd_exceeded"`, or `"cancelled"` when an operator cancelled it), alongside
+`max_cost_usd` echoing the requested cap so a reader can tell "no cap" from "a cap that was not hit".
+A batch that ends with its spend exactly at the cap reports `budget_exceeded: true` as well: the
+ceiling did bind, and pretending otherwise would invite a retry with the same cap.
+
+These three fields are **extensions to OpenAI's batch object**, not part of its schema. A client that
+does not know them ignores them; one that reads them learns something OpenAI's own batches cannot say.
+
+## 11. Uploading the input file
+
+A batch is submitted in two steps: upload the JSONL, then reference the file id. The upload route
+accepts both shapes people actually use, and they are equally supported:
+
+```bash
+# What OpenAI's examples and every SDK send.
+curl -H "Authorization: Bearer $KEY" \
+     -F purpose=batch -F file=@input.jsonl \
+     http://127.0.0.1:20900/v1/files
+
+# What a shell client sends when it would rather not build a multipart envelope.
+curl -H "Authorization: Bearer $KEY" -H 'Content-Type: application/octet-stream' \
+     --data-binary @input.jsonl \
+     'http://127.0.0.1:20900/v1/files?filename=input.jsonl&purpose=batch'
+```
+
+`multipart/form-data` is the documented shape, so when a request somehow carries both, the form
+decides. In the form, `file` is the only part with bytes and `purpose` is a text field; another part is
+read and dropped rather than refused, because a client library that adds a field this lane ignores is
+still sending a valid upload. A form with no `file` part is refused with `invalid_request_error`, and
+so is a second `file` part — one upload is one file.
+
+The filename is metadata. It is recorded next to the file id and is never used to open a path, so a
+name containing `../` cannot reach outside the state directory. `purpose` must be `batch`; the refusal
+names the purpose it got, because `fine-tune` is the mistake people make.
+
 ## See also
 
 - [research/ARCHITECTURE-gpu-rentals.md](research/ARCHITECTURE-gpu-rentals.md) — the frozen interface:

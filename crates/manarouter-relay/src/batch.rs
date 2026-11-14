@@ -39,6 +39,26 @@
 //! `server.rs`, which is where the health state is reachable from) counts it by diffing the health
 //! snapshot around each item.
 //!
+//! # A ceiling on what a batch may spend
+//!
+//! Reporting a cost after the fact does not stop a batch from running up one, so a submission may
+//! carry `max_cost_usd`. The check is made against money **already settled**, never against a
+//! prediction: before each item is dispatched the lane reads the ledger it has been keeping, and if
+//! the batch has reached its cap it dispatches nothing further. The items that never ran are retired
+//! with no result file, exactly as a cancellation retires them — they are not failures, because
+//! nothing about them failed; the operator's ceiling was reached first.
+//!
+//! In-flight items are not interrupted. A cap that killed a request mid-answer would waste the GPU
+//! seconds it had already been billed for and produce neither a result nor an error, so the ceiling
+//! stops the queue and lets the current item land. An endpoint that declares no `price_per_second`
+//! contributes `0.0` to the ledger, which makes the running total a *floor*: a capped batch can
+//! overspend its cap by the unpriced share, but it can never under-report what it spent.
+//!
+//! A batch that stops this way ends as `cancelled`, because that is what the OpenAI batch status
+//! vocabulary offers for "stopped before its item count", and carries `budget_exceeded: true` and
+//! `stopped_reason: "max_cost_usd_exceeded"` so the reason is never inferred from the status alone.
+//! A batch that happens to end exactly at its cap reports the same, since the cap did bind.
+//!
 //! # Admission is KV tokens, not requests
 //!
 //! A rented endpoint has a fixed KV-cache budget (the operator's own measurements: 1,777,758 tokens
@@ -108,7 +128,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body as AxumBody;
-use axum::extract::{Path as RoutePath, Query, State};
+use axum::extract::{FromRequest, Multipart, Path as RoutePath, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use bytes::Bytes;
@@ -356,6 +376,18 @@ struct JobMeta {
     /// The cost report. Absent until the batch reaches a terminal state.
     #[serde(default)]
     usage: Option<BatchUsage>,
+    /// The operator's ceiling for this batch, if they set one. Recorded at submit time and enforced
+    /// between items; see [`BatchLane::run_task`].
+    #[serde(default)]
+    max_cost_usd: Option<f64>,
+    /// Whether the cap stopped the batch. False for a batch with no cap, and false for one that ran
+    /// to the end below its cap.
+    #[serde(default)]
+    budget_exceeded: bool,
+    /// Why the batch stopped early, when it did: `cancelled` for an operator's cancellation and
+    /// `max_cost_usd_exceeded` for the cap. Absent when nothing stopped it.
+    #[serde(default)]
+    stopped_reason: Option<String>,
 }
 
 impl JobMeta {
@@ -378,6 +410,11 @@ impl JobMeta {
             "output_file_id": self.output_file_id,
             "error_file_id": self.error_file_id,
             "errors": self.errors,
+            // The cap is echoed even when it is null: a client that polls a batch it did not submit
+            // should be able to see that nothing was capped rather than infer it from an absence.
+            "max_cost_usd": self.max_cost_usd,
+            "budget_exceeded": self.budget_exceeded,
+            "stopped_reason": self.stopped_reason,
         });
         // The timestamps OpenAI omits until they happen are omitted here too: a null `completed_at`
         // on a running batch is noise the operator has to filter out of every poll.
@@ -678,6 +715,15 @@ struct Job {
     /// The batch is finished when this reaches zero — which is the only completion condition that is
     /// correct under cancellation, where most of the items are skipped rather than run.
     outstanding: AtomicUsize,
+    /// Dollars spent by the items that have settled so far, as reported.
+    ///
+    /// A running total rather than a predicted one: the cap is checked against it before an item is
+    /// dispatched, so nothing here ever claims to know what an item will cost. An item whose endpoint
+    /// declares no price adds nothing, which makes this a floor — it can let a batch overspend past
+    /// its cap, and never the reverse.
+    spent: Mutex<f64>,
+    /// Set once the cap has stopped the run, so the batch's terminal status can say why.
+    budget_stopped: AtomicBool,
 }
 
 impl Job {
@@ -688,6 +734,37 @@ impl Job {
             meta.completed += 1;
         } else {
             meta.failed += 1;
+        }
+        // The cap is enforced against what has settled, so the ledger is updated in the same critical
+        // section that counts the item: a dispatcher that read the two separately could see a count
+        // of one with a spend of zero and let an item through.
+        let spent = item_cost(result);
+        drop(meta);
+        if spent > 0.0 {
+            *lock(&self.spent) += spent;
+        }
+    }
+
+    /// Whether this batch has spent up to its cap.
+    fn over_budget(&self) -> bool {
+        self.over_budget_at(self.spent_at())
+    }
+
+    /// Dollars spent by settled items so far.
+    fn spent_at(&self) -> f64 {
+        *lock(&self.spent)
+    }
+
+    /// Whether a spend of `spent` has reached this batch's cap.
+    ///
+    /// Split out from [`Self::over_budget`] so a recovered batch can ask the question with the total
+    /// it reloaded rather than the one in memory.
+    fn over_budget_at(&self, spent: f64) -> bool {
+        match lock(&self.meta).max_cost_usd {
+            // A cap of zero cannot be written through the API — `parse_max_cost_usd` refuses it — but a
+            // hand-edited job.json could hold one, and a batch that must spend nothing should stop.
+            Some(cap) => spent >= cap,
+            None => false,
         }
     }
 }
@@ -931,6 +1008,8 @@ impl BatchLane {
             cancelled: AtomicBool::new(true),
             cancelled_notify: Notify::new(),
             outstanding: AtomicUsize::new(0),
+            spent: Mutex::new(0.0),
+            budget_stopped: AtomicBool::new(false),
         });
         lock(&self.jobs).insert(job.id.clone(), job);
     }
@@ -997,6 +1076,9 @@ impl BatchLane {
 
         let settled = load_settled_sync(&dir.join("items"));
         meta.total = items.len();
+        // What the batches that settled before the crash already spent, so a resumed batch's cap counts
+        // money that was really spent rather than starting again from zero.
+        let spent_before: f64 = settled.values().map(item_cost).sum();
         let job = Arc::new(Job {
             id,
             dir: dir.to_path_buf(),
@@ -1005,6 +1087,8 @@ impl BatchLane {
             cancelled: AtomicBool::new(false),
             cancelled_notify: Notify::new(),
             outstanding: AtomicUsize::new(0),
+            spent: Mutex::new(spent_before),
+            budget_stopped: AtomicBool::new(false),
         });
 
         let mut remaining = 0usize;
@@ -1218,6 +1302,9 @@ impl BatchLane {
             error_file_id: None,
             errors: None,
             usage: None,
+            max_cost_usd: spec.max_cost_usd,
+            budget_exceeded: false,
+            stopped_reason: None,
         };
         let job = Arc::new(Job {
             id: id.clone(),
@@ -1227,6 +1314,8 @@ impl BatchLane {
             cancelled: AtomicBool::new(false),
             cancelled_notify: Notify::new(),
             outstanding: AtomicUsize::new(0),
+            spent: Mutex::new(0.0),
+            budget_stopped: AtomicBool::new(false),
         });
         // The record goes down before the first item is queued: a batch that exists in memory but not
         // on disk would vanish, and its items would be dispatched against nothing.
@@ -1322,6 +1411,15 @@ impl BatchLane {
         if job.cancelled.load(Ordering::SeqCst) {
             // A cancelled batch runs nothing more. The item is retired without a result file, so it is
             // counted neither as completed nor as failed: it never happened.
+            self.retire(&job).await;
+            return;
+        }
+        if job.over_budget() {
+            // The same treatment for a batch that has spent its cap: the item that was not dispatched
+            // has no result, so it neither counts nor fails. Items already in flight when the cap was
+            // reached are not interrupted — their cost is being incurred either way, and killing one
+            // would not refund it.
+            job.budget_stopped.store(true, Ordering::SeqCst);
             self.retire(&job).await;
             return;
         }
@@ -1661,6 +1759,9 @@ impl BatchLane {
 
         let usage = summarize(&results);
         let cancelled = job.cancelled.load(Ordering::SeqCst);
+        // Derived from the ledger as well as from the flag: a batch that spent exactly its cap with no
+        // item left to skip never set the flag, and it still ran to its limit.
+        let budget_exceeded = job.budget_stopped.load(Ordering::SeqCst) || job.over_budget();
         let now = now_seconds();
         let snapshot = {
             let mut meta = lock(&job.meta);
@@ -1670,9 +1771,17 @@ impl BatchLane {
             meta.error_file_id = error_file_id;
             meta.usage = usage;
             meta.finalizing_at = Some(now);
-            if cancelled {
+            if cancelled || budget_exceeded {
+                // `cancelled` is the vocabulary this API has for "stopped before every item ran", and it
+                // fits: the batch was not finished, it was cut off. The reason tells the two apart.
                 meta.status = Status::Cancelled;
                 meta.cancelled_at = Some(now);
+                meta.budget_exceeded = budget_exceeded;
+                meta.stopped_reason = Some(if budget_exceeded {
+                    "max_cost_usd_exceeded".to_owned()
+                } else {
+                    "cancelled".to_owned()
+                });
             } else {
                 meta.status = Status::Completed;
                 meta.completed_at = Some(now);
@@ -1900,6 +2009,22 @@ fn load_settled_sync(dir: &Path) -> BTreeMap<usize, ItemResult> {
 ///
 /// Returns `None` when nothing settled, because a batch that produced no results has no cost to
 /// report — and `0.0` would be a lie, since the endpoint may well have booted for nothing.
+/// What one settled item cost, by the same arithmetic the report uses.
+///
+/// `gpu_seconds * price` plus the boot fee when the declared price identifies a measured card. A
+/// cold start whose card this build has no measurement for contributes its GPU seconds and no boot
+/// fee, so the figure is a floor rather than a guess. `None` when the endpoint declared no price:
+/// an unpriced item has no cost this module can state, and inventing one would move the cap.
+fn item_cost(result: &ItemResult) -> f64 {
+    let Some(price) = result.price_per_second else {
+        return 0.0;
+    };
+    let boot = boot_profile(price)
+        .map(|profile| f64::from(result.cold_starts) * profile.boot_seconds * price)
+        .unwrap_or(0.0);
+    result.gpu_seconds * price + boot
+}
+
 fn summarize(results: &[ItemResult]) -> Option<BatchUsage> {
     if results.is_empty() {
         return None;
@@ -2127,26 +2252,117 @@ impl Refusal {
 // --- HTTP handlers --------------------------------------------------------------------------
 
 /// `POST /v1/files`.
+///
+/// Two body shapes are accepted, because both are in real use. `multipart/form-data` is what OpenAI's
+/// own examples and every SDK send (`-F purpose=batch -F file=@input.jsonl`), and a raw body with the
+/// filename and purpose in the query string is what a shell client sends when it would rather not
+/// build a multipart envelope. The multipart form wins when both are present: it is the documented
+/// shape, so it is the one that decides.
+///
+/// The file's *name* is metadata here, not a path. It is stored next to the file id and never used to
+/// open anything, so a name containing `../` cannot escape the state directory.
 pub async fn create_file(
     State(app): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<FileParams>,
-    body: AxumBody,
+    request: Request,
 ) -> Response {
     if let Some(denied) = crate::server::authorize_batch_request(&app, &headers) {
         return denied;
     }
-    let bytes = match crate::server::read_body(body, MAX_FILE_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(error) => return error.into_response(),
+    let is_form = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim_start().starts_with("multipart/form-data"))
+        .unwrap_or(false);
+    let (bytes, filename, purpose) = if is_form {
+        let form = match Multipart::from_request(request, &()).await {
+            Ok(form) => form,
+            Err(error) => {
+                return Refusal::bad_request(
+                    "invalid_request_error",
+                    format!("the upload form could not be read: {error}"),
+                )
+                .into_response()
+            }
+        };
+        match read_upload_form(form).await {
+            Ok(parts) => parts,
+            Err(refusal) => return refusal.into_response(),
+        }
+    } else {
+        let bytes = match crate::server::read_body(request.into_body(), MAX_FILE_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(error) => return error.into_response(),
+        };
+        (bytes.to_vec(), params.filename, params.purpose)
     };
-    match app
-        .batch
-        .put_file(bytes.to_vec(), params.filename, params.purpose)
-        .await
-    {
+    match app.batch.put_file(bytes, filename, purpose).await {
         Ok(view) => crate::server::json_response(StatusCode::OK, view),
         Err(refusal) => refusal.into_response(),
+    }
+}
+
+/// Read an OpenAI-style upload form into `(bytes, filename, purpose)`.
+///
+/// Only the `file` part carries bytes; `purpose` is a short text field. Extra parts are read and
+/// dropped rather than refused, because a client library that adds a field this lane does not use is
+/// still sending a valid upload.
+async fn read_upload_form(
+    mut form: Multipart,
+) -> Result<(Vec<u8>, Option<String>, Option<String>), Refusal> {
+    let mut bytes: Option<Vec<u8>> = None;
+    let mut filename: Option<String> = None;
+    let mut purpose: Option<String> = None;
+    loop {
+        let field = match form.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => {
+                return Err(Refusal::bad_request(
+                    "invalid_request_error",
+                    format!("the upload form could not be read: {error}"),
+                ))
+            }
+        };
+        let name = field.name().unwrap_or_default().to_owned();
+        match name.as_str() {
+            "file" => {
+                if bytes.is_some() {
+                    return Err(Refusal::bad_request(
+                        "invalid_request_error",
+                        "the upload form must contain exactly one \"file\" part",
+                    ));
+                }
+                filename = field.file_name().map(str::to_owned);
+                match field.bytes().await {
+                    Ok(part) => bytes = Some(part.to_vec()),
+                    Err(error) => {
+                        return Err(Refusal::bad_request(
+                            "invalid_request_error",
+                            format!("the \"file\" part could not be read: {error}"),
+                        ))
+                    }
+                }
+            }
+            "purpose" => match field.text().await {
+                Ok(text) => purpose = Some(text),
+                Err(error) => {
+                    return Err(Refusal::bad_request(
+                        "invalid_request_error",
+                        format!("the \"purpose\" field could not be read: {error}"),
+                    ))
+                }
+            },
+            _ => {}
+        }
+    }
+    match bytes {
+        Some(bytes) => Ok((bytes, filename, purpose)),
+        None => Err(Refusal::bad_request(
+            "invalid_request_error",
+            "the upload form has no \"file\" part",
+        )),
     }
 }
 
@@ -2259,6 +2475,10 @@ pub async fn create_batch(
             .unwrap_or("24h")
             .to_owned(),
         metadata: value.get("metadata").cloned(),
+        max_cost_usd: match parse_max_cost_usd(value.get("max_cost_usd")) {
+            Ok(cap) => cap,
+            Err(refusal) => return refusal.into_response(),
+        },
     };
     match app.batch.submit(spec).await {
         Ok(view) => crate::server::json_response(StatusCode::OK, view),
@@ -2319,6 +2539,45 @@ struct BatchSpec {
     endpoint: String,
     completion_window: String,
     metadata: Option<Value>,
+    /// The operator's spending ceiling for this batch, in dollars, or `None` for no ceiling.
+    max_cost_usd: Option<f64>,
+}
+
+/// The largest cap this lane will accept, in dollars.
+///
+/// A cap exists to stop a batch from costing more than the operator expected, so the number has to be
+/// a real one. It is deliberately not read from the environment or a config file: a ceiling that a
+/// deployment sets for everybody is a different feature from one the operator sets for this batch.
+const MAX_COST_CEILING: f64 = 1000.0;
+
+/// Read `max_cost_usd` from a batch request body.
+///
+/// Absent and `null` both mean "no cap", which is why they are not an error. Everything else must be
+/// a finite number of dollars in `(0, MAX_COST_CEILING]`: a negative cap would stop before the first
+/// item, a zero one would do the same while looking like a valid request, and `NaN` compares false
+/// against every limit, so a cap that could never trip is worse than a refusal.
+fn parse_max_cost_usd(value: Option<&Value>) -> Result<Option<f64>, Refusal> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(cap) = value.as_f64() else {
+        return Err(Refusal::bad_request(
+            "invalid_request_error",
+            format!("\"max_cost_usd\" must be a number of dollars, not {value}"),
+        ));
+    };
+    if !cap.is_finite() || cap <= 0.0 || cap > MAX_COST_CEILING {
+        return Err(Refusal::bad_request(
+            "invalid_request_error",
+            format!(
+                "\"max_cost_usd\" must be greater than zero and at most {MAX_COST_CEILING}, not {cap}"
+            ),
+        ));
+    }
+    Ok(Some(cap))
 }
 
 /// Query parameters of the file upload form this lane accepts.
@@ -2687,6 +2946,7 @@ mod tests {
             .to_owned();
         let view = lane
             .submit(BatchSpec {
+                max_cost_usd: None,
                 input_file_id,
                 endpoint: CHAT_COMPLETIONS_PATH.to_owned(),
                 completion_window: "24h".to_owned(),
@@ -3462,6 +3722,9 @@ mod tests {
         // A batch record whose input file no longer exists. Written by hand because the only way to
         // reach this state is a crash plus an operator deleting a file.
         let meta = JobMeta {
+            max_cost_usd: None,
+            budget_exceeded: false,
+            stopped_reason: None,
             id: id.to_owned(),
             input_file_id: "file_gone".to_owned(),
             endpoint: CHAT_COMPLETIONS_PATH.to_owned(),
@@ -3692,6 +3955,7 @@ mod tests {
         assert!(lane.file_bytes(&file_id).await.is_none());
 
         let spec = |input_file_id: &str, endpoint: &str, window: &str| BatchSpec {
+            max_cost_usd: None,
             input_file_id: input_file_id.to_owned(),
             endpoint: endpoint.to_owned(),
             completion_window: window.to_owned(),
@@ -3767,5 +4031,250 @@ mod tests {
         let list = lane.batches_view(10, None);
         assert_eq!(list["object"], "list");
         assert_eq!(list["data"][0]["id"], id.as_str());
+    }
+
+    // --- Uploading a file --------------------------------------------------------------------
+
+    /// A `multipart/form-data` body with the given parts, as a client library would build it.
+    fn upload_form(parts: &[(&str, Option<&str>, &str)]) -> Request {
+        const BOUNDARY: &str = "----manarouter-test-boundary";
+        let mut body = String::new();
+        for (name, filename, value) in parts {
+            body.push_str(&format!("--{BOUNDARY}\r\n"));
+            match filename {
+                Some(filename) => body.push_str(&format!(
+                    "Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n\
+                     Content-Type: application/octet-stream\r\n\r\n"
+                )),
+                None => body.push_str(&format!(
+                    "Content-Disposition: form-data; name=\"{name}\"\r\n\r\n"
+                )),
+            }
+            body.push_str(value);
+            body.push_str("\r\n");
+        }
+        body.push_str(&format!("--{BOUNDARY}--\r\n"));
+        Request::builder()
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={BOUNDARY}"),
+            )
+            .body(AxumBody::from(body))
+            .expect("a request is built")
+    }
+
+    #[tokio::test]
+    async fn an_upload_form_is_read_from_its_file_and_purpose_parts() {
+        let request = upload_form(&[
+            ("purpose", None, "batch"),
+            ("file", Some("in.jsonl"), "{\"a\":1}\n"),
+            // A field this lane does not use is read and dropped, not refused: a client library that
+            // adds one is still sending a valid upload.
+            ("unused", None, "whatever"),
+        ]);
+        let form = Multipart::from_request(request, &())
+            .await
+            .expect("the body is a valid form");
+        let (bytes, filename, purpose) = read_upload_form(form).await.ok().expect("the form reads");
+        assert_eq!(bytes, b"{\"a\":1}\n");
+        assert_eq!(filename.as_deref(), Some("in.jsonl"));
+        assert_eq!(purpose.as_deref(), Some("batch"));
+    }
+
+    #[tokio::test]
+    async fn an_upload_form_without_a_file_is_refused() {
+        let request = upload_form(&[("purpose", None, "batch")]);
+        let form = Multipart::from_request(request, &())
+            .await
+            .expect("the body is a valid form");
+        let error = read_upload_form(form)
+            .await
+            .expect_err("a form with no file is refused");
+        assert_eq!(error.code, "invalid_request_error");
+        assert!(error.message.contains("no \"file\" part"));
+    }
+
+    // --- The spending cap ------------------------------------------------------------------
+
+    /// Submit a batch with a cap, for the tests that trip one.
+    async fn submit_capped(lane: &Arc<BatchLane>, items: &[(&str, &str)], cap: f64) -> String {
+        let file = lane
+            .put_file(input_body(items), Some("input.jsonl".to_owned()), None)
+            .await
+            .ok()
+            .expect("the input file is accepted");
+        let input_file_id = file["id"]
+            .as_str()
+            .expect("a stored file has an id")
+            .to_owned();
+        let view = lane
+            .submit(BatchSpec {
+                input_file_id,
+                endpoint: CHAT_COMPLETIONS_PATH.to_owned(),
+                completion_window: "24h".to_owned(),
+                metadata: None,
+                max_cost_usd: Some(cap),
+            })
+            .await
+            .ok()
+            .expect("the batch is accepted");
+        // The cap is echoed from the first response, not only once it has been spent.
+        assert_eq!(view["max_cost_usd"], json!(cap));
+        assert_eq!(view["budget_exceeded"], json!(false));
+        view["id"].as_str().expect("a batch has an id").to_owned()
+    }
+
+    #[test]
+    fn a_cost_cap_is_read_as_a_positive_number_of_dollars() {
+        // Absent and null both mean "no cap": a client that omits the field is not refused, and one
+        // that sends an explicit null is sending the same request.
+        assert_eq!(parse_max_cost_usd(None).ok(), Some(None));
+        assert_eq!(parse_max_cost_usd(Some(&Value::Null)).ok(), Some(None));
+        assert_eq!(parse_max_cost_usd(Some(&json!(0.5))).ok(), Some(Some(0.5)));
+        assert_eq!(
+            parse_max_cost_usd(Some(&json!(25.0))).ok(),
+            Some(Some(25.0))
+        );
+        // The ceiling itself is allowed; above it is not.
+        assert_eq!(
+            parse_max_cost_usd(Some(&json!(MAX_COST_CEILING))).ok(),
+            Some(Some(MAX_COST_CEILING))
+        );
+
+        for refused in [
+            json!(0),
+            json!(-1),
+            json!(MAX_COST_CEILING + 0.01),
+            json!("5"),
+            json!(true),
+            json!([1]),
+        ] {
+            let error = parse_max_cost_usd(Some(&refused))
+                .err()
+                .unwrap_or_else(|| panic!("{refused} must not be accepted as a cap"));
+            assert_eq!(error.code, "invalid_request_error");
+        }
+        // A cap of zero is refused rather than obeyed: it would stop before the first item while
+        // looking like a request that runs a batch.
+        assert!(parse_max_cost_usd(Some(&json!(0))).is_err());
+    }
+
+    #[test]
+    fn an_item_costs_its_gpu_seconds_plus_the_boot_fee() {
+        let price = 3.03 / 3600.0;
+        let facts = PlanFacts {
+            provider_id: Some("local".to_owned()),
+            model: Some("m".to_owned()),
+            price_per_second: Some(price),
+        };
+        let item = BatchItem {
+            custom_id: "c".to_owned(),
+            body: Bytes::new(),
+        };
+        let mut result = ItemResult::start(&item, &facts, "req", 1);
+        result.gpu_seconds = 3600.0;
+        result.cold_starts = 1;
+        // One card-hour at the RTX PRO 6000 rate, plus one 180-second boot at the same rate.
+        let cost = item_cost(&result);
+        assert!(
+            (cost - (3.03 + 180.0 * price)).abs() < 1e-9,
+            "cost was {cost}"
+        );
+
+        // Cold starts on a card this build has no measurement for contribute their GPU seconds and no
+        // boot fee, which is a floor rather than a guess.
+        result.price_per_second = Some(5.0);
+        result.cold_starts = 3;
+        let cost = item_cost(&result);
+        assert!((cost - 18000.0).abs() < 1e-6, "cost was {cost}");
+
+        // An endpoint that declares no price has no cost this module can state, so it adds nothing to
+        // the ledger rather than a made-up figure.
+        result.price_per_second = None;
+        assert_eq!(item_cost(&result), 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_reaches_its_cap_stops_and_says_so() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        // A dollar a second, so one item that takes tens of milliseconds costs whole dollars and the
+        // test does not depend on the resolution of the wall clock.
+        let price = 1.0;
+        let answerer: Answerer = Arc::new(|model: &str, _nth: usize, _request: &ItemRequest| {
+            Answer::Later(Duration::from_millis(30), ok_reply(model, 1, 1))
+        });
+        let stub = Arc::new(Stub::new(following(10, UNLIMITED, Some(price)), answerer));
+        // One worker, so the queue is drained in order and the first settled item is item-0.
+        let lane = stub_lane(root.path(), Arc::new(AdmissionPool::new()), &stub, 1);
+
+        let id = submit_capped(
+            &lane,
+            &[
+                ("item-0", "item-0"),
+                ("item-1", "item-1"),
+                ("item-2", "item-2"),
+            ],
+            0.01,
+        )
+        .await;
+        let view = wait_terminal(&lane, &id).await;
+
+        // The batch stopped rather than completed: it was cut off below its item count, and the cap is
+        // the reason. Nothing predicted the cost — the ledger was read after item-0 settled.
+        assert_eq!(view["status"], "cancelled");
+        assert_eq!(view["budget_exceeded"], json!(true));
+        assert_eq!(view["stopped_reason"], json!("max_cost_usd_exceeded"));
+        assert!(view["cancelled_at"].is_number());
+        assert_eq!(count_of(&view, "total"), 3);
+        // Exactly one item ran: the other two were never dispatched, so they are neither completed nor
+        // failed — the same treatment a cancellation gives them.
+        assert_eq!(count_of(&view, "completed") + count_of(&view, "failed"), 1);
+        assert_eq!(stub.calls(), 1);
+        // A single item at a dollar a second is well past the one-cent cap, and the report says how far.
+        assert!(view["usage"]["cost_usd"].as_f64().unwrap_or(0.0) > 0.01);
+        // The item that ran is on disk with its result; the ones that did not are absent, not failed.
+        let output = view["output_file_id"]
+            .as_str()
+            .expect("the item that ran has an output file");
+        assert_eq!(custom_ids(&result_lines(&lane, output).await).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_batch_below_its_cap_runs_every_item_and_reports_no_stop() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let price = 3.03 / 3600.0;
+        let answerer: Answerer = Arc::new(|model: &str, _nth: usize, _request: &ItemRequest| {
+            Answer::Now(ok_reply(model, 5, 5))
+        });
+        let stub = Arc::new(Stub::new(following(10, UNLIMITED, Some(price)), answerer));
+        let lane = stub_lane(root.path(), Arc::new(AdmissionPool::new()), &stub, 2);
+
+        let id = submit_capped(&lane, &[("item-0", "item-0"), ("item-1", "item-1")], 1000.0).await;
+        let view = wait_terminal(&lane, &id).await;
+
+        // Under its cap the batch is ordinary: every item ran, and the report says nothing stopped it.
+        assert_eq!(view["status"], "completed");
+        assert_eq!(view["budget_exceeded"], json!(false));
+        assert_eq!(view["max_cost_usd"], json!(1000.0));
+        assert!(view["stopped_reason"].is_null());
+        assert_eq!(count_of(&view, "completed"), 2);
+        assert_eq!(count_of(&view, "failed"), 0);
+        assert_eq!(stub.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_batch_with_no_cap_reports_a_null_cap() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let answerer: Answerer = Arc::new(|model: &str, _nth: usize, _request: &ItemRequest| {
+            Answer::Now(ok_reply(model, 1, 1))
+        });
+        let stub = Arc::new(Stub::new(following(10, UNLIMITED, None), answerer));
+        let lane = stub_lane(root.path(), Arc::new(AdmissionPool::new()), &stub, 1);
+        let id = submit(&lane, &[("item-0", "item-0")]).await;
+        let view = wait_terminal(&lane, &id).await;
+        assert_eq!(view["status"], "completed");
+        assert!(view["max_cost_usd"].is_null());
+        assert_eq!(view["budget_exceeded"], json!(false));
+        assert!(view["stopped_reason"].is_null());
     }
 }

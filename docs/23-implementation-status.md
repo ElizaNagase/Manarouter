@@ -285,7 +285,11 @@ counted) and `serving_usd_per_million_output_tokens` (the same figure with the b
 is what a card-to-card comparison needs). Both are divisions of two measured numbers and both are
 `null` when either is missing — a batch that produced no output tokens has no denominator, and a price
 of zero matches no measured boot time, so neither figure is invented to fill the gap. A pre-flight hold would need a throughput figure this build does not
-have for any card; inventing one is the guess the module refuses to make.
+have for any card; inventing one is the guess the module refuses to make. What the lane *will* do is
+stop: a submission may carry `max_cost_usd`, checked against dollars already settled before each
+item is dispatched, and a batch that stops that way ends `cancelled` with
+`stopped_reason: "max_cost_usd_exceeded"` rather than a status OpenAI's vocabulary does not have
+([25-gpu-rentals.md](25-gpu-rentals.md) §10).
 
 Still not verified: no batch has been submitted to a real GPU and observed to complete, so every
 figure in the lane is a computation over a recorded measurement rather than a fresh observation.

@@ -32,7 +32,7 @@ hyper-util = { version = "0.1", features = ["server", "client", "client-legacy",
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
-axum = { version = "0.8", features = ["json", "query", "macros"] }
+axum = { version = "0.8", features = ["json", "query", "macros", "multipart"] }
 tower = "0.5"
 futures-util = "0.3"
 async-trait = "0.1"
