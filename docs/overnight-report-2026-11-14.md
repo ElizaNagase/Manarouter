@@ -11,6 +11,14 @@ or marked as unverified. Twenty-nine commits are on `main` locally and **not pus
   and a real `cursor/auto` turn were re-checked afterwards (answer `"ok"`, `usage` present).
 - `/v1/models` reports 23 056 models, of which **24** are `cursor/*`.
 
+## The probe key is gone
+
+The probes ran on their own client key, `cursor-probe8`, scoped to `cursor/*` with a 120-request
+limit rather than a copy of anyone's key, and it was referred to only from a 0600 curl config. That
+key is now **disabled** at the relay (`mr key disable`), the config file holding it was shredded, no
+other copy of it exists on disk, and a request with the old value is answered `401 invalid_api_key`.
+Nothing from the probes remains that can still authenticate.
+
 ## Cursor, end to end
 
 The provider works. A live call answers, streams, and reports usage:
@@ -92,8 +100,12 @@ and that is stated where the figures live.
 
 1. **Rotate the Modal CLI credential.** It was exposed in a log earlier. I did not repeat it anywhere.
 2. **Push.** Twenty-nine commits sit on local `main`. GitHub refuses writes from this session's
-   identity (`403 … denied to ElizaNagase`), so PR 15 is merged *locally* only (`0e36fa2`) and
-   nothing upstream has moved.
+   identity — `gh auth status` shows a single account, `ElizaNagase`, with `repo` scope but no
+   collaborator rights, and the push is answered `403 Permission to RobertoTornel/Manarouter.git
+   denied`. PR 15 is merged *locally* only (`0e36fa2`, verified: the PR's head `4f6eeda` is an
+   ancestor of the merge), the PR itself is still `OPEN` upstream and reports `MERGEABLE`, and
+   nothing upstream has moved. With an account that can write, `git push origin main` then merging
+   #15 on GitHub finishes both in under a minute; nothing in the tree needs changing first.
 3. **One interpretation to confirm.** "Add a custom language for OpenRouter routing" was implemented
    as carrying OpenRouter's routing fields across the Anthropic translation (`e90f50f`). If you meant
    something else by "custom language" — a dialect, a panel surface, a docs page — say which and it
