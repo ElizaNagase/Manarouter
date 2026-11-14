@@ -1,7 +1,7 @@
 # Overnight report — 14 November 2026
 
 Written at 03:00 local (02:00 UTC). Everything below is either verified against the running instance
-or marked as unverified. Twenty-nine commits are on `main` locally and **not pushed** (see
+or marked as unverified. A night's work — thirty-odd commits — is on `main` locally and **not pushed** (see
 "Blocked").
 
 ## What is running, right now
@@ -99,7 +99,7 @@ and that is stated where the figures live.
 ## Blocked, and needing you
 
 1. **Rotate the Modal CLI credential.** It was exposed in a log earlier. I did not repeat it anywhere.
-2. **Push.** Twenty-nine commits sit on local `main`. GitHub refuses writes from this session's
+2. **Push.** Thirty-odd commits sit on local `main`, and the push is a plain fast-forward (`origin/main` is an ancestor of `HEAD`), so nothing needs rebasing once an account that can write is authenticated. GitHub refuses writes from this session's
    identity — `gh auth status` shows a single account, `ElizaNagase`, with `repo` scope but no
    collaborator rights, and the push is answered `403 Permission to RobertoTornel/Manarouter.git
    denied`. PR 15 is merged *locally* only (`0e36fa2`, verified: the PR's head `4f6eeda` is an
