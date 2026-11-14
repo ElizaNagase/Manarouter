@@ -1875,8 +1875,8 @@ export function stepList(draft, catalog = null) {
       hint: 'The probe’s architecture gives an analytic KV estimate. Overrides are yours; vLLM’s startup line is authoritative.',
       fields: [
         numberField({ name: 'maxModelLen', label: 'Max model length', value: fieldValue(d, 'maxModelLen'), min: 1, step: 1, hint: 'vLLM `--max-model-len`. Defaults to the config’s `max_position_embeddings`; lowering it raises concurrency.' }),
-        numberField({ name: 'maxNumSeqs', label: 'Max sequences', value: fieldValue(d, 'maxNumSeqs'), min: 1, step: 1, hint: 'vLLM `--max-num-seqs`: sequences per scheduling step, not simultaneous sessions.' }),
-        numberField({ name: 'shutdownCooldownSecs', label: 'Scale-down window (s)', value: fieldValue(d, 'shutdownCooldownSecs'), min: SCALEDOWN_WINDOW_LIMITS.min, max: SCALEDOWN_WINDOW_LIMITS.max, step: 1, hint: 'Modal `scaledown_window`: default 60, range 2–1200.' }),
+        numberField({ name: 'maxNumSeqs', label: 'Simultaneous sessions', value: fieldValue(d, 'maxNumSeqs'), min: 1, step: 1, hint: 'vLLM `--max-num-seqs`, the number of sequences scheduled in one step: the ceiling on simultaneous sessions.' }),
+        numberField({ name: 'shutdownCooldownSecs', label: 'Shutdown cooldown (seconds)', value: fieldValue(d, 'shutdownCooldownSecs'), min: SCALEDOWN_WINDOW_LIMITS.min, max: SCALEDOWN_WINDOW_LIMITS.max, step: 1, hint: 'Modal `scaledown_window`: default 60, range 2–1200.' }),
         readout({
           name: 'sizingKvBasis', label: 'KV bytes per token', value: sizing.kv_bytes_per_token ?? null,
           visible: sizing.kv_bytes_per_token != null,
@@ -2171,12 +2171,12 @@ export function validateStep(draft, stepId, catalog = null, accounts = null) {
     if (seqs != null && seqs !== '') {
       const value = toNumber(seqs);
       if (value == null || !Number.isInteger(value) || value < 1) {
-        problems.push(problem('maxNumSeqs', 'Max sequences must be a whole number of at least 1, or empty.'));
+        problems.push(problem('maxNumSeqs', 'Simultaneous sessions must be a whole number of at least 1, or empty.'));
       }
     }
     const cooldown = toNumber(d.shutdownCooldownSecs);
     if (cooldown == null || !Number.isInteger(cooldown)) {
-      problems.push(problem('shutdownCooldownSecs', 'Scale-down window must be a whole number of seconds.'));
+      problems.push(problem('shutdownCooldownSecs', 'Shutdown cooldown must be a whole number of seconds.'));
     } else if (cooldown < SCALEDOWN_WINDOW_LIMITS.min || cooldown > SCALEDOWN_WINDOW_LIMITS.max) {
       problems.push(problem('shutdownCooldownSecs', `Modal accepts scaledown_window from ${SCALEDOWN_WINDOW_LIMITS.min} to ${SCALEDOWN_WINDOW_LIMITS.max} seconds (default ${SCALEDOWN_WINDOW_LIMITS.default}).`));
     }
