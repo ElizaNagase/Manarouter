@@ -1873,18 +1873,35 @@ impl Refusal {
 /// end-of-stream trailer carrying the same object. A frame that is not JSON, or JSON without an
 /// `error` member, is not a refusal and returns `None` — the caller keeps its existing behaviour
 /// rather than inventing a cause.
+///
+/// An `error` member with nothing readable in it *is* a refusal, with a message this function writes
+/// itself. That case is not academic: the server sometimes sends `{"error":{"message":"Error",
+/// "type":"invalid_request_error"}}` — the placeholder and nothing else — and returning `None` for it
+/// let the frame through as an ordinary in-band server error. The caller's whole point in asking is
+/// to decide *before* the response head is committed, so "the server refused and did not say why"
+/// must still be a refusal: otherwise a non-streaming client is handed `200` with an error body, and
+/// the account that should have been failed over is the one that keeps the traffic.
 pub fn refusal(frame: &Frame) -> Option<Refusal> {
     if frame.payload.first() != Some(&b'{') {
         return None;
     }
     let value: Value = serde_json::from_slice(&frame.payload).ok()?;
     let error = value.get("error")?;
-    let message = refusal_message(&value)?;
     let code = error
         .get("code")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    // The server's own sentence when it wrote one, and an honest stand-in when it did not. Saying
+    // "without saying why" is better than repeating its placeholder: `Error` as a message is
+    // indistinguishable from a bug in this port.
+    let message = refusal_message(&value).unwrap_or_else(|| {
+        if code.is_empty() {
+            "the server refused the turn without saying why".to_owned()
+        } else {
+            format!("the server refused the turn ({code})")
+        }
+    });
     let model_unavailable = error
         .get("details")
         .and_then(Value::as_array)
@@ -2812,6 +2829,27 @@ mod tests {
         assert_eq!(classified.status(), 404);
         assert!(!classified.model_unavailable);
         assert!(classified.message.contains("not valid"));
+
+        // The placeholder and nothing else is still a refusal. This is the shape that used to fall
+        // through as an ordinary in-band error, committing a `200` whose body was an error object.
+        let bare = br#"{"error":{"message":"Error","type":"invalid_request_error"}}"#;
+        let classified = refusal(&Frame {
+            payload: bare.to_vec(),
+            trailer: false,
+        })
+        .expect("a refusal even without a usable message");
+        assert_eq!(classified.status(), 502);
+        assert!(!classified.model_unavailable);
+        assert!(
+            classified.message.contains("refused the turn"),
+            "{}",
+            classified.message
+        );
+        assert!(
+            !classified.message.contains("Error"),
+            "{}",
+            classified.message
+        );
 
         // JSON that carries no error, and a frame that is not JSON at all, are not refusals.
         assert!(refusal(&Frame {

@@ -1513,6 +1513,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refusal_with_no_message_still_replaces_the_stream_instead_of_answering_200() {
+        // The shape the server actually sent once: an `error` member whose only message is the
+        // placeholder, and no code. It used to fall through as an ordinary in-band error, because
+        // the refusal parser had no sentence to keep and returned `None` — so the head was committed
+        // as `200` and a non-streaming client was handed an error object under a success status. The
+        // account that refused kept the traffic instead of being failed over.
+        let payload = br#"{"error":{"message":"Error","type":"invalid_request_error"}}"#;
+        let exchange = MockExchange::new(
+            vec![Step::Bytes(Bytes::from(cursor::encode_frame(payload)))],
+            StatusCode::OK,
+        );
+        let prepared = prepared(&ctx("gemini-4-hydrogen-high"), true);
+        let response = run_turn(&exchange, prepared, Duration::from_secs(5))
+            .await
+            .expect("a response");
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_GATEWAY,
+            "a refusal the server did not explain is still a refusal"
+        );
+        let body = text(&drain(response.body).await);
+        assert!(body.contains(r#""type":"upstream_error""#), "{body}");
+        assert!(body.contains("refused the turn"), "{body}");
+        assert!(
+            !body.contains(r#""message":"Error""#),
+            "the placeholder must not be repeated as if it were the cause: {body}"
+        );
+        assert!(!body.contains("chat.completion.chunk"), "{body}");
+    }
+
+    #[tokio::test]
     async fn a_turn_that_ends_before_any_answer_is_a_bad_gateway_rather_than_an_empty_stream() {
         // A silent close with no refusal and no text: the account may well answer next time, so the
         // client must see a failure it can retry, not a `200` with nothing in it.
