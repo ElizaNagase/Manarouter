@@ -89,7 +89,7 @@ upstream response straight back.
 
 ---
 
-## The ten dialects at a glance
+## The eleven dialects at a glance
 
 | Dialect | Upstream path | Body passthrough possible | Always answers as SSE | Upstream shape |
 |---|---|---|---|---|
