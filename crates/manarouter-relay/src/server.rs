@@ -2582,12 +2582,8 @@ async fn attempt_step(
 
     match response {
         Ok(response) if response.status.is_success() => {
-            app.health.record_success(
-                provider.cooldown_scope,
-                step.provider_id.as_str(),
-                account.id.as_str(),
-                &step.model,
-            );
+            app.health
+                .record_success(step.provider_id.as_str(), account.id.as_str(), &step.model);
             if let Some(combo) = combo.filter(|c| sticky_applies(c)) {
                 app.sticky_success.record_success(
                     &combo.id,
@@ -2656,6 +2652,24 @@ async fn attempt_step(
                 reason = named;
                 named_wait = wait.or(named_wait);
             }
+            // A model the *plan* does not include is not a spent account, and the difference is
+            // worth two lines: the account keeps serving every other model, so parking it whole
+            // would take request capacity away from the models that do work in order to punish
+            // one that never will. Cursor reports this under `resource_exhausted`, the same code it
+            // uses for a rate limit, and the only field that separates them is the model-switch
+            // button on the error — see `cursor::Refusal::model_unavailable`. The transport reads
+            // that structure and, once, writes the answer here.
+            //
+            // The consequence is a cooldown keyed on this model alone (`CooldownScope::Model`), and
+            // a request that fails over to the account or step that does have it, which is what an
+            // operator asking for a model means by "my account is on the Free plan".
+            let model_unavailable = response
+                .body
+                .first_frame_bytes()
+                .is_some_and(|bytes| names_an_unavailable_model(bytes));
+            if model_unavailable {
+                reason = select::CooldownReason::QuotaExhausted;
+            }
             // A refusal used to leave no trace at all, which made the most expensive failure in
             // a combo — the one that silently sends every request to the next step — invisible.
             // The excerpt is what names the cause: `prefill_cap_refused` reads as a rate limit in
@@ -2670,6 +2684,7 @@ async fn attempt_step(
                 provider = %step.provider_id,
                 status = response.status.as_u16(),
                 reason = ?reason,
+                model_unavailable,
                 named_wait_ms = named_wait,
                 body = %excerpt,
                 "upstream refused the request"
@@ -2700,7 +2715,7 @@ async fn attempt_step(
                     retry_accounts: false,
                 };
             }
-            let effective_scope = if modal_cold_start {
+            let effective_scope = if modal_cold_start || model_unavailable {
                 mr_core::model::CooldownScope::Model
             } else {
                 provider.cooldown_scope
@@ -3315,7 +3330,6 @@ fn last_resort_step<'a>(
                 .filter(|account| select::account_allows_model(account, &step.model))
                 .map(|account| {
                     select::route_reset_instant(
-                        provider.cooldown_scope,
                         provider.id.as_str(),
                         account.id.as_str(),
                         &step.model,
@@ -3513,6 +3527,24 @@ fn capacity_refusal(body: &[u8]) -> Option<u64> {
         .and_then(|seconds| seconds.parse::<u64>().ok())
         .map(|seconds| seconds.min(86_400).saturating_mul(1000));
     Some(hinted.unwrap_or(FALLBACK_MS))
+}
+
+/// Whether a refusal body says the *plan* does not include the requested model.
+///
+/// Only transports that can tell the two apart write this member, because the upstream status alone
+/// cannot: Cursor answers both a rate limit and a model its Free tier lacks with
+/// `resource_exhausted`, and a relay reading the code would park a healthy account for a model it was
+/// never going to be allowed to use. The marker is owned by the relay — its transport puts it there,
+/// having read the upstream's structured switch-model button — so this is not prose matching.
+fn names_an_unavailable_model(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    value
+        .get("error")
+        .and_then(|error| error.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("model_unavailable")
 }
 
 fn exhausted_by_body(body: &[u8]) -> Option<(select::CooldownReason, Option<u64>)> {
