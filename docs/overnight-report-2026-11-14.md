@@ -109,13 +109,15 @@ access would let the same push go straight upstream.
 ## Blocked, and needing you
 
 1. **Rotate the Modal CLI credential.** It was exposed in a log earlier. I did not repeat it anywhere.
-2. **Push.** Thirty-odd commits sit on local `main`, and the push is a plain fast-forward (`origin/main` is an ancestor of `HEAD`), so nothing needs rebasing once an account that can write is authenticated. GitHub refuses writes from this session's
-   identity — `gh auth status` shows a single account, `ElizaNagase`, with `repo` scope but no
-   collaborator rights, and the push is answered `403 Permission to RobertoTornel/Manarouter.git
-   denied`. PR 15 is merged *locally* only (`0e36fa2`, verified: the PR's head `4f6eeda` is an
-   ancestor of the merge), the PR itself is still `OPEN` upstream and reports `MERGEABLE`, and
-   nothing upstream has moved. With an account that can write, `git push origin main` then merging
-   #15 on GitHub finishes both in under a minute; nothing in the tree needs changing first.
+2. **Merge upstream.** The branch is pushed and PR #16 is open from `ElizaNagase/Manarouter` into
+   `RobertoTornel/Manarouter` (`OPEN`, `MERGEABLE`, head equals local `HEAD`), carrying PR #15's merge
+   `0e36fa2` and everything after it. The merge itself is refused for this session's identity —
+   `gh pr merge 16` answers `ElizaNagase does not have the correct permissions to execute
+   MergePullRequest`, and a direct push is answered `403 Permission ... denied to ElizaNagase`.
+   `gh auth status` shows that single account with `repo` scope and no collaborator rights. Merging
+   #16 needs an account with write access to the upstream repository; nothing in the tree needs
+   changing first. PR #15 is merged locally only, and remains `OPEN` upstream, but #16 already
+   contains its head `4f6eeda`.
 3. **One interpretation to confirm.** "Add a custom language for OpenRouter routing" was implemented
    as carrying OpenRouter's routing fields across the Anthropic translation (`e90f50f`). If you meant
    something else by "custom language" — a dialect, a panel surface, a docs page — say which and it
